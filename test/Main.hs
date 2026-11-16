@@ -76,7 +76,6 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), cu
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
 import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, checkGitRef, checkGitRev, checkGitUrl, currentSystemStr, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evalParsed, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, listedBuiltins, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
-import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.Builtin (Builtin, builtinIndex, builtinName, builtinNamed)
 import qualified Nix.Eval.Builtin as Builtin
@@ -88,6 +87,7 @@ import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsTy
 import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks, thunkListToCList)
 import Nix.Eval.CRoots (crootsAddThunk)
 import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
+import Nix.Eval.CStatus (CStatusError (..), arenaLive)
 import Nix.Eval.CStr (cstrNew)
 import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBool, cthunkGetCtxStr, cthunkGetInt, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkPrimop, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
@@ -95,7 +95,7 @@ import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, reassembleInt64)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), LambdaName (..))
-import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, evalBaseEnv, newEvalState, newEvalStateWith, renderEvalFailure, runEvalIO, runEvalIOTraced)
+import Nix.Eval.IO (EvalFailure (..), EvalState (..), SessionSettings (..), allowEvalPath, evalBaseEnv, newEvalStateWith, nixPathSearchPath, renderEvalFailure, runEvalIO, runEvalIOTraced, withEvalSession)
 import Nix.Eval.Operator (evalUpdate)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printSymbol, printValue)
@@ -1828,6 +1828,11 @@ testCensus = do
         after <- censusOf [RootRegistered]
         let thunks = fmap (figuresCount . kindThunks . censusReached)
         pure (assertEqual "thunks reached" (fmap (fmap (+ 1)) (thunks before)) (thunks after)),
+      runTestM "a nested session forgets the roots it registered as it ends" $ do
+        before <- censusOf [RootRegistered]
+        inTestSession (pure ())
+        after <- censusOf [RootRegistered]
+        pure (assertEqual "reached from the registered roots" (fmap censusReached before) (fmap censusReached after)),
       runTestM "a session registers the value an import caches, which a census from the registered roots reaches" $ do
         storeDir <- evalNixIOStoreDir
         st <- testEvalState storeDir tmpBase
@@ -4668,18 +4673,19 @@ evalNixIO baseDir source = do
   evalNixIOStore storeDir baseDir source
 
 -- | An evaluation state with no search path, whatever @NIX_PATH@ the suite
--- runs under.  'newEvalState' makes @NIX_PATH@'s entries as it runs,
--- interning their strings, so a test whose result depends on the order
--- names were interned in would otherwise depend on the machine; a test of
+-- runs under.  'nixPathSearchPath' makes @NIX_PATH@'s entries, interning
+-- their strings, so a test whose result depends on the order names were
+-- interned in would otherwise depend on the machine; a test of
 -- @NIX_PATH@ itself uses 'evalNixIOWithNixPath'.
 testEvalState :: StoreDir -> FilePath -> IO EvalState
 testEvalState = newEvalStateWith unrestrictedPolicy []
 
--- | 'evalNixIO' with the search path @NIX_PATH@ gives ('newEvalState').
+-- | 'evalNixIO' with the search path @NIX_PATH@ gives ('nixPathSearchPath').
 evalNixIOWithNixPath :: FilePath -> Text -> IO (Either Text NixValue)
 evalNixIOWithNixPath baseDir source = do
   storeDir <- evalNixIOStoreDir
-  st <- newEvalState unrestrictedPolicy storeDir baseDir
+  searchPaths <- nixPathSearchPath
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir baseDir
   evalNixIOIn st baseDir source
 
 -- | 'evalNixIO' keeping a failure whole, its lines of context included.
@@ -6254,7 +6260,7 @@ unpairedSurrogateNixPath dir
       runTestM "NIX_PATH holding an unpaired surrogate is refused" $
         withEnvVar (T.unpack nixPathVarName) "a=\xD800" $ do
           storeDir <- evalNixIOStoreDir
-          outcome <- try (newEvalState unrestrictedPolicy storeDir dir)
+          outcome <- try (nixPathSearchPath >>= \searchPaths -> newEvalStateWith unrestrictedPolicy searchPaths storeDir dir)
           pure $ case outcome of
             Left (err :: IOException)
               | unpairedSurrogateWords `T.isInfixOf` T.pack (displayException err) -> Pass
@@ -24131,10 +24137,9 @@ testToJSONPathIO = do
 -- ---------------------------------------------------------------------------
 
 -- | The argument that turns this executable into the child of
--- 'testArenaGuard'.  The child reaches the C layer with no 'arenaInit',
--- which the suite cannot do in its own process: 'main' brackets every
--- group, and a destroy-then-reinit cycle would invalidate the arena
--- pointers that process-lifetime CAFs already hold.
+-- 'testArenaGuard'.  The child reaches the C layer outside any
+-- evaluation session, which the suite cannot do in its own process:
+-- 'main' runs every group in one session ('inTestSession').
 arenaGuardChildFlag :: String
 arenaGuardChildFlag = "--arena-guard-child"
 
@@ -24147,7 +24152,7 @@ data ArenaGuardPath = ArenaGuardPath
     guardClaim :: !Text,
     -- | What the child must report.
     guardOutcome :: !GuardOutcome,
-    -- | The child's body, run with no 'arenaInit' of its own.
+    -- | The child's body, run outside any evaluation session.
     guardAction :: !(IO ())
   }
 
@@ -24164,13 +24169,13 @@ servedLine = "served without an exception"
 
 -- | The paths a library user reaches the C layer by.  The first C call
 -- of each of the first five lands in a different sub-arena, and the
--- sixth runs a full init .. destroy cycle first, so both ends of the
--- window are covered.  The next two read the shared @null@, @true@ and
+-- sixth runs a whole session first, so both ends of the window are
+-- covered.  The next two read the shared @null@, @true@ and
 -- @false@ thunks, which must be valid in every window: were they arena
 -- cells behind a process-lifetime CAF, forcing one outside the window
 -- would poison it with 'ArenaNotInitialized' for every later arena, and
--- forcing one inside an arena would leave it pointing into memory the
--- next 'arenaDestroy' frees, a use-after-free the ASan job reports.  The
+-- forcing one inside a session would leave it pointing into memory the
+-- session's end frees, a use-after-free the ASan job reports.  The
 -- last evaluates an empty string before anything else in a fresh arena:
 -- its payload of no words sits at data offset 0, which the store does
 -- not hold yet, so a read there fails the store's bounds assertion.
@@ -24181,30 +24186,59 @@ arenaGuardPaths =
     noArena "string" "nn_str_new" (void (evaluated (mkStr "a"))),
     noArena "symbol" "nn_symbol_intern" (void (symbolIntern "a")),
     noArena "env" "nn_env_new" (void (evaluated VNull >>= \nullCell -> newEnv EnvApply Nothing [nullCell])),
-    noArena "after-destroy" "nn_bc_emit" (bracket_ arenaInit arenaDestroy (pure ()) >> evalNamelessProgram),
+    noArena "after-session" "nn_bc_emit" (inTestSession (pure ()) >> evalNamelessProgram),
     ArenaGuardPath
       { guardName = "constants-outside-window",
-        guardClaim = "the null, true and false thunks read correctly before arenaInit and in a later arena",
+        guardClaim = "the null, true and false thunks read correctly outside every session and in a later one",
         guardOutcome = Served,
-        guardAction = readConstants >> bracket_ arenaInit arenaDestroy readConstants
+        guardAction = readConstants >> inTestSession readConstants
       },
     ArenaGuardPath
       { guardName = "constants-across-cycles",
-        guardClaim = "the null, true and false thunks read correctly across two init .. destroy cycles",
+        guardClaim = "the null, true and false thunks read correctly across two sessions",
         guardOutcome = Served,
-        guardAction = bracket_ arenaInit arenaDestroy readConstants >> bracket_ arenaInit arenaDestroy readConstants
+        guardAction = inTestSession readConstants >> inTestSession readConstants
       },
     ArenaGuardPath
       { guardName = "empty-string-first",
         guardClaim = "an empty string evaluated first in a fresh arena reads no data word",
         guardOutcome = Served,
-        guardAction = bracket_ arenaInit arenaDestroy $ case runPureEval (eval emptyEnv (EStr [])) of
+        guardAction = inTestSession $ case runPureEval (eval emptyEnv (EStr [])) of
           Right (VStr bytes _) | BS.null bytes -> pure ()
           other -> throwIO (ErrorCall ("the empty string evaluated to " ++ show other))
+      },
+    ArenaGuardPath
+      { guardName = "session-returns",
+        guardClaim = "a session tears the arena down as it returns",
+        guardOutcome = Served,
+        guardAction = inTestSession (pure ()) >> arenaGone "a session that returned"
+      },
+    ArenaGuardPath
+      { guardName = "session-throws",
+        guardClaim = "a session tears the arena down as an exception leaves it",
+        guardOutcome = Served,
+        guardAction = do
+          left <- try (inTestSession (throwIO (ErrorCall "inside the session")))
+          case left of
+            Left (ErrorCall _) -> arenaGone "a session an exception left"
+            Right () -> throwIO (ErrorCall "the exception did not leave the session")
+      },
+    ArenaGuardPath
+      { guardName = "nested-session",
+        guardClaim = "a nested session leaves the arena to the session around it",
+        guardOutcome = Served,
+        guardAction = inTestSession $ do
+          inTestSession (pure ())
+          live <- arenaLive
+          unless live (throwIO (ErrorCall "the nested session tore the outer session's arena down"))
+          readConstants
       }
   ]
   where
     noArena name site = ArenaGuardPath name ("no arena: " <> T.pack name <> " raises ArenaNotInitialized at " <> site) (RefusedAt site)
+    arenaGone what = do
+      live <- arenaLive
+      when live (throwIO (ErrorCall (what ++ " left the arena live")))
     -- A small program forced to its result.  It names nothing, so its
     -- first C call compiles it rather than interning a name.
     evalNamelessProgram = case parseNix "/tmp" (SourceText "<expr>") "5 * 2 + 1" of
@@ -24301,7 +24335,7 @@ emits label source expected = runTestM label $ do
 -- compiles what it parses, then print each name the compile added to the
 -- symbol table, one a line, in the order it added them.  Symbols are
 -- numbered from 1 in that order (cbits/nn_symbol.c), and the child's
--- table holds only the startup names 'arenaInit' interned.
+-- table holds only the startup names its session interned as it started.
 internOrderChildFlag :: String
 internOrderChildFlag = "--intern-order-child"
 
@@ -24330,6 +24364,13 @@ internsInOrder label source expected = runTestM label $ do
 namesOnlyChildFlag :: String
 namesOnlyChildFlag = "--names-only-child"
 
+-- | Run an action in an evaluation session with no search path, as the
+-- suite and its children run theirs; a state made inside it is its own.
+inTestSession :: IO a -> IO a
+inTestSession action = do
+  storeDir <- evalNixIOStoreDir
+  withEvalSession (SessionSettings unrestrictedPolicy (pure []) storeDir testBaseDir) (const action)
+
 -- | The flag that runs 'arenaCycleChild'.
 arenaCycleChildFlag :: String
 arenaCycleChildFlag = "--arena-cycle-child"
@@ -24342,7 +24383,7 @@ arenaCycleChildFlag = "--arena-cycle-child"
 -- own names and in @builtins@, and an imported file's value.
 arenaCycleChild :: IO ()
 arenaCycleChild = do
-  mapM_ (const (bracket_ arenaInit arenaDestroy cycleOnce)) [1 :: Int, 2]
+  mapM_ (const (inTestSession cycleOnce)) [1 :: Int, 2]
   where
     cycleOnce = do
       storeDir <- evalNixIOStoreDir
@@ -24597,8 +24638,8 @@ testParseOrderInterningIO = do
 -- Tests: upstream's startup names, and the call, select and abort errors
 -- ---------------------------------------------------------------------------
 
--- | Run as a child, print every name the symbol table holds once
--- 'arenaInit' has run, one a line, in symbol order.
+-- | Run as a child, print every name the symbol table holds once its
+-- session has started, one a line, in symbol order.
 startupSymbolsChildFlag :: String
 startupSymbolsChildFlag = "--startup-symbols-child"
 
@@ -24631,7 +24672,7 @@ failsInChild label source expected = runTestM label $ do
 callFailure :: Text -> Text -> EvalFailure
 callFailure function what = EvalFailure ["from call site"] ("function '" <> function <> "' called " <> what)
 
--- | The symbol table once 'arenaInit' has run: the names upstream 2.24.9
+-- | The symbol table once a session has started: the names upstream 2.24.9
 -- interns as it starts with its default settings, each once, in the
 -- order it first interns them.  @EvalState@'s constructor interns its
 -- static symbols in the order eval.hh declares them (eval.hh:173-187,
@@ -24921,7 +24962,7 @@ testStartupSymbolsIO = do
   let unexpected name = callFailure "anonymous lambda" ("with unexpected argument '" <> name <> "'")
       unknownTo = filter (`notElem` startupSymbols)
   sequence
-    [ runTestM "arenaInit interns upstream's startup names first, in upstream's order" $ do
+    [ runTestM "a session's start interns upstream's startup names first, in upstream's order" $ do
         (_, out, _) <- Proc.readCreateProcessWithExitCode (Proc.proc self [startupSymbolsChildFlag]) ""
         pure (assertEqual "symbol table" upstreamStartupTable (T.lines (T.pack out))),
       runTest "the startup names hold upstream's base environment under both spellings" $
@@ -25187,9 +25228,9 @@ internOversizedSymbol =
   withOversizedBytes $ \bytes ->
     BSU.unsafeUseAsCStringLen bytes $ \(ptr, len) -> c_nn_symbol_intern ptr (fromIntegral len)
 
--- | Reaching the C layer outside the 'arenaInit' .. 'arenaDestroy'
--- window raises 'ArenaNotInitialized' naming the entry point, rather
--- than a SIGSEGV.  Each such path runs in a child process.
+-- | Reaching the C layer outside an evaluation session raises
+-- 'ArenaNotInitialized' naming the entry point, rather than a SIGSEGV.
+-- Each such path runs in a child process.
 -- The live side of the same check runs in this process, under the
 -- suite's bracket: a refusal with the arena up is 'CAllocationFailed'.
 testArenaGuard :: IO [Bool]
@@ -25203,8 +25244,8 @@ testArenaGuard = do
           let message = T.pack out
           pure $ case (code, guardOutcome path) of
             (ExitSuccess, RefusedAt site)
-              | "arenaInit" `T.isInfixOf` message && site `T.isInfixOf` message -> Pass
-              | otherwise -> Fail ("message does not name arenaInit and " <> site <> ": " <> message)
+              | "withEvalSession" `T.isInfixOf` message && site `T.isInfixOf` message -> Pass
+              | otherwise -> Fail ("message does not name withEvalSession and " <> site <> ": " <> message)
             (ExitSuccess, Served)
               | T.strip message == T.pack servedLine -> Pass
               | otherwise -> Fail ("expected no exception, got: " <> message)
@@ -25253,7 +25294,6 @@ testArenaGuard = do
 testSymbol :: IO [Bool]
 testSymbol = do
   putStrLn "symbol"
-  -- Symbol table is initialized by arenaInit in main bracket.
   sequence
     [ runTestM "intern returns non-zero" $ do
         sym <- symbolIntern "hello"
@@ -25309,11 +25349,10 @@ cptrToSp = castPtrToStablePtr . castPtr
 testCAttrSet :: IO [Bool]
 testCAttrSet = do
   putStrLn "cattrset"
-  -- Symbol table is initialized by arenaInit in main bracket.
   sequence
     [ runTestM "new/free" $ do
         _set <- cattrsetNew SetLiteral 16
-        -- set freed by arenaDestroy via nn_attrset_free_all
+        -- set freed as the session ends (nn_attrset_free_all)
         pure Pass,
       runTestM "insert + freeze + lookup" $ do
         set <- cattrsetNew SetLiteral 4
@@ -25327,13 +25366,13 @@ testCAttrSet = do
         result <- cattrsetLookup set kName
         case result of
           Nothing -> do
-            -- set freed by arenaDestroy via nn_attrset_free_all
+            -- set freed as the session ends (nn_attrset_free_all)
             freeStablePtr valName
             freeStablePtr valVer
             pure (Fail "lookup returned Nothing")
           Just cptr -> do
             val <- deRefStablePtr (cptrToSp cptr) :: IO Text
-            -- set freed by arenaDestroy via nn_attrset_free_all
+            -- set freed as the session ends (nn_attrset_free_all)
             freeStablePtr valName
             freeStablePtr valVer
             pure (assertEqual "lookup name" "hello" val),
@@ -25345,7 +25384,7 @@ testCAttrSet = do
         cattrsetInsert set kFoo noPos (spToCPtr sp)
         cattrsetFreeze set
         result <- cattrsetLookup set kBar
-        -- set freed by arenaDestroy via nn_attrset_free_all
+        -- set freed as the session ends (nn_attrset_free_all)
         freeStablePtr sp
         pure (case result of Nothing -> Pass; Just _ -> Fail "expected Nothing"),
       runTestM "size after freeze" $ do
@@ -25359,7 +25398,7 @@ testCAttrSet = do
         cattrsetInsert set k3 noPos (spToCPtr sp)
         cattrsetFreeze set
         n <- cattrsetSize set
-        -- set freed by arenaDestroy via nn_attrset_free_all
+        -- set freed as the session ends (nn_attrset_free_all)
         freeStablePtr sp
         pure (assertEqual "size" 3 n),
       runTestM "duplicate keys: last writer wins" $ do
@@ -25375,7 +25414,7 @@ testCAttrSet = do
         val <- case result of
           Nothing -> pure "MISSING"
           Just cptr -> deRefStablePtr (cptrToSp cptr)
-        -- set freed by arenaDestroy via nn_attrset_free_all
+        -- set freed as the session ends (nn_attrset_free_all)
         freeStablePtr sp1
         freeStablePtr sp2
         pure
@@ -25395,7 +25434,7 @@ testCAttrSet = do
         cattrsetInsert set k3 noPos (spToCPtr sp)
         cattrsetFreeze set
         keys <- cattrsetKeys set
-        -- set freed by arenaDestroy via nn_attrset_free_all
+        -- set freed as the session ends (nn_attrset_free_all)
         freeStablePtr sp
         -- Keys should be sorted by symbol ID (ascending)
         let ids = map unSymbol keys
@@ -25422,7 +25461,7 @@ testCAttrSet = do
         valX <- case resultX of
           Nothing -> pure "MISSING"
           Just cptr -> deRefStablePtr (cptrToSp cptr)
-        -- sets freed by arenaDestroy via nn_attrset_free_all
+        -- sets freed as the session ends (nn_attrset_free_all)
         freeStablePtr spA
         freeStablePtr spB
         freeStablePtr spZ
@@ -25442,7 +25481,7 @@ testCAttrSet = do
         hit <- case drop 5000 syms of
           middleSym : _ -> cattrsetLookup set middleSym
           [] -> pure Nothing
-        -- set freed by arenaDestroy via nn_attrset_free_all
+        -- set freed as the session ends (nn_attrset_free_all)
         freeStablePtr sp
         pure
           ( if n == 10000 && isJust hit
@@ -25494,7 +25533,7 @@ testCAttrSet = do
                       rightModel = Map.fromList right
                   pure (actual QC.=== [leftModel, Map.union rightModel leftModel, Map.withoutKeys leftModel (Set.fromList removed)])
         result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
-        -- sets freed by arenaDestroy via nn_attrset_free_all
+        -- sets freed as the session ends (nn_attrset_free_all)
         freeStablePtr sp
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
     ]
@@ -26004,7 +26043,7 @@ codeShape idx = do
     _ -> pure (OtherCode op flags)
 
 -- | The instructions and data words evaluating a source adds to the
--- bytecode store, which only 'arenaDestroy' frees.  The source must
+-- bytecode store, which only the session's end frees.  The source must
 -- evaluate to an integer computed from everything it builds, so each
 -- element has been forced when the counts are read.
 bytecodeGrowth :: Text -> IO (Either Text (Word32, Word32))
@@ -28325,14 +28364,14 @@ main :: IO ()
 main =
   getArgs >>= \case
     [flag, name] | flag == arenaGuardChildFlag -> arenaGuardChild name
-    [flag, source] | flag == evalChildFlag -> bracket_ arenaInit arenaDestroy (evalChild source)
-    [flag, source] | flag == internOrderChildFlag -> bracket_ arenaInit arenaDestroy (internOrderChild source)
-    [flag] | flag == startupSymbolsChildFlag -> bracket_ arenaInit arenaDestroy startupSymbolsChild
-    [flag, source] | flag == failureChildFlag -> bracket_ arenaInit arenaDestroy (failureChild source)
-    [flag, source] | flag == namesOnlyChildFlag -> bracket_ arenaInit arenaDestroy (namesOnlyChild source)
+    [flag, source] | flag == evalChildFlag -> inTestSession (evalChild source)
+    [flag, source] | flag == internOrderChildFlag -> inTestSession (internOrderChild source)
+    [flag] | flag == startupSymbolsChildFlag -> inTestSession startupSymbolsChild
+    [flag, source] | flag == failureChildFlag -> inTestSession (failureChild source)
+    [flag, source] | flag == namesOnlyChildFlag -> inTestSession (namesOnlyChild source)
     [flag] | flag == arenaCycleChildFlag -> arenaCycleChild
     [flag] | flag == writeCliJsonFlag -> BS.writeFile cliJsonPath Ref.referenceJson
-    _ -> withRunTempRoot (bracket_ arenaInit arenaDestroy runSuite)
+    _ -> withRunTempRoot (inTestSession runSuite)
 
 -- | Give the run a temporary root of its own and point the process's
 -- temporary directory at it, so every fixture the suite derives from

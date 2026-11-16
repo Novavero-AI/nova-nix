@@ -41,9 +41,9 @@
 --
 -- == Lifecycle
 --
--- Parsing is pure and touches none of the C data layer, so it runs with
--- or without 'Nix.Eval.Arena.arenaInit'.  Evaluating the resulting
--- 'Expr' does need the arena; see "Nix.Eval.Arena".
+-- Parsing is pure and touches none of the C data layer, so it runs in an
+-- evaluation session or outside one.  Evaluating the resulting 'Expr'
+-- runs in a session ('Nix.Eval.IO.withEvalSession').
 module Nix.Parser
   ( -- * Parsing
     parseNix,

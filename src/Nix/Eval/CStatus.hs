@@ -4,10 +4,9 @@
 -- instead of aborting: a NULL pointer, @UINT32_MAX@ from the bytecode
 -- emitters, @NN_SYMBOL_INVALID@ from the symbol table, @-1@ from the
 -- list constructors and the attribute set insert.  Each covers two
--- causes a caller needs to tell apart: the sub-arena is outside its
--- init .. destroy window (nothing ran 'Nix.Eval.Arena.arenaInit', or
--- 'Nix.Eval.Arena.arenaDestroy' already ran), or it is live and could
--- not grow.  Only the C side knows which, so the failure path asks it
+-- causes a caller needs to tell apart: the call ran outside an
+-- evaluation session ('Nix.Eval.IO.withEvalSession'), so the sub-arena
+-- has no memory, or the arena is live and could not grow.  Only the C side knows which, so the failure path asks it
 -- once, through @nn_arena_live@, and raises a 'CStatusError' that names
 -- the C entry point.  The question is asked only after a failure, so
 -- the hot path pays the sentinel comparison and nothing more.
@@ -48,14 +47,12 @@ foreign import ccall unsafe "nn_arena_live"
 -- | Why a C data-layer call reported failure.  Each constructor carries
 -- the C entry point that refused.
 data CStatusError
-  = -- | The call ran outside the 'Nix.Eval.Arena.arenaInit' ..
-    -- 'Nix.Eval.Arena.arenaDestroy' window.  A setup diagnosis to act
-    -- on by adding the bracket and starting the process again, not an
-    -- error to catch and retry in place: GHC updates a thunk whose
-    -- evaluation raised with that exception, so any shared value whose
-    -- evaluation reached C before the window re-raises this inside a
-    -- later, live arena.  The @null@, @true@ and @false@ thunks are C
-    -- statics rather than arena cells, so they are not among them.
+  = -- | The call ran outside an evaluation session
+    -- ('Nix.Eval.IO.withEvalSession').  A setup diagnosis to act on by
+    -- running the evaluation in a session, not an error to catch and
+    -- retry in place: GHC updates a thunk whose evaluation raised with
+    -- that exception, so a shared value whose evaluation reached C
+    -- outside a session re-raises it inside a later one.
     ArenaNotInitialized !String
   | -- | The arena is live and the allocation itself failed: exhaustion,
     -- or a size the C side rejects.  The second field is the detail.
@@ -70,8 +67,8 @@ data CStatusError
 instance Exception CStatusError where
   displayException (ArenaNotInitialized site) =
     site
-      ++ ": the C data layer is not initialized; evaluation must run between "
-      ++ "Nix.Eval.Arena.arenaInit and Nix.Eval.Arena.arenaDestroy"
+      ++ ": the C data layer is not initialized; evaluation must run in an "
+      ++ "evaluation session (Nix.Eval.IO.withEvalSession)"
   displayException (CAllocationFailed site detail) = site ++ ": " ++ detail
   displayException (CInvariantViolated site detail) =
     site ++ ": internal invariant violated: " ++ detail

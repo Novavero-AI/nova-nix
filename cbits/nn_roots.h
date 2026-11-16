@@ -10,8 +10,10 @@
  * (nn_stats.h), as upstream's collector scans the import cache it keeps
  * in traceable memory (fileEvalCache, eval.hh at 2.24.9).
  *
- * Registered roots live until nn_roots_clear, which the arena's teardown
- * runs.  Not thread-safe.
+ * Sessions nest, so roots do too: a session marks the registry as it
+ * starts and releases back to the mark as it ends, forgetting every root
+ * registered within it; the arena's teardown clears what is left.  Not
+ * thread-safe.
  */
 
 #ifndef NN_ROOTS_H
@@ -33,6 +35,13 @@ uint32_t nn_roots_thunk_count(void);
 uint32_t nn_roots_env_count(void);
 struct nn_thunk *nn_roots_thunk(uint32_t index);
 struct nn_env *nn_roots_env(uint32_t index);
+
+/* The registry's size now, to release back to. */
+void nn_roots_mark(uint32_t *thunks, uint32_t *envs);
+
+/* Forget every root registered since the mark, which an earlier
+ * nn_roots_mark returned with no release past it since. */
+void nn_roots_release(uint32_t thunks, uint32_t envs);
 
 /* Forget every root and release the registry's memory. */
 void nn_roots_clear(void);

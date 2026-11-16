@@ -42,10 +42,10 @@
 --   with-scope is still unresolved when it passes between runs can show
 --   this, and only tests pass one.
 --
--- Whatever runs, reads or allocates through these, outside the window
--- between 'Nix.Eval.Arena.arenaInit' and 'Nix.Eval.Arena.arenaDestroy',
--- raises 'Nix.Eval.CStatus.ArenaNotInitialized' or reads freed memory,
--- as any other action does.
+-- Whatever runs, reads or allocates through these outside an evaluation
+-- session ('Nix.Eval.IO.withEvalSession') raises
+-- 'Nix.Eval.CStatus.ArenaNotInitialized' or reads freed memory, as any
+-- other action does.
 module Nix.Eval.CData
   ( -- * Actions
     CData (..),

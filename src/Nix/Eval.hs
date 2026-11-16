@@ -14,11 +14,9 @@
 -- recursive attribute sets all extend the environment.
 --
 -- Thunks, environments and values live in the C data layer, so
--- everything here that builds or forces one runs between
--- 'Nix.Eval.Arena.arenaInit' and 'Nix.Eval.Arena.arenaDestroy'
--- (@bracket_ arenaInit arenaDestroy@).  Outside that window the first
--- C call raises 'Nix.Eval.CStatus.ArenaNotInitialized' instead of
--- faulting.
+-- everything here that builds or forces one runs in an evaluation
+-- session ('Nix.Eval.IO.withEvalSession').  Outside one the first C call
+-- raises 'Nix.Eval.CStatus.ArenaNotInitialized' instead of faulting.
 module Nix.Eval
   ( -- * Values (re-exported from Types)
     NixValue (..),

@@ -1,39 +1,22 @@
--- | Unified arena lifecycle for the C data layer.
+-- | The C data layer's arena lifecycle, which an evaluation session owns
+-- ('Nix.Eval.IO.withEvalSession'): 'arenaInit' sets up every C sub-arena
+-- (symbol table, string arena, thunk arena, env pages, bytecode store) as
+-- the outermost session starts, and 'arenaDestroy' tears them down as it
+-- ends.  Every value lives in C, so the teardown frees a session's values
+-- whole, with nothing in GHC's heap to release.  The module is internal to
+-- the library: no caller sets the arena up or tears it down.
 --
--- Initializes and destroys all C sub-arenas (symbol table, string arena,
--- thunk arena, env slot allocator, bytecode store) with a single pair of
--- calls.  Every value lives in C, so tearing the arenas down frees an
--- evaluation's values whole, with nothing in GHC's heap to release.
---
--- Everything that evaluates runs between the two calls:
---
--- @
--- bracket_ arenaInit arenaDestroy $ do
---   ... evaluation ...
--- @
---
--- Outside that window the C layer has no memory to hand out, and every
--- path into it ('Nix.Builtins.builtinEnv', 'Nix.Eval.eval',
--- 'Nix.Eval.force', the value constructors) raises
--- 'ArenaNotInitialized' naming the C entry point that refused, rather
--- than dereferencing state that does not exist.  Parsing ("Nix.Parser")
--- is pure and needs no arena.
---
--- 'ArenaNotInitialized' is a setup diagnosis: add the bracket and start
--- the process again.  It is not an error to catch and retry in the same
--- process, because GHC updates a thunk whose evaluation raised with that
--- exception: any shared value whose evaluation reached C before the
--- window re-raises it inside a later, live arena.  The @null@, @true@
--- and @false@ thunks and each builtin's own cell are C statics outside
--- every arena, so forcing one needs no window and survives every cycle.
+-- Outside a session the C layer has no memory to hand out, and every path
+-- into it ('Nix.Builtins.builtinEnv', 'Nix.Eval.eval', 'Nix.Eval.force',
+-- the value constructors) raises 'Nix.Eval.CStatus.ArenaNotInitialized'
+-- naming the C entry point that refused, rather than dereferencing state
+-- that does not exist.  Parsing ("Nix.Parser") is pure and needs no
+-- arena.  The @null@, @true@, @false@ and empty list cells and each
+-- builtin's own cell are C statics outside every arena, so forcing one
+-- needs no session and survives every one.
 module Nix.Eval.Arena
-  ( -- * Lifecycle
-    arenaInit,
+  ( arenaInit,
     arenaDestroy,
-    arenaLive,
-
-    -- * Errors
-    CStatusError (..),
   )
 where
 
@@ -44,7 +27,6 @@ import Nix.Eval.CLambda (clambdaFreeAll)
 import Nix.Eval.CList (clistFreeAll)
 import Nix.Eval.CPrimop (cprimopAppFreeAll)
 import Nix.Eval.CRoots (crootsClear)
-import Nix.Eval.CStatus (CStatusError (..), arenaLive)
 import Nix.Eval.CStr (cstrDestroy, cstrInit)
 import Nix.Eval.CThunk (cthunkDestroy, cthunkInit)
 import Nix.Eval.StartupSymbols (startupSymbols)

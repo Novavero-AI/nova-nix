@@ -6,18 +6,23 @@
 --
 -- Provides t'EvalIO', a concrete 'MonadEval' instance that performs
 -- real file-system access.  The @import@ builtin reads, parses, and
--- evaluates @.nix@ files with a per-process import cache.  Source parsed
--- by 'Nix.Parser.parseNix' evaluates as:
+-- evaluates @.nix@ files with a per-session import cache.  Source parsed
+-- by 'Nix.Parser.parseNix' evaluates in a session ('withEvalSession'):
 --
 -- @
--- st <- newEvalState storeDir "/path/to/project"
--- result <- runEvalIO st (evalParsed (builtinEnv unrestrictedPolicy 0 []) parsed)
+-- withEvalSession (SessionSettings unrestrictedPolicy nixPathSearchPath storeDir "/path/to/project") $ \\st ->
+--   runEvalIO st (evalParsed (pure (evalBaseEnv st)) parsed)
 -- @
 module Nix.Eval.IO
   ( -- * Evaluator
     EvalIO,
     runEvalIO,
     runEvalIOTraced,
+
+    -- * Sessions
+    SessionSettings (..),
+    withEvalSession,
+    nixPathSearchPath,
 
     -- * State
     EvalState
@@ -31,7 +36,7 @@ module Nix.Eval.IO
         esAllowedPaths
       ),
     evalBaseEnv,
-    newEvalState,
+    evalSearchPath,
     newEvalStateWith,
     nixPathValue,
     allowEvalPath,
@@ -45,7 +50,7 @@ module Nix.Eval.IO
   )
 where
 
-import Control.Exception (Exception, IOException, SomeAsyncException, SomeException, catch, catchJust, displayException, fromException, onException, throwIO, try)
+import Control.Exception (Exception, IOException, SomeAsyncException, SomeException, bracket, bracket_, catch, catchJust, displayException, fromException, onException, throwIO, try)
 import Control.Monad (unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
@@ -71,11 +76,12 @@ import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath, rootScopeNam
 import Nix.Derivation (fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Eval (deepForce, eval, evalBytecode, evalParsed)
+import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CData (MonadCData (..), runCData)
 import Nix.Eval.CList (CList (..))
-import Nix.Eval.CRoots (crootsAddEnv, crootsAddThunk)
-import Nix.Eval.CStatus (cInvariantViolated)
+import Nix.Eval.CRoots (crootsAddEnv, crootsAddThunk, crootsMark, crootsRelease)
+import Nix.Eval.CStatus (arenaLive, cInvariantViolated)
 import Nix.Eval.CThunk (CThunkPtr, cthunkMarkBlackhole, cthunkMarkPending, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedPrimop, cthunkSetComputedPrimopApp, cthunkSetComputedStr, cthunkState)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
@@ -165,7 +171,7 @@ errorPrefix = "error: "
 -- | Shared state for IO evaluation: an evaluation session.
 --
 -- The policy, the time and the search path are fixed as the session
--- starts ('newEvalState'), when its base environment is built over them,
+-- starts ('withEvalSession'), when its base environment is built over them,
 -- as upstream's @EvalState@ takes its settings and lookup path as it is
 -- constructed; the module exports no way to change one after.
 --
@@ -204,6 +210,7 @@ data EvalState = EvalState
     -- writes honor @--store@ the same way the builder does.
     esStoreDir :: !SP.StoreDir,
     esTimestamp :: !Int64,
+    esSearchPaths :: ![Thunk],
     -- | The call frames active around the current evaluation and the
     -- @max-call-depth@ ceiling.  Per frame like 'esBaseDir':
     -- 'withCallFrame' scopes it with 'local', so a failure unwinding
@@ -224,20 +231,52 @@ data EvalState = EvalState
     esAllowedPaths :: !(IORef AllowedPaths)
   }
 
--- | Start an evaluation session under a policy, rooted at the given
--- directory, reading and writing store objects under the given store
--- directory, with the search path @NIX_PATH@ gives ('nixPathValue').
--- Like 'newEvalStateWith', it runs between 'Nix.Eval.Arena.arenaInit'
--- and 'Nix.Eval.Arena.arenaDestroy'.
-newEvalState :: EvalPolicy -> SP.StoreDir -> FilePath -> IO EvalState
-newEvalState policy storeDir baseDir = do
-  searchPaths <- nixPathValue >>= parseNixPath
-  newEvalStateWith policy searchPaths storeDir baseDir
+-- | What an evaluation session starts with: upstream's settings and
+-- lookup path, which its @EvalState@ takes as it is constructed.
+data SessionSettings = SessionSettings
+  { -- | What the evaluation may reach.
+    sessionPolicy :: !EvalPolicy,
+    -- | The search path, made once the session's arena is live; for
+    -- the one @NIX_PATH@ gives, 'nixPathSearchPath'.
+    sessionSearchPath :: !(IO [Thunk]),
+    -- | Where store objects live.
+    sessionStoreDir :: !SP.StoreDir,
+    -- | The directory relative paths in the evaluated source resolve
+    -- against.
+    sessionBaseDir :: !FilePath
+  }
+
+-- | Run an action in an evaluation session: the C data layer's arena is
+-- set up when no session holds it already, the session's state is made
+-- over the settings ('newEvalStateWith'), and the action runs with it.
+-- As the session ends, by returning or by an exception, it forgets the
+-- roots it registered, and the outermost session tears the arena down,
+-- freeing every C object its evaluations made.  A nested session shares
+-- the arena of the session around it.  Nothing made in a session is used
+-- after it ends: no value, environment or thunk outlives its arena.
+withEvalSession :: SessionSettings -> (EvalState -> IO a) -> IO a
+withEvalSession settings action = withArena (bracket crootsMark crootsRelease (const session))
+  where
+    session = do
+      searchPaths <- sessionSearchPath settings
+      newEvalStateWith (sessionPolicy settings) searchPaths (sessionStoreDir settings) (sessionBaseDir settings) >>= action
+    withArena body = do
+      live <- arenaLive
+      if live then body else bracket_ arenaInit arenaDestroy body
+
+-- | The search path @NIX_PATH@ gives ('nixPathValue').
+nixPathSearchPath :: IO [Thunk]
+nixPathSearchPath = nixPathValue >>= parseNixPath
 
 -- | The base environment a session evaluates a file in: every name
 -- upstream's base environment binds ('Nix.Builtins.builtinEnv').
 evalBaseEnv :: EvalState -> Env
 evalBaseEnv = esBaseEnv
+
+-- | The search path the session was started with, the one
+-- @builtins.nixPath@ holds.
+evalSearchPath :: EvalState -> [Thunk]
+evalSearchPath = esSearchPaths
 
 -- | The bytes of @NIX_PATH@, unchanged, as upstream's @initGC@ reads them
 -- (src/libexpr/eval-gc.cc at Nix 2.24.9), and empty when it is unset.  The
@@ -251,17 +290,17 @@ nixPathValue =
     EnvUnpairedSurrogate ->
       ioError (userError "NIX_PATH holds an unpaired UTF-16 surrogate, which has no UTF-8 form")
 
--- | 'newEvalState' with the search path given, for a caller that builds
--- its own from @NIX_PATH@ and more.  The call-depth ceiling starts at
--- upstream's default; a caller with a configured one replaces
--- 'esCallDepth'.
+-- | The state of a session, made in the session already open: what
+-- 'withEvalSession' makes for a new one, and a caller already inside one
+-- can make another with.  The call-depth ceiling starts at upstream's
+-- default; a caller with a configured one replaces 'esCallDepth'.
 --
 -- Under a restricting policy, the roots it should admit are seeded with
 -- 'allowEvalPath' before evaluation starts, as upstream's constructor
 -- allows its lookup path.  The base environment is built here, in the C
--- data layer, so this runs between 'Nix.Eval.Arena.arenaInit' and
--- 'Nix.Eval.Arena.arenaDestroy'; it is registered as a root, and the
--- search path with it, through @builtins.nixPath@.
+-- data layer, so this runs in a session ('withEvalSession'), whose roots
+-- the base environment joins, and the search path with it, through
+-- @builtins.nixPath@.
 newEvalStateWith :: EvalPolicy -> [Thunk] -> SP.StoreDir -> FilePath -> IO EvalState
 newEvalStateWith policy searchPaths storeDir baseDir = do
   cache <- newIORef Map.empty
@@ -284,6 +323,7 @@ newEvalStateWith policy searchPaths storeDir baseDir = do
         esBaseDir = baseDir,
         esStoreDir = storeDir,
         esTimestamp = now,
+        esSearchPaths = searchPaths,
         esCallDepth = topLevelCallDepth defaultMaxCallDepth,
         esPolicy = policy,
         esAllowedPaths = allowedPaths

@@ -65,6 +65,20 @@ nn_roots_env(uint32_t index)
 }
 
 void
+nn_roots_mark(uint32_t *thunks, uint32_t *envs)
+{
+    *thunks = g_thunks.count;
+    *envs = g_envs.count;
+}
+
+void
+nn_roots_release(uint32_t thunks, uint32_t envs)
+{
+    if (thunks < g_thunks.count) g_thunks.count = thunks;
+    if (envs < g_envs.count) g_envs.count = envs;
+}
+
+void
 nn_roots_clear(void)
 {
     release(&g_thunks);
