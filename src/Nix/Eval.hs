@@ -88,11 +88,10 @@ module Nix.Eval
     encodeFetchCache,
     decodeFetchCache,
 
-    -- * Builtin registry
+    -- * Builtin definitions
     BuiltinDef (..),
     ArgMode (..),
-    builtinRegistry,
-    builtinNames,
+    listedBuiltins,
 
     -- * Platform
     currentSystemStr,
@@ -133,6 +132,8 @@ import Foreign.Ptr (Ptr)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAttrs, structuredAttrsKey)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
+import Nix.Eval.Builtin (Builtin, builtinName)
+import qualified Nix.Eval.Builtin as Builtin
 import Nix.Eval.CBytecode (appDeferred, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, cbcStringText, reservedApply1, reservedApply2, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpPos, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (MonadCData)
 import Nix.Eval.CList (CList, clistDrop, clistIndex)
@@ -635,7 +636,7 @@ callBc env argIdx funcVal = case funcVal of
     argThunk <- cheapThunkBc env argIdx
     extEnv <- matchFormals closureEnv formals argThunk
     evalBytecode extEnv bodyBcIdx
-  VBuiltin name taken -> applyBuiltin name taken $ \case
+  VBuiltin builtin taken -> applyBuiltin builtin taken $ \case
     ForceOnApply -> ArgForced <$> evalBytecode env argIdx
     ForceOnUse -> ArgDeferred <$> cheapThunkBc env argIdx
   VAttrs attrs ->
@@ -1183,7 +1184,7 @@ formalSlots lambdaName attrs formals = do
         Nothing -> pure (maybe (Left name) (Right . flip mkThunkBc) defBcIdx)
 
 -- ---------------------------------------------------------------------------
--- Builtin registry (single-definition-site for all builtins)
+-- Builtin definitions
 -- ---------------------------------------------------------------------------
 
 -- | How a builtin takes the argument at one position.
@@ -1202,9 +1203,9 @@ data ArgMode
 -- | A builtin's shape: how it takes each argument, first to last (the
 -- arity is the length), and its implementation over the arguments taken.
 -- Each shape below defines both together, and its implementation type
--- marks a 'ForceOnUse' position with a 'BuiltinArg' parameter, so an
--- implementation's type picks the same shape in the registry and in
--- 'executeBuiltin'.
+-- marks a 'ForceOnUse' position with a 'BuiltinArg' parameter, so the
+-- modes 'applyBuiltin' takes arguments by are the ones the implementation
+-- matches.
 data BuiltinDef m = BuiltinDef
   { bdArgs :: !(NonEmpty ArgMode),
     bdApply :: [BuiltinArg] -> m NixValue
@@ -1243,242 +1244,214 @@ listThunks cl = map Thunk <$> clistThunks cl
 -- shape, which 'applyBuiltin' never builds: it runs a builtin at its last
 -- position, and every caller supplies a 'ForceOnApply' position as
 -- 'ArgForced'.
-arityError :: (MonadEval m) => Text -> m a
-arityError name = throwEvalError ("builtins." <> name <> ": internal arity error")
+arityError :: (MonadEval m) => Builtin -> m a
+arityError builtin = throwEvalError ("builtins." <> builtinName builtin <> ": internal arity error")
 
 -- | One argument, forced as it is applied.
-forced1 :: (MonadEval m) => (NixValue -> m NixValue) -> Text -> BuiltinDef m
-forced1 f name = BuiltinDef (ForceOnApply :| []) $ \case
+forced1 :: (MonadEval m) => (NixValue -> m NixValue) -> Builtin -> BuiltinDef m
+forced1 f builtin = BuiltinDef (ForceOnApply :| []) $ \case
   [ArgForced a] -> f a
-  _ -> arityError name
+  _ -> arityError builtin
 
 -- | Two arguments, each forced as it is applied.
-forced2 :: (MonadEval m) => (NixValue -> NixValue -> m NixValue) -> Text -> BuiltinDef m
-forced2 f name = BuiltinDef (ForceOnApply :| [ForceOnApply]) $ \case
+forced2 :: (MonadEval m) => (NixValue -> NixValue -> m NixValue) -> Builtin -> BuiltinDef m
+forced2 f builtin = BuiltinDef (ForceOnApply :| [ForceOnApply]) $ \case
   [ArgForced a, ArgForced b] -> f a b
-  _ -> arityError name
+  _ -> arityError builtin
 
 -- | Three arguments, each forced as it is applied.
-forced3 :: (MonadEval m) => (NixValue -> NixValue -> NixValue -> m NixValue) -> Text -> BuiltinDef m
-forced3 f name = BuiltinDef (ForceOnApply :| [ForceOnApply, ForceOnApply]) $ \case
+forced3 :: (MonadEval m) => (NixValue -> NixValue -> NixValue -> m NixValue) -> Builtin -> BuiltinDef m
+forced3 f builtin = BuiltinDef (ForceOnApply :| [ForceOnApply, ForceOnApply]) $ \case
   [ArgForced a, ArgForced b, ArgForced c] -> f a b c
-  _ -> arityError name
+  _ -> arityError builtin
 
 -- | One argument, held unforced.
-onUse1 :: (MonadEval m) => (BuiltinArg -> m NixValue) -> Text -> BuiltinDef m
-onUse1 f name = BuiltinDef (ForceOnUse :| []) $ \case
+onUse1 :: (MonadEval m) => (BuiltinArg -> m NixValue) -> Builtin -> BuiltinDef m
+onUse1 f builtin = BuiltinDef (ForceOnUse :| []) $ \case
   [a] -> f a
-  _ -> arityError name
+  _ -> arityError builtin
 
 -- | Two arguments, both held unforced.
-onUse2 :: (MonadEval m) => (BuiltinArg -> BuiltinArg -> m NixValue) -> Text -> BuiltinDef m
-onUse2 f name = BuiltinDef (ForceOnUse :| [ForceOnUse]) $ \case
+onUse2 :: (MonadEval m) => (BuiltinArg -> BuiltinArg -> m NixValue) -> Builtin -> BuiltinDef m
+onUse2 f builtin = BuiltinDef (ForceOnUse :| [ForceOnUse]) $ \case
   [a, b] -> f a b
-  _ -> arityError name
+  _ -> arityError builtin
 
 -- | Two arguments, the first held unforced and the second forced as it
 -- is applied.
-onUseFirst :: (MonadEval m) => (BuiltinArg -> NixValue -> m NixValue) -> Text -> BuiltinDef m
-onUseFirst f name = BuiltinDef (ForceOnUse :| [ForceOnApply]) $ \case
+onUseFirst :: (MonadEval m) => (BuiltinArg -> NixValue -> m NixValue) -> Builtin -> BuiltinDef m
+onUseFirst f builtin = BuiltinDef (ForceOnUse :| [ForceOnApply]) $ \case
   [a, ArgForced b] -> f a b
-  _ -> arityError name
+  _ -> arityError builtin
 
 -- | Two arguments, the first forced as it is applied and the second held
 -- unforced.
-onUseSecond :: (MonadEval m) => (NixValue -> BuiltinArg -> m NixValue) -> Text -> BuiltinDef m
-onUseSecond f name = BuiltinDef (ForceOnApply :| [ForceOnUse]) $ \case
+onUseSecond :: (MonadEval m) => (NixValue -> BuiltinArg -> m NixValue) -> Builtin -> BuiltinDef m
+onUseSecond f builtin = BuiltinDef (ForceOnApply :| [ForceOnUse]) $ \case
   [ArgForced a, b] -> f a b
-  _ -> arityError name
+  _ -> arityError builtin
 
 -- | Three arguments, the middle one held unforced and the others forced
 -- as they are applied.
-onUseMiddle :: (MonadEval m) => (NixValue -> BuiltinArg -> NixValue -> m NixValue) -> Text -> BuiltinDef m
-onUseMiddle f name = BuiltinDef (ForceOnApply :| [ForceOnUse, ForceOnApply]) $ \case
+onUseMiddle :: (MonadEval m) => (NixValue -> BuiltinArg -> NixValue -> m NixValue) -> Builtin -> BuiltinDef m
+onUseMiddle f builtin = BuiltinDef (ForceOnApply :| [ForceOnUse, ForceOnApply]) $ \case
   [ArgForced a, b, ArgForced c] -> f a b c
-  _ -> arityError name
+  _ -> arityError builtin
 
--- | A registry entry of the given shape.
-builtinShaped :: Text -> (Text -> BuiltinDef m) -> (Text, BuiltinDef m)
-builtinShaped name shape = (name, shape name)
-
--- | Define an arity-1 builtin.
-builtin1 :: (MonadEval m) => Text -> (NixValue -> m NixValue) -> (Text, BuiltinDef m)
-builtin1 name = builtinShaped name . forced1
-
--- | Define an arity-2 builtin.
-builtin2 ::
-  (MonadEval m) =>
-  Text ->
-  (NixValue -> NixValue -> m NixValue) ->
-  (Text, BuiltinDef m)
-builtin2 name = builtinShaped name . forced2
-
--- | Define an arity-3 builtin.
-builtin3 ::
-  (MonadEval m) =>
-  Text ->
-  (NixValue -> NixValue -> NixValue -> m NixValue) ->
-  (Text, BuiltinDef m)
-builtin3 name = builtinShaped name . forced3
-
--- | Central registry of all builtins: the source of 'builtinNames' and of
--- each builtin's argument modes.  A new builtin is an entry here and a
--- case in 'executeBuiltin' that uses the same shape.
-builtinRegistry :: (MonadEval m) => Map Text (BuiltinDef m)
-builtinRegistry =
-  Map.fromList
-    [ -- Type checking (arity 1)
-      builtin1 "typeOf" (pure . mkStr . typeOfValue),
-      builtin1 "isNull" (pure . VBool . isNullVal),
-      builtin1 "isInt" (pure . VBool . isIntVal),
-      builtin1 "isFloat" (pure . VBool . isFloatVal),
-      builtin1 "isBool" (pure . VBool . isBoolVal),
-      builtin1 "isString" (pure . VBool . isStringVal),
-      builtin1 "isList" (pure . VBool . isListVal),
-      builtin1 "isAttrs" (pure . VBool . isAttrsVal),
-      builtin1 "isFunction" (pure . VBool . isFunctionVal),
+-- | Every builtin's shape and implementation.  Upstream binds
+-- @fetchMercurial@ and nova-nix has no implementation for it: it takes
+-- one argument, forced, and fails naming itself an unknown builtin.
+builtinDef :: (MonadEval m) => Builtin -> BuiltinDef m
+builtinDef builtin = shape builtin
+  where
+    shape = case builtin of
+      -- Type checking (arity 1)
+      Builtin.TypeOf -> forced1 (pure . mkStr . typeOfValue)
+      Builtin.IsNull -> forced1 (pure . VBool . isNullVal)
+      Builtin.IsInt -> forced1 (pure . VBool . isIntVal)
+      Builtin.IsFloat -> forced1 (pure . VBool . isFloatVal)
+      Builtin.IsBool -> forced1 (pure . VBool . isBoolVal)
+      Builtin.IsString -> forced1 (pure . VBool . isStringVal)
+      Builtin.IsList -> forced1 (pure . VBool . isListVal)
+      Builtin.IsAttrs -> forced1 (pure . VBool . isAttrsVal)
+      Builtin.IsFunction -> forced1 (pure . VBool . isFunctionVal)
       -- List operations (arity 1)
-      builtin1 "length" builtinLength,
-      builtin1 "head" builtinHead,
-      builtin1 "tail" builtinTail,
+      Builtin.Length -> forced1 builtinLength
+      Builtin.Head -> forced1 builtinHead
+      Builtin.Tail -> forced1 builtinTail
       -- String operations (arity 1)
-      builtin1 "toString" (fmap (uncurry VStr) . coerceToStringPermissive),
-      builtin1 "stringLength" builtinStringLength,
+      Builtin.ToString -> forced1 (fmap (uncurry VStr) . coerceToStringPermissive)
+      Builtin.StringLength -> forced1 builtinStringLength
       -- Control (arity 1)
-      builtin1 "throw" builtinThrow,
-      builtin1 "abort" builtinAbort,
+      Builtin.Throw -> forced1 builtinThrow
+      Builtin.Abort -> forced1 builtinAbort
       -- Attr set operations (arity 1)
-      builtin1 "attrNames" builtinAttrNames,
-      builtin1 "attrValues" builtinAttrValues,
-      builtin1 "listToAttrs" builtinListToAttrs,
+      Builtin.AttrNames -> forced1 builtinAttrNames
+      Builtin.AttrValues -> forced1 builtinAttrValues
+      Builtin.ListToAttrs -> forced1 builtinListToAttrs
       -- Attr set operations (arity 2)
-      builtin2 "hasAttr" builtinHasAttr,
-      builtin2 "getAttr" builtinGetAttr,
-      builtin2 "removeAttrs" builtinRemoveAttrs,
-      builtin2 "intersectAttrs" builtinIntersectAttrs,
-      builtin2 "catAttrs" builtinCatAttrs,
+      Builtin.HasAttr -> forced2 builtinHasAttr
+      Builtin.GetAttr -> forced2 builtinGetAttr
+      Builtin.RemoveAttrs -> forced2 builtinRemoveAttrs
+      Builtin.IntersectAttrs -> forced2 builtinIntersectAttrs
+      Builtin.CatAttrs -> forced2 builtinCatAttrs
       -- List higher-order (arity 2)
-      builtinShaped "map" (onUseFirst builtinMap),
-      builtinShaped "filter" (onUseFirst builtinFilter),
-      builtinShaped "genList" (onUseFirst builtinGenList),
-      builtinShaped "sort" (onUseFirst builtinSort),
-      builtin2 "concatMap" builtinConcatMap,
-      builtin2 "any" builtinAny,
-      builtin2 "all" builtinAll,
-      builtinShaped "elem" (onUseFirst builtinElem),
-      builtinShaped "elemAt" (onUseFirst builtinElemAt),
-      builtin2 "partition" builtinPartition,
-      builtin2 "groupBy" builtinGroupBy,
+      Builtin.Map -> onUseFirst builtinMap
+      Builtin.Filter -> onUseFirst builtinFilter
+      Builtin.GenList -> onUseFirst builtinGenList
+      Builtin.Sort -> onUseFirst builtinSort
+      Builtin.ConcatMap -> forced2 builtinConcatMap
+      Builtin.Any -> forced2 builtinAny
+      Builtin.All -> forced2 builtinAll
+      Builtin.Elem -> onUseFirst builtinElem
+      Builtin.ElemAt -> onUseFirst builtinElemAt
+      Builtin.Partition -> forced2 builtinPartition
+      Builtin.GroupBy -> forced2 builtinGroupBy
       -- String operations (arity 2)
-      builtin2 "concatStringsSep" builtinConcatStringsSep,
+      Builtin.ConcatStringsSep -> forced2 builtinConcatStringsSep
       -- Arity 3
-      builtinShaped "foldl'" (onUseMiddle builtinFoldl),
-      builtin3 "substring" builtinSubstring,
+      Builtin.FoldlStrict -> onUseMiddle builtinFoldl
+      Builtin.Substring -> forced3 builtinSubstring
       -- Numeric
-      builtin1 "isPath" (pure . VBool . isPathVal),
-      builtin1 "ceil" builtinCeil,
-      builtin1 "floor" builtinFloor,
-      builtin2 "seq" builtinSeq,
-      builtinShaped "trace" (onUseSecond builtinTrace),
-      builtinShaped "warn" (onUseSecond builtinWarn),
-      builtin1 "unsafeDiscardStringContext" builtinDiscardContext,
-      builtin1 "unsafeDiscardOutputDependency" builtinDiscardOutputDep,
-      builtin1 "addDrvOutputDependencies" builtinAddDrvOutputDeps,
+      Builtin.IsPath -> forced1 (pure . VBool . isPathVal)
+      Builtin.Ceil -> forced1 builtinCeil
+      Builtin.Floor -> forced1 builtinFloor
+      Builtin.Seq -> forced2 builtinSeq
+      Builtin.Trace -> onUseSecond builtinTrace
+      Builtin.Warn -> onUseSecond builtinWarn
+      Builtin.UnsafeDiscardStringContext -> forced1 builtinDiscardContext
+      Builtin.UnsafeDiscardOutputDependency -> forced1 builtinDiscardOutputDep
+      Builtin.AddDrvOutputDependencies -> forced1 builtinAddDrvOutputDeps
       -- String context introspection
-      builtin1 "hasContext" builtinHasContext,
-      builtin1 "getContext" builtinGetContext,
-      builtin2 "appendContext" builtinAppendContext,
-      builtin1 "baseNameOf" builtinBaseNameOf,
-      builtin1 "dirOf" builtinDirOf,
-      builtin1 "concatLists" builtinConcatLists,
-      builtin2 "lessThan" builtinLessThan,
+      Builtin.HasContext -> forced1 builtinHasContext
+      Builtin.GetContext -> forced1 builtinGetContext
+      Builtin.AppendContext -> forced2 builtinAppendContext
+      Builtin.BaseNameOf -> forced1 builtinBaseNameOf
+      Builtin.DirOf -> forced1 builtinDirOf
+      Builtin.ConcatLists -> forced1 builtinConcatLists
+      Builtin.LessThan -> forced2 builtinLessThan
       -- Arithmetic + bitwise
-      builtin2 "add" primAdd,
-      builtin2 "sub" primSub,
-      builtin2 "mul" primMul,
-      builtin2 "div" primDiv,
-      builtin2 "bitAnd" (bitwise (.&.)),
-      builtin2 "bitOr" (bitwise (.|.)),
-      builtin2 "bitXor" (bitwise xor),
+      Builtin.Add -> forced2 primAdd
+      Builtin.Sub -> forced2 primSub
+      Builtin.Mul -> forced2 primMul
+      Builtin.Div -> forced2 primDiv
+      Builtin.BitAnd -> forced2 (bitwise (.&.))
+      Builtin.BitOr -> forced2 (bitwise (.|.))
+      Builtin.BitXor -> forced2 (bitwise xor)
       -- Attr set higher-order
-      builtinShaped "mapAttrs" (onUseFirst builtinMapAttrs),
-      builtin1 "functionArgs" builtinFunctionArgs,
-      builtin2 "zipAttrsWith" builtinZipAttrsWith,
+      Builtin.MapAttrs -> onUseFirst builtinMapAttrs
+      Builtin.FunctionArgs -> forced1 builtinFunctionArgs
+      Builtin.ZipAttrsWith -> forced2 builtinZipAttrsWith
       -- String manipulation
-      builtin2 "match" builtinMatch,
-      builtin2 "split" builtinSplit,
-      builtin3 "replaceStrings" builtinReplaceStrings,
-      builtin2 "compareVersions" builtinCompareVersions,
-      builtin1 "splitVersion" builtinSplitVersion,
-      builtin1 "parseDrvName" builtinParseDrvName,
+      Builtin.Match -> forced2 builtinMatch
+      Builtin.Split -> forced2 builtinSplit
+      Builtin.ReplaceStrings -> forced3 builtinReplaceStrings
+      Builtin.CompareVersions -> forced2 builtinCompareVersions
+      Builtin.SplitVersion -> forced1 builtinSplitVersion
+      Builtin.ParseDrvName -> forced1 builtinParseDrvName
       -- Serialization + hashing
-      builtin1 "toJSON" builtinToJSON,
-      builtin1 "fromJSON" builtinFromJSON,
-      builtin2 "hashString" builtinHashString,
+      Builtin.ToJSON -> forced1 builtinToJSON
+      Builtin.FromJSON -> forced1 builtinFromJSON
+      Builtin.HashString -> forced2 builtinHashString
       -- Error handling + sequencing
-      builtinShaped "tryEval" (onUse1 builtinTryEval),
-      builtinShaped "deepSeq" (onUseSecond builtinDeepSeq),
+      Builtin.TryEval -> onUse1 builtinTryEval
+      Builtin.DeepSeq -> onUseSecond builtinDeepSeq
       -- Graph traversal
-      builtin1 "genericClosure" builtinGenericClosure,
+      Builtin.GenericClosure -> forced1 builtinGenericClosure
       -- IO builtins (delegate to MonadEval methods)
-      builtin1 "import" builtinImport,
-      builtin1 "readFile" builtinReadFile,
-      builtin1 "pathExists" builtinPathExists,
-      builtin1 "readDir" builtinReadDir,
-      builtin1 "getEnv" builtinGetEnv,
-      builtin1 "toPath" builtinToPath,
+      Builtin.Import -> forced1 builtinImport
+      Builtin.ReadFile -> forced1 builtinReadFile
+      Builtin.PathExists -> forced1 builtinPathExists
+      Builtin.ReadDir -> forced1 builtinReadDir
+      Builtin.GetEnv -> forced1 builtinGetEnv
+      Builtin.ToPath -> forced1 builtinToPath
       -- Store path operations
-      builtin1 "placeholder" builtinPlaceholder,
-      builtin1 "storePath" builtinStorePath,
-      builtin2 "findFile" builtinFindFile,
-      builtin2 "toFile" builtinToFile,
-      builtinShaped "scopedImport" (onUseFirst builtinScopedImport),
+      Builtin.Placeholder -> forced1 builtinPlaceholder
+      Builtin.StorePath -> forced1 builtinStorePath
+      Builtin.FindFile -> forced2 builtinFindFile
+      Builtin.ToFile -> forced2 builtinToFile
+      Builtin.ScopedImport -> onUseFirst builtinScopedImport
       -- Network fetchers
-      builtin1 "fetchurl" builtinFetchurl,
-      builtin1 "fetchTarball" builtinFetchTarball,
-      builtin1 "fetchGit" builtinFetchGit,
+      Builtin.Fetchurl -> forced1 builtinFetchurl
+      Builtin.FetchTarball -> forced1 builtinFetchTarball
+      Builtin.FetchGit -> forced1 builtinFetchGit
       -- Derivation construction.  The lazy 'derivation' wrapper is not a
       -- primop: it is a Nix lambda over this one, bound as a constant by
       -- "Nix.Builtins".
-      builtin1 "derivationStrict" builtinDerivationStrict,
+      Builtin.DerivationStrict -> forced1 builtinDerivationStrict
       -- Error context
-      builtinShaped "addErrorContext" (onUse2 builtinAddErrorContext),
+      Builtin.AddErrorContext -> onUse2 builtinAddErrorContext
       -- Attr position
-      builtinShaped "unsafeGetAttrPos" (onUseSecond builtinUnsafeGetAttrPos),
+      Builtin.UnsafeGetAttrPos -> onUseSecond builtinUnsafeGetAttrPos
       -- Debugging
-      builtinShaped "traceVerbose" (onUse2 builtinTraceVerbose),
-      builtin1 "break" pure,
+      Builtin.TraceVerbose -> onUse2 builtinTraceVerbose
+      Builtin.Break -> forced1 pure
       -- IO: file hashing + type detection
-      builtin2 "hashFile" builtinHashFile,
-      builtin1 "readFileType" builtinReadFileType,
+      Builtin.HashFile -> forced2 builtinHashFile
+      Builtin.ReadFileType -> forced1 builtinReadFileType
       -- Serialization
-      builtin1 "fromTOML" builtinFromTOML,
+      Builtin.FromTOML -> forced1 builtinFromTOML
       -- Hash conversion
-      builtin1 "convertHash" builtinConvertHash,
+      Builtin.ConvertHash -> forced1 builtinConvertHash
       -- XML serialization
-      builtin1 "toXML" builtinToXML,
+      Builtin.ToXML -> forced1 builtinToXML
       -- Source filtering + path import
-      builtin1 "path" builtinPath,
-      builtinShaped "filterSource" (onUseFirst builtinFilterSource),
+      Builtin.Path -> forced1 builtinPath
+      Builtin.FilterSource -> onUseFirst builtinFilterSource
       -- Experimental feature stubs
-      builtin2 "outputOf" builtinOutputOf,
-      builtin1 "fetchTree" builtinFetchTree,
-      builtin1 "fetchClosure" builtinFetchClosure
-    ]
+      Builtin.OutputOf -> forced2 builtinOutputOf
+      Builtin.FetchTree -> forced1 builtinFetchTree
+      Builtin.FetchClosure -> forced1 builtinFetchClosure
+      Builtin.FetchMercurial -> forced1 (const (throwEvalError ("unknown builtin '" <> builtinName builtin <> "'")))
 
--- | Names of all registered builtins.
-builtinNames :: [Text]
-builtinNames = Map.keys (builtinRegistry :: Map Text (BuiltinDef PureEval))
+-- | The builtins @builtins@ lists: every one but @fetchMercurial@, which
+-- it leaves out so that a feature test still sees it is missing.
+listedBuiltins :: [Builtin]
+listedBuiltins = filter (/= Builtin.FetchMercurial) [minBound .. maxBound]
 
 -- ---------------------------------------------------------------------------
 -- Builtin dispatch (partial application via accumulated args)
 -- ---------------------------------------------------------------------------
-
--- | How a builtin takes each argument, first to last.  A name the
--- registry does not hold takes one argument, so applying it runs it and
--- 'executeBuiltin' reports it unknown.
-builtinArgModes :: Text -> NonEmpty ArgMode
-builtinArgModes name = maybe (ForceOnApply :| []) bdArgs (Map.lookup name (builtinRegistry :: Map Text (BuiltinDef PureEval)))
 
 -- | Apply a builtin, holding the arguments it has taken, to one more.
 -- The caller supplies the argument as the builtin's mode for its
@@ -1491,18 +1464,19 @@ builtinArgModes name = maybe (ForceOnApply :| []) bdArgs (Map.lookup name (built
 -- argument thunk when it makes the call.  The cell exists before this
 -- runs, and the bang holds the argument as a constructor rather than as a
 -- thunk that would build one.
-applyBuiltin :: (MonadEval m) => Text -> [BuiltinArg] -> (ArgMode -> m BuiltinArg) -> m NixValue
-applyBuiltin name taken takeArg = case builtinArgModes name of
+applyBuiltin :: (MonadEval m) => Builtin -> [BuiltinArg] -> (ArgMode -> m BuiltinArg) -> m NixValue
+applyBuiltin builtin taken takeArg = case bdArgs definition of
   first :| later -> nextPosition taken first later
   where
+    definition = builtinDef builtin
     nextPosition [] mode later = do
       !arg <- takeArg mode
       let held = taken ++ [arg]
       if null later
-        then executeBuiltin name held
-        else pure (VBuiltin name held)
+        then bdApply definition held
+        else pure (VBuiltin builtin held)
     nextPosition (_ : before) _ (mode : later) = nextPosition before mode later
-    nextPosition (_ : _) _ [] = arityError name
+    nextPosition (_ : _) _ [] = arityError builtin
 {-# INLINE applyBuiltin #-}
 
 -- | Apply a function value (lambda or builtin) to one argument, in a call
@@ -1516,8 +1490,8 @@ applyForced :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 applyForced (VLambda closureEnv formals bodyBcIdx) arg = do
   extEnv <- evaluated arg >>= matchFormals closureEnv formals
   evalBytecode extEnv bodyBcIdx
-applyForced (VBuiltin name taken) arg =
-  applyBuiltin name taken (const (pure (ArgForced arg)))
+applyForced (VBuiltin builtin taken) arg =
+  applyBuiltin builtin taken (const (pure (ArgForced arg)))
 applyForced other _ =
   throwEvalError ("attempt to call " <> typeName other <> ", which is not a function")
 
@@ -1535,7 +1509,7 @@ applyUnforced :: (MonadEval m) => NixValue -> Thunk -> m NixValue
 applyUnforced (VLambda closureEnv formals bodyBcIdx) argThunk = do
   extEnv <- matchFormals closureEnv formals argThunk
   evalBytecode extEnv bodyBcIdx
-applyUnforced (VBuiltin name taken) argThunk = applyBuiltin name taken $ \case
+applyUnforced (VBuiltin builtin taken) argThunk = applyBuiltin builtin taken $ \case
   ForceOnApply -> ArgForced <$> force argThunk
   ForceOnUse -> pure (ArgDeferred argThunk)
 applyUnforced other argThunk = do
@@ -1547,157 +1521,6 @@ applyUnforced other argThunk = do
 applyArg :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
 applyArg fun (ArgForced val) = applyValue fun val
 applyArg fun (ArgDeferred thunk) = applyValueLazy fun thunk
-
--- | Execute a builtin once all arguments are collected.
---
--- Direct case dispatch avoids rebuilding the polymorphic 'builtinRegistry'
--- Map on every call.  'builtinRegistry' is polymorphic in @m@ so GHC
--- cannot cache it as a CAF - it gets reconstructed on every use.
--- Pattern matching on the name is zero-allocation.  Each case runs the
--- shape its registry entry uses, which the implementation's type fixes.
-executeBuiltin :: (MonadEval m) => Text -> [BuiltinArg] -> m NixValue
-executeBuiltin name args = case name of
-  -- Type checking (arity 1)
-  "typeOf" -> apply1 (pure . mkStr . typeOfValue)
-  "isNull" -> apply1 (pure . VBool . isNullVal)
-  "isInt" -> apply1 (pure . VBool . isIntVal)
-  "isFloat" -> apply1 (pure . VBool . isFloatVal)
-  "isBool" -> apply1 (pure . VBool . isBoolVal)
-  "isString" -> apply1 (pure . VBool . isStringVal)
-  "isList" -> apply1 (pure . VBool . isListVal)
-  "isAttrs" -> apply1 (pure . VBool . isAttrsVal)
-  "isFunction" -> apply1 (pure . VBool . isFunctionVal)
-  -- List operations (arity 1)
-  "length" -> apply1 builtinLength
-  "head" -> apply1 builtinHead
-  "tail" -> apply1 builtinTail
-  -- String operations (arity 1)
-  "toString" -> apply1 (fmap (uncurry VStr) . coerceToStringPermissive)
-  "stringLength" -> apply1 builtinStringLength
-  -- Control (arity 1)
-  "throw" -> apply1 builtinThrow
-  "abort" -> apply1 builtinAbort
-  -- Attr set operations (arity 1)
-  "attrNames" -> apply1 builtinAttrNames
-  "attrValues" -> apply1 builtinAttrValues
-  "listToAttrs" -> apply1 builtinListToAttrs
-  -- Attr set operations (arity 2)
-  "hasAttr" -> apply2 builtinHasAttr
-  "getAttr" -> apply2 builtinGetAttr
-  "removeAttrs" -> apply2 builtinRemoveAttrs
-  "intersectAttrs" -> apply2 builtinIntersectAttrs
-  "catAttrs" -> apply2 builtinCatAttrs
-  -- List higher-order (arity 2)
-  "map" -> run (onUseFirst builtinMap)
-  "filter" -> run (onUseFirst builtinFilter)
-  "genList" -> run (onUseFirst builtinGenList)
-  "sort" -> run (onUseFirst builtinSort)
-  "concatMap" -> apply2 builtinConcatMap
-  "any" -> apply2 builtinAny
-  "all" -> apply2 builtinAll
-  "elem" -> run (onUseFirst builtinElem)
-  "elemAt" -> run (onUseFirst builtinElemAt)
-  "partition" -> apply2 builtinPartition
-  "groupBy" -> apply2 builtinGroupBy
-  -- String operations (arity 2)
-  "concatStringsSep" -> apply2 builtinConcatStringsSep
-  -- Arity 3
-  "foldl'" -> run (onUseMiddle builtinFoldl)
-  "substring" -> apply3 builtinSubstring
-  -- Numeric
-  "isPath" -> apply1 (pure . VBool . isPathVal)
-  "ceil" -> apply1 builtinCeil
-  "floor" -> apply1 builtinFloor
-  "seq" -> apply2 builtinSeq
-  "trace" -> run (onUseSecond builtinTrace)
-  "warn" -> run (onUseSecond builtinWarn)
-  "unsafeDiscardStringContext" -> apply1 builtinDiscardContext
-  "unsafeDiscardOutputDependency" -> apply1 builtinDiscardOutputDep
-  "addDrvOutputDependencies" -> apply1 builtinAddDrvOutputDeps
-  -- String context introspection
-  "hasContext" -> apply1 builtinHasContext
-  "getContext" -> apply1 builtinGetContext
-  "appendContext" -> apply2 builtinAppendContext
-  "baseNameOf" -> apply1 builtinBaseNameOf
-  "dirOf" -> apply1 builtinDirOf
-  "concatLists" -> apply1 builtinConcatLists
-  "lessThan" -> apply2 builtinLessThan
-  -- Arithmetic + bitwise
-  "add" -> apply2 primAdd
-  "sub" -> apply2 primSub
-  "mul" -> apply2 primMul
-  "div" -> apply2 primDiv
-  "bitAnd" -> apply2 (bitwise (.&.))
-  "bitOr" -> apply2 (bitwise (.|.))
-  "bitXor" -> apply2 (bitwise xor)
-  -- Attr set higher-order
-  "mapAttrs" -> run (onUseFirst builtinMapAttrs)
-  "functionArgs" -> apply1 builtinFunctionArgs
-  "zipAttrsWith" -> apply2 builtinZipAttrsWith
-  -- String manipulation
-  "match" -> apply2 builtinMatch
-  "split" -> apply2 builtinSplit
-  "replaceStrings" -> apply3 builtinReplaceStrings
-  "compareVersions" -> apply2 builtinCompareVersions
-  "splitVersion" -> apply1 builtinSplitVersion
-  "parseDrvName" -> apply1 builtinParseDrvName
-  -- Serialization + hashing
-  "toJSON" -> apply1 builtinToJSON
-  "fromJSON" -> apply1 builtinFromJSON
-  "hashString" -> apply2 builtinHashString
-  -- Error handling + sequencing
-  "tryEval" -> run (onUse1 builtinTryEval)
-  "deepSeq" -> run (onUseSecond builtinDeepSeq)
-  -- Graph traversal
-  "genericClosure" -> apply1 builtinGenericClosure
-  -- IO builtins (delegate to MonadEval methods)
-  "import" -> apply1 builtinImport
-  "readFile" -> apply1 builtinReadFile
-  "pathExists" -> apply1 builtinPathExists
-  "readDir" -> apply1 builtinReadDir
-  "getEnv" -> apply1 builtinGetEnv
-  "toPath" -> apply1 builtinToPath
-  -- Store path operations
-  "placeholder" -> apply1 builtinPlaceholder
-  "storePath" -> apply1 builtinStorePath
-  "findFile" -> apply2 builtinFindFile
-  "toFile" -> apply2 builtinToFile
-  "scopedImport" -> run (onUseFirst builtinScopedImport)
-  -- Network fetchers
-  "fetchurl" -> apply1 builtinFetchurl
-  "fetchTarball" -> apply1 builtinFetchTarball
-  "fetchGit" -> apply1 builtinFetchGit
-  -- Derivation construction
-  "derivationStrict" -> apply1 builtinDerivationStrict
-  -- Error context
-  "addErrorContext" -> run (onUse2 builtinAddErrorContext)
-  -- Attr position
-  "unsafeGetAttrPos" -> run (onUseSecond builtinUnsafeGetAttrPos)
-  -- Debugging
-  "traceVerbose" -> run (onUse2 builtinTraceVerbose)
-  "break" -> apply1 pure
-  -- IO: file hashing + type detection
-  "hashFile" -> apply2 builtinHashFile
-  "readFileType" -> apply1 builtinReadFileType
-  -- Serialization
-  "fromTOML" -> apply1 builtinFromTOML
-  -- Hash conversion
-  "convertHash" -> apply1 builtinConvertHash
-  -- XML serialization
-  "toXML" -> apply1 builtinToXML
-  -- Source filtering + path import
-  "path" -> apply1 builtinPath
-  "filterSource" -> run (onUseFirst builtinFilterSource)
-  -- Experimental feature stubs
-  "outputOf" -> apply2 builtinOutputOf
-  "fetchTree" -> apply1 builtinFetchTree
-  "fetchClosure" -> apply1 builtinFetchClosure
-  _ -> throwEvalError ("unknown builtin '" <> name <> "'")
-  where
-    run shape = bdApply (shape name) args
-    apply1 = run . forced1
-    apply2 = run . forced2
-    apply3 = run . forced3
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - type checking
@@ -2068,7 +1891,7 @@ builtinSort _ other =
 -- call frame; any other comparator is applied as a function, one frame
 -- per application.
 sortComparison :: (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
-sortComparison (VBuiltin "lessThan" []) a b = builtinLessThan a b
+sortComparison (VBuiltin Builtin.LessThan []) a b = builtinLessThan a b
 sortComparison cmp a b = applyValue cmp a >>= (`applyValue` b)
 
 -- | Stable O(n log n) merge sort under a comparison answering whether its
@@ -3378,7 +3201,7 @@ builtinReadDir val = do
   -- Resolved only when an entry needs it, so a listing that types every
   -- entry costs nothing more.
   dir <- if any (isNothing . snd) entries then resolveSymlinks p else pure p
-  let untypedEntry name = evaluated (VPath (canonPathValue (dir <> "/" <> name))) >>= deferApply EnvApply (VBuiltin "readFileType" [])
+  let untypedEntry name = evaluated (VPath (canonPathValue (dir <> "/" <> name))) >>= deferApply EnvApply (VBuiltin Builtin.ReadFileType [])
       entryValue name = maybe (untypedEntry name) (evaluated . mkStr)
   values <- Map.traverseWithKey entryValue (Map.fromList entries)
   VAttrs <$> attrSetFromMap SetReadDir values

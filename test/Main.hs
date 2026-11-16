@@ -74,10 +74,12 @@ import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
-import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, builtinNames, checkGitRef, checkGitRev, checkGitUrl, currentSystemStr, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evalParsed, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
+import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, checkGitRef, checkGitRev, checkGitUrl, currentSystemStr, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evalParsed, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, listedBuiltins, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
+import Nix.Eval.Builtin (builtinName, builtinNamed)
+import qualified Nix.Eval.Builtin as Builtin
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcEmitString, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, cbcString, cbcStringText, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
@@ -1710,7 +1712,7 @@ testCensus = do
             pure (fmap figures first QC.=== fmap figures second),
       runTestM "a census follows a value behind a StablePtr to the cells it holds" $ do
         inner <- cthunkNewComputedInt 7
-        held <- evaluated (VBuiltin "map" [ArgDeferred (Thunk inner)])
+        held <- evaluated (VBuiltin Builtin.Map [ArgDeferred (Thunk inner)])
         withCensus [RootThunk held] $ \census ->
           assertEqual "thunks" (Figures (Just 2) (2 * censusCellBytes)) (kindThunks (censusReached census))
             `andThen` assertEqual "StablePtrs reached" 1 (censusStablePtrsReached census)
@@ -13771,12 +13773,12 @@ testEvalFidelity = do
       -- PureEval tryEval must NOT catch abort - it propagates (matches C++ Nix)
       runTest "tryEval does not catch abort" $
         assertEvalFail "tryeval-abort" "(builtins.tryEval (builtins.abort \"x\")).success",
-      -- every builtin in the registry (the source of builtinNames/builtinArgModes)
-      -- is actually exposed in the builtins set - guards against builtinRegistry
-      -- drifting from the exposed builtins
-      runTest "every registered builtin is exposed" $
-        let missing = [n | n <- builtinNames, evalNix ("builtins ? \"" <> n <> "\"") /= Right (VBool True)]
-         in if null missing then Pass else Fail ("not exposed: " <> T.intercalate ", " missing)
+      runTest "every builtin builtins lists is in it" $
+        let missing = [n | n <- map builtinName listedBuiltins, evalNix ("builtins ? \"" <> n <> "\"") /= Right (VBool True)]
+         in if null missing then Pass else Fail ("not exposed: " <> T.intercalate ", " missing),
+      runTest "every builtin is the one its name names" $
+        let misnamed = [builtinName b | b <- [minBound .. maxBound], builtinNamed (builtinName b) /= Just b]
+         in if null misnamed then Pass else Fail ("misnamed: " <> T.intercalate ", " misnamed)
     ]
 
 -- | Pure hash decode/digest helpers shared by eval (fixed-output paths) and

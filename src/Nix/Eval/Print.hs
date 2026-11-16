@@ -55,6 +55,7 @@ import Data.String (IsString)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Nix.Eval.Builtin (builtinName)
 import Nix.Eval.CData (MonadCData)
 import Nix.Eval.CList (CListPtr)
 import Nix.Eval.CThunk (CThunkPtr)
@@ -137,8 +138,8 @@ printAt options depth cell val = case val of
     entering repeatedMarker (Just key) (printAttrs options depth attrs)
   -- What upstream prints for a lambda whose expression it cannot reach.
   VLambda {} -> pure (marker "lambda")
-  VBuiltin name [] -> pure (marker ("primop " <> name))
-  VBuiltin name _ -> pure (marker ("partially applied primop " <> name))
+  VBuiltin builtin [] -> pure (marker ("primop " <> builtinName builtin))
+  VBuiltin builtin _ -> pure (marker ("partially applied primop " <> builtinName builtin))
 
 -- | Upstream's @printAttrs@.  A set's attributes count toward the bound
 -- after the attributes of any set inside them, as upstream counts one
