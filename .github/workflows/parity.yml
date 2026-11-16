@@ -29,9 +29,21 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request supersedes the run in flight, so that one
+# is cancelled.  A run on main or in the merge queue is not cancelled once
+# it starts, but one still waiting when a newer run joins the group is:
+# GitHub cancels a group's pending run, here as in ci.yml's group.
+concurrency:
+  group: parity-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   parity:
     name: Nix ${{ matrix.nix }}, nixpkgs ${{ matrix.channel }}
+    # A push to main by the merge queue carries the commit its merge group's
+    # run tested, here as in ci.yml, so the rows skip it.  A push by anyone
+    # else reaches main untested and runs them.
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -154,7 +166,8 @@ jobs:
   gate:
     name: Parity
     needs: [parity]
-    if: always()
+    # Skipped with the rows on a push by the merge queue.
+    if: ${{ always() && !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

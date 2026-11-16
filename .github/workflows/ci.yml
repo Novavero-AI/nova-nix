@@ -57,6 +57,17 @@ env:
 # ---------------------------------------------------------------------------
 
 jobs:
+  # A push to main by the merge queue carries the commit its merge group's
+  # run tested, since the queue moves main to that commit, so its run skips
+  # the builds, tests and Stage0 legs that run ran there.  The textual
+  # checks through Cabal Check still run, about two minutes: Stage0
+  # (nova-nix), whose build the ladder runs, needs Cabal Check, and a job
+  # whose chain of needs holds a skipped job is skipped unless its own
+  # condition says otherwise.  What a merge group's run does not run still
+  # runs: the ladder, after Cabal Check as on any push, and the jobs that
+  # publish to the public cache, which on such a push wait for no textual
+  # check.  A push by anyone else reaches main untested and runs every job.
+  # github.actor stays the queue when such a run is re-run.
   ascii:
     name: ASCII source
     runs-on: ubuntu-latest
@@ -205,6 +216,8 @@ jobs:
   sdist:
     name: Build from sdist
     needs: [cabal-check]
+    # Skipped on a push by the merge queue (the comment above ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -242,6 +255,8 @@ jobs:
   sanitizers:
     name: ASan/UBSan
     needs: [cabal-check]
+    # Skipped on a push by the merge queue (the comment above ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -301,6 +316,8 @@ jobs:
   build:
     name: Build (${{ matrix.os }})
     needs: [cabal-check]
+    # Skipped on a push by the merge queue (the comment above ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     strategy:
       fail-fast: false
       matrix:
@@ -567,6 +584,8 @@ jobs:
   e2e-windows:
     name: E2E (Windows)
     needs: [cabal-check]
+    # Skipped on a push by the merge queue (the comment above ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -742,6 +761,8 @@ jobs:
   stage0-windows:
     name: Stage0 (${{ matrix.name }})
     needs: [stage0-nova-nix]
+    # Skipped on a push by the merge queue (the comment above ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     strategy:
       fail-fast: false
       matrix:
@@ -1256,7 +1277,11 @@ jobs:
   publish:
     name: Publish (public cache)
     needs: [e2e-windows]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # On main, once E2E (Windows) passes, or on a push by the merge queue,
+    # where it is skipped, its merge group's run having passed it on this
+    # commit.  A skipped need skips a job whose condition reads no status,
+    # so this one reads them.
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && (needs.e2e-windows.result == 'success' || github.actor == 'github-merge-queue[bot]') }}
     runs-on: windows-latest
     timeout-minutes: 45
     environment:
@@ -1343,7 +1368,10 @@ jobs:
   e2e-public-cache:
     name: E2E (public cache)
     needs: [publish]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Once Publish (public cache) passes.  On a push by the merge queue, E2E
+    # (Windows), which Publish needs, is skipped, and a skip applies to every
+    # job after it in the chain whose condition reads no status.
+    if: ${{ !cancelled() && needs.publish.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -1434,6 +1462,8 @@ jobs:
   e2e-loop:
     name: E2E (substitute loop)
     needs: [cabal-check]
+    # Skipped on a push by the merge queue (the comment above ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
