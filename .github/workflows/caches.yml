@@ -1,0 +1,288 @@
+name: Caches
+
+# The Actions caches CI and Parity restore, saved from main alone: each
+# OS's Cabal store, the sdist build's store, the formatter binary and the
+# nixpkgs trees Parity reads.  A cache saved by a pull request's run or a
+# merge group's run is scoped to that ref, so no other run restores it, and
+# it counts against the repository's 10 GB, where GitHub evicts the entries
+# accessed longest ago to make room, main's among them.  This workflow is
+# what saves these caches, each where main lacks it, and CI's and Parity's
+# jobs restore them, so that a run on any ref finds main's.
+#
+# Two workflows keep caches apart from these.  Scoreboard restores the
+# nixpkgs trees under the keys this workflow saves them with, and saves
+# one that main lacks, and a Cabal store under a key of its own, from the
+# ref it runs on: main when dispatched, or a pull request that changes it.
+# Hackage, dispatched from main, keeps a Cabal store of its own.
+#
+# A cache is keyed by what decides its contents: a Cabal store by the build
+# plan (.github/actions/cabal-store), the formatter by its version, a
+# nixpkgs tree by its revision.  A job here asks for its key without
+# downloading, and on a miss restores the nearest cache, adds what the key
+# needs and saves it.  It runs on a push to main that changes what a key
+# reads, this workflow included, where the GHC and ormolu versions are
+# spelled (test/Main.hs holds them to the other workflows'), as is the
+# haskell-actions/setup pin, whose bundled version list decides the cabal
+# "latest" resolves to; daily, for the Hackage index the sdist build
+# resolves against and for a cache GitHub evicted; and when dispatched.
+on:
+  push:
+    branches: [main]
+    paths:
+      - nova-nix.cabal
+      - cabal.project
+      - .github/actions/cabal-store/action.yml
+      - .github/workflows/caches.yml
+      - .github/workflows/parity.yml
+  schedule:
+    # Off the hour: GitHub delays scheduled runs at the start of every
+    # hour, its busiest time.
+    - cron: "13 2 * * *"
+  workflow_dispatch:
+
+# Drop the default GITHUB_TOKEN to read-only; nothing here writes via it.
+permissions:
+  contents: read
+
+# A newer run saves what an older one would, so the older one is
+# cancelled.
+concurrency:
+  group: caches-${{ github.ref }}
+  cancel-in-progress: true
+
+# Every job runs on main alone: a run dispatched on another branch would
+# save caches scoped to that branch, which no other run restores.
+jobs:
+  # The store every job on an OS restores, holding the packages nova-nix,
+  # its tests and its benchmark build with, and on Linux and Windows those
+  # nova-cache-server builds with too: E2E (substitute loop) installs the
+  # server on Linux and Ladder (handoff server) on Windows, each in this
+  # project, so cabal resolves it under cabal.project's index-state.
+  cabal-store:
+    name: Cabal store (${{ matrix.os }})
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            server: true
+          - os: macos-latest
+            server: false
+          - os: windows-latest
+            server: true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # As ci.yml's build selects it, for the reason the step of this name
+      # there gives: GHC's macOS bindist links against the Command Line
+      # Tools SDK.
+      - name: Use the Command Line Tools linker
+        if: runner.os == 'macOS'
+        run: sudo xcode-select -s /Library/Developer/CommandLineTools
+
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
+        id: setup
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Look for the plan's store
+        id: lookup
+        uses: ./.github/actions/cabal-store
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
+          lookup-only: "true"
+
+      - name: Restore the nearest store
+        if: steps.lookup.outputs.cache-hit != 'true'
+        uses: ./.github/actions/cabal-store
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
+
+      - name: Build the dependencies
+        if: steps.lookup.outputs.cache-hit != 'true'
+        run: cabal build --enable-tests --only-dependencies
+
+      - name: Build nova-cache-server
+        if: steps.lookup.outputs.cache-hit != 'true' && matrix.server
+        shell: bash
+        run: cabal install nova-cache -f server --install-method=copy --installdir="$RUNNER_TEMP/server" --overwrite-policy=always
+
+      - name: Save the store
+        if: steps.lookup.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: ${{ steps.lookup.outputs.key }}
+
+  # Build from sdist's store: the tarball builds outside the checkout, where
+  # no cabal.project pins the index-state, so it resolves against the
+  # newest index and its plan is its own.
+  sdist-store:
+    name: Cabal store (sdist)
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
+        id: setup
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      # As Build from sdist plans it: unpacked outside the checkout, with
+      # the plan copied into the checkout for hashFiles, which reads the
+      # workspace alone.
+      - name: Unpack and plan the tarball a Hackage user gets
+        run: |
+          cabal sdist -o "$RUNNER_TEMP/sdist"
+          tar -xzf "$RUNNER_TEMP"/sdist/nova-nix-*.tar.gz -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP"/nova-nix-*/
+          cabal build --enable-tests --dry-run
+          cp dist-newstyle/cache/plan.json "$GITHUB_WORKSPACE/sdist-plan.json"
+
+      - name: Look for the plan's store
+        id: lookup
+        uses: ./.github/actions/cabal-store
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          prefix: cabal-sdist-${{ runner.os }}
+          plan-hash: ${{ hashFiles('sdist-plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
+          lookup-only: "true"
+
+      - name: Restore the nearest store
+        if: steps.lookup.outputs.cache-hit != 'true'
+        uses: ./.github/actions/cabal-store
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          prefix: cabal-sdist-${{ runner.os }}
+          plan-hash: ${{ hashFiles('sdist-plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
+
+      - name: Build the dependencies
+        if: steps.lookup.outputs.cache-hit != 'true'
+        run: |
+          cd "$RUNNER_TEMP"/nova-nix-*/
+          cabal build --enable-tests --only-dependencies
+
+      - name: Save the store
+        if: steps.lookup.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: ${{ steps.lookup.outputs.key }}
+
+  # The formatter Ormolu runs, built from Hackage as that job builds it on
+  # a miss; the version is the one ci.yml's Ormolu job pins.
+  ormolu:
+    name: Formatter binary
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ORMOLU_VERSION: "0.9.0.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Look for the binary
+        id: lookup
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/ormolu
+          key: ormolu-${{ env.ORMOLU_VERSION }}-${{ runner.os }}
+          lookup-only: true
+
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
+        if: steps.lookup.outputs.cache-hit != 'true'
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      - name: Build ormolu from Hackage
+        if: steps.lookup.outputs.cache-hit != 'true'
+        run: cabal install "ormolu-$ORMOLU_VERSION" --install-method=copy --installdir="$HOME/.local/bin" --overwrite-policy=always
+
+      - name: Save the binary
+        if: steps.lookup.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/bin/ormolu
+          key: ${{ steps.lookup.outputs.cache-primary-key }}
+
+  # The revisions are parity.yml's matrix rows, read from it, as
+  # scoreboard.yml reads them, so a bumped row needs no edit here.
+  pairings:
+    name: Pairings
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      include: ${{ steps.read.outputs.include }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read parity.yml's matrix
+        id: read
+        run: |
+          set -euo pipefail
+          include=$(yq -o=json -I=0 '.jobs.parity.strategy.matrix.include' .github/workflows/parity.yml)
+          echo "$include"
+          [ "$(jq 'length' <<<"$include")" -gt 0 ] || { echo "parity.yml lists no pairing" >&2; exit 1; }
+          echo "include=$include" >> "$GITHUB_OUTPUT"
+
+  # Each pinned nixpkgs tree, under the key and path Parity and Scoreboard
+  # restore it from, fetched as they fetch it on a miss.
+  nixpkgs:
+    name: nixpkgs ${{ matrix.channel }}
+    needs: [pairings]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.pairings.outputs.include) }}
+    env:
+      NIXPKGS_REV: ${{ matrix.rev }}
+    steps:
+      - name: Look for the tree
+        id: lookup
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: nixpkgs-ref
+          key: parity-nixpkgs-${{ runner.os }}-${{ env.NIXPKGS_REV }}
+          lookup-only: true
+
+      - name: Fetch the pinned nixpkgs tree
+        if: steps.lookup.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git init nixpkgs-ref
+          git -C nixpkgs-ref remote add origin https://github.com/NixOS/nixpkgs
+          git -C nixpkgs-ref fetch --depth 1 origin "$NIXPKGS_REV"
+          git -C nixpkgs-ref checkout --detach FETCH_HEAD
+
+      - name: Save the tree
+        if: steps.lookup.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: nixpkgs-ref
+          key: ${{ steps.lookup.outputs.cache-primary-key }}

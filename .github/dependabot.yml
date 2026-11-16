@@ -1,7 +1,11 @@
 version: 2
 updates:
   - package-ecosystem: github-actions
-    directory: /
+    # / is .github/workflows and an action.yml at the root; each local
+    # action under .github/actions is a directory of its own.
+    directories:
+      - /
+      - /.github/actions/*
     schedule:
       interval: weekly
     commit-message:
