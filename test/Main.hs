@@ -15,7 +15,7 @@ import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
-import Control.Monad (filterM, foldM, unless, void, when, zipWithM, (>=>))
+import Control.Monad (filterM, foldM, replicateM, unless, void, when, zipWithM, (>=>))
 import Control.Monad.Except (runExceptT)
 import Control.Monad.State.Strict (State, evalStateT, get, gets, modify', runState)
 import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
@@ -49,7 +49,7 @@ import Data.Tuple (swap)
 import Data.Word (Word16, Word32, Word64, Word8)
 import qualified Database.SQLite.Simple as SQL
 import Foreign.C.Error (Errno (..), eACCES, eISDIR, eNOENT, eNOTDIR)
-import Foreign.C.Types (CChar)
+import Foreign.C.Types (CChar, CSize (..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, WordPtr, castPtr, nullPtr, ptrToWordPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
@@ -78,13 +78,14 @@ import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
 import Nix.Eval.Arena (CStatusError (..), arenaDestroy, arenaInit, arenaLive)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
-import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcEmitString, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, cbcString, cbcStringText, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
 import Nix.Eval.CEnv (cenvLazyScope, cenvNewScoped, cenvParent)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsType, clambdaNew, clambdaShape, clambdaShapeAllowExtra, clambdaShapeFormalCount, clambdaShapeFormalsType)
 import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks, thunkListToCList)
 import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
-import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBool, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkState, cthunkValueTag)
+import Nix.Eval.CStr (cstrNew)
+import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBool, cthunkGetCtxStr, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputed, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkSetComputed, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, reassembleInt64)
@@ -97,8 +98,8 @@ import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecorder, noPos, recordPos)
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.StringInterp (joinCoercedList)
-import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolInternBytes, symbolLen, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), attrSetKeys, emptyCList, envLookupResolved, envWithScopesRaw, mkThunkBc, newEnv, newScopeEnv, pendingCode, pendingThunkEnv, pushLazyWithScope, readComputed, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
+import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
+import Nix.Eval.Types (AttrSet (..), Env (..), attrSetKeys, cheapThunkBc, emptyCList, envLookupResolved, envWithScopesRaw, mkThunkBc, newEnv, newScopeEnv, pendingCode, pendingThunkEnv, pushLazyWithScope, readComputed, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -1557,6 +1558,15 @@ envHeaderBytes, envScopesBytes :: Word64
 envHeaderBytes = 8
 envScopesBytes = 24
 
+-- | Bytes a string of these bytes takes in its block: a 4-byte length,
+-- then the bytes, padded to the next multiple of 4 (cbits/nn_str.h).
+censusStringBytes :: BS.ByteString -> Word64
+censusStringBytes bytes = (4 + fromIntegral (BS.length bytes) + 3) `div` 4 * 4
+
+-- | A store path hash: 32 characters of the base-32 alphabet.
+censusStoreHash :: Text
+censusStoreHash = "0123456789abcdfghijklmnpqrsvwxyz"
+
 genCensusTree :: QC.Gen CensusTree
 genCensusTree = QC.sized grow
   where
@@ -1665,15 +1675,33 @@ testCensus = do
         suffixFirst <- censusOf [RootList suffix, RootList whole]
         wholeFirst <- censusOf [RootList whole, RootList suffix]
         pure (assertEqual "suffix first" (Right expected) (listsAndCells <$> suffixFirst) `andThen` assertEqual "whole first" (Right expected) (listsAndCells <$> wholeFirst)),
-      runTestM "a census reaches a set's names and its string values as symbols" $ do
+      runTestM "a census reaches a set's names as symbols and its string values as strings" $ do
         value <- evaluated (mkStr "nova-nix census value")
         set <- attrSetFromMap SetLiteral (Map.fromList [("novaNixCensusName", value)])
         withCensus [RootAttrSet set] $ \census ->
           assertEqual
-            "sets, thunks and symbols"
-            (Just 1, Just 1, Figures (Just 2) (fromIntegral (T.length "novaNixCensusName" + T.length "nova-nix census value" + 2)))
-            (figuresCount (kindAttrSets (censusReached census)), figuresCount (kindThunks (censusReached census)), kindSymbols (censusReached census))
+            "sets, thunks, strings and symbols"
+            (Just 1, Just 1, Figures (Just 1) (censusStringBytes "nova-nix census value"), Figures (Just 1) (fromIntegral (T.length "novaNixCensusName" + 1)))
+            (figuresCount (kindAttrSets (censusReached census)), figuresCount (kindThunks (censusReached census)), kindStrings (censusReached census), kindSymbols (censusReached census))
             `andThen` assertEqual "set sizes" (Map.fromList [(1, 1)]) (censusSetSizes census)
+            `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
+      runTestM "a census reaches a context string's text, store path and output as strings" $ do
+        let element = SCDrvOutput (StorePath censusStoreHash "zname") "zout"
+        cell <- evaluated (VStr "ztext" (StringContext (Set.singleton element)))
+        withCensus [RootThunk cell] $ \census ->
+          assertEqual "context strings" (Just 1) (figuresCount (kindCtxStrs (censusReached census)))
+            `andThen` assertEqual
+              "strings"
+              (Figures (Just 4) (sum (map censusStringBytes ["ztext", TE.encodeUtf8 censusStoreHash, "zname", "zout"])))
+              (kindStrings (censusReached census))
+            `andThen` assertEqual "symbols" (Figures (Just 0) 0) (kindSymbols (censusReached census))
+            `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
+      runTestM "a census places a literal's bytes in the code and the empty string, counting neither" $ do
+        literal <- compileExpr (EStr [StrLit "zcensus literal"]) >>= cheapThunkBc emptyEnv
+        empty <- evaluated (mkStr "")
+        withCensus [RootThunk literal, RootThunk empty] $ \census ->
+          assertEqual "thunks" (Just 2) (figuresCount (kindThunks (censusReached census)))
+            `andThen` assertEqual "strings" (Figures (Just 0) 0) (kindStrings (censusReached census))
             `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
       runTestM "a census of the builtins reaches no more than is allocated and places every pointer it meets" $ do
         env <- builtinEnv unrestrictedPolicy 0 []
@@ -1784,7 +1812,7 @@ testCensus = do
         ( concat
             [ [name <> ".allocated.count 3" | name /= "envs"]
                 ++ [name <> ".allocated.bytes " <> (if name == "envs" then "96" else "48"), name <> ".reached.count 1", name <> ".reached.bytes 16"]
-            | name <- ["thunks", "envs", "attrsets", "lists", "lambdas", "ctxstrs", "symbols"]
+            | name <- ["thunks", "envs", "attrsets", "lists", "lambdas", "ctxstrs", "strings", "symbols"]
             ]
             ++ [ "overhead.bytes 5",
                  "code.bytes 6",
@@ -22966,8 +22994,8 @@ servedLine :: String
 servedLine = "served without an exception"
 
 -- | The paths a library user reaches the C layer by.  The first C call
--- of each of the first four lands in a different sub-arena, and the
--- fifth runs a full init .. destroy cycle first, so both ends of the
+-- of each of the first five lands in a different sub-arena, and the
+-- sixth runs a full init .. destroy cycle first, so both ends of the
 -- window are covered.  The next two read the shared @null@, @true@ and
 -- @false@ thunks, which must be valid in every window: were they arena
 -- cells behind a process-lifetime CAF, forcing one outside the window
@@ -22981,7 +23009,8 @@ arenaGuardPaths :: [ArenaGuardPath]
 arenaGuardPaths =
   [ noArena "compile" "nn_bc_emit" evalNamelessProgram,
     noArena "thunk" "nn_thunk_new_computed_int" (void (evaluated (VInt 1))),
-    noArena "symbol" "nn_symbol_intern" (void (evaluated (mkStr "a"))),
+    noArena "string" "nn_str_new" (void (evaluated (mkStr "a"))),
+    noArena "symbol" "nn_symbol_intern" (void (symbolIntern "a")),
     noArena "env" "nn_env_new" (void (evaluated VNull >>= \nullCell -> newEnv EnvApply Nothing [nullCell])),
     noArena "after-destroy" "nn_bc_emit" (bracket_ arenaInit arenaDestroy (pure ()) >> evalNamelessProgram),
     ArenaGuardPath
@@ -23124,14 +23153,163 @@ internsInOrder label source expected = runTestM label $ do
   (_, out, _) <- Proc.readCreateProcessWithExitCode (Proc.proc self [internOrderChildFlag, T.unpack source]) ""
   pure (assertEqual label expected (T.lines (T.pack out)))
 
+-- | Run as a child, parse one source as the file 'namesOnlyFile', build
+-- the builtins once so the names interned at startup are in the table,
+-- then evaluate the source as an evaluation does, and print each symbol
+-- the evaluation added, one a line, in the order it added them, and the
+-- failure if it failed.
+namesOnlyChildFlag :: String
+namesOnlyChildFlag = "--names-only-child"
+
+-- | Where 'namesOnlyChild' says its source comes from: a position records
+-- its file, which upstream keeps out of its symbol table.
+namesOnlyFile :: Text
+namesOnlyFile = "/nova-nix-test/znames-only.nix"
+
+namesOnlyChild :: String -> IO ()
+namesOnlyChild source = case parseNix testBaseDir (SourceFile namesOnlyFile) (TE.encodeUtf8 (T.pack source)) of
+  Left err -> putStrLn ("error: " <> show err)
+  Right parsed -> do
+    storeDir <- evalNixIOStoreDir
+    st <- testEvalState storeDir testBaseDir
+    _ <- builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)
+    before <- symbolCount
+    result <- runEvalIO st (evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed)
+    after <- symbolCount
+    mapM_ (TIO.putStrLn . symbolText . Symbol) [before + 1 .. after]
+    either (\err -> TIO.putStrLn ("error: " <> err)) (const (pure ())) result
+
+-- | Evaluate the source in a child process running 'namesOnlyChild' and
+-- check that every symbol it added is one of the names, and that the
+-- ones listed in @interned@ were added in that order.
+internsNamesOnly :: Text -> Text -> [Text] -> [Text] -> IO Bool
+internsNamesOnly label source names interned = runTestM label $ do
+  self <- getExecutablePath
+  (_, out, _) <- Proc.readCreateProcessWithExitCode (Proc.proc self [namesOnlyChildFlag, T.unpack source]) ""
+  let added = T.lines (T.pack out)
+  pure $
+    assertEqual "symbols that are no name" [] (filter (`notElem` names) added)
+      `andThen` assertEqual "names interned, in order" interned (filter (`elem` interned) added)
+
+-- | The symbol table holds names alone, as upstream's does
+-- (@SymbolTable@, symbol-table.hh at 2.24.9): a string value, a path, a
+-- URI, a search path, a string's context and a source file's path take
+-- no symbol, so none moves the place of a name interned after it, which
+-- decides the order of a set's attributes.
+testStringsOffSymbolsIO :: IO [Bool]
+testStringsOffSymbolsIO = do
+  putStrLn "eval/strings-off-symbols"
+  sequence
+    [ internsNamesOnly
+        "an evaluation interns its names and no value it makes"
+        ( T.unlines
+            [ "let",
+              "  zs = \"zlit\";",
+              "  zi = \"zi${zs}\";",
+              "  zj = ''",
+              "    zind''\\t${zs}",
+              "  '';",
+              "  zu = http://zuri.example/zu;",
+              "  zp = /zpath/zlit;",
+              "  zq = /zpath/${zs};",
+              "  zn = _: <zsearch>;",
+              "  zl = builtins.split \"(zre)\" \"zazreb\";",
+              "  zc = builtins.appendContext \"zctx\" { \"/nix/store/" <> censusStoreHash <> "-zctxname.drv\" = { path = true; outputs = [ \"zout\" ]; }; };",
+              "in",
+              "builtins.deepSeq [ zs zi zj zu zp zq zn zl zc ] null"
+            ]
+        )
+        -- The names the source writes, and allOutputs, which appendContext
+        -- interns as it runs, as upstream's does (context.cc:270-271 at
+        -- 2.24.9).
+        ( ["zs", "zi", "zj", "zu", "zp", "zq", "zn", "_", "zl", "zc", "builtins", "split", "appendContext", "deepSeq", "null", "true", "path", "outputs", "/nix/store/" <> censusStoreHash <> "-zctxname.drv"]
+            ++ ["allOutputs"]
+        )
+        ["zs", "zi", "zj", "zu", "zp", "zq", "zn", "zl", "zc"],
+      -- Upstream interns the names a set built at run time takes as it
+      -- builds it (prim_listToAttrs, primops.cc:2889-2896 at 2.24.9), so the
+      -- first in symbol order is the first in the list.  The strings
+      -- evaluated before, in the other order, take no symbol.
+      emits
+        "string values equal to a set's names do not decide its order"
+        "let early = builtins.concatStringsSep \",\" [ (\"z\" + \"b\") (\"z\" + \"a\") ]; in builtins.seq early (({ }: null) (builtins.listToAttrs [ { name = \"z\" + \"a\"; value = 1; } { name = \"z\" + \"b\"; value = 2; } ]))"
+        ["error: function 'anonymous lambda' called with unexpected argument 'za'"],
+      emits
+        "a string literal equal to a set's name does not decide its order"
+        "let early = [ \"zb\" \"za\" ]; in builtins.seq (builtins.deepSeq early early) (({ }: null) (builtins.listToAttrs [ { name = \"z\" + \"a\"; value = 1; } { name = \"z\" + \"b\"; value = 2; } ]))"
+        ["error: function 'anonymous lambda' called with unexpected argument 'za'"]
+    ]
+
+-- | A string's bytes are made once and shared by every cell that holds
+-- the string, as upstream copies a @Value@ with the pointer to its bytes
+-- (value.hh at 2.24.9), where a copy per cell would grow the string arena
+-- each time a string passes from one cell to another.  A string literal's
+-- value is its bytes in the code, as upstream's @ExprString@ hands out
+-- the value it holds (eval.cc:1024-1028).
+testStringSharing :: IO [Bool]
+testStringSharing = do
+  putStrLn "eval/string-sharing"
+  tmpBase <- getTemporaryDirectory
+  sequence
+    [ runTestM "a string, a string with context and a path read from one cell share their bytes with the cell that stores them" $ do
+        let source =
+              T.unlines
+                [ "let",
+                  "  s = builtins.concatStringsSep \"\" [ \"z\" \"pass\" ];",
+                  "  c = builtins.appendContext \"zctx\" { \"/nix/store/" <> censusStoreHash <> "-zname.drv\" = { outputs = [ \"out\" ]; }; };",
+                  "  p = /zpass + \"/x\";",
+                  "  f = _: \"zlit\";",
+                  "  pick = x: x;",
+                  "  l = [ s (pick s) c (pick c) p (pick p) (f 1) (f 2) ];",
+                  "in",
+                  "builtins.deepSeq l l"
+                ]
+        result <- evalNixIO tmpBase source
+        case result of
+          Left failure -> pure (Fail failure)
+          Right (VList list) -> do
+            cells <- clistThunks list
+            case cells of
+              [s1, s2, c1, c2, p1, p2, l1, l2] -> do
+                strs <- mapM cthunkGetStr [s1, s2]
+                literals <- mapM cthunkGetStr [l1, l2]
+                ctxs <- mapM cthunkGetCtxStr [c1, c2]
+                paths <- mapM cthunkGetPath [p1, p2]
+                pure $
+                  assertEqual "string" True (allSame strs)
+                    `andThen` assertEqual "literal" True (allSame literals)
+                    `andThen` assertEqual "string with context" True (allSame ctxs)
+                    `andThen` assertEqual "path" True (allSame paths)
+              _ -> pure (Fail ("expected eight cells, got " <> T.pack (show (length cells))))
+          Right other -> pure (Fail ("expected a list, got " <> typeName other)),
+      runTestM "every cell a string literal makes points at the literal's bytes in the code" $ do
+        idx <- compileExpr (EStr [StrLit "zshared literal"])
+        (_, dataOff) <- cbcCountedPayload idx =<< cbcArg1 idx
+        code <- cbcData (dataOff + 1) >>= cbcString
+        cells <- replicateM 2 (cheapThunkBc emptyEnv idx)
+        held <- mapM (cthunkGetStr . unThunk) cells
+        values <- mapM readThunkValue cells
+        pure $
+          assertEqual "the code's string" [code, code] held
+            `andThen` assertEqual "values" [Just (mkStr "zshared literal"), Just (mkStr "zshared literal")] values,
+      runTestM "a URI literal's cell points at the URI's bytes in the code" $ do
+        idx <- compileExpr (ELit (NixUri "zuri:shared"))
+        code <- cbcArg1 idx >>= cbcString
+        cell <- cheapThunkBc emptyEnv idx
+        held <- cthunkGetStr (unThunk cell)
+        value <- readThunkValue cell
+        pure (assertEqual "the code's string" code held `andThen` assertEqual "value" (Just (mkStr "zuri:shared")) value)
+    ]
+  where
+    allSame xs = and (zipWith (==) xs (drop 1 xs))
+
 -- | Names are interned in the order upstream's parser interns them, the
 -- order a set's attributes are stored in.  There is no Nix here to run,
 -- so each expected order is derived from the actions of parser.y at
 -- 2.24.9, cited per case: bison runs a rule's action once the rule's
 -- right-hand side is parsed, so the name an action interns follows the
 -- names inside the rule.  No name whose order a case checks is one
--- either evaluator interns at startup, and no source holds a string
--- literal other than a key, which this evaluator also interns.  A name
+-- either evaluator interns at startup.  A name
 -- noted after a function's body is followed by another name, so that the
 -- compiler, which interns a function's argument after its body, cannot
 -- give the order on its own.
@@ -23721,20 +23899,32 @@ testTraceVerboseOff = do
 slotCountPastUInt32 :: Int
 slotCountPastUInt32 = fromIntegral (maxBound :: Word32) `div` sizeOf (nullPtr :: Ptr ()) + 1
 
--- | One byte past the longest string the symbol table can hold.
-symbolLengthPastUInt32 :: Int
-symbolLengthPastUInt32 = fromIntegral (maxBound :: Word32) + 1
+-- | One byte past the longest string the symbol table or a string arena
+-- can hold.
+lengthPastUInt32 :: Int
+lengthPastUInt32 = fromIntegral (maxBound :: Word32) + 1
 
--- | Intern a ByteString whose length claims 'symbolLengthPastUInt32'
+-- | Run an action on a ByteString whose length claims 'lengthPastUInt32'
 -- bytes over one real byte, so no 4 GiB buffer is needed.  Sound only
--- because the interner refuses on the length before reading: an
--- interner that read would run out of bounds here.
-internOversizedSymbol :: IO Symbol
-internOversizedSymbol =
+-- because each C function it reaches refuses on the length before
+-- reading: one that read would run out of bounds here.
+withOversizedBytes :: (BS.ByteString -> IO a) -> IO a
+withOversizedBytes use =
   alloca $ \byte -> do
     poke byte (0 :: CChar)
-    oversized <- BSU.unsafePackCStringLen (byte, symbolLengthPastUInt32)
-    symbolInternBytes oversized
+    use =<< BSU.unsafePackCStringLen (byte, lengthPastUInt32)
+
+-- | The interner itself, for the one refusal no name reaches: the library
+-- interns names given as text, and no test can build 4 GiB of text.
+foreign import ccall unsafe "nn_symbol_intern"
+  c_nn_symbol_intern :: Ptr CChar -> CSize -> IO Word32
+
+-- | Intern an oversized name through the C entry point, answering what it
+-- returns.
+internOversizedSymbol :: IO Word32
+internOversizedSymbol =
+  withOversizedBytes $ \bytes ->
+    BSU.unsafeUseAsCStringLen bytes $ \(ptr, len) -> c_nn_symbol_intern ptr (fromIntegral len)
 
 -- | Reaching the C layer outside the 'arenaInit' .. 'arenaDestroy'
 -- window raises 'ArenaNotInitialized' naming the entry point, rather
@@ -23767,20 +23957,22 @@ testArenaGuard = do
         -- refused there and must surface as a list failure, where a NULL
         -- return would read as the empty list.
         liveRefusal "a list past UINT32_MAX slot bytes" "nn_list_new" (void (clistNew (fromIntegral slotCountPastUInt32))),
-        -- A length the entry's uint32_t cannot hold, refused rather than
-        -- truncated to alias a shorter string.
-        liveRefusal "a symbol longer than UINT32_MAX bytes" "nn_symbol_intern" (void internOversizedSymbol)
+        -- A length a string's uint32_t cannot hold, refused rather than
+        -- truncated to a shorter string, in the value arena and in the
+        -- code's.
+        liveRefusal "a string longer than UINT32_MAX bytes" "nn_str_new" (void (withOversizedBytes cstrNew)),
+        liveRefusal "a code string longer than UINT32_MAX bytes" "nn_bc_emit_string" (void (withOversizedBytes cbcEmitString))
       ]
   tableIntact <-
-    runTestM "a refused symbol leaves the table unchanged" $ do
+    runTestM "a symbol longer than UINT32_MAX bytes is refused, leaving the table unchanged" $ do
       before <- symbolCount
-      _ <- try internOversizedSymbol :: IO (Either CStatusError Symbol)
+      refused <- internOversizedSymbol
       after <- symbolCount
       sym <- symbolIntern "after-a-refusal"
       pure $
-        if before == after && symbolText sym == "after-a-refusal"
+        if refused == 0 && before == after && symbolText sym == "after-a-refusal"
           then Pass
-          else Fail ("count " <> T.pack (show before) <> " -> " <> T.pack (show after) <> ", text " <> symbolText sym)
+          else Fail ("answer " <> T.pack (show refused) <> ", count " <> T.pack (show before) <> " -> " <> T.pack (show after) <> ", text " <> symbolText sym)
   pure (children ++ live ++ [tableIntact])
   where
     liveRefusal what site action =
@@ -25643,18 +25835,18 @@ testBytecodeCompile = do
       runTestM "compile ELit NixUri" $ do
         idx <- compileExpr (ELit (NixUri "https://example.com"))
         op <- cbcOpcode idx
-        sym <- cbcArg1 idx
+        uri <- cbcArg1 idx >>= cbcStringText
         pure
-          ( if op == OpLitUri && symbolText (Symbol sym) == "https://example.com"
+          ( if op == OpLitUri && uri == "https://example.com"
               then Pass
               else Fail "uri mismatch"
           ),
       runTestM "compile ELit NixPath" $ do
         idx <- compileExpr (ELit (NixPath "/nix/store/foo"))
         op <- cbcOpcode idx
-        sym <- cbcArg1 idx
+        path <- cbcArg1 idx >>= cbcStringText
         pure
-          ( if op == OpLitPath && symbolText (Symbol sym) == "/nix/store/foo"
+          ( if op == OpLitPath && path == "/nix/store/foo"
               then Pass
               else Fail "path mismatch"
           ),
@@ -26855,6 +27047,7 @@ main =
     [flag, source] | flag == internOrderChildFlag -> bracket_ arenaInit arenaDestroy (internOrderChild source)
     [flag] | flag == startupSymbolsChildFlag -> bracket_ arenaInit arenaDestroy startupSymbolsChild
     [flag, source] | flag == failureChildFlag -> bracket_ arenaInit arenaDestroy (failureChild source)
+    [flag, source] | flag == namesOnlyChildFlag -> bracket_ arenaInit arenaDestroy (namesOnlyChild source)
     [flag] | flag == writeCliJsonFlag -> BS.writeFile cliJsonPath Ref.referenceJson
     _ -> withRunTempRoot (bracket_ arenaInit arenaDestroy runSuite)
 
@@ -26996,6 +27189,8 @@ runSuite = do
           testParseOrderInterningIO,
           testStartupSymbolsIO,
           testCallErrorsIO,
+          testStringsOffSymbolsIO,
+          testStringSharing,
           testTraceVerboseOff,
           testStorePathLinksIO,
           testDeepContextClosureIO,

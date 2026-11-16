@@ -10,6 +10,13 @@
  * stored in the data buffer, referenced by offset from instructions,
  * and so are the source positions bindings refer to.
  *
+ * The bytes of the code's literals (a string's literal parts, a URI, a
+ * path, a search path, a source file's path) are strings of the code's
+ * own (nn_str.h), named by their index in a string table: an instruction
+ * or data word holds the index, and nn_bc_string answers the string.
+ * A value a literal evaluates to can point at that string rather than
+ * copy it, since the code's strings live as long as the code.
+ *
  * Goal: eliminate StablePtr (Expr, Env) in pending thunks.  After
  * compilation, pending thunks hold (bc_idx, nn_env_t*) -- both
  * C-native, zero GHC heap pressure.
@@ -21,7 +28,10 @@
 #ifndef NN_BYTECODE_H
 #define NN_BYTECODE_H
 
+#include <stddef.h>
 #include <stdint.h>
+
+#include "nn_str.h"
 
 /* --- Opcodes (one per Expr constructor) --- */
 
@@ -121,7 +131,7 @@ typedef struct nn_op {
                             region and the payload starts one word later
                             (emit/decode live on the Haskell side:
                             Nix.Eval.CBytecode.cbcCountedPayload). */
-    uint32_t arg1;       /* Child index, symbol, data offset, lo32, etc. */
+    uint32_t arg1;       /* Child index, symbol, string index, data offset, lo32, etc. */
     uint32_t arg2;       /* Child index, symbol, hi32, etc. */
     uint32_t arg3;       /* Child index, data offset, etc. */
 } nn_op_t;
@@ -177,6 +187,12 @@ uint32_t nn_bc_emit(uint8_t opcode, uint8_t flags, uint16_t short_arg,
  * UINT32_MAX on failure (same contract as nn_bc_emit). */
 uint32_t nn_bc_emit_data(uint32_t value);
 
+/* Copy len bytes into a new string of the code's and add it to the string
+ * table.  (NULL, 0) is the empty string.  Returns its index, or
+ * UINT32_MAX on failure (same contract as nn_bc_emit; a length past
+ * NN_STR_MAX_LEN is refused before a byte is read). */
+uint32_t nn_bc_emit_string(const char *bytes, size_t len);
+
 /* --- Read instructions --- */
 
 uint8_t  nn_bc_opcode(uint32_t idx);
@@ -190,13 +206,22 @@ uint32_t nn_bc_arg3(uint32_t idx);
 
 uint32_t nn_bc_data(uint32_t offset);
 
+/* The string at an index nn_bc_emit_string returned, valid until
+ * nn_bytecode_destroy(), or NULL for an index it did not return. */
+nn_str_t *nn_bc_string(uint32_t index);
+
 /* --- Diagnostics --- */
 
 uint32_t nn_bc_op_count(void);
 uint32_t nn_bc_data_count(void);
 
 /* Bytes the store holds from the allocator: the instruction and data
- * arrays at their capacities (nn_stats.h). */
+ * arrays and the string table at their capacities, and the arena of the
+ * code's strings (nn_stats.h). */
 uint64_t nn_bc_reserved_bytes(void);
+
+/* The arena of the code's strings, which the census places a string in
+ * without counting it (nn_stats.h). */
+const nn_str_arena_t *nn_bc_strings(void);
 
 #endif /* NN_BYTECODE_H */

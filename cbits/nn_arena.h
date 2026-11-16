@@ -8,7 +8,7 @@
  * scalar/C-pointer payloads (INT .. LAMBDA) are skipped.
  *
  * Used by Haskell-side Arena.hs to free all StablePtrs before
- * destroying the sub-arenas (thunk, env, symbol, bytecode).
+ * destroying the sub-arenas (thunk, env, symbol, string, bytecode).
  *
  * nn_arena_live answers whether every sub-arena is inside its init ..
  * destroy window.  Outside it, each sub-arena's allocators report
@@ -26,8 +26,8 @@
 /* Bulk-free all tracked attribute sets (called during arena teardown). */
 void nn_attrset_free_all(void);
 
-/* Nonzero when the symbol table, thunk arena, env allocator and bytecode
- * store are all initialized. */
+/* Nonzero when the symbol table, string arena, thunk arena, env
+ * allocator and bytecode store are all initialized. */
 int nn_arena_live(void);
 
 /* Count how many thunk payloads are StablePtrs (need freeing).

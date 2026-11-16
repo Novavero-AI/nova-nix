@@ -2,9 +2,13 @@
 
 -- | C-backed bytecode storage via FFI.
 --
--- Wraps @cbits/nn_bytecode.c@ - two growable arrays storing flat Nix
--- expression bytecode: an @nn_op_t[]@ instruction array (16 bytes each)
--- and a @uint32_t[]@ data buffer for variable-length operands.
+-- Wraps @cbits/nn_bytecode.c@ - growable arrays storing flat Nix
+-- expression bytecode: an @nn_op_t[]@ instruction array (16 bytes each),
+-- a @uint32_t[]@ data buffer for variable-length operands, and a table of
+-- the code's strings, the bytes of its literals, which an instruction or
+-- a data word names by index.  The code's strings live as long as the
+-- code, so a value a literal evaluates to can point at one rather than
+-- copy it.
 --
 -- @
 -- cbcInit 0 0
@@ -21,6 +25,8 @@ module Nix.Eval.CBytecode
     -- * Emit
     cbcEmit,
     cbcEmitData,
+    cbcEmitString,
+    cbcEmitText,
 
     -- * Read instructions
     cbcOpcode,
@@ -32,6 +38,11 @@ module Nix.Eval.CBytecode
 
     -- * Read data
     cbcData,
+
+    -- * Read strings
+    cbcString,
+    cbcStringBytes,
+    cbcStringText,
 
     -- * Counted payloads (short_arg spill)
     spilledCountSentinel,
@@ -124,9 +135,16 @@ module Nix.Eval.CBytecode
   )
 where
 
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Unsafe as BSU
+import Data.Text (Text)
+import qualified Data.Text.Foreign as TF
 import Data.Word (Word16, Word32, Word8)
+import Foreign.C.Types (CChar, CSize (..))
+import Foreign.Ptr (Ptr, nullPtr)
 import Nix.Eval.CData (MonadCData, cdataIO)
-import Nix.Eval.CStatus (cStatusFailure)
+import Nix.Eval.CStatus (cInvariantViolated, cStatusFailure)
+import Nix.Eval.CStr (CStrPtr, cstrBytes, cstrText)
 
 -- ---------------------------------------------------------------------------
 -- FFI imports (all unsafe - no callbacks, fast data access)
@@ -143,6 +161,12 @@ foreign import ccall unsafe "nn_bc_emit"
 
 foreign import ccall unsafe "nn_bc_emit_data"
   c_nn_bc_emit_data :: Word32 -> IO Word32
+
+foreign import ccall unsafe "nn_bc_emit_string"
+  c_nn_bc_emit_string :: Ptr CChar -> CSize -> IO Word32
+
+foreign import ccall unsafe "nn_bc_string"
+  c_nn_bc_string :: Word32 -> IO CStrPtr
 
 foreign import ccall unsafe "nn_bc_opcode"
   c_nn_bc_opcode :: Word32 -> IO Word8
@@ -199,6 +223,23 @@ cbcEmit opcode flags shortArg arg1 arg2 arg3 =
 cbcEmitData :: (MonadCData m) => Word32 -> m Word32
 cbcEmitData value = cdataIO (checkedEmit "nn_bc_emit_data" =<< c_nn_bc_emit_data value)
 
+-- | Copy bytes into a new string of the code's and answer its index,
+-- which 'cbcString' reads back.  'BSU.unsafeUseAsCStringLen' is safe
+-- here: @nn_bc_emit_string@ copies the bytes and keeps no pointer to
+-- them.
+cbcEmitString :: (MonadCData m) => ByteString -> m Word32
+cbcEmitString bytes =
+  cdataIO . BSU.unsafeUseAsCStringLen bytes $ \(ptr, len) ->
+    checkedEmit "nn_bc_emit_string" =<< c_nn_bc_emit_string ptr (fromIntegral len)
+
+-- | 'cbcEmitString' for text's UTF-8 bytes: a path, a URI, a search path
+-- or a source file's path, which the evaluator reads back as text
+-- ('cbcStringText').
+cbcEmitText :: (MonadCData m) => Text -> m Word32
+cbcEmitText text =
+  cdataIO . TF.withCStringLen text $ \(ptr, len) ->
+    checkedEmit "nn_bc_emit_string" =<< c_nn_bc_emit_string ptr (fromIntegral len)
+
 -- | @UINT32_MAX@ from a C emit function signals a failed append (realloc
 -- exhaustion or the uint32 index ceiling), not a valid index.  Must stay
 -- in lockstep with the emit docs in @cbits\/nn_bytecode.h@.
@@ -247,9 +288,33 @@ cbcArg3 = cdataIO . c_nn_bc_arg3
 -- Read data
 -- ---------------------------------------------------------------------------
 
--- | Read entry @i@ of the bytecode data pool (interned literals, symbols).
+-- | Read entry @i@ of the bytecode data pool (symbols, string indices,
+-- child indices and the rest).
 cbcData :: (MonadCData m) => Word32 -> m Word32
 cbcData = cdataIO . c_nn_bc_data
+
+-- ---------------------------------------------------------------------------
+-- Read strings
+-- ---------------------------------------------------------------------------
+
+-- | The code's string at an index 'cbcEmitString' answered.  It lives as
+-- long as the code, so a cell may point at it.  The compiler writes every
+-- index the evaluator reads, so an index with no string is a corrupt
+-- store.
+cbcString :: (MonadCData m) => Word32 -> m CStrPtr
+cbcString index = cdataIO $ do
+  str <- c_nn_bc_string index
+  if str == nullPtr
+    then cInvariantViolated "nn_bc_string" ("no string at index " ++ show index)
+    else pure str
+
+-- | A copy of the bytes of the code's string at an index.
+cbcStringBytes :: (MonadCData m) => Word32 -> m ByteString
+cbcStringBytes index = cbcString index >>= cstrBytes
+
+-- | The text of the code's string at an index 'cbcEmitText' answered.
+cbcStringText :: (MonadCData m) => Word32 -> m Text
+cbcStringText index = cbcString index >>= cstrText
 
 -- ---------------------------------------------------------------------------
 -- Counted payloads (short_arg spill)

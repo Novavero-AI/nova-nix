@@ -2,10 +2,11 @@
 
 -- | The evaluator's boundary with the C data layer.
 --
--- Thunks, environments, attribute sets, lists, lambdas, strings with
--- context, interned symbols and the bytecode the evaluator runs all live
--- in C (@cbits/@), reached through the bindings in the @Nix.Eval.C*@
--- modules, "Nix.Eval.Symbol" and "Nix.Eval.SourcePos".  Every read of,
+-- Thunks, environments, attribute sets, lists, lambdas, the bytes of
+-- strings and paths, strings with context, interned names and the
+-- bytecode the evaluator runs all live in C (@cbits/@), reached through
+-- the bindings in the @Nix.Eval.C*@ modules, "Nix.Eval.Symbol" and
+-- "Nix.Eval.SourcePos".  Every read of,
 -- write to and allocation in that memory is a t'CData' action, and the
 -- evaluator runs one in its own monad through 'MonadCData'.  An action
 -- runs where the evaluation reaches it, in order with the actions around

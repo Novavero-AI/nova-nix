@@ -2,8 +2,11 @@
 -- an attribute, read back as a file, line and column on demand.
 --
 -- A position is recorded when the construct it belongs to is compiled, as
--- three words in the bytecode data buffer: the interned path of the file it
--- is in ('noFile' for text with no file behind it), its line and its column.
+-- three words in the bytecode data buffer: the file it is in, one past the
+-- index of its path among the code's strings ('noFile' for text with no
+-- file behind it), its line and its column.  The path is a string and not
+-- a symbol, as upstream keeps a file in a position's origin and not in its
+-- symbol table (@PosTable::Origin@, pos-table.hh:15-38 at 2.24.9).
 -- Its index is one past the record's offset, so 0 is free to mean no
 -- position, the bias upstream's @PosIdx@ carries for the same reason
 -- (@noPos@ in pos-idx.hh, @PosTable::add@ in pos-table.hh, at 2.24.9).
@@ -28,9 +31,8 @@ where
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Word (Word32)
-import Nix.Eval.CBytecode (cbcData, cbcEmitData)
+import Nix.Eval.CBytecode (cbcData, cbcEmitData, cbcEmitText, cbcStringText)
 import Nix.Eval.CData (MonadCData)
-import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
 import Nix.Expr.Types (SourceOrigin (..), SrcPos (..))
 
 -- | Where something was defined: 'noPos', or the index of a recorded
@@ -43,15 +45,15 @@ newtype PosIdx = PosIdx {unPosIdx :: Word32}
 noPos :: PosIdx
 noPos = PosIdx 0
 
--- | The file word of a position in text with no file.  No symbol is 0
--- (@NN_SYMBOL_INVALID@), so it cannot be mistaken for a path.
+-- | The file word of a position in text with no file.  A file's word is
+-- one past its path's string index, so it cannot be mistaken for one.
 noFile :: Word32
 noFile = 0
 
 -- | Records the positions of one compilation.  It remembers the last
 -- origin it recorded and that origin's file word, because the positions
--- of one parse share their origin, and interning the path again for each
--- one would copy and hash it as many times.
+-- of one parse share their origin, and storing the path again for each
+-- one would copy it as many times.
 newtype PosRecorder = PosRecorder (IORef (Maybe SeenOrigin))
 
 -- | An origin and its file word.
@@ -79,11 +81,11 @@ recordPos (PosRecorder seen) (SrcPos origin line column) = case (toWord32 line, 
       case remembered of
         Just (SeenOrigin known word) | known == origin -> pure word
         _ -> do
-          word <- internedFile origin
+          word <- storedFile origin
           writeIORef seen (Just (SeenOrigin origin word))
           pure word
-    internedFile (SourceFile path) = unSymbol <$> symbolIntern path
-    internedFile (SourceText _) = pure noFile
+    storedFile (SourceFile path) = (+ 1) <$> cbcEmitText path
+    storedFile (SourceText _) = pure noFile
     toWord32 n
       | n >= 0 && toInteger n <= toInteger (maxBound :: Word32) = Just (fromIntegral n)
       | otherwise = Nothing
@@ -104,7 +106,7 @@ lookupPos (PosIdx idx) = do
   file <- cbcData offset
   line <- fromIntegral <$> cbcData (offset + 1)
   column <- fromIntegral <$> cbcData (offset + 2)
-  pure . Just $
-    if file == noFile
-      then PosInText line column
-      else PosInFile (symbolText (Symbol file)) line column
+  Just
+    <$> if file == noFile
+      then pure (PosInText line column)
+      else (\path -> PosInFile path line column) <$> cbcStringText (file - 1)

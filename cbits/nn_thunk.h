@@ -43,8 +43,8 @@
 #define NN_VALUE_FLOAT   1   /* payload = memcpy'd double */
 #define NN_VALUE_BOOL    2   /* payload = (void*)(intptr_t)(0 or 1) */
 #define NN_VALUE_NULL    3   /* payload = NULL */
-#define NN_VALUE_STR     4   /* payload = (void*)(intptr_t)nn_symbol_t (no context) */
-#define NN_VALUE_PATH    5   /* payload = (void*)(intptr_t)nn_symbol_t */
+#define NN_VALUE_STR     4   /* payload = nn_str_t* (no context) */
+#define NN_VALUE_PATH    5   /* payload = nn_str_t* (the path's UTF-8 text) */
 #define NN_VALUE_LIST    6   /* payload = nn_list_t* */
 #define NN_VALUE_ATTRS   7   /* payload = nn_attrset_t* */
 #define NN_VALUE_CTXSTR  8   /* payload = nn_ctxstr_t* (string with context) */
@@ -119,8 +119,8 @@ nn_thunk_t *nn_thunk_new_computed_int(int64_t value);
 nn_thunk_t *nn_thunk_new_computed_float(double value);
 
 /* Allocate pre-COMPUTED thunks with C-native complex values (no StablePtr). */
-nn_thunk_t *nn_thunk_new_computed_str(uint32_t symbol);
-nn_thunk_t *nn_thunk_new_computed_path(uint32_t symbol);
+nn_thunk_t *nn_thunk_new_computed_str(void *str);
+nn_thunk_t *nn_thunk_new_computed_path(void *str);
 nn_thunk_t *nn_thunk_new_computed_list(void *list);
 nn_thunk_t *nn_thunk_new_computed_attrs(void *attrset);
 nn_thunk_t *nn_thunk_new_computed_ctxstr(void *ctxstr);
@@ -155,8 +155,8 @@ double  nn_thunk_get_float(const nn_thunk_t *thunk);
 uint8_t nn_thunk_get_bool(const nn_thunk_t *thunk);
 
 /* Read C-native complex values from a COMPUTED thunk. */
-uint32_t nn_thunk_get_str(const nn_thunk_t *thunk);
-uint32_t nn_thunk_get_path(const nn_thunk_t *thunk);
+void    *nn_thunk_get_str(const nn_thunk_t *thunk);
+void    *nn_thunk_get_path(const nn_thunk_t *thunk);
 void    *nn_thunk_get_list(const nn_thunk_t *thunk);
 void    *nn_thunk_get_attrs(const nn_thunk_t *thunk);
 void    *nn_thunk_get_ctxstr(const nn_thunk_t *thunk);
@@ -187,8 +187,8 @@ int nn_thunk_set_computed_int(nn_thunk_t *thunk, int64_t value);
 int nn_thunk_set_computed_float(nn_thunk_t *thunk, double value);
 int nn_thunk_set_computed_bool(nn_thunk_t *thunk, uint8_t value);
 int nn_thunk_set_computed_null(nn_thunk_t *thunk);
-int nn_thunk_set_computed_str(nn_thunk_t *thunk, uint32_t symbol);
-int nn_thunk_set_computed_path(nn_thunk_t *thunk, uint32_t symbol);
+int nn_thunk_set_computed_str(nn_thunk_t *thunk, void *str);
+int nn_thunk_set_computed_path(nn_thunk_t *thunk, void *str);
 int nn_thunk_set_computed_list(nn_thunk_t *thunk, void *list);
 int nn_thunk_set_computed_attrs(nn_thunk_t *thunk, void *attrset);
 int nn_thunk_set_computed_ctxstr(nn_thunk_t *thunk, void *ctxstr);

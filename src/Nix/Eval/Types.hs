@@ -9,7 +9,8 @@
 -- 'NixValue', t'Thunk', and t'Env' without creating import cycles.
 module Nix.Eval.Types
   ( -- * Values
-    NixValue (..),
+    NixValue (.., VStr, VPath),
+    HeldBytes (..),
     BuiltinArg (..),
     CompiledRegex (..),
     Thunk (..),
@@ -111,6 +112,12 @@ module Nix.Eval.Types
     pattern ValueCtxStr,
     pattern ValueLambda,
 
+    -- * Cells holding strings
+    heldString,
+    StringCell (..),
+    stringCell,
+    pathCell,
+
     -- * Evaluation monad
     MonadEval (..),
     PathExistence (..),
@@ -145,13 +152,14 @@ import GHC.Float (castWord64ToDouble)
 import Nix.Derivation (Derivation)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
-import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
+import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
 import Nix.Eval.CData (CData (..), MonadCData (..), cdataIO, inspectForDisplay, runCDataPure)
 import Nix.Eval.CEnv (NnEnv, cenvAllocWithScopes, cenvEmpty, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewScoped, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvSlots, cenvWithCount, cenvWithOwner, cenvWithScopes)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaLambdaNameSym, clambdaNameSym, clambdaNew, clambdaSetEntry)
 import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
 import Nix.Eval.CStatus (cInvariantViolated, checkedCPtr)
+import Nix.Eval.CStr (CStrPtr, cstrBytes, cstrFromText, cstrNew, cstrText)
 import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetAttrs, cthunkGetBcIdx, cthunkGetBool, cthunkGetCtxStr, cthunkGetFloat, cthunkGetInt, cthunkGetLambda, cthunkGetList, cthunkGetPath, cthunkGetStr, cthunkNewBc, cthunkNewComputed, cthunkNewComputedAttrs, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedPath, cthunkNewComputedStr, cthunkNull, cthunkPayload, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
@@ -159,7 +167,7 @@ import Nix.Eval.Compile (compileExpr, compileFormalsToEval, compileParsed)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), lambdaNameFromSymbol, lambdaNameSymbol)
 import Nix.Eval.Policy (EvalPolicy (..), unrestrictedPolicy)
 import Nix.Eval.SourcePos (PosIdx, noPos)
-import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolBytes, symbolIntern, symbolInternBytes, symbolText)
+import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolIntern, symbolText)
 import Nix.Expr.Types (CaptureInfo (..), Expr (..), NixAtom (..))
 import Nix.Parser (ParsedSource)
 import Nix.Store.Path (BadStorePath, StorePath, badStorePathText)
@@ -315,13 +323,15 @@ readComputed ptr = do
     ValueFloat -> VFloat <$> cthunkGetFloat ptr
     ValueBool -> (\b -> VBool (b /= 0)) <$> cthunkGetBool ptr
     ValueNull -> pure VNull
-    ValueStr -> (\sym -> VStr (symbolBytes (Symbol sym)) emptyContext) <$> cthunkGetStr ptr
-    ValuePath -> VPath . symbolText . Symbol <$> cthunkGetPath ptr
+    ValueStr -> cthunkGetStr ptr >>= heldString
+    ValuePath -> do
+      str <- cthunkGetPath ptr
+      (`VPathHeld` HeldStr str) <$> cstrText str
     ValueList -> VList . CList . castPtr <$> cthunkGetList ptr
     ValueAttrs -> VAttrs . AttrSet . castPtr <$> cthunkGetAttrs ptr
     ValueCtxStr -> do
-      csptr <- cthunkGetCtxStr ptr
-      uncurry VStr <$> unmarshalStringContext (castPtr csptr)
+      csptr <- castPtr <$> cthunkGetCtxStr ptr
+      (\(bytes, ctx) -> VStrHeld bytes ctx (HeldCtxStr csptr)) <$> unmarshalStringContext csptr
     ValueLambda -> cthunkGetLambda ptr >>= unmarshalLambdaValue
     _ {- PTR -} -> do
       payload <- cthunkPayload ptr
@@ -337,15 +347,17 @@ data NixValue
     VBool !Bool
   | -- | The null value.
     VNull
-  | -- | String with dependency context.  The payload is a BYTE string,
-    -- as upstream: @stringLength@/@substring@ index bytes, regexes match
-    -- bytes, and @readFile@ carries raw file bytes (so invalid UTF-8 is
-    -- representable).  Text enters via 'mkStr' (UTF-8 encode) and leaves
-    -- through explicit decode at boundaries (attr names strictly, display
-    -- lossily via 'bytesToTextLossy').
-    VStr !ByteString !StringContext
-  | -- | Path.
-    VPath !Text
+  | -- | String with dependency context, and where its bytes already are
+    -- in C ('VStr' builds and matches one without).  The payload is a
+    -- BYTE string, as upstream: @stringLength@/@substring@ index bytes,
+    -- regexes match bytes, and @readFile@ carries raw file bytes (so
+    -- invalid UTF-8 is representable).  Text enters via 'mkStr' (UTF-8
+    -- encode) and leaves through explicit decode at boundaries (attr
+    -- names strictly, display lossily via 'bytesToTextLossy').
+    VStrHeld !ByteString !StringContext !HeldBytes
+  | -- | Path, and where its bytes already are in C ('VPath' builds and
+    -- matches one without).
+    VPathHeld !Text !HeldBytes
   | -- | List of thunks (lazy elements), backed by C array.
     VList !CList
   | -- | Attribute set: unified lazy/eager representation.
@@ -359,6 +371,56 @@ data NixValue
     -- Internal only - never exposed to Nix code directly.
     VCompiledRegex !CompiledRegex
   deriving (Eq, Show)
+
+-- | A string with dependency context: its bytes and their context.  Built
+-- with it, a value's bytes are held in Haskell only, and a cell that
+-- stores it takes a copy.
+pattern VStr :: ByteString -> StringContext -> NixValue
+pattern VStr bytes ctx <- VStrHeld bytes ctx _
+  where
+    VStr bytes ctx = VStrHeld bytes ctx NotHeld
+
+-- | A path.  Built with it, a path's bytes are held in Haskell only, and
+-- a cell that stores it takes a copy.
+pattern VPath :: Text -> NixValue
+pattern VPath path <- VPathHeld path _
+  where
+    VPath path = VPathHeld path NotHeld
+
+{-# COMPLETE VInt, VFloat, VBool, VNull, VStr, VPath, VList, VAttrs, VLambda, VBuiltin, VCompiledRegex #-}
+
+-- | Where a string or path value's bytes already are in the C data
+-- layer.  A value read from a cell, and a literal's value, carry the C
+-- object their bytes are in, and a cell that stores the value points at
+-- that object rather than at a copy, as upstream copies a @Value@ with
+-- the pointer to its bytes (value.hh at 2.24.9): a string passed from
+-- cell to cell takes its bytes once.  A value is built held only where
+-- its bytes are read from the object it holds, and the objects never
+-- change once made, so a value's bytes stay its object's.
+data HeldBytes
+  = -- | In Haskell only.
+    NotHeld
+  | -- | A context-free string's or a path's bytes.
+    HeldStr !CStrPtr
+  | -- | A string with context, whole.
+    HeldCtxStr !CCtxStrPtr
+
+-- | Every two are equal.  The held object is where a value's bytes live,
+-- not part of the value, so two values with equal bytes and context are
+-- equal wherever their bytes are.
+instance Eq HeldBytes where
+  _ == _ = True
+
+instance Show HeldBytes where
+  showsPrec _ held = showString $ case held of
+    NotHeld -> "NotHeld"
+    HeldStr _ -> "HeldStr"
+    HeldCtxStr _ -> "HeldCtxStr"
+
+-- | The value of a context-free string whose bytes are a C string: a
+-- cell's, or a literal's in the code.
+heldString :: (MonadCData m) => CStrPtr -> m NixValue
+heldString str = (\bytes -> VStrHeld bytes emptyContext (HeldStr str)) <$> cstrBytes str
 
 -- | An argument a builtin has taken.  A primop that forces an argument
 -- before anything it does can be observed has it forced as it is
@@ -810,16 +872,14 @@ cheapThunkBc env bcIdx =
       flag <- cbcShortArg bcIdx
       pure (Thunk (cthunkBool (flag /= 0)))
     OpLitNull -> pure (Thunk cthunkNull)
-    OpLitUri -> do
-      sym <- cbcArg1 bcIdx
-      Thunk <$> newComputedStrPtr (symbolBytes (Symbol sym))
+    OpLitUri -> Thunk <$> (cbcArg1 bcIdx >>= cbcString >>= cthunkNewComputedStr)
     OpStr ->
-      literalStrBytes bcIdx >>= \case
-        Just bytes -> Thunk <$> newComputedStrPtr bytes
+      literalStr bcIdx >>= \case
+        Just str -> Thunk <$> cthunkNewComputedStr str
         Nothing -> mkThunkBc env bcIdx
     OpLitPath ->
       constantPathValue bcIdx >>= \case
-        Just resolved -> Thunk <$> newComputedPathPtr resolved
+        Just resolved -> Thunk <$> cthunkNewComputedPath resolved
         Nothing -> mkThunkBc env bcIdx
     OpList -> do
       empty <- emptyBcList bcIdx
@@ -846,20 +906,25 @@ literalWord64 bcIdx = do
   hi <- cbcArg2 bcIdx
   pure (fromIntegral lo .|. (fromIntegral hi `shiftL` 32))
 
--- | The value of a path literal, when producing it is not work.
+-- | The bytes of a path literal's value, when producing it is not work:
+-- the literal's own in the code when they are already canonical, as they
+-- are for any path written canonically, and a copy of the canonical form
+-- otherwise.
 --
 -- Parsing resolves every relative path literal against the file's directory
 -- ('Nix.Expr.Resolve.resolveRelativePaths'), so what reaches here is already
 -- absolute and only wants the lexical canonicalisation every path value
 -- carries.  The exception is a home-relative literal, which parsing leaves
 -- alone: expanding it reads @HOME@, and that is an effect this cannot run.
-constantPathValue :: (MonadCData m) => Word32 -> m (Maybe Text)
+constantPathValue :: (MonadCData m) => Word32 -> m (Maybe CStrPtr)
 constantPathValue bcIdx = do
-  text <- symbolText . Symbol <$> cbcArg1 bcIdx
-  pure $
-    if T.isPrefixOf "~/" text
-      then Nothing
-      else Just (canonPathValue text)
+  code <- cbcArg1 bcIdx >>= cbcString
+  text <- cstrText code
+  let canonical = canonPathValue text
+      held = if canonical == text then HeldStr code else NotHeld
+  if T.isPrefixOf "~/" text
+    then pure Nothing
+    else Just <$> pathCell canonical held
 
 -- | Whether a list expression has no elements, and so is the same empty list
 -- however many times it is written.  Upstream hands back one shared
@@ -874,8 +939,13 @@ emptyBcList bcIdx = do
 strPartLiteral :: Word32
 strPartLiteral = 0
 
--- | The bytes of a string expression every part of which is literal, or
--- 'Nothing' when one is an interpolation and producing the value is work.
+-- | The string a string expression makes when every part of it is
+-- literal, or 'Nothing' when one is an interpolation and producing the
+-- value is work.  A string with no interpolation is one literal part,
+-- since the lexer joins a run of characters and escapes into one chunk,
+-- and its value is that part's own string in the code, which the cell
+-- points at rather than a copy, as upstream's @ExprString@ hands out the
+-- value it holds (@ExprString::maybeThunk@, eval.cc:1024-1028 at 2.24.9).
 --
 -- Upstream draws this line in the parser: a fully literal string folds into
 -- an @ExprString@ carrying a ready-made value, and only a string with
@@ -887,25 +957,29 @@ strPartLiteral = 0
 -- stripped during evaluation rather than in the parser, so its value is not
 -- yet a constant at this point.  Upstream can treat one as a constant
 -- because its parser has already done that stripping.
-literalStrBytes :: (MonadCData m) => Word32 -> m (Maybe ByteString)
-literalStrBytes bcIdx = do
+literalStr :: (MonadCData m) => Word32 -> m (Maybe CStrPtr)
+literalStr bcIdx = do
   (count, dataOff) <- cbcCountedPayload bcIdx =<< cbcArg1 bcIdx
-  fmap BS.concat <$> partBytes count dataOff
+  partIndices count dataOff >>= \case
+    Just [index] -> Just <$> cbcString index
+    Just indices -> Just <$> (mapM cbcStringBytes indices >>= cstrNew . BS.concat)
+    Nothing -> pure Nothing
   where
-    partBytes 0 _ = pure (Just [])
-    partBytes n off = do
+    partIndices 0 _ = pure (Just [])
+    partIndices n off = do
       tag <- cbcData off
       if tag /= strPartLiteral
         then pure Nothing
         else do
-          sym <- cbcData (off + 1)
-          fmap (symbolBytes (Symbol sym) :) <$> partBytes (n - 1 :: Int) (off + 2)
+          index <- cbcData (off + 1)
+          fmap (index :) <$> partIndices (n - 1 :: Int) (off + 2)
 
 -- | Wrap an already-computed value as a thunk.
 -- Ints and floats use inline C thunks (no StablePtr); booleans and null
 -- are the shared static cells, as upstream hands out one @vTrue@,
 -- @vFalse@ and @vNull@ (eval.cc at 2.24.9, @EvalState::getBool@).
--- Attrs, paths, and context-free strings use C-native tags (no StablePtr).
+-- Attrs, paths, and strings use C-native tags (no StablePtr), a string or
+-- a path over a copy of its bytes.
 -- Other complex values fall back to StablePtr-backed C thunks.
 evaluated :: (MonadCData m) => NixValue -> m Thunk
 evaluated val =
@@ -915,12 +989,11 @@ evaluated val =
     VBool b -> pure (cthunkBool b)
     VNull -> pure cthunkNull
     VAttrs (AttrSet cset) -> cthunkNewComputedAttrs (castPtr cset)
-    VPath p -> newComputedPathPtr p
-    VStr t ctx
-      | ctx == emptyContext -> newComputedStrPtr t
-      | otherwise -> do
-          ptr <- marshalStringContext t ctx
-          cthunkNewComputedCtxStr (castPtr ptr)
+    VPathHeld p held -> pathCell p held >>= cthunkNewComputedPath
+    VStrHeld t ctx held ->
+      stringCell t ctx held >>= \case
+        StrCell str -> cthunkNewComputedStr str
+        CtxStrCell csptr -> cthunkNewComputedCtxStr (castPtr csptr)
     VList (CList clistPtr) -> cthunkNewComputedList (castPtr clistPtr)
     VLambda (Env envPtr) formals bodyBcIdx -> marshalLambda envPtr formals bodyBcIdx >>= cthunkNewComputedLambda
     _ -> do
@@ -937,17 +1010,32 @@ thunkSameRef (Thunk p1) (Thunk p2) = p1 == p2
 thunkToCPtr :: Thunk -> CThunkPtr
 thunkToCPtr (Thunk ptr) = ptr
 
--- | Wrap a context-free string in a pre-computed C thunk (interned symbol, no StablePtr).
-newComputedStrPtr :: (MonadCData m) => ByteString -> m CThunkPtr
-newComputedStrPtr t = do
-  Symbol sym <- symbolInternBytes t
-  cthunkNewComputedStr sym
+-- | The C object a cell holding a string value points at.
+data StringCell
+  = -- | A context-free string's bytes.
+    StrCell !CStrPtr
+  | -- | A string with context.
+    CtxStrCell !CCtxStrPtr
 
--- | Wrap a path in a pre-computed C thunk (interned symbol, no StablePtr).
-newComputedPathPtr :: (MonadCData m) => Text -> m CThunkPtr
-newComputedPathPtr p = do
-  Symbol sym <- symbolIntern p
-  cthunkNewComputedPath sym
+-- | The C object for a cell holding a string: the one its bytes are held
+-- in, or a new one made from them.  A string with context held whole is
+-- reused only while it still has context, and a context-free one only
+-- while it is context-free, which is how a cell read gives them.
+stringCell :: (MonadCData m) => ByteString -> StringContext -> HeldBytes -> m StringCell
+stringCell bytes ctx held
+  | ctx == emptyContext = StrCell <$> heldOr (cstrNew bytes) held
+  | otherwise = case held of
+      HeldCtxStr csptr -> pure (CtxStrCell csptr)
+      _ -> CtxStrCell <$> marshalStringContext bytes ctx
+  where
+    heldOr _ (HeldStr str) = pure str
+    heldOr make _ = make
+
+-- | The C string for a cell holding a path: the one its bytes are held
+-- in, or a copy of its text's bytes.
+pathCell :: (MonadCData m) => Text -> HeldBytes -> m CStrPtr
+pathCell _ (HeldStr str) = pure str
+pathCell path _ = cstrFromText path
 
 -- | Marshal Env + EvalFormals + body bc_idx to a C nn_lambda_t.
 marshalLambda :: (MonadCData m) => Ptr NnEnv -> EvalFormals -> Word32 -> m (Ptr ())
@@ -1020,15 +1108,15 @@ unmarshalLambdaValue rawPtr = do
       let defMaybe = if hasDef /= 0 then Just defIdx else Nothing
       pure (EvalFormal (symbolText (Symbol nameSym)) defMaybe)
 
--- | Marshal payload bytes + StringContext to a C nn_ctxstr_t.  The
--- payload interns byte-level ('symbolInternBytes'); the StorePath and
--- output-name fields are Text and intern as UTF-8.
+-- | Marshal payload bytes + StringContext to a C nn_ctxstr_t, each a
+-- string's bytes: the payload as it is, and the StorePath and output-name
+-- fields as their text's UTF-8.
 marshalStringContext :: (MonadCData m) => ByteString -> StringContext -> m CCtxStrPtr
 marshalStringContext textVal (StringContext ctxSet) = do
-  Symbol textSym <- symbolInternBytes textVal
+  text <- cstrNew textVal
   let elems = Set.toAscList ctxSet
       count = fromIntegral (length elems) :: Word32
-  ptr <- checked "nn_ctxstr_new" =<< cctxstrNew textSym count
+  ptr <- checked "nn_ctxstr_new" =<< cctxstrNew text count
   fillElems ptr 0 elems
   pure ptr
   where
@@ -1037,25 +1125,24 @@ marshalStringContext textVal (StringContext ctxSet) = do
       marshalElem ptr idx e
       fillElems ptr (idx + 1) es
     marshalElem eptr eidx (SCPlain (StorePath h n)) = do
-      Symbol hashSym <- symbolIntern h
-      Symbol nameSym <- symbolIntern n
-      cctxstrSetPlain eptr eidx hashSym nameSym
+      hash <- cstrFromText h
+      name <- cstrFromText n
+      cctxstrSetPlain eptr eidx hash name
     marshalElem eptr eidx (SCDrvOutput (StorePath h n) out) = do
-      Symbol hashSym <- symbolIntern h
-      Symbol nameSym <- symbolIntern n
-      Symbol outSym <- symbolIntern out
-      cctxstrSetDrvOutput eptr eidx hashSym nameSym outSym
+      hash <- cstrFromText h
+      name <- cstrFromText n
+      output <- cstrFromText out
+      cctxstrSetDrvOutput eptr eidx hash name output
     marshalElem eptr eidx (SCAllOutputs (StorePath h n)) = do
-      Symbol hashSym <- symbolIntern h
-      Symbol nameSym <- symbolIntern n
-      cctxstrSetAllOutputs eptr eidx hashSym nameSym
+      hash <- cstrFromText h
+      name <- cstrFromText n
+      cctxstrSetAllOutputs eptr eidx hash name
 
 -- | Unmarshal a C nn_ctxstr_t back to (payload bytes, StringContext).
 unmarshalStringContext :: (MonadCData m) => CCtxStrPtr -> m (ByteString, StringContext)
 unmarshalStringContext ptr = do
-  textSym <- cctxstrText ptr
+  textVal <- cctxstrText ptr >>= cstrBytes
   count <- cctxstrCtxCount ptr
-  let textVal = symbolBytes (Symbol textSym)
   -- count - 1 underflows Word32 at 0 (defensive: marshal sites store
   -- only non-empty contexts).
   elems <-
@@ -1066,18 +1153,16 @@ unmarshalStringContext ptr = do
   where
     readElem cptr idx = do
       tag <- cctxstrElemTag cptr idx
-      hashSym <- cctxstrElemHash cptr idx
-      nameSym <- cctxstrElemName cptr idx
+      hash <- cctxstrElemHash cptr idx >>= cstrText
+      name <- cctxstrElemName cptr idx >>= cstrText
       -- Raw construction (Nix.Store.Path.Internal): provenance-safe -
-      -- these symbols were interned from a validated StorePath's own
-      -- fields by marshalStringContext, so this is a round-trip, not a
-      -- parse boundary.
-      let sp = StorePath (symbolText (Symbol hashSym)) (symbolText (Symbol nameSym))
+      -- these strings were made from a validated StorePath's own fields
+      -- by marshalStringContext, so this is a round-trip, not a parse
+      -- boundary.
+      let sp = StorePath hash name
       case tag of
         0 -> pure (SCPlain sp)
-        1 -> do
-          outSym <- cctxstrElemOutput cptr idx
-          pure (SCDrvOutput sp (symbolText (Symbol outSym)))
+        1 -> SCDrvOutput sp <$> (cctxstrElemOutput cptr idx >>= cstrText)
         _ -> pure (SCAllOutputs sp)
 
 -- | Tie a frame whose slots hold thunks that may point back at it: the

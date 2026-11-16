@@ -1,12 +1,14 @@
 /*
  * nn_bytecode.c -- Flat bytecode storage for Nix expressions.
  *
- * Two growable arrays:
- *   - g_ops:  nn_op_t instructions (16 bytes each), indexed by uint32
- *   - g_data: uint32_t values for variable-length operands
+ * Three growable arrays:
+ *   - g_ops:     nn_op_t instructions (16 bytes each), indexed by uint32
+ *   - g_data:    uint32_t values for variable-length operands
+ *   - g_strings: the code's strings, indexed by uint32
  *
- * Both use realloc-doubling.  Write-once during compilation, random
- * access during evaluation.  Indices remain stable across realloc.
+ * All use realloc-doubling.  Write-once during compilation, random
+ * access during evaluation.  Indices remain stable across realloc, and
+ * the strings the table points at live in an arena, so they never move.
  */
 
 #include "nn_bytecode.h"
@@ -20,6 +22,7 @@
 
 #define NN_BC_DEFAULT_OP_CAPACITY    65536u
 #define NN_BC_DEFAULT_DATA_CAPACITY 131072u
+#define NN_BC_STRING_INITIAL_CAPACITY 4096u
 
 /* --- Reserved instructions (layout in nn_bytecode.h) --- */
 
@@ -44,6 +47,11 @@ static uint32_t  g_op_capacity  = 0;
 static uint32_t *g_data          = NULL;
 static uint32_t  g_data_count    = 0;
 static uint32_t  g_data_capacity = 0;
+
+static nn_str_t      **g_strings          = NULL;
+static uint32_t        g_string_count     = 0;
+static uint32_t        g_string_capacity  = 0;
+static nn_str_arena_t  g_string_arena;
 
 /* --- Lifecycle --- */
 
@@ -83,6 +91,12 @@ void nn_bytecode_destroy(void)
     g_data          = NULL;
     g_data_count    = 0;
     g_data_capacity = 0;
+
+    free(g_strings);
+    g_strings         = NULL;
+    g_string_count    = 0;
+    g_string_capacity = 0;
+    nn_str_arena_free(&g_string_arena);
 }
 
 /* --- Internal: grow arrays --- */
@@ -116,6 +130,25 @@ static int ensure_data_space(void)
     return 0;
 }
 
+/* Room for one more string table entry.  The table starts on the first
+ * string, and UINT32_MAX is never an index, as it is the emitters'
+ * failure answer. */
+static int ensure_string_space(void)
+{
+    if (!g_ops) return -1;
+    if (g_string_count < g_string_capacity) return 0;
+    if (g_string_capacity > UINT32_MAX / 2) return -1;
+    uint32_t new_cap = g_string_capacity == 0
+                           ? NN_BC_STRING_INITIAL_CAPACITY
+                           : g_string_capacity * 2;
+    nn_str_t **new_strings = (nn_str_t **)realloc(
+        g_strings, (size_t)new_cap * sizeof(nn_str_t *));
+    if (!new_strings) return -1;
+    g_strings = new_strings;
+    g_string_capacity = new_cap;
+    return 0;
+}
+
 /* --- Emit --- */
 
 uint32_t nn_bc_emit(uint8_t opcode, uint8_t flags, uint16_t short_arg,
@@ -141,6 +174,16 @@ uint32_t nn_bc_emit_data(uint32_t value)
     return offset;
 }
 
+uint32_t nn_bc_emit_string(const char *bytes, size_t len)
+{
+    if (ensure_string_space() != 0) return UINT32_MAX;
+    nn_str_t *s = nn_str_arena_new(&g_string_arena, bytes, len);
+    if (!s) return UINT32_MAX;
+    uint32_t index = g_string_count++;
+    g_strings[index] = s;
+    return index;
+}
+
 /* --- Read instructions --- */
 
 uint8_t  nn_bc_opcode(uint32_t idx)    { NN_ASSERT(idx < g_op_count, "nn_bc_opcode: idx out of bounds"); return g_ops[idx].opcode;    }
@@ -154,6 +197,15 @@ uint32_t nn_bc_arg3(uint32_t idx)      { NN_ASSERT(idx < g_op_count, "nn_bc_arg3
 
 uint32_t nn_bc_data(uint32_t offset)   { NN_ASSERT(offset < g_data_count, "nn_bc_data: offset out of bounds"); return g_data[offset]; }
 
+/* The index comes from a data word or an argument the compiler wrote, so
+ * only a corrupt store holds one out of range; the bound stays live under
+ * NDEBUG and answers NULL, which the Haskell boundary refuses. */
+nn_str_t *nn_bc_string(uint32_t index)
+{
+    NN_ASSERT(index < g_string_count, "nn_bc_string: index out of bounds");
+    return index < g_string_count ? g_strings[index] : NULL;
+}
+
 /* --- Diagnostics --- */
 
 uint32_t nn_bc_op_count(void)   { return g_op_count;   }
@@ -162,5 +214,12 @@ uint32_t nn_bc_data_count(void) { return g_data_count; }
 uint64_t nn_bc_reserved_bytes(void)
 {
     return (uint64_t)g_op_capacity * sizeof(nn_op_t)
-         + (uint64_t)g_data_capacity * sizeof(uint32_t);
+         + (uint64_t)g_data_capacity * sizeof(uint32_t)
+         + (uint64_t)g_string_capacity * sizeof(nn_str_t *)
+         + nn_str_arena_reserved_bytes(&g_string_arena);
+}
+
+const nn_str_arena_t *nn_bc_strings(void)
+{
+    return &g_string_arena;
 }

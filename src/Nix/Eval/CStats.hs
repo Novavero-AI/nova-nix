@@ -23,7 +23,8 @@
 -- Symbols are reached through the values that hold them, not through the
 -- compiled code that names them, so the symbols reached are a lower bound
 -- on the symbols in use.  The bytecode store is counted and never marked,
--- since nothing frees code.
+-- since nothing frees code, and a value pointing at one of the code's
+-- strings (a literal's bytes) reaches nothing the census counts.
 module Nix.Eval.CStats
   ( -- * Kinds of object
     PerKind (..),
@@ -70,9 +71,11 @@ import Foreign.StablePtr (castPtrToStablePtr, deRefStablePtr)
 import Foreign.Storable (peek, peekElemOff)
 import GHC.Clock (getMonotonicTime)
 import Nix.Eval.AllocSite (EnvSite, SetSite, envSiteIndex, envSiteName, setSiteIndex, setSiteName)
+import Nix.Eval.CCtxStr (CCtxStrPtr)
 import Nix.Eval.CList (CList (..))
 import Nix.Eval.CStatus (CStatusError (..))
-import Nix.Eval.Types (AttrSet (..), BuiltinArg (..), Env (..), NixValue (..), Thunk (..))
+import Nix.Eval.CStr (CStrPtr)
+import Nix.Eval.Types (AttrSet (..), BuiltinArg (..), Env (..), HeldBytes (..), NixValue (..), Thunk (..))
 import Numeric (showFFloat)
 
 -- ---------------------------------------------------------------------------
@@ -111,6 +114,12 @@ foreign import ccall unsafe "nn_stats_root_attrset"
 
 foreign import ccall unsafe "nn_stats_root_list"
   c_nn_stats_root_list :: Ptr () -> IO ()
+
+foreign import ccall unsafe "nn_stats_root_string"
+  c_nn_stats_root_string :: Ptr () -> IO ()
+
+foreign import ccall unsafe "nn_stats_root_ctxstr"
+  c_nn_stats_root_ctxstr :: Ptr () -> IO ()
 
 foreign import ccall safe "nn_stats_mark"
   c_nn_stats_mark :: IO CInt
@@ -163,7 +172,10 @@ data PerKind a = PerKind
     kindLambdas :: !a,
     -- | Strings with context.
     kindCtxStrs :: !a,
-    -- | Interned text: every attribute name and context-free string.
+    -- | The bytes of strings and paths, a string with context's text and
+    -- its context's store paths and output names among them.
+    kindStrings :: !a,
+    -- | Interned names: attribute names, formals and variables.
     kindSymbols :: !a
   }
   deriving (Eq, Show, Functor, Foldable, Traversable)
@@ -171,19 +183,19 @@ data PerKind a = PerKind
 -- | Kind by kind: 'pure' is the same value for every kind, and '<*>'
 -- applies each kind's function to that kind's value.
 instance Applicative PerKind where
-  pure a = PerKind a a a a a a a
-  PerKind f1 f2 f3 f4 f5 f6 f7 <*> PerKind a1 a2 a3 a4 a5 a6 a7 =
-    PerKind (f1 a1) (f2 a2) (f3 a3) (f4 a4) (f5 a5) (f6 a6) (f7 a7)
+  pure a = PerKind a a a a a a a a
+  PerKind f1 f2 f3 f4 f5 f6 f7 f8 <*> PerKind a1 a2 a3 a4 a5 a6 a7 a8 =
+    PerKind (f1 a1) (f2 a2) (f3 a3) (f4 a4) (f5 a5) (f6 a6) (f7 a7) (f8 a8)
 
 -- | Each kind's index in the arrays @nn_stats_allocated@ and
 -- @nn_stats_reached@ fill: the @NN_STATS_*@ constants of
 -- @cbits\/nn_stats.h@, which this must match.
 kindIndices :: PerKind Int
-kindIndices = PerKind 0 1 2 3 4 5 6
+kindIndices = PerKind 0 1 2 3 4 5 6 7
 
 -- | @NN_STATS_KIND_COUNT@: the length of those arrays.
 kindCount :: Int
-kindCount = 7
+kindCount = 8
 
 -- | @NN_STATS_UNCOUNTED@: a count no allocator keeps.
 uncounted :: Word64
@@ -191,7 +203,7 @@ uncounted = maxBound
 
 -- | Each kind's name in 'renderCensus'.
 kindNames :: PerKind BS.ByteString
-kindNames = PerKind "thunks" "envs" "attrsets" "lists" "lambdas" "ctxstrs" "symbols"
+kindNames = PerKind "thunks" "envs" "attrsets" "lists" "lambdas" "ctxstrs" "strings" "symbols"
 
 -- ---------------------------------------------------------------------------
 -- Figures
@@ -231,7 +243,7 @@ data Census = Census
     censusStablePtrsReached :: !Word64,
     -- | Objects the mark entered: thunks, envs, with-scope arrays, sets,
     -- list headers, items arrays, lambdas and strings with context.
-    -- Symbols are marked and not entered.
+    -- Strings and symbols hold no pointer, and are marked and not entered.
     censusVisitedObjects :: !Word64,
     -- | The bytes those objects hold.
     censusVisitedBytes :: !Word64,
@@ -376,6 +388,10 @@ data CRoot
   | RootEnv !Env
   | RootAttrSet !AttrSet
   | RootList !CList
+  | -- | A string's or a path's bytes.
+    RootString !CStrPtr
+  | -- | A string with context.
+    RootCtxStr !CCtxStrPtr
 
 -- | The C objects a value holds.  A value read from a cell is a view of
 -- the cell's C objects; one held in GHC's heap behind a StablePtr (a
@@ -387,8 +403,8 @@ valueRoots value = case value of
   VFloat _ -> []
   VBool _ -> []
   VNull -> []
-  VStr _ _ -> []
-  VPath _ -> []
+  VStrHeld _ _ held -> heldRoots held
+  VPathHeld _ held -> heldRoots held
   VList list -> [RootList list]
   VAttrs set -> [RootAttrSet set]
   VLambda env _ _ -> [RootEnv env]
@@ -397,6 +413,9 @@ valueRoots value = case value of
   where
     argumentRoots (ArgForced forced) = valueRoots forced
     argumentRoots (ArgDeferred thunk) = [RootThunk thunk]
+    heldRoots NotHeld = []
+    heldRoots (HeldStr str) = [RootString str]
+    heldRoots (HeldCtxStr csptr) = [RootCtxStr csptr]
 
 -- | Name a root to the open session.
 nameRoot :: CRoot -> IO ()
@@ -405,6 +424,8 @@ nameRoot root = case root of
   RootEnv (Env ptr) -> c_nn_stats_root_env (castPtr ptr)
   RootAttrSet (AttrSet ptr) -> c_nn_stats_root_attrset (castPtr ptr)
   RootList (CList ptr) -> c_nn_stats_root_list (castPtr ptr)
+  RootString str -> c_nn_stats_root_string (castPtr str)
+  RootCtxStr csptr -> c_nn_stats_root_ctxstr (castPtr csptr)
 
 -- ---------------------------------------------------------------------------
 -- Taking a census

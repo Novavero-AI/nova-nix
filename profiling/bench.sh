@@ -734,7 +734,7 @@ write_memory() {
     scoreboard_row "GHC heap when the slice ends, by -hT" "not measured" "$(figure_or "$(mib "$theirs")" "Boehm heap" "")"
   fi
   if [[ -s "$census" ]]; then
-    for kind in thunks envs attrsets lists lambdas ctxstrs symbols; do
+    for kind in thunks envs attrsets lists lambdas ctxstrs strings symbols; do
       allocated_count=$(named_value "$census" "$kind.allocated.count")
       allocated_bytes=$(named_value "$census" "$kind.allocated.bytes")
       reached_count=$(named_value "$census" "$kind.reached.count")
@@ -748,6 +748,7 @@ write_memory() {
         lists) noun="list headers"; theirs=$(objects_figure "$(upstream_stat "$stats" .list.elements)" "$(upstream_stat "$stats" .list.bytes)" elements) ;;
         lambdas) noun="lambdas"; theirs="" ;;
         ctxstrs) noun="strings with context"; theirs="" ;;
+        strings) noun="strings"; theirs="" ;;
         symbols) noun="symbols"; theirs=$(objects_figure "$(upstream_stat "$stats" .symbols.number)" "$(upstream_stat "$stats" .symbols.bytes)" symbols) ;;
       esac
       scoreboard_row "C $noun: allocated" "$(objects_figure "$allocated_count" "$allocated_bytes" "$noun")" "$theirs"
