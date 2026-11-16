@@ -1,0 +1,83 @@
+name: GHC installation (macOS)
+description: >-
+  Restore the GHC installation ghcup made on this macOS runner image, and
+  keep it only where it compiles and links a program; give the key and the
+  directory to save one under.  The macOS image carries no GHC of the
+  version, and haskell-actions/setup installs it with ghcup, about five
+  minutes.  setup asks ghcup where the version is installed before
+  installing it, and ghcup finds an installation by its directory under
+  ~/.ghcup/ghc, so a directory kept here is used as it is, and setup
+  installs the version as before where none is.  caches.yml saves the
+  installation from main; Build (macos-latest) restores it.
+inputs:
+  ghc-version:
+    description: The GHC version, as haskell-actions/setup's ghc-version input names it
+    required: true
+outputs:
+  restored:
+    description: Whether an installation was restored whole and links a program
+    value: ${{ steps.check.outputs.restored }}
+  key:
+    description: The key to save an installation under, empty where none is to be saved
+    value: ${{ steps.image.outputs.key }}
+  path:
+    description: The installation's directory
+    value: ${{ steps.image.outputs.path }}
+runs:
+  using: composite
+  steps:
+    # ghcup configures an installation for the image's toolchain, which the
+    # image's weekly update can change, so the key names the image and its
+    # version, macos26 and 20261102.0473.1 for one.  An image that already
+    # has the version keeps its own, and one that does not name itself
+    # caches nothing.
+    - name: Name the image
+      id: image
+      shell: bash
+      env:
+        GHC_VERSION: ${{ inputs.ghc-version }}
+      run: |
+        path="$HOME/.ghcup/ghc/$GHC_VERSION"
+        echo "path=$path" >> "$GITHUB_OUTPUT"
+        if [ -e "$path" ]; then
+          echo "the image has GHC $GHC_VERSION already"
+        elif [ -z "${ImageOS:-}" ] || [ -z "${ImageVersion:-}" ]; then
+          echo "::warning::the image names no ImageOS or ImageVersion, so its GHC installation is not cached"
+        else
+          echo "key=ghc-$ImageOS-$ImageVersion-$RUNNER_ARCH-$GHC_VERSION" | tee -a "$GITHUB_OUTPUT"
+        fi
+
+    - name: Restore the installation
+      id: restore
+      if: steps.image.outputs.key != ''
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.image.outputs.path }}
+        key: ${{ steps.image.outputs.key }}
+
+    # Kept only where the restore was an exact hit whose compiler links a
+    # program with the image's toolchain, and removed otherwise: a restore
+    # that fails partway leaves part of the directory and no hit, and ghcup
+    # takes any directory there for an installation.  An exact hit that
+    # does not link is an entry no save replaces, since a key is saved
+    # once, so the warning asks for it to be deleted.
+    - name: Check the installation
+      id: check
+      if: steps.image.outputs.key != ''
+      shell: bash
+      env:
+        HIT: ${{ steps.restore.outputs.cache-hit }}
+        KEY: ${{ steps.image.outputs.key }}
+        INSTALLATION: ${{ steps.image.outputs.path }}
+        GHC_VERSION: ${{ inputs.ghc-version }}
+      run: |
+        if [ "$HIT" = true ] && bash "$GITHUB_WORKSPACE/.github/cache/ghc-links.sh" "$INSTALLATION/bin/ghc-$GHC_VERSION"; then
+          echo "the restored GHC $GHC_VERSION links a program"
+          echo "restored=true" >> "$GITHUB_OUTPUT"
+        else
+          if [ "$HIT" = true ]; then
+            echo "::warning::the GHC restored from $KEY does not link a program, so setup installs it; delete that cache entry"
+          fi
+          rm -rf "$INSTALLATION"
+          echo "restored=false" >> "$GITHUB_OUTPUT"
+        fi
