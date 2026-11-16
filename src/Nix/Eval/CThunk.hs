@@ -44,6 +44,7 @@ module Nix.Eval.CThunk
     -- * Shared constants
     cthunkNull,
     cthunkBool,
+    cthunkEmptyList,
     cthunkPrimop,
 
     -- * State queries
@@ -152,6 +153,10 @@ foreign import ccall unsafe "nn_thunk_new_computed_primop_app"
 -- | The shared COMPUTED @null@ thunk.
 foreign import ccall unsafe "nn_thunk_null"
   cthunkNull :: CThunkPtr
+
+-- | The shared COMPUTED empty list thunk.
+foreign import ccall unsafe "nn_thunk_empty_list"
+  cthunkEmptyList :: CThunkPtr
 
 foreign import ccall unsafe "nn_thunk_bool"
   c_nn_thunk_bool :: Word8 -> CThunkPtr

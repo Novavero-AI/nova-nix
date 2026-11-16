@@ -127,8 +127,8 @@ nn_thunk_t *nn_thunk_new_computed_primop_app(void *app);
 
 /* --- Shared constants --- */
 
-/* The COMPUTED null, true and false cells, as upstream shares one vNull,
- * vTrue and vFalse per EvalState.  They are file-scope statics, not
+/* The COMPUTED null, true and false cells and the empty list's, as
+ * upstream shares one vNull, vTrue, vFalse and vEmptyList per EvalState.  They are file-scope statics, not
  * arena memory, so each has one address in every init .. destroy window
  * and outside all of them: a constant built from one before
  * nn_thunk_init, or kept across nn_thunk_destroy, still reads correctly.
@@ -136,6 +136,7 @@ nn_thunk_t *nn_thunk_new_computed_primop_app(void *app);
  * them.  nn_thunk_bool answers the true cell for any nonzero value. */
 nn_thunk_t *nn_thunk_null(void);
 nn_thunk_t *nn_thunk_bool(uint8_t value);
+nn_thunk_t *nn_thunk_empty_list(void);
 
 /* The builtins the static cells can name: one more than the highest
  * index nn_thunk_primop answers for. */
@@ -150,8 +151,8 @@ nn_thunk_t *nn_thunk_bool(uint8_t value);
  * nothing reads one in another state. */
 nn_thunk_t *nn_thunk_primop(uint32_t primop);
 
-/* Nonzero for a static cell: the null, true and false cells and the
- * builtins' cells, which no arena holds. */
+/* Nonzero for a static cell: the null, true, false and empty list cells
+ * and the builtins' cells, which no arena holds. */
 int nn_thunk_is_static(const nn_thunk_t *thunk);
 
 /* --- State queries --- */

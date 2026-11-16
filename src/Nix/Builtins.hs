@@ -49,7 +49,7 @@ import Nix.Eval (Env (..), NixValue (..), Thunk (..), attrSetFromMap, attrSetLoo
 import Nix.Eval.AllocSite (EnvSite (EnvApply, EnvRoot), SetSite (SetRoot))
 import Nix.Eval.Builtin (Builtin, builtinIndex, builtinName, builtinNamed)
 import qualified Nix.Eval.Builtin as Builtin
-import Nix.Eval.CData (MonadCData, cdataIO, runCDataPure)
+import Nix.Eval.CData (MonadCData, cdataIO)
 import Nix.Eval.CStatus (cInvariantViolated)
 import Nix.Eval.CThunk (cthunkPrimop)
 import Nix.Eval.Types (AttrSet, EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newScopeEnv, thunkToCPtr)
@@ -62,6 +62,11 @@ import Nix.Store.Path (defaultStoreDirText)
 -- holds under that name less a @__@ prefix, as upstream's @addPrimOp@ and
 -- @addConstant@ install one value under both (eval.cc at 2.24.9).  So
 -- @__typeOf@ is @builtins.typeOf@, and @map@ is @builtins.map@.
+--
+-- An evaluation session builds it once ('Nix.Eval.IO.newEvalState') and
+-- evaluates every file it imports in it, as upstream's @createBaseEnv@
+-- builds one base environment per @EvalState@; the @derivation@ wrapper
+-- in it is the session's one.
 --
 -- @fetchMercurial@ is the one name upstream binds by default that nova-nix
 -- does not implement: it is bound as a builtin of that name, so binding
@@ -108,11 +113,10 @@ rootScopeNames policy
 builtinFunction :: (MonadCData m) => Builtin -> m Thunk
 builtinFunction = fmap Thunk . cthunkPrimop . builtinIndex
 
--- | Like 'builtinEnv' but with additional scope bindings overlaid on
--- the top-level environment.  Used by @scopedImport@.
-builtinEnvWithScope :: (MonadCData m) => EvalPolicy -> Int64 -> [Thunk] -> [(Text, Thunk)] -> m Env
-builtinEnvWithScope policy timestamp searchPaths scope = do
-  base <- builtinEnv policy timestamp searchPaths
+-- | A base environment with additional scope bindings overlaid on it.
+-- Used by @scopedImport@.
+builtinEnvWithScope :: (MonadCData m) => Env -> [(Text, Thunk)] -> m Env
+builtinEnvWithScope base scope = do
   overlay <- attrSetFromMap SetRoot (Map.fromList scope)
   newScopeEnv EnvRoot (Just base) overlay
 
@@ -142,8 +146,7 @@ standardEntries policy timestamp searchPaths =
       ("nixVersion", evaluated (mkStr targetNixVersion)),
       ("langVersion", evaluated (VInt 6)),
       ("nixPath", clistFromThunks (map thunkToCPtr searchPaths) >>= evaluated . VList),
-      -- Forced here, in its turn, should no environment have made it yet.
-      ("derivation", pure $! derivationWrapper)
+      ("derivation", derivationWrapper)
     ]
       ++ [("currentTime", evaluated (VInt timestamp)) | not (epPureEval policy)]
       ++ [("currentSystem", evaluated (mkStr currentSystemStr)) | not (epPureEval policy)]
@@ -236,22 +239,17 @@ derivationWrapperScope = do
 
 -- | The @derivation@ constant: the wrapper lambda closed over
 -- 'derivationWrapperScope'.  One value bound in both the root scope and
--- @builtins@, as upstream's @addConstant@ binds it.  It is compiled once
--- for the process rather than once per environment: 'builtinEnv' runs for
--- every imported file, and the arena the lambda lives in is the process's
--- ("Nix.Eval.Arena").  So it is a process-global value, allocated where
--- the first 'builtinEnv' reads it ('runCDataPure'); the allocation writes
--- only cells it makes.  The source is a constant, so a parse failure is a
--- defect in this module; it surfaces as an abort at the first use of
+-- @builtins@ of the base environment it is made for, as upstream's
+-- @addConstant@ binds it.  The source is a constant, so a parse failure
+-- is a defect in this module; it surfaces as an abort at the first use of
 -- @derivation@ rather than as a crash while the environment is assembled.
-derivationWrapper :: Thunk
-derivationWrapper = runCDataPure $ do
+derivationWrapper :: (MonadCData m) => m Thunk
+derivationWrapper = do
   scope <- derivationWrapperScope
   env <- attrSetFromMap SetRoot scope >>= newScopeEnv EnvRoot Nothing
   case parseNixWithScope (Map.keysSet scope) "/" derivationWrapperOrigin derivationWrapperSource of
     Right parsed -> cheapThunk env (parsedExpr parsed)
     Left err -> abortingThunk ("the derivation wrapper does not parse: " <> T.pack (show err))
-{-# NOINLINE derivationWrapper #-}
 
 -- | A thunk that aborts evaluation with the message when forced: @abort@
 -- applied to it, deferred the way "Nix.Eval" defers any application.

@@ -134,6 +134,9 @@ void nn_stats_root_list(const void *list);
 void nn_stats_root_string(const void *str);
 void nn_stats_root_ctxstr(const void *ctxstr);
 
+/* Name every root the session has registered (nn_roots.h). */
+void nn_stats_root_registered(void);
+
 /* Follow every pointer from the roots named since the last call.  Marks
  * accumulate across calls.  Returns 0, or -1 when the work stack could
  * not grow, after which the session's figures are incomplete. */

@@ -20,7 +20,17 @@ module Nix.Eval.IO
     runEvalIOTraced,
 
     -- * State
-    EvalState (..),
+    EvalState
+      ( esDrvModuloCache,
+        esDrvClosure,
+        esSourcePathCache,
+        esStoreWriteCache,
+        esBaseDir,
+        esStoreDir,
+        esCallDepth,
+        esAllowedPaths
+      ),
+    evalBaseEnv,
     newEvalState,
     newEvalStateWith,
     nixPathValue,
@@ -64,13 +74,14 @@ import Nix.Eval (deepForce, eval, evalBytecode, evalParsed)
 import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CData (MonadCData (..), runCData)
 import Nix.Eval.CList (CList (..))
+import Nix.Eval.CRoots (crootsAddEnv, crootsAddThunk)
 import Nix.Eval.CStatus (cInvariantViolated)
 import Nix.Eval.CThunk (CThunkPtr, cthunkMarkBlackhole, cthunkMarkPending, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedPrimop, cthunkSetComputedPrimopApp, cthunkSetComputedStr, cthunkState)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
-import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, unrestrictedPolicy, uriAccess)
+import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, uriAccess)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetSize, bytesToTextLossy, marshalLambda, pathCell, pendingCode, primopCell, readComputed, storePathOrThrow, stringCell, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetSize, bytesToTextLossy, evaluated, marshalLambda, pathCell, pendingCode, primopCell, readComputed, storePathOrThrow, stringCell, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -151,19 +162,25 @@ errorPrefix = "error: "
 -- State
 -- ---------------------------------------------------------------------------
 
--- | Shared state for IO evaluation.
+-- | Shared state for IO evaluation: an evaluation session.
 --
--- 'esImportCache' is a shared mutable cache (global across all frames).
--- Single-threaded only - switch to @MVar@ or @TVar@ if concurrent
--- evaluation is ever added.
+-- The policy, the time and the search path are fixed as the session
+-- starts ('newEvalState'), when its base environment is built over them,
+-- as upstream's @EvalState@ takes its settings and lookup path as it is
+-- constructed; the module exports no way to change one after.
+--
+-- 'esImportCache' is a shared mutable cache (global across all frames),
+-- holding each file's value in a cell registered as a root
+-- ("Nix.Eval.CRoots").  Single-threaded only - switch to @MVar@ or
+-- @TVar@ if concurrent evaluation is ever added.
 --
 -- 'esBaseDir' is immutable per frame - @import@ uses 'local' to set it
 -- for nested evaluations, so it is exception-safe with no save\/restore.
---
--- 'esSearchPaths' holds parsed @NIX_PATH@ entries as thunks, populating
--- @builtins.nixPath@.
 data EvalState = EvalState
-  { esImportCache :: !(IORef (Map FilePath NixValue)),
+  { esImportCache :: !(IORef (Map FilePath Thunk)),
+    -- | The base environment every file the session evaluates is
+    -- evaluated in, @builtins.nixPath@ the search path in it.
+    esBaseEnv :: !Env,
     -- | Cache of derivation modulo-hashes (drv store path to hex), populated
     -- bottom-up by @builtinDerivationStrict@ so input derivations can be
     -- substituted by their content hashes when computing output paths.
@@ -187,7 +204,6 @@ data EvalState = EvalState
     -- writes honor @--store@ the same way the builder does.
     esStoreDir :: !SP.StoreDir,
     esTimestamp :: !Int64,
-    esSearchPaths :: ![Thunk],
     -- | The call frames active around the current evaluation and the
     -- @max-call-depth@ ceiling.  Per frame like 'esBaseDir':
     -- 'withCallFrame' scopes it with 'local', so a failure unwinding
@@ -208,15 +224,20 @@ data EvalState = EvalState
     esAllowedPaths :: !(IORef AllowedPaths)
   }
 
--- | Create a fresh evaluation state rooted at the given directory, reading
--- and writing store objects under the given store directory, with the
--- search path @NIX_PATH@ gives ('nixPathValue').  The entries are built
--- in the C data layer, so with @NIX_PATH@ set this runs between
--- 'Nix.Eval.Arena.arenaInit' and 'Nix.Eval.Arena.arenaDestroy'.
-newEvalState :: SP.StoreDir -> FilePath -> IO EvalState
-newEvalState storeDir baseDir = do
+-- | Start an evaluation session under a policy, rooted at the given
+-- directory, reading and writing store objects under the given store
+-- directory, with the search path @NIX_PATH@ gives ('nixPathValue').
+-- Like 'newEvalStateWith', it runs between 'Nix.Eval.Arena.arenaInit'
+-- and 'Nix.Eval.Arena.arenaDestroy'.
+newEvalState :: EvalPolicy -> SP.StoreDir -> FilePath -> IO EvalState
+newEvalState policy storeDir baseDir = do
   searchPaths <- nixPathValue >>= parseNixPath
-  newEvalStateWith searchPaths storeDir baseDir
+  newEvalStateWith policy searchPaths storeDir baseDir
+
+-- | The base environment a session evaluates a file in: every name
+-- upstream's base environment binds ('Nix.Builtins.builtinEnv').
+evalBaseEnv :: EvalState -> Env
+evalBaseEnv = esBaseEnv
 
 -- | The bytes of @NIX_PATH@, unchanged, as upstream's @initGC@ reads them
 -- (src/libexpr/eval-gc.cc at Nix 2.24.9), and empty when it is unset.  The
@@ -235,11 +256,14 @@ nixPathValue =
 -- upstream's default; a caller with a configured one replaces
 -- 'esCallDepth'.
 --
--- The state is unrestricted.  A restricting policy is set on 'esPolicy',
--- and the roots it should admit are seeded with 'allowEvalPath' before
--- evaluation starts, as upstream's constructor allows its lookup path.
-newEvalStateWith :: [Thunk] -> SP.StoreDir -> FilePath -> IO EvalState
-newEvalStateWith searchPaths storeDir baseDir = do
+-- Under a restricting policy, the roots it should admit are seeded with
+-- 'allowEvalPath' before evaluation starts, as upstream's constructor
+-- allows its lookup path.  The base environment is built here, in the C
+-- data layer, so this runs between 'Nix.Eval.Arena.arenaInit' and
+-- 'Nix.Eval.Arena.arenaDestroy'; it is registered as a root, and the
+-- search path with it, through @builtins.nixPath@.
+newEvalStateWith :: EvalPolicy -> [Thunk] -> SP.StoreDir -> FilePath -> IO EvalState
+newEvalStateWith policy searchPaths storeDir baseDir = do
   cache <- newIORef Map.empty
   drvCache <- newIORef Map.empty
   drvClosure <- newIORef Map.empty
@@ -247,9 +271,12 @@ newEvalStateWith searchPaths storeDir baseDir = do
   storeWriteCache <- newIORef Map.empty
   allowedPaths <- newIORef noAllowedPaths
   now <- floor <$> getPOSIXTime :: IO Int64
+  baseEnv@(Env baseEnvPtr) <- builtinEnv policy now searchPaths
+  crootsAddEnv baseEnvPtr
   pure
     EvalState
       { esImportCache = cache,
+        esBaseEnv = baseEnv,
         esDrvModuloCache = drvCache,
         esDrvClosure = drvClosure,
         esSourcePathCache = srcCache,
@@ -257,9 +284,8 @@ newEvalStateWith searchPaths storeDir baseDir = do
         esBaseDir = baseDir,
         esStoreDir = storeDir,
         esTimestamp = now,
-        esSearchPaths = searchPaths,
         esCallDepth = topLevelCallDepth defaultMaxCallDepth,
-        esPolicy = unrestrictedPolicy,
+        esPolicy = policy,
         esAllowedPaths = allowedPaths
       }
 
@@ -351,11 +377,9 @@ instance Monad EvalIO where
 
 {-# SPECIALIZE selectAttrPath :: Text -> NixValue -> EvalIO (Either Text NixValue) #-}
 
--- The root environment each import and scopedImport builds, here too:
--- left to the flags, a piece of it ran on the dictionary-passing code.
-{-# SPECIALIZE builtinEnv :: EvalPolicy -> Int64 -> [Thunk] -> EvalIO Env #-}
-
-{-# SPECIALIZE builtinEnvWithScope :: EvalPolicy -> Int64 -> [Thunk] -> [(Text, Thunk)] -> EvalIO Env #-}
+-- The environment each scopedImport builds over the base one, here too:
+-- left to the flags, it ran on the dictionary-passing code.
+{-# SPECIALIZE builtinEnvWithScope :: Env -> [(Text, Thunk)] -> EvalIO Env #-}
 
 -- ---------------------------------------------------------------------------
 -- MonadEval instance
@@ -429,8 +453,7 @@ instance MonadEval EvalIO where
 
   importFile rawPath = do
     baseDir <- EvalIO (asks esBaseDir)
-    timestamp <- EvalIO (asks esTimestamp)
-    searchPaths <- EvalIO (asks esSearchPaths)
+    baseEnv <- EvalIO (asks esBaseEnv)
     policy <- EvalIO (asks esPolicy)
     -- Resolved, and so checked, before the cache is consulted, as
     -- upstream resolves the file before its fileEvalCache lookup: a
@@ -440,7 +463,7 @@ instance MonadEval EvalIO where
     cacheRef <- EvalIO (asks esImportCache)
     cache <- EvalIO (liftIO (readIORef cacheRef))
     case Map.lookup target cache of
-      Just cached -> pure cached
+      Just (Thunk cell) -> readComputed cell
       Nothing -> do
         source <- sourceIO ReadFile (T.pack target) (BS.readFile ioTarget)
         let fileDir = takeDirectory target
@@ -452,18 +475,21 @@ instance MonadEval EvalIO where
                   EvalIO
                     ( local
                         (\s -> s {esBaseDir = fileDir})
-                        (unEvalIO (evalParsed (builtinEnv policy timestamp searchPaths) parsed))
+                        (unEvalIO (evalParsed (pure baseEnv) parsed))
                     )
             result <- nested
             -- Skip caching very large attr sets (e.g. all-packages.nix
-            -- with 30k+ entries) so GC can reclaim them.  nixpkgs only
-            -- imports all-packages.nix once at the top level, so skipping
-            -- the cache for it has zero performance cost.
+            -- with 30k+ entries): the cache keeps what it holds for the
+            -- whole session, and nixpkgs imports all-packages.nix once,
+            -- at the top level, so skipping it costs nothing.  The value
+            -- is kept in a cell registered as a root.
             shouldCache <- case result of
               VAttrs attrs -> (< importCacheMaxAttrs) <$> attrSetSize attrs
               _ -> pure True
-            when shouldCache $
-              wrapIO (modifyIORef' cacheRef (Map.insert target result))
+            when shouldCache $ do
+              cell <- evaluated result
+              crootsAddThunk (unThunk cell)
+              wrapIO (modifyIORef' cacheRef (Map.insert target cell))
             pure result
 
   -- Upstream's getEnv answers empty under either setting
@@ -590,8 +616,7 @@ instance MonadEval EvalIO where
 
   scopedImportFile scope rawPath = do
     baseDir <- EvalIO (asks esBaseDir)
-    timestamp <- EvalIO (asks esTimestamp)
-    searchPaths <- EvalIO (asks esSearchPaths)
+    baseEnv <- EvalIO (asks esBaseEnv)
     policy <- EvalIO (asks esPolicy)
     (target, ioTarget) <- resolveImportTarget baseDir rawPath
     source <- sourceIO ReadFile (T.pack target) (BS.readFile ioTarget)
@@ -603,7 +628,7 @@ instance MonadEval EvalIO where
         EvalIO
           ( local
               (\s -> s {esBaseDir = fileDir})
-              (unEvalIO (evalParsed (builtinEnvWithScope policy timestamp searchPaths scope) parsed))
+              (unEvalIO (evalParsed (builtinEnvWithScope baseEnv scope) parsed))
           )
 
   readFileBytes path = do

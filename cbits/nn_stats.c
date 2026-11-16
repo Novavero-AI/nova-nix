@@ -36,6 +36,7 @@
 #include "nn_lambda.h"
 #include "nn_list.h"
 #include "nn_primop.h"
+#include "nn_roots.h"
 #include "nn_str.h"
 #include "nn_symbol.h"
 #include "nn_thunk.h"
@@ -655,8 +656,8 @@ static void count_reached(int kind, uint64_t bytes)
     g.visited_bytes += bytes;
 }
 
-/* The null, true and false cells, the builtins' cells and the empty env
- * are statics, not allocations: reached and neither counted nor entered,
+/* The null, true, false and empty list cells, the builtins' cells and
+ * the empty env are statics, not allocations: reached and neither counted nor entered,
  * as they hold no pointer. */
 static int is_static(int kind, const void *object)
 {
@@ -914,6 +915,14 @@ void nn_stats_root_attrset(const void *set)   { if (g.open) reach(NN_STATS_ATTRS
 void nn_stats_root_list(const void *list)     { if (g.open) reach(NN_STATS_LISTS, list); }
 void nn_stats_root_string(const void *str)    { if (g.open) reach_string((const nn_str_t *)str); }
 void nn_stats_root_ctxstr(const void *ctxstr) { if (g.open) reach(NN_STATS_CTXSTRS, ctxstr); }
+
+void nn_stats_root_registered(void)
+{
+    uint32_t i, n;
+    if (!g.open) return;
+    for (i = 0, n = nn_roots_thunk_count(); i < n; i++) reach(NN_STATS_THUNKS, nn_roots_thunk(i));
+    for (i = 0, n = nn_roots_env_count(); i < n; i++) reach(NN_STATS_ENVS, nn_roots_env(i));
+}
 
 int nn_stats_mark(void)
 {

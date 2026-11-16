@@ -86,6 +86,7 @@ import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
 import Nix.Eval.CEnv (cenvLazyScope, cenvNewScoped, cenvParent)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsType, clambdaNew, clambdaShape, clambdaShapeAllowExtra, clambdaShapeFormalCount, clambdaShapeFormalsType)
 import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks, thunkListToCList)
+import Nix.Eval.CRoots (crootsAddThunk)
 import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
 import Nix.Eval.CStr (cstrNew)
 import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBool, cthunkGetCtxStr, cthunkGetInt, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkPrimop, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
@@ -94,7 +95,7 @@ import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, reassembleInt64)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), LambdaName (..))
-import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, newEvalState, newEvalStateWith, renderEvalFailure, runEvalIO, runEvalIOTraced)
+import Nix.Eval.IO (EvalFailure (..), EvalState (..), allowEvalPath, evalBaseEnv, newEvalState, newEvalStateWith, renderEvalFailure, runEvalIO, runEvalIOTraced)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printSymbol, printValue)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
@@ -1715,6 +1716,35 @@ testCensus = do
             second <- censusOf [RootThunk (Thunk root)]
             let figures c = (censusAllocated c, censusReached c, censusVisitedObjects c, censusSetSizes c)
             pure (fmap figures first QC.=== fmap figures second),
+      -- The registry only grows, so what it reaches before and after one
+      -- registration differs by what that root alone holds.
+      -- Under the sanitizers' build a read of memory the first teardown
+      -- freed fails the child, and without them it reads what the second
+      -- window put there, so the two results differ.
+      runTestM "an evaluation after the arena is torn down and set up again reads nothing the teardown freed" $ do
+        self <- getExecutablePath
+        (_, out, err) <- Proc.readCreateProcessWithExitCode (Proc.proc self [arenaCycleChildFlag]) ""
+        pure $ case lines out of
+          [first, second]
+            | not ("error: " `isPrefixOf` first) -> assertEqual "second window's result" first second
+          _ -> Fail ("child printed " <> T.pack (show out) <> " and " <> T.pack err),
+      runTestM "a census from the registered roots reaches a cell once it is registered" $ do
+        cell <- cthunkNewComputedInt 7
+        before <- censusOf [RootRegistered]
+        crootsAddThunk cell
+        after <- censusOf [RootRegistered]
+        let thunks = fmap (figuresCount . kindThunks . censusReached)
+        pure (assertEqual "thunks reached" (fmap (fmap (+ 1)) (thunks before)) (thunks after)),
+      runTestM "a session registers the value an import caches, which a census from the registered roots reaches" $ do
+        storeDir <- evalNixIOStoreDir
+        st <- testEvalState storeDir tmpBase
+        before <- censusOf [RootRegistered]
+        imported <- evalNixIOIn st tmpBase "import (builtins.toFile \"cached.nix\" \"{ a = 1; b = 2; }\")"
+        after <- censusOf [RootRegistered]
+        let sets = fmap (figuresCount . kindAttrSets . censusReached)
+        pure $ case imported of
+          Left failure -> Fail failure
+          Right _ -> assertEqual "sets reached" (fmap (fmap (+ 1)) (sets before)) (sets after),
       runTestM "a census follows a partial application in C to the cells it holds" $ do
         inner <- cthunkNewComputedInt 7
         held <- evaluated (VBuiltin Builtin.Map [ArgDeferred (Thunk inner)])
@@ -4487,13 +4517,13 @@ evalNixIO baseDir source = do
 -- names were interned in would otherwise depend on the machine; a test of
 -- @NIX_PATH@ itself uses 'evalNixIOWithNixPath'.
 testEvalState :: StoreDir -> FilePath -> IO EvalState
-testEvalState = newEvalStateWith []
+testEvalState = newEvalStateWith unrestrictedPolicy []
 
 -- | 'evalNixIO' with the search path @NIX_PATH@ gives ('newEvalState').
 evalNixIOWithNixPath :: FilePath -> Text -> IO (Either Text NixValue)
 evalNixIOWithNixPath baseDir source = do
   storeDir <- evalNixIOStoreDir
-  st <- newEvalState storeDir baseDir
+  st <- newEvalState unrestrictedPolicy storeDir baseDir
   evalNixIOIn st baseDir source
 
 -- | 'evalNixIO' keeping a failure whole, its lines of context included.
@@ -4503,7 +4533,7 @@ evalNixIOTraced baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8
   Right parsed -> do
     storeDir <- evalNixIOStoreDir
     st <- testEvalState storeDir baseDir
-    runEvalIOTraced st (evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed)
+    runEvalIOTraced st (evalParsed (pure (evalBaseEnv st)) parsed)
 
 -- | 'evalNixIO' as @nova-nix eval --strict@ evaluates: the result, once
 -- everything inside it is forced in place.
@@ -4514,7 +4544,7 @@ evalStrictIO baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 so
     storeDir <- evalNixIOStoreDir
     st <- testEvalState storeDir baseDir
     runEvalIO st $ do
-      val <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      val <- evalParsed (pure (evalBaseEnv st)) parsed
       val <$ deepForce val
 
 -- | IO eval of a derivation expression to the 'Derivation' the session
@@ -4528,7 +4558,7 @@ evalDerivationIO baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf
     storeDir <- evalNixIOStoreDir
     st <- testEvalState storeDir baseDir
     runEvalIO st $ do
-      pathVal <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      pathVal <- evalParsed (pure (evalBaseEnv st)) parsed
       case pathVal of
         VStr pathBytes _ -> do
           recorded <- lookupSessionDrv (bytesText pathBytes)
@@ -6068,7 +6098,7 @@ unpairedSurrogateNixPath dir
       runTestM "NIX_PATH holding an unpaired surrogate is refused" $
         withEnvVar (T.unpack nixPathVarName) "a=\xD800" $ do
           storeDir <- evalNixIOStoreDir
-          outcome <- try (newEvalState storeDir dir)
+          outcome <- try (newEvalState unrestrictedPolicy storeDir dir)
           pure $ case outcome of
             Left (err :: IOException)
               | unpairedSurrogateWords `T.isInfixOf` T.pack (displayException err) -> Pass
@@ -6222,7 +6252,7 @@ evalAtCeiling limit source = case parseNix "." testOrigin (TE.encodeUtf8 source)
     storeDir <- evalNixIOStoreDir
     st0 <- testEvalState storeDir "."
     let st = st0 {esCallDepth = topLevelCallDepth limit}
-    runEvalIO st (evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed)
+    runEvalIO st (evalParsed (pure (evalBaseEnv st)) parsed)
 
 -- | The function-call nesting ceiling, upstream's max-call-depth (10000).
 -- Every boundary here was read off nix-instantiate 2.33.2 and the 2.24.9
@@ -15509,13 +15539,12 @@ testStage0Pe32Chain = do
   putStrLn "pkgs/stage0-pe32"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   -- The package set's fetchurl hands a single URL to <nix/fetchurl.nix>,
   -- which resolves against the checkout's data directory as the installed
   -- binary resolves it against its own.
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      chain = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ").stage0-pe32"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let chain = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ").stage0-pe32"
       runCommandTests = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "run-command.nix")
       quoted name = "\"" <> name <> "\""
       source =
@@ -15536,7 +15565,7 @@ testStage0Pe32Chain = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip (("seed" : links ++ bins) ++ map extraAttr extras ++ map runAttr runs) (T.words (bytesText bytes)))
@@ -15826,10 +15855,9 @@ testMesWindows = do
   putStrLn "pkgs/mes"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "mes.nix")
       quoted name = "\"" <> name <> "\""
       source =
@@ -15850,7 +15878,7 @@ testMesWindows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> case T.words (bytesText bytes) of
           prefix : paths -> do
@@ -15978,10 +16006,9 @@ testTinyccWindows = do
   putStrLn "pkgs/tinycc"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "tinycc.nix")
       quoted name = "\"" <> name <> "\""
       source =
@@ -16005,7 +16032,7 @@ testTinyccWindows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> case T.words (bytesText bytes) of
           prefix : paths -> do
@@ -16251,10 +16278,9 @@ testGnumakeWindows = do
   putStrLn "pkgs/gnumake"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gnumake.nix")
       source =
         T.concat
@@ -16269,7 +16295,7 @@ testGnumakeWindows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -16354,10 +16380,9 @@ testBusyboxWindows = do
   putStrLn "pkgs/busybox-w32"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "busybox.nix")
       source =
         T.concat
@@ -16372,7 +16397,7 @@ testBusyboxWindows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -16478,10 +16503,9 @@ testChecksForbidSubstitutes = do
   putStrLn "pkgs/checks"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      fileOf name = nixQuotedPath (cwd </> "test" </> "data" </> T.unpack name)
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let fileOf name = nixQuotedPath (cwd </> "test" </> "data" </> T.unpack name)
       source =
         T.concat
           [ "let substitutable = file: set: map (name: \"${file}:${name}\") (builtins.filter (name: (set.${name}.allowSubstitutes or true) != false) (builtins.attrNames set)); in builtins.concatStringsSep \" \" (",
@@ -16491,7 +16515,7 @@ testChecksForbidSubstitutes = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> pure (T.words (bytesText bytes))
         other -> throwEvalError ("expected the attributes as one string, got " <> typeName other)
@@ -16521,10 +16545,9 @@ testSeedStdenvWindows = do
   putStrLn "pkgs/seed-stdenv"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "seed-stdenv.nix")
       source =
         T.concat
@@ -16539,7 +16562,7 @@ testSeedStdenvWindows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -16646,10 +16669,9 @@ testBinutilsWindows = do
   putStrLn "pkgs/binutils"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "binutils.nix")
       source =
         T.concat
@@ -16664,7 +16686,7 @@ testBinutilsWindows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -16763,10 +16785,9 @@ testGccCoreWindows = do
   putStrLn "pkgs/gcc-core"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-core.nix")
       source =
         T.concat
@@ -16781,7 +16802,7 @@ testGccCoreWindows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -16930,10 +16951,9 @@ testGcc46Windows = do
   putStrLn "pkgs/gcc46"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc46.nix")
       source =
         T.concat
@@ -16948,7 +16968,7 @@ testGcc46Windows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -17071,10 +17091,9 @@ testGcc46CxxWindows = do
   putStrLn "pkgs/gcc46-cxx"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc46-cxx.nix")
       source =
         T.concat
@@ -17089,7 +17108,7 @@ testGcc46CxxWindows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -17250,10 +17269,9 @@ testGcc10Windows = do
   putStrLn "pkgs/gcc10"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc10.nix")
       source =
         T.concat
@@ -17268,7 +17286,7 @@ testGcc10Windows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -17441,10 +17459,9 @@ testMingwW64LatestWindows = do
   putStrLn "pkgs/mingw-w64-latest"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "mingw-w64-latest.nix")
       source =
         T.concat
@@ -17459,7 +17476,7 @@ testMingwW64LatestWindows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -17587,10 +17604,9 @@ testGccLatestWindows = do
   putStrLn "pkgs/gcc-latest"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-latest.nix")
       source =
         T.concat
@@ -17605,7 +17621,7 @@ testGccLatestWindows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -17779,10 +17795,9 @@ testBinutilsX8664Windows = do
   putStrLn "pkgs/binutils-x86_64"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "binutils-x86_64.nix")
       source =
         T.concat
@@ -17797,7 +17812,7 @@ testBinutilsX8664Windows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -17920,10 +17935,9 @@ testGccCoreX8664Windows = do
   putStrLn "pkgs/gcc-core-x86_64"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-core-x86_64.nix")
       source =
         T.concat
@@ -17938,7 +17952,7 @@ testGccCoreX8664Windows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -18099,10 +18113,9 @@ testMingwW64CrtX8664Windows = do
   putStrLn "pkgs/mingw-w64-crt-x86_64"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "mingw-w64-x86_64.nix")
       source =
         T.concat
@@ -18117,7 +18130,7 @@ testMingwW64CrtX8664Windows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -18227,10 +18240,9 @@ testGccX8664Windows = do
   putStrLn "pkgs/gcc-x86_64"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-x86_64.nix")
       source =
         T.concat
@@ -18245,7 +18257,7 @@ testGccX8664Windows = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
@@ -18406,10 +18418,9 @@ testWindowsSources = do
   putStrLn "pkgs/sources"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = cwd </> "pkgs" </> "windows"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = cwd </> "pkgs" </> "windows"
       source =
         T.concat
           [ "let pkgs = import ",
@@ -18430,7 +18441,7 @@ testWindowsSources = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let (listed, roots) = break (== listEnd) (T.words (bytesText bytes))
@@ -18541,11 +18552,10 @@ testWindowsRungs = do
   putStrLn "pkgs/rungs"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   workflow <- try (BS.readFile ladderWorkflowPath)
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = cwd </> "pkgs" </> "windows"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = cwd </> "pkgs" </> "windows"
       source =
         T.concat
           [ "let pkgs = import ",
@@ -18565,7 +18575,7 @@ testWindowsRungs = do
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> pure (stageLists (T.words (bytesText bytes)))
         other -> throwEvalError ("expected the stages as one string, got " <> typeName other)
@@ -18827,7 +18837,7 @@ evalNixIOStore storeDir baseDir source = do
 evalNixIOIn :: EvalState -> FilePath -> Text -> IO (Either Text NixValue)
 evalNixIOIn st baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> pure (Left (T.pack (show err)))
-  Right parsed -> runEvalIO st (evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed)
+  Right parsed -> runEvalIO st (evalParsed (pure (evalBaseEnv st)) parsed)
 
 testFetchGitShallow :: IO [Bool]
 testFetchGitShallow = do
@@ -22084,7 +22094,7 @@ evalAndBuild storeDir source = do
       -- honored on writes but not on reads pass the whole suite.
       st <- testEvalState storeDir "."
       evalResult <- runEvalIO st $ do
-        val <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+        val <- evalParsed (pure (evalBaseEnv st)) parsed
         -- What the CLI driver does: force drvPath, which runs
         -- derivationStrict (so a missing required attr surfaces as an eval
         -- error) and records the .drv the build reads back by that path.
@@ -23438,15 +23448,14 @@ testTrustWindowsGraphs = do
   putStrLn "trust/pkgs-windows"
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
-  fresh <- testEvalState storeDir cwd
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  let st = fresh {esSearchPaths = searchPaths}
-      windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       source = "builtins.concatStringsSep \" \" [ " <> windows <> ".stage0-pe32.kaem-unwrapped.drvPath " <> windows <> ".hello.drvPath ]"
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> runEvalIO st $ do
-      value <- evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
       case value of
         VStr bytes _ -> do
           let roots = T.words (bytesText bytes)
@@ -23921,10 +23930,9 @@ testPhase4IO = do
             Left err -> Fail ("eval error: " <> err),
         -- Search path with --nix-path equivalent (populated nixPath)
         runTestM "search path with populated nixPath" $ do
-          st <- testEvalState platformStoreDir testDir
           nixPaths <- parseNixPath (TE.encodeUtf8 ("mypkg=" <> T.pack subDir))
-          env <- builtinEnv unrestrictedPolicy (esTimestamp st) nixPaths
-          result <- runEvalIO st (eval env (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "mypkg"])))
+          st <- newEvalStateWith unrestrictedPolicy nixPaths platformStoreDir testDir
+          result <- runEvalIO st (eval (evalBaseEnv st) (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "mypkg"])))
           pure $ case result of
             Right (VPath _) -> Pass
             Right other -> Fail ("expected VPath, got " <> T.pack (show other))
@@ -24166,6 +24174,33 @@ internsInOrder label source expected = runTestM label $ do
 namesOnlyChildFlag :: String
 namesOnlyChildFlag = "--names-only-child"
 
+-- | The flag that runs 'arenaCycleChild'.
+arenaCycleChildFlag :: String
+arenaCycleChildFlag = "--arena-cycle-child"
+
+-- | Evaluate one program in two arena windows, one after the other, each
+-- in a session of its own, and print each result: the second can read
+-- nothing the first's teardown freed only if no constant of the program
+-- points into the arena.  The program reaches every value the evaluator
+-- shares: the @derivation@ wrapper, an empty list, builtins under their
+-- own names and in @builtins@, and an imported file's value.
+arenaCycleChild :: IO ()
+arenaCycleChild = do
+  mapM_ (const (bracket_ arenaInit arenaDestroy cycleOnce)) [1 :: Int, 2]
+  where
+    cycleOnce = do
+      storeDir <- evalNixIOStoreDir
+      tmpBase <- getTemporaryDirectory
+      result <- evalNixIOStore storeDir tmpBase arenaCycleProgram
+      putStrLn (either (("error: " <>) . T.unpack) show result)
+
+-- | The program 'arenaCycleChild' evaluates.
+arenaCycleProgram :: Text
+arenaCycleProgram =
+  "builtins.toJSON { drv = (derivation { name = \"cycle\"; builder = \"/bin/sh\"; system = \"x86_64-linux\"; }).drvPath; "
+    <> "empty = [ ] ++ [ ]; mapped = map toString [ 1 2 ]; listed = builtins.map (x: x) [ 3 ]; "
+    <> "imported = import (builtins.toFile \"cycle.nix\" \"{ a = 1; }\"); }"
+
 -- | Where 'namesOnlyChild' says its source comes from: a position records
 -- its file, which upstream keeps out of its symbol table.
 namesOnlyFile :: Text
@@ -24177,9 +24212,8 @@ namesOnlyChild source = case parseNix testBaseDir (SourceFile namesOnlyFile) (TE
   Right parsed -> do
     storeDir <- evalNixIOStoreDir
     st <- testEvalState storeDir testBaseDir
-    _ <- builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)
     before <- symbolCount
-    result <- runEvalIO st (evalParsed (builtinEnv unrestrictedPolicy (esTimestamp st) (esSearchPaths st)) parsed)
+    result <- runEvalIO st (evalParsed (pure (evalBaseEnv st)) parsed)
     after <- symbolCount
     mapM_ (TIO.putStrLn . symbolText . Symbol) [before + 1 .. after]
     either (\err -> TIO.putStrLn ("error: " <> err)) (const (pure ())) result
@@ -28140,6 +28174,7 @@ main =
     [flag] | flag == startupSymbolsChildFlag -> bracket_ arenaInit arenaDestroy startupSymbolsChild
     [flag, source] | flag == failureChildFlag -> bracket_ arenaInit arenaDestroy (failureChild source)
     [flag, source] | flag == namesOnlyChildFlag -> bracket_ arenaInit arenaDestroy (namesOnlyChild source)
+    [flag] | flag == arenaCycleChildFlag -> arenaCycleChild
     [flag] | flag == writeCliJsonFlag -> BS.writeFile cliJsonPath Ref.referenceJson
     _ -> withRunTempRoot (bracket_ arenaInit arenaDestroy runSuite)
 
@@ -28636,10 +28671,9 @@ evalPolicyIO policy roots searchPaths baseDir source = do
   case parseNixWithScope (rootScopeNames policy) baseDir testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> do
-      st0 <- testEvalState storeDir baseDir
-      let st = st0 {esPolicy = policy, esSearchPaths = searchPaths}
+      st <- newEvalStateWith policy searchPaths storeDir baseDir
       mapM_ (allowEvalPath st) roots
-      runEvalIO st (evalParsed (builtinEnv policy (esTimestamp st) searchPaths) parsed)
+      runEvalIO st (evalParsed (pure (evalBaseEnv st)) parsed)
 
 -- | The battery the modes were pinned against, run through EvalIO: every
 -- expression here was run through nix-instantiate under restrict-eval and

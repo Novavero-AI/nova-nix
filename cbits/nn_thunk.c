@@ -291,6 +291,8 @@ nn_thunk_new_computed_primop_app(void *app)
 static nn_thunk_t g_null_cell  = { NN_THUNK_COMPUTED, NN_VALUE_NULL, 0, 0, NULL };
 static nn_thunk_t g_true_cell  = { NN_THUNK_COMPUTED, NN_VALUE_BOOL, 0, 0, (void *)(intptr_t)1 };
 static nn_thunk_t g_false_cell = { NN_THUNK_COMPUTED, NN_VALUE_BOOL, 0, 0, NULL };
+/* An empty list is the NULL list (nn_list.h). */
+static nn_thunk_t g_empty_list_cell = { NN_THUNK_COMPUTED, NN_VALUE_LIST, 0, 0, NULL };
 
 nn_thunk_t *
 nn_thunk_null(void)
@@ -302,6 +304,12 @@ nn_thunk_t *
 nn_thunk_bool(uint8_t value)
 {
     return value ? &g_true_cell : &g_false_cell;
+}
+
+nn_thunk_t *
+nn_thunk_empty_list(void)
+{
+    return &g_empty_list_cell;
 }
 
 /* Zero until asked for, which is PENDING: nn_thunk_primop fills a cell
@@ -329,6 +337,7 @@ nn_thunk_is_static(const nn_thunk_t *thunk)
     uintptr_t p = (uintptr_t)thunk;
     uintptr_t cells = (uintptr_t)g_primop_cells;
     return thunk == &g_null_cell || thunk == &g_true_cell || thunk == &g_false_cell
+        || thunk == &g_empty_list_cell
         || (p >= cells && p - cells < sizeof(g_primop_cells));
 }
 
