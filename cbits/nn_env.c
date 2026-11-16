@@ -42,6 +42,7 @@ struct nn_env_page {
 struct nn_env_align_pointer { char c; void *p; };
 struct nn_env_align_env_pointer { char c; nn_env_t *p; };
 struct nn_env_align_scopes { char c; nn_env_scopes_t s; };
+struct nn_env_align_word { char c; uintptr_t w; };
 
 typedef char nn_env_page_data_check_[
     (offsetof(struct nn_env_page, data) % NN_ENV_ALIGNMENT == 0) ? 1 : -1];
@@ -51,6 +52,15 @@ typedef char nn_env_env_pointer_align_check_[
     (offsetof(struct nn_env_align_env_pointer, p) <= offsetof(struct nn_env_align_pointer, p)) ? 1 : -1];
 typedef char nn_env_scopes_align_check_[
     (offsetof(struct nn_env_align_scopes, s) <= offsetof(struct nn_env_align_pointer, p)) ? 1 : -1];
+
+/* A short env keeps its slot count in the low bits of its parent's
+ * address, so every env's address has them clear: one from the pages,
+ * at an NN_ENV_ALIGNMENT boundary, and the static empty env, aligned as
+ * its word is. */
+typedef char nn_env_short_page_check_[(NN_ENV_ALIGNMENT > NN_ENV_SHORT_MASK) ? 1 : -1];
+typedef char nn_env_short_static_check_[
+    (offsetof(struct nn_env_align_word, w) > NN_ENV_SHORT_MASK) ? 1 : -1];
+typedef char nn_env_short_max_check_[(NN_ENV_SHORT_MAX == NN_ENV_SHORT_MASK) ? 1 : -1];
 
 /* --- Global state --- */
 
@@ -126,57 +136,98 @@ nn_env_alloc_pointers(uint32_t count)
     return (void **)nn_env_alloc_raw((uint32_t)bytes64);
 }
 
-/* The bytes an env of this shape takes: its header, its slots and the
- * fields its kind names (nn_env.h). */
+/* --- The word (nn_env.h) --- */
+
+/* Whether an env is short: its word is its parent and slot count. */
+static int
+is_short(const nn_env_t *env)
+{
+    return (env->word & NN_ENV_SHORT_MASK) != 0;
+}
+
+static uint32_t
+slot_count_of(const nn_env_t *env)
+{
+    return is_short(env) ? (uint32_t)(env->word & NN_ENV_SHORT_MASK)
+                         : (uint32_t)(env->word >> NN_ENV_COUNT_SHIFT);
+}
+
+/* The fields a header says follow the slots; none for a short env. */
+static uintptr_t
+fields_of(const nn_env_t *env)
+{
+    return is_short(env) ? 0 : env->word & (NN_ENV_PARENT | NN_ENV_SCOPES);
+}
+
+/* The bytes an env of this shape takes: its word, its slots and the
+ * fields its header names (nn_env.h), none for a short env. */
 static uint64_t
-env_shape_bytes(uint32_t slot_count, uint32_t kind)
+env_shape_bytes(uint32_t slot_count, uintptr_t fields)
 {
     return (uint64_t)sizeof(nn_env_t)
          + (uint64_t)slot_count * sizeof(void *)
-         + ((kind & NN_ENV_PARENT) ? sizeof(nn_env_t *) : 0)
-         + ((kind & NN_ENV_SCOPES) ? sizeof(nn_env_scopes_t) : 0);
+         + ((fields & NN_ENV_PARENT) ? sizeof(nn_env_t *) : 0)
+         + ((fields & NN_ENV_SCOPES) ? sizeof(nn_env_scopes_t) : 0);
 }
 
-/* The first byte past an env's slots, where its parent and scopes go. */
+/* The first byte past an env's slots, where a header's parent and scopes
+ * go. */
 static char *
 tail_of(nn_env_t *env)
 {
-    return (char *)(void *)(env->slots + env->slot_count);
+    return (char *)(void *)(env->slots + slot_count_of(env));
 }
 
 static const char *
 const_tail_of(const nn_env_t *env)
 {
-    return (const char *)(const void *)(env->slots + env->slot_count);
+    return (const char *)(const void *)(env->slots + slot_count_of(env));
 }
 
-/* Where the scopes of an env with NN_ENV_SCOPES start: after its parent
+/* Where the scopes of a header with NN_ENV_SCOPES start: after its parent
  * when it has one. */
 static size_t
-scopes_offset(uint32_t kind)
+scopes_offset(uintptr_t fields)
 {
-    return (kind & NN_ENV_PARENT) ? sizeof(nn_env_t *) : 0;
+    return (fields & NN_ENV_PARENT) ? sizeof(nn_env_t *) : 0;
 }
 
-/* An env of `slot_count` NULL slots whose kind and fields are given; the
- * scopes are written when `scopes` is non-NULL.  It counts once under
+static nn_env_t *
+parent_of(const nn_env_t *env)
+{
+    if (is_short(env)) return (nn_env_t *)(env->word & ~NN_ENV_SHORT_MASK);
+    if (!(env->word & NN_ENV_PARENT)) return NULL;
+    return *(nn_env_t *const *)(const void *)const_tail_of(env);
+}
+
+/* An env of `slot_count` NULL slots under `parent` (or none), with the
+ * scopes when `scopes` is non-NULL: short when nn_env.h says it is, and
+ * otherwise a header and the fields it names.  It counts once under
  * `site` while the census counts sites (nn_stats.h), with its slots and
  * its bytes, which are a whole number of NN_ENV_ALIGNMENT units. */
 static nn_env_t *
 env_alloc(uint32_t slot_count, nn_env_t *parent, const nn_env_scopes_t *scopes,
           uint32_t site)
 {
-    uint32_t kind = (parent ? NN_ENV_PARENT : 0u) | (scopes ? NN_ENV_SCOPES : 0u);
-    uint64_t bytes = env_shape_bytes(slot_count, kind);
+    int short_env = slot_count >= 1 && slot_count <= NN_ENV_SHORT_MAX && !scopes;
+    uintptr_t fields = short_env ? 0
+                     : (parent ? NN_ENV_PARENT : 0) | (scopes ? NN_ENV_SCOPES : 0);
+    uint64_t bytes = env_shape_bytes(slot_count, fields);
+    /* A parent's low bits would read back as a slot count.  No env's
+     * address has them set, so a parent that does is corrupt input. */
+    if ((uintptr_t)parent & NN_ENV_SHORT_MASK) return NULL;
     if (bytes > UINT32_MAX) return NULL;
     nn_env_t *env = (nn_env_t *)nn_env_alloc_raw((uint32_t)bytes);
     if (!env) return NULL;
     if (nn_stats_counting) nn_stats_count_env(site, slot_count, bytes);
-    env->slot_count = slot_count;
-    env->kind = kind;
+    if (short_env) {
+        env->word = (uintptr_t)parent | (uintptr_t)slot_count;
+        return env;
+    }
+    env->word = ((uintptr_t)slot_count << NN_ENV_COUNT_SHIFT) | fields;
     if (parent) *(nn_env_t **)(void *)tail_of(env) = parent;
     if (scopes)
-        *(nn_env_scopes_t *)(void *)(tail_of(env) + scopes_offset(kind)) = *scopes;
+        *(nn_env_scopes_t *)(void *)(tail_of(env) + scopes_offset(fields)) = *scopes;
     return env;
 }
 
@@ -277,12 +328,13 @@ nn_env_push_with(nn_env_t *base, void *scope, uint32_t site)
                (size_t)outer * sizeof(void *));
     }
 
-    nn_env_t *env = nn_env_new_scoped(base->slot_count, nn_env_parent(base),
+    uint32_t slot_count = slot_count_of(base);
+    nn_env_t *env = nn_env_new_scoped(slot_count, parent_of(base),
                                       nn_env_lazy_scope(base),
                                       new_withs, new_count, site);
     if (!env) return NULL;
-    if (base->slot_count > 0) {
-        memcpy(env->slots, base->slots, (size_t)base->slot_count * sizeof(void *));
+    if (slot_count > 0) {
+        memcpy(env->slots, base->slots, (size_t)slot_count * sizeof(void *));
     }
     return env;
 }
@@ -298,22 +350,22 @@ nn_env_slots(nn_env_t *env)
 uint32_t
 nn_env_slot_count(const nn_env_t *env)
 {
-    return env->slot_count;
+    return slot_count_of(env);
 }
 
 nn_env_t *
 nn_env_parent(const nn_env_t *env)
 {
-    if (!(env->kind & NN_ENV_PARENT)) return NULL;
-    return *(nn_env_t *const *)(const void *)const_tail_of(env);
+    return parent_of(env);
 }
 
 const nn_env_scopes_t *
 nn_env_scopes(const nn_env_t *env)
 {
-    if (!(env->kind & NN_ENV_SCOPES)) return NULL;
+    uintptr_t fields = fields_of(env);
+    if (!(fields & NN_ENV_SCOPES)) return NULL;
     return (const nn_env_scopes_t *)(const void *)
-        (const_tail_of(env) + scopes_offset(env->kind));
+        (const_tail_of(env) + scopes_offset(fields));
 }
 
 void *
@@ -341,7 +393,7 @@ uint32_t
 nn_env_bytes(const nn_env_t *env)
 {
     /* env_alloc refused every shape past UINT32_MAX bytes. */
-    return (uint32_t)env_shape_bytes(env->slot_count, env->kind);
+    return (uint32_t)env_shape_bytes(slot_count_of(env), fields_of(env));
 }
 
 /* --- Lookup --- */
@@ -354,7 +406,7 @@ nn_env_lookup_resolved(const nn_env_t *env, int level, int idx)
         return NULL;
     }
     while (level > 0) {
-        const nn_env_t *parent = nn_env_parent(env);
+        const nn_env_t *parent = parent_of(env);
         NN_ASSERT(parent != NULL, "nn_env_lookup_resolved: parent chain too short for level");
         if (parent == NULL) {
             return NULL;
@@ -365,8 +417,8 @@ nn_env_lookup_resolved(const nn_env_t *env, int level, int idx)
     /* The resolver supplies these indices; guard the slot read in release
        builds too (NDEBUG strips the assert) so a resolver bug surfaces as a
        NULL rather than an out-of-bounds read past the slots. */
-    NN_ASSERT(idx >= 0 && (uint32_t)idx < env->slot_count, "nn_env_lookup_resolved: idx out of bounds");
-    if (idx < 0 || (uint32_t)idx >= env->slot_count) {
+    NN_ASSERT(idx >= 0 && (uint32_t)idx < slot_count_of(env), "nn_env_lookup_resolved: idx out of bounds");
+    if (idx < 0 || (uint32_t)idx >= slot_count_of(env)) {
         return NULL;
     }
     return env->slots[idx];
@@ -376,7 +428,7 @@ void *
 nn_env_root_scope(const nn_env_t *env)
 {
     const nn_env_t *parent;
-    while ((parent = nn_env_parent(env)) != NULL) {
+    while ((parent = parent_of(env)) != NULL) {
         env = parent;
     }
     return nn_env_lazy_scope(env);
@@ -386,7 +438,7 @@ nn_env_t *
 nn_env_with_owner(nn_env_t *env)
 {
     while (env && nn_env_with_count(env) == 0) {
-        env = nn_env_parent(env);
+        env = parent_of(env);
     }
     return env;
 }

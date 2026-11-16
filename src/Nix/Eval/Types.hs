@@ -678,8 +678,9 @@ fillCAttrSetValues cset thunkMap =
 
 -- | Evaluation environment - C-backed scope chain.
 --
--- An arena-allocated @nn_env_t@: its slots inline, then its parent when
--- it has one and its lazy scope and with-scopes when it has them
+-- An arena-allocated @nn_env_t@: a word holding its parent and slot
+-- count or a header, its slots inline, then, after a header, its parent
+-- when it has one and its lazy scope and with-scopes when it has them
 -- (@cbits/nn_env.h@).  Haskell holds only the pointer.  Variable lookup
 -- has two paths:
 --

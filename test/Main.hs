@@ -52,7 +52,7 @@ import qualified Database.SQLite.Simple as SQL
 import Foreign.C.Error (Errno (..), eACCES, eISDIR, eNOENT, eNOTDIR)
 import Foreign.C.Types (CChar, CSize (..))
 import Foreign.Marshal.Alloc (alloca)
-import Foreign.Ptr (Ptr, WordPtr, castPtr, nullPtr, ptrToWordPtr)
+import Foreign.Ptr (Ptr, WordPtr, castPtr, nullPtr, plusPtr, ptrToWordPtr)
 import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Foreign.Storable (peekElemOff, poke, sizeOf)
 import qualified GHC.Foreign as GHCForeign
@@ -82,7 +82,7 @@ import qualified Nix.Eval.Builtin as Builtin
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (appDeferred, attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcEmitString, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, cbcString, cbcStringText, formalName, formalNamedSet, formalSet, reservedApply1, reservedApply2, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
-import Nix.Eval.CEnv (cenvLazyScope, cenvNewScoped, cenvParent)
+import Nix.Eval.CEnv (cenvLazyScope, cenvNew, cenvNewScoped, cenvParent)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsType, clambdaNew, clambdaShape, clambdaShapeAllowExtra, clambdaShapeFormalCount, clambdaShapeFormalsType)
 import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks, thunkListToCList)
 import Nix.Eval.CRoots (crootsAddThunk)
@@ -1716,13 +1716,26 @@ censusPointerBytes = 8
 primopAppHeaderBytes :: Word64
 primopAppHeaderBytes = 8
 
--- | The bytes of an env's header word and of the scopes an env with a
--- lazy scope or with-scopes has: @NN_ENV_HEADER_BYTES@ and
--- @NN_ENV_SCOPES_BYTES@ of @cbits/nn_env.h@.  Its slots and its parent
--- take a pointer each.
-envHeaderBytes, envScopesBytes :: Word64
-envHeaderBytes = 8
+-- | The bytes of an env's word and of the scopes an env with a lazy scope
+-- or with-scopes has: @NN_ENV_WORD_BYTES@ and @NN_ENV_SCOPES_BYTES@ of
+-- @cbits/nn_env.h@.  Its slots, and a parent after a header, take a
+-- pointer each.
+envWordBytes, envScopesBytes :: Word64
+envWordBytes = 8
 envScopesBytes = 24
+
+-- | The most slots a short env, whose word holds its parent, has:
+-- @NN_ENV_SHORT_MAX@ of @cbits/nn_env.h@.
+envShortMax :: Int
+envShortMax = 7
+
+-- | The bytes of an env of this many slots under a parent, with no
+-- scopes: a short one's word holds the parent, and a header is followed
+-- by it.
+childEnvBytes :: Int -> Word64
+childEnvBytes n
+  | n >= 1 && n <= envShortMax = envWordBytes + censusPointerBytes * fromIntegral n
+  | otherwise = envWordBytes + censusPointerBytes * fromIntegral (n + 1)
 
 -- | Bytes a string of these bytes takes in its block: a 4-byte length,
 -- then the bytes, padded to the next multiple of 4 (cbits/nn_str.h).
@@ -1869,7 +1882,7 @@ testCensus = do
         pending <- mkThunkBc env code
         withCensus [RootThunk pending] $ \census ->
           assertEqual "thunks" (Figures (Just 4) (4 * censusCellBytes)) (kindThunks (censusReached census))
-            `andThen` assertEqual "envs" (Figures (Just 1) (envHeaderBytes + 3 * censusPointerBytes)) (kindEnvs (censusReached census))
+            `andThen` assertEqual "envs" (Figures (Just 1) (envWordBytes + 3 * censusPointerBytes)) (kindEnvs (censusReached census))
             `andThen` assertEqual "unplaced" 0 (censusUnplaced census),
       runTestM "a list and its suffix count one items array, whichever is reached first" $ do
         cells <- mapM cthunkNewComputedInt [1, 2, 3, 4]
@@ -2044,8 +2057,8 @@ data SetAllocation = SetAllocation !SetSite !Int
   deriving (Show)
 
 -- | Bytes of a set header and a set entry (its key, position and value)
--- on a 64-bit target (cbits/nn_attrset.c).  An env's are
--- 'envHeaderBytes' and a pointer for each slot.
+-- on a 64-bit target (cbits/nn_attrset.c).  An env's are given by
+-- 'childEnvBytes'.
 setHeaderSize, setEntrySize :: Word64
 setHeaderSize = 40
 setEntrySize = 16
@@ -2146,33 +2159,34 @@ testAllocSites = do
             mapM_ (\(AttrSet left, AttrSet right) -> void (cattrsetUnion SetUpdate left right)) [(one, none), (none, one), (one, one)]
         pure (assertEqual "update" (Right (Map.singleton SetUpdate (SetSiteFigures 3 2 (3 * setHeaderSize + 4 * setEntrySize)))) (fmap sitesSets added)),
       -- Each source's figures are worked out by hand from the evaluator:
-      -- an env is an 8-byte header with 8 bytes a slot and 8 for a
-      -- parent, a with's env 24 more for its scopes and 8 for each entry
-      -- of its with-scope array, and a set a 40-byte header with 16 bytes
-      -- an entry, with room for one when it is an empty set of its own;
-      -- the shared empty set is no allocation.  The root env is each
-      -- evaluation's, and every other env made in it has a parent; a
-      -- trimmed closure's, a capture's, and a builtin's deferred
-      -- application have none.
+      -- an env is an 8-byte word with 8 bytes a slot, which holds the
+      -- parent of an env of one to seven slots and no scopes and is
+      -- otherwise a header followed by 8 bytes for a parent, a with's env
+      -- 24 more for its scopes and 8 for each entry of its with-scope
+      -- array, and a set a 40-byte header with 16 bytes an entry, with
+      -- room for one when it is an empty set of its own; the shared empty
+      -- set is no allocation.  The root env is each evaluation's, and
+      -- every other env made in it has a parent; a trimmed closure's, a
+      -- capture's, and a builtin's deferred application have none.
       sitesTest
         "a let makes one env with a slot a binding"
         "let a = 1; b = 2; in a + b"
-        [(EnvLet, EnvSiteFigures 1 2 32)]
+        [(EnvLet, EnvSiteFigures 1 2 24)]
         [],
       sitesTest
         "a call of a lambda with an argument name makes one env of one slot"
         "(x: x) 1"
-        [(EnvCall, EnvSiteFigures 1 1 24)]
+        [(EnvCall, EnvSiteFigures 1 1 16)]
         [],
       sitesTest
         "a curried call makes an env per call, and the inner lambda a closure of what it uses"
         "(x: y: x) 1 2"
-        [(EnvCall, EnvSiteFigures 2 2 48), (EnvClosure, EnvSiteFigures 1 1 16)]
+        [(EnvCall, EnvSiteFigures 2 2 32), (EnvClosure, EnvSiteFigures 1 1 16)]
         [],
       sitesTest
         "a call of a lambda with formals makes one env of a slot a formal"
         "({ a, b ? 2 }: a + b) { a = 1; }"
-        [(EnvCallFormals, EnvSiteFigures 1 2 32)]
+        [(EnvCallFormals, EnvSiteFigures 1 2 24)]
         [(SetLiteral, SetSiteFigures 1 0 56)],
       sitesTest
         "a with makes one env, a copy of its scope's slots, with an array of its with-scopes"
@@ -2187,7 +2201,7 @@ testAllocSites = do
       sitesTest
         "a with's env holds and counts the slots it copies from the env it is made in"
         "let b = 2; in with { a = 1; }; a + b"
-        [(EnvLet, EnvSiteFigures 1 1 24), (EnvLetCapture, EnvSiteFigures 1 0 40), (EnvWith, EnvSiteFigures 1 1 64)]
+        [(EnvLet, EnvSiteFigures 1 1 16), (EnvLetCapture, EnvSiteFigures 1 0 40), (EnvWith, EnvSiteFigures 1 1 64)]
         [(SetLiteral, SetSiteFigures 1 0 56)],
       sitesTest
         "an update with an empty operand makes no set, and the empty literal is the shared empty set"
@@ -2226,32 +2240,32 @@ testAllocSites = do
       sitesTest
         "map defers an application per element, each of which calls the function"
         "builtins.deepSeq (builtins.map (x: x) [ 1 2 3 ]) null"
-        [(EnvCall, EnvSiteFigures 3 3 72), (EnvMap, EnvSiteFigures 3 6 72)]
+        [(EnvCall, EnvSiteFigures 3 3 48), (EnvMap, EnvSiteFigures 3 6 72)]
         [],
       sitesTest
         "concatMap defers an application per element before it forces it"
         "builtins.deepSeq (builtins.concatMap (x: [ x ]) [ 1 2 ]) null"
-        [(EnvCall, EnvSiteFigures 2 2 48), (EnvConcatMap, EnvSiteFigures 2 4 48)]
+        [(EnvCall, EnvSiteFigures 2 2 32), (EnvConcatMap, EnvSiteFigures 2 4 48)]
         [],
       sitesTest
         "each inherit (from) makes an env of one slot"
         "let s = { a = 1; b = 2; }; in builtins.deepSeq { inherit (s) a; inherit (s) b; } null"
-        [(EnvLet, EnvSiteFigures 1 1 24), (EnvInheritFrom, EnvSiteFigures 2 2 32)]
+        [(EnvLet, EnvSiteFigures 1 1 16), (EnvInheritFrom, EnvSiteFigures 2 2 32)]
         [(SetLiteral, SetSiteFigures 2 0 144)],
       sitesTest
         "a let using a variable from outside it makes its frame and a capture of that variable"
         "(x: let y = x; in y) 1"
-        [(EnvCall, EnvSiteFigures 1 1 24), (EnvLet, EnvSiteFigures 1 1 24), (EnvLetCapture, EnvSiteFigures 1 1 16)]
+        [(EnvCall, EnvSiteFigures 1 1 16), (EnvLet, EnvSiteFigures 1 1 16), (EnvLetCapture, EnvSiteFigures 1 1 16)]
         [],
       sitesTest
         "a rec set makes one env with a slot a binding and its set"
         "builtins.deepSeq (rec { a = 1; b = a; }) null"
-        [(EnvRec, EnvSiteFigures 1 2 32)]
+        [(EnvRec, EnvSiteFigures 1 2 24)]
         [(SetRec, SetSiteFigures 1 0 72)],
       sitesTest
         "mapAttrs defers an application per attribute, each of which makes two calls"
         "builtins.deepSeq (builtins.mapAttrs (n: v: v) { a = 1; b = 2; }) null"
-        [(EnvCall, EnvSiteFigures 4 4 96), (EnvMapAttrs, EnvSiteFigures 2 6 64)]
+        [(EnvCall, EnvSiteFigures 4 4 64), (EnvMapAttrs, EnvSiteFigures 2 6 64)]
         [(SetLiteral, SetSiteFigures 1 0 72), (SetMapAttrs, SetSiteFigures 1 0 72)],
       sitesTest
         "functionArgs of a lambda without formals or with no formal is the shared empty set"
@@ -2279,7 +2293,7 @@ testAllocSites = do
     envsExpected allocations =
       ( Map.fromListWith
           addEnv
-          [(site, EnvSiteFigures 1 slots (envHeaderBytes + censusPointerBytes * slots)) | EnvAllocation site n <- allocations, let slots = fromIntegral n],
+          [(site, EnvSiteFigures 1 slots (envWordBytes + censusPointerBytes * slots)) | EnvAllocation site n <- allocations, let slots = fromIntegral n],
         Map.fromListWith (+) [(EnvSlots (fromIntegral n), 1) | EnvAllocation _ n <- allocations]
       )
     setsExpected allocations =
@@ -2311,8 +2325,8 @@ data EnvStep
 genEnvStep :: QC.Gen EnvStep
 genEnvStep =
   QC.oneof
-    [ StepChild <$> QC.chooseInt (0, 4),
-      StepParentless <$> QC.chooseInt (0, 4),
+    [ StepChild <$> QC.chooseInt (0, envShortMax + 2),
+      StepParentless <$> QC.chooseInt (0, envShortMax + 2),
       pure StepScope,
       pure StepWith
     ]
@@ -2345,12 +2359,12 @@ envStep prev step = case step of
   StepChild n -> do
     cells <- newCells n
     env <- newEnv EnvCall (Just (modelEnv prev)) (map Thunk cells)
-    pure (EnvModel env cells (Just prev) Nothing (modelWithCells prev) [] (envHeaderBytes + censusPointerBytes * (genericLength cells + 1)))
+    pure (EnvModel env cells (Just prev) Nothing (modelWithCells prev) [] (childEnvBytes n))
   StepParentless n -> parentlessModel n
   StepScope -> do
     (set@(AttrSet cset), value) <- oneNameScope
     env <- newScopeEnv EnvLet (Just (modelEnv prev)) set
-    pure (EnvModel env [] (Just prev) (Just (castPtr cset, value)) (modelWithCells prev) [] (envHeaderBytes + censusPointerBytes + envScopesBytes))
+    pure (EnvModel env [] (Just prev) (Just (castPtr cset, value)) (modelWithCells prev) [] (envWordBytes + censusPointerBytes + envScopesBytes))
   StepWith -> do
     -- Nothing forces the with's set here, so any cell stands for the
     -- thunk that evaluates to it.
@@ -2359,14 +2373,14 @@ envStep prev step = case step of
     let withs = cell : modelWithCells prev
         parentBytes = maybe 0 (const censusPointerBytes) (modelParent prev)
         slotBytes = censusPointerBytes * genericLength (modelSlots prev)
-    pure (EnvModel env (modelSlots prev) (modelParent prev) (modelScope prev) withs withs (envHeaderBytes + slotBytes + parentBytes + envScopesBytes + censusPointerBytes * genericLength withs))
+    pure (EnvModel env (modelSlots prev) (modelParent prev) (modelScope prev) withs withs (envWordBytes + slotBytes + parentBytes + envScopesBytes + censusPointerBytes * genericLength withs))
 
 -- | A model of an env with no parent holding this many fresh cells.
 parentlessModel :: Int -> IO EnvModel
 parentlessModel n = do
   cells <- newCells n
   env <- newEnv EnvClosure Nothing (map Thunk cells)
-  pure (EnvModel env cells Nothing Nothing [] [] (envHeaderBytes + censusPointerBytes * genericLength cells))
+  pure (EnvModel env cells Nothing Nothing [] [] (envWordBytes + censusPointerBytes * genericLength cells))
 
 -- | This many fresh integer cells.
 newCells :: Int -> IO [CThunkPtr]
@@ -2433,17 +2447,22 @@ testEnvLayout = do
         -- A with's: a copy of the two slots of the env it is made in and
         -- a with-scope array of one entry, its own.
         withEnv <- envStep callParent StepWith
-        reached <- mapM (\env -> fmap (kindEnvs . censusReached) <$> censusOf [RootEnv env]) [modelEnv trimmed, modelEnv call, root, modelEnv withEnv]
+        -- A frame of more slots than a short env holds, under a parent.
+        wide <- envStep callParent (StepChild (envShortMax + 1))
+        reached <- mapM (\env -> fmap (kindEnvs . censusReached) <$> censusOf [RootEnv env]) [modelEnv trimmed, modelEnv call, root, modelEnv withEnv, modelEnv wide]
+        let parentBytes = envWordBytes + 2 * censusPointerBytes
         pure $
           assertEqual
             "envs reached"
-            [ Right (Figures (Just 1) (envHeaderBytes + 3 * censusPointerBytes)),
-              -- The call's header, slot and parent, and its parent's
-              -- header and two slots.
-              Right (Figures (Just 2) ((envHeaderBytes + censusPointerBytes + censusPointerBytes) + (envHeaderBytes + 2 * censusPointerBytes))),
-              Right (Figures (Just 1) (envHeaderBytes + envScopesBytes)),
+            [ Right (Figures (Just 1) (envWordBytes + 3 * censusPointerBytes)),
+              -- The call's word, which holds its parent, and its slot, and
+              -- its parent's word and two slots.
+              Right (Figures (Just 2) ((envWordBytes + censusPointerBytes) + parentBytes)),
+              Right (Figures (Just 1) (envWordBytes + envScopesBytes)),
               -- Its header, two slots, scopes and one-entry array.
-              Right (Figures (Just 1) (envHeaderBytes + 2 * censusPointerBytes + envScopesBytes + censusPointerBytes))
+              Right (Figures (Just 1) (envWordBytes + 2 * censusPointerBytes + envScopesBytes + censusPointerBytes)),
+              -- Its header, eight slots and parent, and its parent's.
+              Right (Figures (Just 2) ((envWordBytes + 8 * censusPointerBytes + censusPointerBytes) + parentBytes))
             ]
             reached,
       runTestM "an env holds the slots, parent and with-scopes its making gives it, and a census reaches what they hold and counts the bytes its shape takes" $
@@ -2463,7 +2482,14 @@ testEnvLayout = do
       -- lookup through NULL.
       runTestM "an env with with-scopes counted and no array is refused" $ do
         refused <- cenvNewScoped EnvRoot 0 nullPtr nullPtr nullPtr 1
-        pure (assertEqual "env" nullPtr refused)
+        pure (assertEqual "env" nullPtr refused),
+      -- A short env's word holds its parent's address with its slot count
+      -- in the low bits, so a parent with any of them set would read
+      -- back as another env and count.
+      runTestM "an env under a parent whose address is not an env's is refused" $ do
+        Env parent <- modelEnv <$> parentlessModel 1
+        refused <- mapM (\n -> cenvNew EnvCall n (parent `plusPtr` 1)) [1, fromIntegral envShortMax + 1]
+        pure (assertEqual "envs" [nullPtr, nullPtr] refused)
     ]
   where
     quickCheckPasses property = do

@@ -5,9 +5,12 @@
 -- they have them.  All memory is freed in bulk via 'cenvDestroy' at
 -- evaluation end.
 --
--- An env is a header word and its slots, followed by its parent when it
--- has one and by its scopes when it has them (@cbits/nn_env.h@): a
--- call's env of one slot takes 24 bytes, none of them on GHC's heap.
+-- An env is a word and its slots (@cbits/nn_env.h@).  One of one to
+-- seven slots and no scopes keeps its parent in that word, as upstream's
+-- @Env@ is a parent and its values: a call's env of one slot takes 16
+-- bytes, none of them on GHC's heap.  Any other env's word is a header,
+-- followed after the slots by its parent when it has one and by its
+-- scopes when it has them.
 -- Every allocation names its 'EnvSite', under which the census counts
 -- it.
 module Nix.Eval.CEnv
