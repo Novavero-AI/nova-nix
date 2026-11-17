@@ -5765,6 +5765,9 @@ testImportIO = do
   tmpBase <- getTemporaryDirectory
   let testDir = tmpBase </> "nova-nix-test-import"
       subDir = testDir </> "sub"
+      -- A thousand attributes, one of them a function.
+      largeSetSource =
+        "{ f = x: x; " <> T.concat ["a" <> T.pack (show i) <> " = " <> T.pack (show i) <> "; " | i <- [1 .. 999 :: Int]] <> "}"
       setup = do
         createDirectoryIfMissing True subDir
         TIO.writeFile (testDir </> "literal.nix") "42"
@@ -5772,6 +5775,7 @@ testImportIO = do
         TIO.writeFile (testDir </> "nested-inner.nix") "99"
         TIO.writeFile (testDir </> "nested-outer.nix") "import ./nested-inner.nix"
         TIO.writeFile (testDir </> "attrset.nix") "{ x = 1; y = 2; }"
+        TIO.writeFile (testDir </> "large-set.nix") largeSetSource
         TIO.writeFile (testDir </> "uses-arg.nix") "let f = x: x + 10; in f 5"
         TIO.writeFile (testDir </> "positions.nix") "{\n  a = 1;\n}\n"
         TIO.writeFile (testDir </> "curpos.nix") "\n  __curPos\n"
@@ -5791,6 +5795,13 @@ testImportIO = do
           testDir
           "(import ./literal.nix) + (import ./literal.nix)"
           (VInt 84),
+        -- A function compares equal only to itself, so the two imports
+        -- are equal only when they are one value: the file evaluated once.
+        runTestIO
+          "two imports of a file whose set is large are one value"
+          testDir
+          "import ./large-set.nix == import ./large-set.nix"
+          (VBool True),
         runTestIOFail "import nonexistent -> error" testDir "import ./nonexistent.nix",
         runTestIO "import attrset + select" testDir "(import ./attrset.nix).x" (VInt 1),
         runTestIO "import let/lambda" testDir "import ./uses-arg.nix" (VInt 15),

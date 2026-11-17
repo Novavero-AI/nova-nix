@@ -87,7 +87,7 @@ import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLe
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, uriAccess)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetSize, bytesToTextLossy, evaluated, marshalLambda, pathCell, primopCell, readComputed, readPending, storePathOrThrow, stringCell, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), bytesToTextLossy, evaluated, marshalLambda, pathCell, primopCell, readComputed, readPending, storePathOrThrow, stringCell, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -518,18 +518,13 @@ instance MonadEval EvalIO where
                         (unEvalIO (evalParsed (pure baseEnv) parsed))
                     )
             result <- nested
-            -- Skip caching very large attr sets (e.g. all-packages.nix
-            -- with 30k+ entries): the cache keeps what it holds for the
-            -- whole session, and nixpkgs imports all-packages.nix once,
-            -- at the top level, so skipping it costs nothing.  The value
-            -- is kept in a cell registered as a root.
-            shouldCache <- case result of
-              VAttrs attrs -> (< importCacheMaxAttrs) <$> attrSetSize attrs
-              _ -> pure True
-            when shouldCache $ do
-              cell <- evaluated result
-              crootsAddThunk (unThunk cell)
-              wrapIO (modifyIORef' cacheRef (Map.insert target cell))
+            -- Every file's value is cached, kept in a cell registered as
+            -- a root, as upstream's fileEvalCache keeps every file it
+            -- evaluates (eval.cc:1096 at 2.24.9): a later import of the
+            -- file is the same value.
+            cell <- evaluated result
+            crootsAddThunk (unThunk cell)
+            wrapIO (modifyIORef' cacheRef (Map.insert target cell))
             pure result
 
   -- Upstream's getEnv answers empty under either setting
@@ -988,12 +983,6 @@ storeComputed ptr val = do
 -- ---------------------------------------------------------------------------
 -- Constants
 -- ---------------------------------------------------------------------------
-
--- | Maximum attribute set size for import caching.  Results larger than this
--- are not cached, allowing GC to reclaim them.  Prevents the import cache
--- from retaining huge attr sets like nixpkgs' 30k-entry all-packages.nix.
-importCacheMaxAttrs :: Int
-importCacheMaxAttrs = 1000
 
 -- | The variable upstream reads its lookup path from.
 nixPathVar :: BS.ByteString
