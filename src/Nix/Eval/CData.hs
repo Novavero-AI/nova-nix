@@ -13,10 +13,10 @@
 -- it: a read sees memory as it is at that point and not whenever a lazy
 -- value happens to be demanded, and an allocation happens once each time
 -- the evaluation passes it, never shared by GHC between two passes.
--- That order is what lets a collector reclaim memory at a known point:
--- nothing still unevaluated can read a cell after it.
+-- A collector of the layer's memory needs that order: nothing still
+-- unevaluated can read a cell at a point the evaluation cannot see.
 --
--- Three functions read the layer outside a monad, each for one kind of
+-- Two functions read the layer outside a monad, each for one kind of
 -- use, with the invariant that makes it sound:
 --
 -- * 'readImmutable' reads an interned symbol's bytes ("Nix.Eval.Symbol"),
@@ -25,14 +25,11 @@
 --   later strings are interned, and a read takes the bytes' address
 --   before it copies them.  So no intern may run between the two, which
 --   holds while one thread at a time uses the layer.
--- * 'inspectForDisplay' backs the 'Show' and 'Eq' instances of the C
---   handles, which describe a value as it stands when they are forced.
---   Nothing the evaluator computes depends on them; tests compare values
---   with them, and a debugger shows them.
 -- * 'runCDataPure' runs a whole computation as a value: a pure
---   evaluation ('Nix.Eval.Types.runPureEval').  Such a computation writes only memory it allocated, the with-scope array
---   entries it resolves ('Nix.Eval.Types.resolveWithScopeAt'), each from
---   a set's thunk to the set the thunk evaluates to, and the static cell
+--   evaluation ('Nix.Eval.Types.runPureEval').  Such a computation
+--   writes only memory it allocated, the with-scope array entries it
+--   resolves ('Nix.Eval.Types.resolveWithScopeAt'), each from a set's
+--   thunk to the set the thunk evaluates to, and the static cell
 --   of a builtin it binds ('Nix.Eval.CThunk.cthunkPrimop'), which it
 --   fills with the one value that cell ever holds.  Two runs that resolve
 --   one entry make two sets with the same contents in different cells, so
@@ -54,7 +51,6 @@ module Nix.Eval.CData
 
     -- * Outside a monad
     readImmutable,
-    inspectForDisplay,
     runCDataPure,
   )
 where
@@ -99,17 +95,11 @@ readImmutable :: CData a -> a
 readImmutable (CData io) = unsafeDupablePerformIO io
 {-# INLINE readImmutable #-}
 
--- | Read a C value's current state for a 'Show' or 'Eq' instance.  The
--- answer is the state when the result is forced, which a later force or
--- update can change; no evaluation result depends on it.
-inspectForDisplay :: CData a -> a
-inspectForDisplay (CData io) = unsafePerformIO io
-
 -- | Run a computation that allocates as a value.  Sound for a computation
 -- that writes only memory it allocated, with-scope entries it resolves,
 -- with what two runs resolving one entry can show, and builtins' static
--- cells, which every run fills alike (see the module header): each run allocates memory of its own, and a run GHC
--- shares or never makes is not observable except through the addresses
--- of the values it returns.
+-- cells, which every run fills alike (see the module header): each run
+-- allocates memory of its own, and a run GHC shares or never makes is not
+-- observable except through the addresses of the values it returns.
 runCDataPure :: CData a -> a
 runCDataPure (CData io) = unsafePerformIO io

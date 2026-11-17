@@ -38,7 +38,6 @@ import Nix.Eval.Types
     attrSetAt,
     attrSetLookup,
     attrSetSize,
-    thunkSameRef,
     typeName,
     typeOfValue,
   )
@@ -371,7 +370,7 @@ thunkPairEqual forceFn (a, b) = do
 -- values.
 forcedPairEqual :: (MonadEval m) => Force m -> (Thunk, NixValue) -> (Thunk, NixValue) -> m Bool
 forcedPairEqual forceFn (a, va) (b, vb)
-  | thunkSameRef a b = pure True
+  | a == b = pure True
   | otherwise = nixEqual forceFn va vb
 
 -- ---------------------------------------------------------------------------
