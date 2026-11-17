@@ -136,7 +136,7 @@ import Nix.Eval.CData (MonadCData)
 import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CStr (cstrText)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
-import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, reassembleDouble, reassembleInt64)
+import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), BcCaptureInfo (..), BcInheritedName (..), decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, foldBcBindings, foldBcInheritedNames, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, plainContext)
 import Nix.Eval.EvalFormals (LambdaName, lambdaNameText)
 import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdate, expectInt, expectedFailure, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
@@ -181,8 +181,8 @@ import Nix.Eval.Types
     attrSetSize,
     attrSetToAscList,
     attrSetToMap,
+    buildBcCaptureEnv,
     buildCAttrSetKeys,
-    buildCaptureEnv,
     bytesToTextLossy,
     cheapThunkBc,
     clistFromThunks,
@@ -220,7 +220,6 @@ import Nix.Eval.Types
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types
   ( BinaryOp (..),
-    CaptureInfo (..),
     Expr (..),
     UnaryOp (..),
   )
@@ -377,18 +376,18 @@ literalWords bcIdx = (,) <$> cbcArg1 bcIdx <*> cbcArg2 bcIdx
 corruptBytecode :: (MonadEval m, Show tag) => Text -> tag -> m a
 corruptBytecode what tag = throwEvalError ("corrupt bytecode: unknown " <> what <> " " <> T.pack (show tag))
 
--- | Continue with the bindings at a data offset, or fail on a binding tag
--- the compiler never writes.  Inlined, so that each caller's continuation
--- is a known function rather than a closure allocated every time the
--- instruction runs.
-withBcBindings :: (MonadEval m) => Int -> Word32 -> ([BcBinding] -> m a) -> m a
-withBcBindings count dataOff next =
-  decodeBcBindings count dataOff >>= either (corruptBytecode "binding tag") next
-{-# INLINE withBcBindings #-}
+-- | Fold over bindings ('foldBcBindings'), or fail on a binding tag the
+-- compiler never writes.  Inlined, so that each caller's step is a known
+-- function rather than a closure allocated every time the instruction
+-- runs, and each caller's step has an INLINE pragma, so that a binding's
+-- fields reach it without the binding being allocated.
+foldBindings :: (MonadEval m) => (acc -> BcBinding -> m acc) -> acc -> BcBindings -> m acc
+foldBindings = foldBcBindings (corruptBytecode "binding tag")
+{-# INLINE foldBindings #-}
 
 -- | Continue with the capture info at a data offset, or fail on a capture
--- tag the compiler never writes.  Inlined, as 'withBcBindings' is.
-withBcCaptureInfo :: (MonadEval m) => Word32 -> (CaptureInfo -> m a) -> m a
+-- tag the compiler never writes.  Inlined, as 'foldBindings' is.
+withBcCaptureInfo :: (MonadEval m) => Word32 -> (BcCaptureInfo -> m a) -> m a
 withBcCaptureInfo captureOff next =
   decodeBcCaptureInfo captureOff >>= either (corruptBytecode "capture info tag") next
 {-# INLINE withBcCaptureInfo #-}
@@ -700,7 +699,7 @@ evalBcLambda env bcIdx0 = do
       bodyBcIdx <- cbcArg2 bcIdx0
       captureOff <- cbcArg3 bcIdx0
       withBcCaptureInfo captureOff $ \captureInfo -> do
-        closureEnv <- buildCaptureEnv EnvClosure env captureInfo
+        closureEnv <- buildBcCaptureEnv EnvClosure env captureInfo
         pure (VLambda closureEnv formals bodyBcIdx)
     Nothing -> corruptBytecode "formals type" flags_
 
@@ -795,11 +794,10 @@ hasBcAttrPath env n off val = case val of
 evalBcAttrs :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcAttrs env bcIdx0 = do
   isRec <- (/= 0) <$> cbcFlags bcIdx0
-  (bindCount, dataOff) <- countedPayload1 bcIdx0
-  withBcBindings bindCount dataOff $ \bindings ->
-    if isRec
-      then cbcArg2 bcIdx0 >>= \captureOff -> withBcCaptureInfo captureOff (evalBcRecAttrs env bindings)
-      else evalBcNonRecAttrs env bindings
+  bindings <- countedPayload1 bcIdx0 >>= uncurry decodeBcBindings
+  if isRec
+    then cbcArg2 bcIdx0 >>= \captureOff -> withBcCaptureInfo captureOff (evalBcRecAttrs env bindings)
+    else evalBcNonRecAttrs env bindings
 
 -- | Evaluate a non-recursive attr set from bytecode bindings: its static
 -- attributes ('bindStaticAttrs'), then its dynamic ones
@@ -813,21 +811,24 @@ evalBcAttrs env bcIdx0 = do
 -- env here is the enclosing one and is fully built, so reading a variable
 -- out of it now is safe; the recursive and @let@ paths knot-tie their own
 -- frame and cannot make the same shortcut.
-evalBcNonRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> m NixValue
+evalBcNonRecAttrs :: (MonadEval m) => Env -> BcBindings -> m NixValue
 evalBcNonRecAttrs env bindings =
   bindStaticAttrs cheapThunkBc env env bindings
-    >>= bindDynamicAttrs cheapThunkBc env bindings
-    >>= fmap VAttrs . attrSetFromSymbolEntriesSizedFor SetLiteral (literalSetSize bindings)
+    >>= fmap VAttrs . literalSet SetLiteral cheapThunkBc env bindings
 
--- | What upstream sizes a literal's set for: one attribute per static name
--- and one per dynamic binding (@attrs.size() + dynamicAttrs.size()@,
--- eval.cc:1193 at 2.24.9), so a literal whose every name is a null
--- @${...}@ makes an empty set of its own.
-literalSetSize :: [BcBinding] -> Int
-literalSetSize = foldl' countOne 0
+-- | The set of bindings whose static attributes are bound, with its
+-- dynamic ones bound in @dynamicEnv@ ('bindDynamicAttrs') when it has
+-- any.  It is sized as upstream sizes a literal's set, for one attribute
+-- per static name and one per dynamic binding (@attrs.size() +
+-- dynamicAttrs.size()@, eval.cc:1193 at 2.24.9), so a literal whose
+-- every name is a null @${...}@ makes an empty set of its own.
+literalSet :: (MonadEval m) => SetSite -> (Env -> Word32 -> m Thunk) -> Env -> BcBindings -> Map Symbol AttrEntry -> m AttrSet
+literalSet site mkValueThunk dynamicEnv bindings@(BcBindings (BcBindingCounts names dynamics) _ _) statics =
+  withDynamics >>= attrSetFromSymbolEntriesSizedFor site (names + dynamics)
   where
-    countOne !acc (BcInheritFrom _ names) = acc + length names
-    countOne !acc _ = acc + 1
+    withDynamics
+      | dynamics == 0 = pure statics
+      | otherwise = bindDynamicAttrs mkValueThunk dynamicEnv bindings statics
 
 -- | The construct a binding frame belongs to.
 data FrameKind = LetFrame | RecFrame
@@ -842,20 +843,35 @@ frameCaptureSite :: FrameKind -> EnvSite
 frameCaptureSite LetFrame = EnvLetCapture
 frameCaptureSite RecFrame = EnvRecCapture
 
+-- | How the frame of a recursive attr set or a @let@ holds its names.
+data FrameLayout
+  = -- | In this many slots, one per name in declaration order: every
+    -- name is static.
+    PositionalFrame !Int
+  | -- | In a name table: a name is dynamic.
+    ScopedFrame
+
+-- | The layout of the frame bindings make, from the names the compiler
+-- counted in their t'BcBindingCounts': by slot when no name is dynamic,
+-- as the resolver resolved the bindings' variables.
+frameLayout :: BcBindings -> FrameLayout
+frameLayout (BcBindings (BcBindingCounts names 0) _ _) = PositionalFrame names
+frameLayout _ = ScopedFrame
+
 -- | The frame of a recursive attr set or a @let@ in @env@ whose names are
 -- not all static: an env whose name table binds the static names
 -- ('bcBindingStaticKeys'), under @env@ as @captureInfo@ trims it
--- ('buildCaptureEnv'), whose with-scopes the frame sees.  Answers the env
+-- ('buildBcCaptureEnv'), whose with-scopes the frame sees.  Answers the env
 -- and the static attributes, bound in it ('bindStaticAttrs') and filled
 -- into its table before any dynamic name is evaluated in it, as
 -- upstream's @ExprAttrs::eval@ fills @env2@ first (eval.cc:1197-1221 at
 -- 2.24.9).  Inlined, as 'tieBindingFrame' is, so that each caller's sites
 -- are constants.
 {-# INLINE scopeBindingFrame #-}
-scopeBindingFrame :: (MonadCData m) => FrameKind -> Env -> [BcBinding] -> CaptureInfo -> m (Env, Map Symbol AttrEntry)
+scopeBindingFrame :: (MonadEval m) => FrameKind -> Env -> BcBindings -> BcCaptureInfo -> m (Env, Map Symbol AttrEntry)
 scopeBindingFrame kind env bindings captureInfo = do
-  scope <- buildCAttrSetKeys (bcBindingStaticKeys bindings)
-  parent <- buildCaptureEnv (frameCaptureSite kind) env captureInfo
+  scope <- bcBindingStaticKeys bindings >>= buildCAttrSetKeys
+  parent <- buildBcCaptureEnv (frameCaptureSite kind) env captureInfo
   frame <- newScopeEnv (frameSite kind) (Just parent) (AttrSet scope)
   statics <- bindStaticAttrs mkThunkBc frame env bindings
   fillCAttrSetValues scope (Map.map entryThunk statics)
@@ -865,91 +881,72 @@ scopeBindingFrame kind env bindings captureInfo = do
 -- frame's env and the thunks in its slots, in declaration order, tied by
 -- 'tieFrame' as upstream's @ExprAttrs::eval@ and @ExprLet::eval@ tie
 -- @env2@.  Its parent is @env@ as @captureInfo@ trims it
--- ('buildCaptureEnv'), whose with-scopes the frame sees.
+-- ('buildBcCaptureEnv'), whose with-scopes the frame sees, and it has
+-- the slots its 'PositionalFrame' layout counts.
 {-# INLINE tieBindingFrame #-}
-tieBindingFrame :: (MonadCData m) => FrameKind -> Env -> [BcBinding] -> CaptureInfo -> m (Env, [Thunk])
-tieBindingFrame kind env bindings captureInfo = do
-  parent <- buildCaptureEnv (frameCaptureSite kind) env captureInfo
-  tieFrame (frameSite kind) (Just parent) (bcBindingSlotCount bindings) (\frame -> buildBcSlotThunks frame env bindings)
+tieBindingFrame :: (MonadEval m) => FrameKind -> Env -> BcBindings -> BcCaptureInfo -> Int -> m (Env, [Thunk])
+tieBindingFrame kind env bindings captureInfo slotCount = do
+  parent <- buildBcCaptureEnv (frameCaptureSite kind) env captureInfo
+  tieFrame (frameSite kind) (Just parent) slotCount (\frame -> buildBcSlotThunks frame env bindings)
 
 -- | Evaluate a recursive attr set from bytecode bindings.
-evalBcRecAttrs :: (MonadEval m) => Env -> [BcBinding] -> CaptureInfo -> m NixValue
-evalBcRecAttrs env bindings captureInfo
-  | allBcPositional bindings = do
-      -- Positional path: slots for variable lookup, CAttrSet for return.
-      (_, thunkList) <- tieBindingFrame RecFrame env bindings captureInfo
-      VAttrs <$> attrSetFromSymbolEntries SetRec (staticAttrsFromSlots bindings thunkList)
-  | otherwise = do
-      -- Dynamic-key path: each dynamic name and value is evaluated in a
-      -- frame whose name table holds the static names, as upstream's are
-      -- in env2, so a dynamic name sees its static siblings and the
-      -- enclosing variables, and no other dynamic name.
-      (recEnv, statics) <- scopeBindingFrame RecFrame env bindings captureInfo
-      bindDynamicAttrs mkThunkBc recEnv bindings statics
-        >>= fmap VAttrs . attrSetFromSymbolEntriesSizedFor SetRec (literalSetSize bindings)
+evalBcRecAttrs :: (MonadEval m) => Env -> BcBindings -> BcCaptureInfo -> m NixValue
+evalBcRecAttrs env bindings captureInfo = case frameLayout bindings of
+  PositionalFrame slotCount -> do
+    -- Positional path: slots for variable lookup, CAttrSet for return.
+    (_, thunkList) <- tieBindingFrame RecFrame env bindings captureInfo slotCount
+    staticAttrsFromSlots bindings thunkList >>= fmap VAttrs . attrSetFromSymbolEntries SetRec
+  ScopedFrame -> do
+    -- Dynamic-key path: each dynamic name and value is evaluated in a
+    -- frame whose name table holds the static names, as upstream's are
+    -- in env2, so a dynamic name sees its static siblings and the
+    -- enclosing variables, and no other dynamic name.
+    (recEnv, statics) <- scopeBindingFrame RecFrame env bindings captureInfo
+    VAttrs <$> literalSet SetRec mkThunkBc recEnv bindings statics
 
 -- | Evaluate a let expression from bytecode.
 evalBcLet :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcLet env bcIdx0 = do
-  (bindCount, dataOff) <- countedPayload1 bcIdx0
+  bindings <- countedPayload1 bcIdx0 >>= uncurry decodeBcBindings
   bodyIdx <- cbcArg2 bcIdx0
   captureOff <- cbcArg3 bcIdx0
-  withBcBindings bindCount dataOff $ \bindings ->
-    withBcCaptureInfo captureOff $ \captureInfo ->
-      if allBcPositional bindings
-        then do
-          -- Positional path: slots for O(1) lookup.
-          (letEnv, _) <- tieBindingFrame LetFrame env bindings captureInfo
-          evalBytecode letEnv bodyIdx
-        else do
-          -- Dynamic path: a dynamic key, which the parser refuses in a
-          -- let as upstream's parser.y does, so only an AST built
-          -- outside the parser reaches here.  Its dynamic names are
-          -- evaluated and checked in the let env as a recursive set's
-          -- are, and bind nothing: the body sees the static names alone.
-          (letEnv, statics) <- scopeBindingFrame LetFrame env bindings captureInfo
-          void (bindDynamicAttrs mkThunkBc letEnv bindings statics)
-          evalBytecode letEnv bodyIdx
-
--- | Check if all bytecode bindings are static keys (eligible for positional).
--- Must stay in sync with @allStaticSingleKey@ in "Nix.Expr.Resolve".
-allBcPositional :: [BcBinding] -> Bool
-allBcPositional = all isEligible
-  where
-    isEligible (BcNamed _ (BcStaticKey _) _) = True
-    isEligible (BcInherit {}) = True
-    isEligible (BcInheritFrom _ _) = True
-    isEligible _ = False
-
--- | Count positional slots for bytecode bindings.
--- Must stay in sync with @lexicalScopeFromBindings@ in "Nix.Expr.Resolve".
-bcBindingSlotCount :: [BcBinding] -> Int
-bcBindingSlotCount = foldl' countOne 0
-  where
-    countOne !acc (BcNamed _ (BcStaticKey _) _) = acc + 1
-    countOne !acc (BcInherit {}) = acc + 1
-    countOne !acc (BcInheritFrom _ names) = acc + length names
-    countOne !acc _ = acc
+  withBcCaptureInfo captureOff $ \captureInfo -> case frameLayout bindings of
+    PositionalFrame slotCount -> do
+      -- Positional path: slots for O(1) lookup.
+      (letEnv, _) <- tieBindingFrame LetFrame env bindings captureInfo slotCount
+      evalBytecode letEnv bodyIdx
+    ScopedFrame -> do
+      -- Dynamic path: a dynamic key, which the parser refuses in a
+      -- let as upstream's parser.y does, so only an AST built
+      -- outside the parser reaches here.  Its dynamic names are
+      -- evaluated and checked in the let env as a recursive set's
+      -- are, and bind nothing: the body sees the static names alone.
+      (letEnv, statics) <- scopeBindingFrame LetFrame env bindings captureInfo
+      void (bindDynamicAttrs mkThunkBc letEnv bindings statics)
+      evalBytecode letEnv bodyIdx
 
 -- | Build thunks for positional bytecode bindings in declaration order.
 -- An inherited variable is read from the enclosing env, as upstream's
 -- @ExprAttrs::eval@ and @ExprLet::eval@ evaluate an Inherited attribute
 -- there through @maybeThunk@ (eval.cc at 2.24.9); that env is fully
 -- built, so the variable's own thunk can be shared now.
-buildBcSlotThunks :: (MonadCData m) => Env -> Env -> [BcBinding] -> m [Thunk]
-buildBcSlotThunks recEnv outerEnv bindings = concat <$> mapM slotThunk bindings
+buildBcSlotThunks :: (MonadEval m) => Env -> Env -> BcBindings -> m [Thunk]
+buildBcSlotThunks recEnv outerEnv bindings = reverse <$> foldBindings slotThunks [] bindings
   where
-    slotThunk (BcNamed _ (BcStaticKey _) valBcIdx) =
-      pure <$> mkThunkBc recEnv valBcIdx
-    slotThunk (BcInherit _ _ valBcIdx) =
-      pure <$> cheapThunkBc outerEnv valBcIdx
-    slotThunk (BcInheritFrom fromBcIdx names) = do
+    {-# INLINE slotThunks #-}
+    slotThunks made (BcNamed _ _ valBcIdx) =
+      (: made) <$> mkThunkBc recEnv valBcIdx
+    slotThunks made (BcInherit _ _ valBcIdx) =
+      (: made) <$> cheapThunkBc outerEnv valBcIdx
+    slotThunks made (BcInheritFrom fromBcIdx names) = do
       -- inherit (from) x y z; becomes one thunk per name that selects
       -- from the from-expr, each in the clause's env ('inheritFromEnv').
       fromEnv <- mkThunkBc recEnv fromBcIdx >>= inheritFromEnv
-      mapM (inheritedSelect fromEnv) names
-    -- Unreachable: allBcPositional guards this path.
-    slotThunk _ = pure []
+      foldBcInheritedNames (\selects inherited -> (: selects) <$> inheritedSelect fromEnv inherited) made names
+    -- Unreachable for compiled code: the compiler counts every dynamic
+    -- name, and frameLayout makes a positional frame only when it counts
+    -- none.
+    slotThunks made (BcDynamic {}) = pure made
 
 -- | The env an @inherit (from)@ clause's selects run in: the from-value's
 -- thunk at slot 0, one env for every name of the clause, as upstream's
@@ -963,23 +960,28 @@ inheritFromEnv fromThunk = newEnv EnvInheritFrom Nothing [fromThunk]
 inheritedSelect :: (MonadCData m) => Env -> BcInheritedName -> m Thunk
 inheritedSelect fromEnv (BcInheritedName _ _ selectBcIdx) = mkThunkBc fromEnv selectBcIdx
 
+-- | Positional attributes being matched with their slots' thunks.
+data SlotWalk = SlotWalk !(Map Symbol AttrEntry) ![Thunk]
+
 -- | The attributes of positional bytecode bindings, from the thunks
 -- 'buildBcSlotThunks' made for their slots: each under the symbol the
 -- bytecode holds for it and at its binding's position.
-staticAttrsFromSlots :: [BcBinding] -> [Thunk] -> Map Symbol AttrEntry
-staticAttrsFromSlots bindings thunks = go bindings thunks Map.empty
+staticAttrsFromSlots :: (MonadEval m) => BcBindings -> [Thunk] -> m (Map Symbol AttrEntry)
+staticAttrsFromSlots bindings thunks = (\(SlotWalk attrs _) -> attrs) <$> foldBindings step (SlotWalk Map.empty thunks) bindings
   where
-    go [] _ !acc = acc
-    go (BcNamed pos (BcStaticKey sym) _ : bs) (t : ts) !acc =
-      go bs ts (Map.insert (Symbol sym) (AttrEntry pos t) acc)
-    go (BcInherit pos sym _ : bs) (t : ts) !acc =
-      go bs ts (Map.insert (Symbol sym) (AttrEntry pos t) acc)
-    go (BcInheritFrom _ names : bs) ts !acc =
-      let (used, rest) = splitAt (length names) ts
-          insertName a (BcInheritedName pos sym _, t0) = Map.insert (Symbol sym) (AttrEntry pos t0) a
-       in go bs rest (foldl' insertName acc (zip names used))
-    -- Unreachable: allBcPositional guards this path.
-    go (_ : bs) ts !acc = go bs ts acc
+    {-# INLINE step #-}
+    step (SlotWalk acc (t : ts)) (BcNamed pos sym _) =
+      pure (SlotWalk (Map.insert (Symbol sym) (AttrEntry pos t) acc) ts)
+    step (SlotWalk acc (t : ts)) (BcInherit pos sym _) =
+      pure (SlotWalk (Map.insert (Symbol sym) (AttrEntry pos t) acc) ts)
+    step walk (BcInheritFrom _ names) = foldBcInheritedNames insertName walk names
+    -- Unreachable for compiled code: frameLayout makes a positional frame
+    -- only when the compiler counts no dynamic name, and of as many slots
+    -- as it counts static names, so there is a thunk for each.
+    step walk _ = pure walk
+    insertName (SlotWalk acc (t : ts)) (BcInheritedName pos sym _) =
+      pure (SlotWalk (Map.insert (Symbol sym) (AttrEntry pos t) acc) ts)
+    insertName walk _ = pure walk
 
 -- | The attributes bindings name statically, which upstream's
 -- @ExprAttrs::eval@ binds before any dynamic one (eval.cc:1197-1254 at
@@ -996,12 +998,13 @@ staticAttrsFromSlots bindings thunks = go bindings thunks Map.empty
 -- the variables point at are not filled yet.  An inherited variable is read
 -- from @outerEnv@, the env around the binding set, which is always built
 -- (for a non-recursive set it is @thunkEnv@ itself).
-bindStaticAttrs :: (MonadCData m) => (Env -> Word32 -> m Thunk) -> Env -> Env -> [BcBinding] -> m (Map Symbol AttrEntry)
-bindStaticAttrs mkValueThunk thunkEnv outerEnv = foldM addBinding Map.empty
+bindStaticAttrs :: (MonadEval m) => (Env -> Word32 -> m Thunk) -> Env -> Env -> BcBindings -> m (Map Symbol AttrEntry)
+bindStaticAttrs mkValueThunk thunkEnv outerEnv = foldBindings addBinding Map.empty
   where
-    addBinding !bound (BcNamed pos (BcStaticKey sym) valBcIdx) =
+    {-# INLINE addBinding #-}
+    addBinding !bound (BcNamed pos sym valBcIdx) =
       bindAt bound pos sym <$> mkValueThunk thunkEnv valBcIdx
-    addBinding !bound (BcNamed _ (BcDynamicKey _) _) = pure bound
+    addBinding !bound (BcDynamic {}) = pure bound
     addBinding !bound (BcInherit pos sym valBcIdx) =
       bindAt bound pos sym <$> cheapThunkBc outerEnv valBcIdx
     addBinding !bound (BcInheritFrom fromBcIdx names) = do
@@ -1014,7 +1017,7 @@ bindStaticAttrs mkValueThunk thunkEnv outerEnv = foldM addBinding Map.empty
       fromEnv <- mkThunkBc thunkEnv fromBcIdx >>= inheritFromEnv
       let addInheritFrom !acc inherited@(BcInheritedName pos sym _) =
             bindAt acc pos sym <$> inheritedSelect fromEnv inherited
-      foldM addInheritFrom bound names
+      foldBcInheritedNames addInheritFrom bound names
     bindAt bound pos sym thunk = Map.insert (Symbol sym) (AttrEntry pos thunk) bound
 
 -- | Bind the dynamic attributes of bindings whose static ones are bound,
@@ -1025,10 +1028,11 @@ bindStaticAttrs mkValueThunk thunkEnv outerEnv = foldM addBinding Map.empty
 -- where the name was defined, before the next name is evaluated.  Any
 -- other name is bound at its binding's position to its value, a thunk in
 -- @dynamicEnv@ made as the caller's @mkValueThunk@ makes one.
-bindDynamicAttrs :: (MonadEval m) => (Env -> Word32 -> m Thunk) -> Env -> [BcBinding] -> Map Symbol AttrEntry -> m (Map Symbol AttrEntry)
-bindDynamicAttrs mkValueThunk dynamicEnv bindings statics = foldM bindDynamic statics bindings
+bindDynamicAttrs :: (MonadEval m) => (Env -> Word32 -> m Thunk) -> Env -> BcBindings -> Map Symbol AttrEntry -> m (Map Symbol AttrEntry)
+bindDynamicAttrs mkValueThunk dynamicEnv bindings statics = foldBindings bindDynamic statics bindings
   where
-    bindDynamic !bound (BcNamed pos (BcDynamicKey keyBcIdx) valBcIdx) =
+    {-# INLINE bindDynamic #-}
+    bindDynamic !bound (BcDynamic pos keyBcIdx valBcIdx) =
       resolveBcDynamicKey dynamicEnv keyBcIdx >>= \case
         Nothing -> pure bound
         Just sym -> case Map.lookup sym bound of
@@ -1055,19 +1059,19 @@ resolveBcDynamicKey env keyBcIdx =
 internComputedName :: (MonadEval m) => NixValue -> m Symbol
 internComputedName = attrNameOf "dynamic attribute key" >=> symbolIntern
 
--- | The names bindings bind statically, in source order: static keys and
--- inherited names, which 'bindStaticAttrs' binds.  They are the name
--- table of a frame whose names are not all static ('scopeBindingFrame'),
--- in which a dynamic name and value are evaluated, so they see a static
--- sibling and the enclosing variables, as upstream's see @env2@, and no
--- dynamic name.
-bcBindingStaticKeys :: [BcBinding] -> [Symbol]
-bcBindingStaticKeys = concatMap oneBinding
+-- | The names bindings bind statically: static keys and inherited names,
+-- which 'bindStaticAttrs' binds.  They are the name table of a frame
+-- whose names are not all static ('scopeBindingFrame'), in which a
+-- dynamic name and value are evaluated, so they see a static sibling and
+-- the enclosing variables, as upstream's see @env2@, and no dynamic name.
+bcBindingStaticKeys :: (MonadEval m) => BcBindings -> m [Symbol]
+bcBindingStaticKeys = foldBindings oneBinding []
   where
-    oneBinding (BcNamed _ (BcStaticKey sym) _) = [Symbol sym]
-    oneBinding (BcNamed {}) = []
-    oneBinding (BcInherit _ sym _) = [Symbol sym]
-    oneBinding (BcInheritFrom _ names) = [Symbol sym | BcInheritedName _ sym _ <- names]
+    {-# INLINE oneBinding #-}
+    oneBinding keys (BcNamed _ sym _) = pure (Symbol sym : keys)
+    oneBinding keys (BcDynamic {}) = pure keys
+    oneBinding keys (BcInherit _ sym _) = pure (Symbol sym : keys)
+    oneBinding keys (BcInheritFrom _ names) = foldBcInheritedNames (\acc (BcInheritedName _ sym _) -> pure (Symbol sym : acc)) keys names
 
 -- ---------------------------------------------------------------------------
 -- Variables
@@ -1089,7 +1093,7 @@ evalVar env name =
 -- 2.24.9).  The resolver makes an 'EWithVar' only of a name no lexical
 -- binding and no global binds, so no other lookup could find it.  A
 -- trimmed closure's env holds the with-scopes it was made under
--- ('CapturesWithScopes').
+-- ('BcCapturesWithScopes').
 -- Supports both resolved and lazy with-scope entries ('withScopeAt').  A
 -- lazy entry is forced on first lookup and replaced in place by its set
 -- ('resolveWithScopeAt'), so subsequent lookups read the set directly.
