@@ -103,7 +103,7 @@ import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecorder, noPos, recordPos)
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.StringInterp (joinCoercedList)
-import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolLen, symbolText)
+import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolCount, symbolIntern, symbolLen, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), Pending (..), attrSetFromEntries, attrSetFromEntriesSizedFor, attrSetKeys, attrSetRemoveKeys, attrSetToMap, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkApply2Thunk, mkApplyThunk, mkThunkBc, newEnv, newScopeEnv, pushLazyWithScope, readComputed, readPending, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
@@ -24262,15 +24262,17 @@ servedLine = "served without an exception"
 -- | The paths a library user reaches the C layer by.  The first C call
 -- of each of the first five lands in a different sub-arena, and the
 -- sixth runs a whole session first, so both ends of the window are
--- covered.  The next two read the shared @null@, @true@ and
--- @false@ thunks, which must be valid in every window: were they arena
--- cells behind a process-lifetime CAF, forcing one outside the window
--- would poison it with 'ArenaNotInitialized' for every later arena, and
--- forcing one inside a session would leave it pointing into memory the
--- session's end frees, a use-after-free the ASan job reports.  The
--- last evaluates an empty string before anything else in a fresh arena:
--- its payload of no words sits at data offset 0, which the store does
--- not hold yet, so a read there fails the store's bounds assertion.
+-- covered.  The seventh reads a symbol, which the table answers outside
+-- the window as it answers an id it does not hold.  The next two read
+-- the shared @null@, @true@ and @false@ thunks, which must be valid in
+-- every window: were they arena cells behind a process-lifetime CAF,
+-- forcing one outside the window would poison it with
+-- 'ArenaNotInitialized' for every later arena, and forcing one inside a
+-- session would leave it pointing into memory the session's end frees,
+-- a use-after-free the ASan job reports.  The last evaluates an empty
+-- string before anything else in a fresh arena: its payload of no words
+-- sits at data offset 0, which the store does not hold yet, so a read
+-- there fails the store's bounds assertion.
 arenaGuardPaths :: [ArenaGuardPath]
 arenaGuardPaths =
   [ noArena "compile" "nn_bc_emit" evalNamelessProgram,
@@ -24279,6 +24281,7 @@ arenaGuardPaths =
     noArena "symbol" "nn_symbol_intern" (void (symbolIntern "a")),
     noArena "env" "nn_env_new" (void (evaluated VNull >>= \nullCell -> newEnv EnvClosure Nothing [nullCell])),
     noArena "after-session" "nn_bc_emit" (inTestSession (pure ()) >> evalNamelessProgram),
+    noArena "symbol-read" "nn_symbol_text" (void (evaluate (symbolText (Symbol 1)))),
     ArenaGuardPath
       { guardName = "constants-outside-window",
         guardClaim = "the null, true and false thunks read correctly outside every session and in a later one",
@@ -25407,8 +25410,17 @@ testSymbol = do
         pure (assertEqual "len" 7 (symbolLen sym)),
       runTestM "empty string interns" $ do
         sym <- symbolIntern ""
-        let txt = symbolText sym
-        pure (assertEqual "empty" "" txt),
+        pure (assertEqual "text and length" ("", 0) (symbolText sym, symbolLen sym)),
+      runTestM "the invalid symbol id reads as no name" $
+        pure (assertEqual "text and length" ("", 0) (symbolText (Symbol invalidSymbolId), symbolLen (Symbol invalidSymbolId))),
+      -- The table answers an id past its count as it answers the invalid
+      -- one, so only the readers' check tells the defect from no name.
+      runTestM "reading a symbol id past the table's count raises CInvariantViolated" $ do
+        count <- symbolCount
+        let unheld = Symbol (count + 1)
+        text <- try (evaluate (symbolText unheld))
+        len <- try (evaluate (symbolLen unheld))
+        pure (assertEqual "sites" (Just "nn_symbol_text", Just "nn_symbol_len") (violatedAt text, violatedAt len)),
       runTestM "symbolCount tracks unique entries" $ do
         _ <- symbolIntern "alpha"
         _ <- symbolIntern "beta"
@@ -25424,6 +25436,11 @@ testSymbol = do
         let unique = length (Set.fromList (map unSymbol syms))
         pure (assertEqual "1000 unique" 1000 unique)
     ]
+  where
+    violatedAt :: Either CStatusError a -> Maybe String
+    violatedAt = \case
+      Left (CInvariantViolated site _) -> Just site
+      _ -> Nothing
 
 -- ---------------------------------------------------------------------------
 -- C attribute set (FFI)
