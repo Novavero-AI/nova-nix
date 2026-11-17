@@ -5,15 +5,28 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Novavero-AI/nova-nix/blob/main/LICENSE)
 
 nova-nix is an implementation of [Nix](https://nixos.org) for Windows, macOS
-and Linux. It evaluates Nix expressions, builds derivations into a Nix store,
-downloads from binary caches and uploads to a nova-cache server. Its store
-paths for nixpkgs match upstream Nix's, so on Linux and macOS it downloads what
-cache.nixos.org has built. On Windows it runs natively, with no WSL or existing
-Nix installation.
+and Linux. It evaluates Nix expressions, builds derivations into a Nix store
+and downloads from binary caches. Its commands are its own: `nova-nix eval`
+and `nova-nix build` take the place of `nix-instantiate --eval` and
+`nix-build`.
 
-Its commands are its own: `nova-nix eval` and `nova-nix build` take the place
-of `nix-instantiate --eval` and `nix-build`. nova-nix is experimental;
-[What is missing](#what-is-missing) lists what it does not do.
+- **Upstream's derivations.** On each nixpkgs tree [the scoreboard][scoreboard]
+  walks, every package `nix-env -qa` lists for x86_64-linux that upstream Nix
+  evaluates gets the same drvPath from nova-nix. Its store paths are
+  upstream's, so on Linux and macOS it downloads what cache.nixos.org has
+  built, checked against the cache's signature.
+- **Native on Windows.** It runs with no WSL or existing Nix installation, and
+  [`pkgs/windows`] builds a toolchain from source: from [stage0-pe32]'s seed,
+  through GNU Mes and TinyCC, to GCC with C++, on x64 Windows and, under its
+  x86 emulation, on ARM64 Windows.
+- **Rebuild checks.** `build --check` builds a derivation again and compares
+  the result with the store's, as `nix-build --check` does.
+- **Closure reports.** `trust` lists the fixed-output derivations a closure
+  bottoms out in, and which of them run as builders or hold prebuilt code.
+- **Cache uploads.** `push` uploads store paths and their closures to a
+  [nova-cache] server.
+
+nova-nix is experimental; [Status](#status) says what it does not do.
 
 ## Install
 
@@ -109,7 +122,12 @@ or downloads. `build`, `store gc` and `store delete` refuse such a store.
 `eval` refuses it once the evaluation writes to the store, as
 `builtins.toFile`, `builtins.path` and the fetchers do, and `trust` once it
 fetches a fixed-output input. Where upstream Nix is installed, give nova-nix
-another directory with `--store`.
+another directory with `--store`. A build in a store other than `/nix/store`
+or `C:\nix\store` writes that store's directory into its output, so the output
+differs from upstream's at the same store path.
+
+Each `nova-nix` process opens the store itself, with no daemon, so whoever
+builds needs write access to the store directory.
 
 **Linux.** The store is `/nix/store`, which nova-nix creates when `/nix` is
 yours:
@@ -133,11 +151,12 @@ error: /nix: createDirectory: permission denied (Read-only file system)
 Give those commands a store in your home directory, `--store ~/nix/store`, as
 the examples below do.
 
-**Windows.** The store is `C:\nix\store`, which nova-nix creates. Turn on
-Developer Mode (Settings, For developers): nova-nix makes native symlinks,
-inside store paths and for `--out-link`, and Windows allows them only in
-Developer Mode or an elevated shell. Without either, building or downloading a
-path that holds a symlink fails.
+**Windows.** The store is `C:\nix\store`, which nova-nix creates, and it
+inherits the drive root's permissions, so every signed-in user can modify it.
+Turn on Developer Mode (Settings, For developers): nova-nix makes native
+symlinks, inside store paths and for `--out-link`, and Windows allows them only
+in Developer Mode or an elevated shell. Without either, building or downloading
+a path that holds a symlink fails.
 
 Expressions see store paths as `/nix/store/...` on Windows too, so a
 derivation has the same store path whichever platform evaluates it; a build
@@ -204,8 +223,7 @@ $ nova-nix eval --strict --expr '{ a = 1 + 1; }'
 
 `eval` prints a value as `nix-instantiate --eval` does. A part of it that
 evaluation never needed prints as `<CODE>`, and `--strict` evaluates the whole
-value first. A
-file evaluates the same way:
+value first. A file evaluates the same way:
 
 ```console
 $ cat greet.nix
@@ -226,7 +244,9 @@ hello
 
 `build` prints the output's path on stdout and its progress on stderr.
 `-o result` links the output from `./result` and makes it a root that
-`nova-nix store gc` keeps. On Linux with `/nix` set up, leave out `--store`.
+`nova-nix store gc` keeps; without it nothing is linked. The collector does not
+keep the `.drv` behind a rooted output, or a path a running program has open.
+On Linux with `/nix` set up, leave out `--store`.
 
 ### Build GNU Hello on Windows
 
@@ -285,37 +305,20 @@ $ ./result/bin/hello
 Hello, world!
 ```
 
-`nova-nix --help` lists the other commands, among them `trust`, which reports
-the fixed-output derivations a build relies on and which of them hold prebuilt
-code, and `push`, which uploads store paths and their closures to a
-[nova-cache] server.
+## Status
 
-## What is missing
+Not implemented yet, and on the [roadmap]: flakes, `nix-shell` and
+`nix develop`, profiles (`nix-env`, `nix profile`; run a program from its store
+path or an `--out-link` instead), and a daemon for a multi-user store. Builds
+are not sandboxed on any platform: a builder can read and write outside its
+build directory and reach the network.
 
-- No flakes.
-- No `nix-shell` or `nix develop`.
-- No profiles and no installing to `PATH` (`nix-env`, `nix profile`): run a
-  program from its store path or from an `--out-link`.
-- No daemon or multi-user mode: each `nova-nix` process opens the store
-  itself, so whoever builds needs write access to the store directory.
-- No build sandbox on any platform: a builder can read and write outside its
-  build directory and reach the network.
-- Evaluation is slower than upstream's.
-- `eval` and `build` take a file or `--expr`, not a directory or a search-path
-  argument such as `<nixpkgs>` (an expression can use one); they take no
-  `--arg` or `--argstr`, and do not call a function the file evaluates to.
-- `build` builds one derivation, where `nix-build` builds each one in a list or
-  set.
-- `build` creates no `./result` link unless `--out-link` is given.
-- A build in a store other than `/nix/store` or `C:\nix\store` writes that
-  store's directory into its output, so the output differs from upstream's at
-  the same store path.
-- On Windows the store inherits the drive root's permissions, so every
-  signed-in user can modify it.
-- `store gc` does not keep what a running program has open, or the `.drv`
-  behind a rooted output.
-- `builtins.fetchurl` runs `curl`, `builtins.fetchTarball` runs `sh`, `curl`
-  and `tar`, and `builtins.fetchGit` runs `git`, each from `PATH`.
+`eval` and `build` take a file or `--expr`, not a directory or a search-path
+argument such as `<nixpkgs>` (an expression can use one). They take no `--arg`
+or `--argstr` and do not call a function the file evaluates to, and `build`
+builds one derivation, where `nix-build` builds each one in a list or set.
+`builtins.fetchurl` runs `curl`, `builtins.fetchTarball` runs `sh`, `curl` and
+`tar`, and `builtins.fetchGit` runs `git`, each from `PATH`.
 
 ## Where to read more
 
@@ -349,9 +352,8 @@ cabal test
 
 ## Contributing
 
-See [CONTRIBUTING.md]. Planned work is on the
-[Nova roadmap](https://github.com/orgs/Novavero-AI/projects/1) project. Please
-report security issues privately through
+See [CONTRIBUTING.md]. Planned work is on the [Nova roadmap][roadmap]
+project. Please report security issues privately through
 [GitHub's vulnerability reporting](https://github.com/Novavero-AI/nova-nix/security/advisories/new)
 rather than in a public issue.
 
@@ -370,3 +372,4 @@ Apache-2.0. See [LICENSE] and [NOTICE].
 [CONTRIBUTING.md]: https://github.com/Novavero-AI/nova-nix/blob/main/CONTRIBUTING.md
 [LICENSE]: https://github.com/Novavero-AI/nova-nix/blob/main/LICENSE
 [NOTICE]: https://github.com/Novavero-AI/nova-nix/blob/main/NOTICE
+[roadmap]: https://github.com/orgs/Novavero-AI/projects/1
