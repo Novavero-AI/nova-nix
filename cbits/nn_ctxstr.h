@@ -19,8 +19,8 @@
  * of every name interned after it.
  *
  * Memory: each nn_ctxstr_t is a single contiguous allocation via
- * C99 flexible array member.  Headers are tracked globally for
- * bulk cleanup via nn_ctxstr_free_all().
+ * C99 flexible array member, tracked (nn_tracker.h) for bulk cleanup via
+ * nn_ctxstr_free_all().
  */
 
 #ifndef NN_CTXSTR_H
@@ -29,6 +29,7 @@
 #include <stdint.h>
 
 #include "nn_str.h"
+#include "nn_tracker.h"
 
 /* --- Context element tags --- */
 
@@ -76,8 +77,7 @@ void nn_ctxstr_free_all(void);
 
 /* --- Element setters --- */
 
-/* idx must be < ctx_count: a NULL struct or an index past it aborts
- * (NN_ASSERT). */
+/* idx must be < ctx_count: an index past it aborts (NN_ASSERT). */
 
 void nn_ctxstr_set_plain(nn_ctxstr_t *s, uint32_t idx,
                          nn_str_t *sp_hash, nn_str_t *sp_name);
@@ -94,8 +94,8 @@ void nn_ctxstr_set_all_outputs(nn_ctxstr_t *s, uint32_t idx,
 nn_str_t *nn_ctxstr_text(const nn_ctxstr_t *s);
 uint32_t  nn_ctxstr_ctx_count(const nn_ctxstr_t *s);
 
-/* Element reads take idx < ctx_count: a NULL struct or an index past it
- * aborts (NN_ASSERT). */
+/* Element reads take idx < ctx_count: an index past it aborts
+ * (NN_ASSERT). */
 uint8_t   nn_ctxstr_elem_tag(const nn_ctxstr_t *s, uint32_t idx);
 nn_str_t *nn_ctxstr_elem_hash(const nn_ctxstr_t *s, uint32_t idx);
 nn_str_t *nn_ctxstr_elem_name(const nn_ctxstr_t *s, uint32_t idx);
@@ -103,11 +103,10 @@ nn_str_t *nn_ctxstr_elem_output(const nn_ctxstr_t *s, uint32_t idx);
 
 /* --- Census (nn_stats.h) --- */
 
-/* The tracked strings, in no particular order: the module's own array,
- * valid until the next string is created or nn_ctxstr_free_all runs.
- * Writes how many it holds to *count and how many it has room for to
- * *capacity. */
-nn_ctxstr_t *const *nn_ctxstr_tracked(uint32_t *count, uint32_t *capacity);
+/* Every string allocated and not yet freed: the module's own tracker,
+ * whose array moves when the next string is created and is freed by
+ * nn_ctxstr_free_all. */
+const nn_tracker_t *nn_ctxstr_tracked(void);
 
 /* Bytes a string holds from the allocator: its header and its context
  * elements. */

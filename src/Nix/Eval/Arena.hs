@@ -11,20 +11,21 @@
 -- 'Nix.Eval.force', the value constructors that make a cell or intern a
 -- name) raises 'Nix.Eval.CStatus.ArenaNotInitialized' naming the C entry
 -- point that refused, rather than dereferencing state that does not
--- exist.  The tracked objects (sets, list headers, lambdas, strings with
--- context, partial applications) are malloc'd, so the binding modules'
--- own constructors for them work outside a session, and the next
--- teardown frees what they made.  Parsing ("Nix.Parser") is pure and
--- needs no arena.  The @null@, @true@, @false@ and empty list cells and each
--- builtin's own cell are C statics outside every arena, so forcing one
--- needs no session and survives every one.
+-- exist.  The tracked objects (sets, lambdas, strings with context,
+-- partial applications) are malloc'd, so the binding modules' own
+-- constructors for them work outside a session, and the next teardown
+-- frees what they made.  A list's header is malloc'd too, but its items
+-- live in the env pages, so outside a session the one list there is to
+-- make is the empty one, which has neither.  Parsing ("Nix.Parser") is
+-- pure and needs no arena.  The @null@, @true@, @false@ and empty list
+-- cells and each builtin's own cell are C statics outside every arena, so
+-- forcing one needs no session and survives every one.
 module Nix.Eval.Arena
   ( arenaInit,
     arenaDestroy,
   )
 where
 
-import Data.Word (Word32)
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.Symbol (symbolIntern)
 
@@ -32,7 +33,7 @@ import Nix.Eval.Symbol (symbolIntern)
 -- The C lifecycle, which only this module calls
 -- ---------------------------------------------------------------------------
 
-foreign import ccall unsafe "nn_symbol_init" c_nn_symbol_init :: Word32 -> IO ()
+foreign import ccall unsafe "nn_symbol_init" c_nn_symbol_init :: IO ()
 
 foreign import ccall unsafe "nn_symbol_destroy" c_nn_symbol_destroy :: IO ()
 
@@ -40,7 +41,7 @@ foreign import ccall unsafe "nn_str_init" c_nn_str_init :: IO ()
 
 foreign import ccall unsafe "nn_str_destroy" c_nn_str_destroy :: IO ()
 
-foreign import ccall unsafe "nn_thunk_init" c_nn_thunk_init :: Word32 -> IO ()
+foreign import ccall unsafe "nn_thunk_init" c_nn_thunk_init :: IO ()
 
 foreign import ccall unsafe "nn_thunk_destroy" c_nn_thunk_destroy :: IO ()
 
@@ -48,7 +49,7 @@ foreign import ccall unsafe "nn_env_init" c_nn_env_init :: IO ()
 
 foreign import ccall unsafe "nn_env_destroy" c_nn_env_destroy :: IO ()
 
-foreign import ccall unsafe "nn_bytecode_init" c_nn_bytecode_init :: Word32 -> Word32 -> IO ()
+foreign import ccall unsafe "nn_bytecode_init" c_nn_bytecode_init :: IO ()
 
 foreign import ccall unsafe "nn_bytecode_destroy" c_nn_bytecode_destroy :: IO ()
 
@@ -64,27 +65,23 @@ foreign import ccall unsafe "nn_list_free_all" c_nn_list_free_all :: IO ()
 
 foreign import ccall unsafe "nn_attrset_free_all" c_nn_attrset_free_all :: IO ()
 
--- | The capacity hint that asks a C arena for its default size.
-defaultCapacity :: Word32
-defaultCapacity = 0
-
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
 -- | Initialize all C data layer arenas, as the outermost evaluation
--- session starts: symbol table, string arena, thunk arena, env slot
--- allocator, bytecode store.  The new symbol table interns upstream's
--- startup names ('startupSymbols') before anything else can, so that a
--- name gets the symbol upstream's would.
+-- session starts: symbol table, string arena, thunk arena, env pages,
+-- bytecode store.  The new symbol table interns upstream's startup names
+-- ('startupSymbols') before anything else can, so that a name gets the
+-- symbol upstream's would.
 arenaInit :: IO ()
 arenaInit = do
-  c_nn_symbol_init defaultCapacity
+  c_nn_symbol_init
   mapM_ symbolIntern startupSymbols
   c_nn_str_init
-  c_nn_thunk_init defaultCapacity
+  c_nn_thunk_init
   c_nn_env_init
-  c_nn_bytecode_init defaultCapacity defaultCapacity
+  c_nn_bytecode_init
 
 -- | Destroy all C arenas: the registered roots, the tracked objects
 -- (strings with context, lambdas, partial applications, lists, sets),

@@ -5,6 +5,7 @@
  */
 
 #include "nn_roots.h"
+#include "nn_assert.h"
 
 #include <stdlib.h>
 
@@ -55,13 +56,15 @@ uint32_t nn_roots_env_count(void)   { return g_envs.count; }
 struct nn_thunk *
 nn_roots_thunk(uint32_t index)
 {
-    return index < g_thunks.count ? (struct nn_thunk *)g_thunks.items[index] : NULL;
+    NN_ASSERT(index < g_thunks.count, "nn_roots_thunk: index is past the registered roots");
+    return (struct nn_thunk *)g_thunks.items[index];
 }
 
 struct nn_env *
 nn_roots_env(uint32_t index)
 {
-    return index < g_envs.count ? (struct nn_env *)g_envs.items[index] : NULL;
+    NN_ASSERT(index < g_envs.count, "nn_roots_env: index is past the registered roots");
+    return (struct nn_env *)g_envs.items[index];
 }
 
 void

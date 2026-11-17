@@ -75,8 +75,9 @@ void nn_str_arena_free(nn_str_arena_t *arena);
 
 /* --- The value arena --- */
 
-/* Start the value arena, ending a live one first.  Outside the init ..
- * destroy window nn_str_new returns NULL. */
+/* Start the value arena.  Called only while it is not live (nn_str_live
+ * is 0), as a second init would leak the live arena's blocks; outside
+ * the init .. destroy window nn_str_new returns NULL. */
 void nn_str_init(void);
 
 /* Nonzero between nn_str_init and nn_str_destroy. */

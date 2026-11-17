@@ -194,6 +194,7 @@ library
     cbits/nn_primop.c
     cbits/nn_roots.c
     cbits/nn_stats.c
+    cbits/nn_tracker.c
     cbits/nn_winfs.c
     cbits/nn_darwinfs.c
     cbits/nn_cpus.c

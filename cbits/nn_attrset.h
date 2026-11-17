@@ -48,6 +48,7 @@
 #define NN_ATTRSET_H
 
 #include "nn_symbol.h"
+#include "nn_tracker.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -72,23 +73,26 @@ nn_attrset_t *nn_attrset_new(uint32_t capacity, uint32_t site);
 /* The shared empty set: frozen, no entries, and no arrays behind it.  A
  * file-scope static, not tracked and never freed, so it has one address
  * in every evaluation and outside all of them.  Nothing writes it: it is
- * frozen, so nn_attrset_insert refuses it, and it has no index for
+ * frozen, so nn_attrset_insert never adds to it, and it has no index for
  * nn_attrset_set_value to write at. */
 nn_attrset_t *nn_attrset_empty(void);
 
 /* --- Construction (before freeze) --- */
 
 /* Append a key-value pair defined at `pos`.  Keys need not be sorted or
- * unique at this stage - duplicates are resolved at freeze time (last
- * insert wins, position included, matching Nix // merge semantics).
- * Grows the internal arrays if capacity is exceeded.  Returns 0, or -1
- * with the set unchanged when it is frozen, already holds
- * NN_ATTRSET_MAX_ENTRIES entries, or cannot grow. */
+ * unique at this stage: freeze sorts them, and of a repeated key keeps
+ * the last insert, position included.  The parser refuses a repeated
+ * name, but an expression built through Nix.Expr can hold one in a
+ * frame's names, and the resolver likewise keeps a repeated name's last
+ * definition.  Grows the internal arrays if capacity is exceeded.
+ * Returns 0, or -1 with the set unchanged when it already holds
+ * NN_ATTRSET_MAX_ENTRIES entries or cannot grow.  A frozen set aborts
+ * (NN_ASSERT). */
 int nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value, uint32_t pos);
 
-/* Sort entries by symbol ID and deduplicate (last writer wins).
- * Must be called exactly once before any lookup/keys/values access.
- * After freeze, no more inserts are allowed. */
+/* Sort the entries by symbol ID, keep the last insert of a repeated key,
+ * and freeze the set: a lookup needs the order, and nn_attrset_insert
+ * aborts on a frozen set.  Freezing a frozen set does nothing. */
 void nn_attrset_freeze(nn_attrset_t *set);
 
 /* --- Query (after freeze) --- */
@@ -127,7 +131,7 @@ const nn_symbol_t *nn_attrset_keys_ptr(const nn_attrset_t *set);
 /* --- Lifecycle: bulk cleanup --- */
 
 /* Free all tracked attribute sets at once (arena-style cleanup).
- * Every set created via nn_attrset_new is automatically tracked.
+ * Every set the constructors here make is tracked.
  * Call this once at evaluation end, before destroying sub-arenas. */
 void nn_attrset_free_all(void);
 
@@ -154,11 +158,10 @@ nn_attrset_t *nn_attrset_remove_keys(
 
 /* --- Census (nn_stats.h) --- */
 
-/* The tracked sets, in no particular order: the module's own array,
- * valid until the next set is created or nn_attrset_free_all runs.
- * Writes how many it holds to *count and how many it has room for to
- * *capacity. */
-nn_attrset_t *const *nn_attrset_tracked(uint32_t *count, uint32_t *capacity);
+/* Every set allocated and not yet freed: the module's own tracker, whose
+ * array moves when the next set is created and is freed by
+ * nn_attrset_free_all. */
+const nn_tracker_t *nn_attrset_tracked(void);
 
 /* Bytes a set holds from the allocator: its header, and its keys,
  * positions and values at its capacity. */

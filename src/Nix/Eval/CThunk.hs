@@ -56,14 +56,7 @@ module Nix.Eval.CThunk
     cthunkGetInt,
     cthunkGetFloat,
     cthunkGetBool,
-    cthunkGetStr,
-    cthunkGetPath,
-    cthunkGetList,
-    cthunkGetAttrs,
-    cthunkGetCtxStr,
-    cthunkGetLambda,
     cthunkGetPrimop,
-    cthunkGetPrimopApp,
 
     -- * State transitions
     cthunkMarkBlackhole,
@@ -186,29 +179,8 @@ foreign import ccall unsafe "nn_thunk_get_float"
 foreign import ccall unsafe "nn_thunk_get_bool"
   c_nn_thunk_get_bool :: CThunkPtr -> IO Word8
 
-foreign import ccall unsafe "nn_thunk_get_str"
-  c_nn_thunk_get_str :: CThunkPtr -> IO CStrPtr
-
-foreign import ccall unsafe "nn_thunk_get_path"
-  c_nn_thunk_get_path :: CThunkPtr -> IO CStrPtr
-
-foreign import ccall unsafe "nn_thunk_get_list"
-  c_nn_thunk_get_list :: CThunkPtr -> IO (Ptr ())
-
-foreign import ccall unsafe "nn_thunk_get_attrs"
-  c_nn_thunk_get_attrs :: CThunkPtr -> IO (Ptr ())
-
-foreign import ccall unsafe "nn_thunk_get_ctxstr"
-  c_nn_thunk_get_ctxstr :: CThunkPtr -> IO (Ptr ())
-
-foreign import ccall unsafe "nn_thunk_get_lambda"
-  c_nn_thunk_get_lambda :: CThunkPtr -> IO (Ptr ())
-
 foreign import ccall unsafe "nn_thunk_get_primop"
   c_nn_thunk_get_primop :: CThunkPtr -> IO Word32
-
-foreign import ccall unsafe "nn_thunk_get_primop_app"
-  c_nn_thunk_get_primop_app :: CThunkPtr -> IO (Ptr ())
 
 foreign import ccall unsafe "nn_thunk_mark_blackhole"
   c_nn_thunk_mark_blackhole :: CThunkPtr -> IO CInt
@@ -261,8 +233,8 @@ foreign import ccall unsafe "nn_thunk_set_computed_primop_app"
 -- answer the arena gives, and a NULL that flowed on would fault at the
 -- next state read instead of raising 'Nix.Eval.CStatus.ArenaNotInitialized'.
 
--- | Allocate a new PENDING thunk with a bytecode index + C env pointer,
--- refused for 'noCode'.
+-- | Allocate a new PENDING thunk with a bytecode index + C env pointer.
+-- The index is never 'noCode', which the C side asserts.
 -- No Haskell heap references - zero GC pressure for pending thunks.
 -- The pointer is an @nn_env_t *@, untyped here because "Nix.Eval.CEnv"
 -- imports this module for the slots it stores.
@@ -272,7 +244,8 @@ cthunkNewBc bcIdx envPtr = cdataIO (checkedCPtr "nn_thunk_new_bc" =<< c_nn_thunk
 -- | Allocate a new PENDING thunk deferring the application of the
 -- function in one cell to the argument in another, as upstream's app
 -- value holds a function and its argument.  Its cells live in the env
--- pages, beside no env.
+-- pages, beside no env.  Neither cell is 'Foreign.Ptr.nullPtr', which
+-- the C side asserts.
 cthunkNewApply1 :: (MonadCData m) => CThunkPtr -> CThunkPtr -> m CThunkPtr
 cthunkNewApply1 fn arg = cdataIO (checkedCPtr "nn_thunk_new_apply1" =<< c_nn_thunk_new_apply1 fn arg)
 
@@ -298,8 +271,8 @@ cthunkPendingForm :: (MonadCData m) => CThunkPtr -> m Word8
 cthunkPendingForm = cdataIO . c_nn_thunk_pending_form
 
 -- | Cell @i@ of a PENDING or BLACKHOLE application, the function's at
--- 0, or 'Foreign.Ptr.nullPtr' for a thunk of another form or an index
--- past its cells.
+-- 0.  The caller reads the form first ('cthunkPendingForm'); a thunk of
+-- another state or form, or an index past its cells, aborts in C.
 cthunkApplyCell :: (MonadCData m) => CThunkPtr -> Word32 -> m CThunkPtr
 cthunkApplyCell ptr i = cdataIO (c_nn_thunk_apply_cell ptr i)
 
@@ -379,7 +352,10 @@ cthunkPrimop primop = cdataIO $ do
 cthunkState :: (MonadCData m) => CThunkPtr -> m Word8
 cthunkState = cdataIO . c_nn_thunk_state
 
--- | Read the payload pointer.  Returns 'Foreign.Ptr.nullPtr' for NULL payloads.
+-- | Read the payload pointer.  For a COMPUTED thunk of a C object (value
+-- tags 4 to 9 and 11) it is that object, cast at the use to the type its
+-- tag names (a t'CStrPtr' for a string or a path); for a PENDING or
+-- BLACKHOLE one, its env or its application's cells.
 cthunkPayload :: (MonadCData m) => CThunkPtr -> m (Ptr ())
 cthunkPayload = cdataIO . c_nn_thunk_payload
 
@@ -402,37 +378,9 @@ cthunkGetFloat ptr = cdataIO $ do
 cthunkGetBool :: (MonadCData m) => CThunkPtr -> m Word8
 cthunkGetBool = cdataIO . c_nn_thunk_get_bool
 
--- | Read a string's bytes pointer from a COMPUTED thunk (val_tag == 4).
-cthunkGetStr :: (MonadCData m) => CThunkPtr -> m CStrPtr
-cthunkGetStr = cdataIO . c_nn_thunk_get_str
-
--- | Read a path's bytes pointer from a COMPUTED thunk (val_tag == 5).
-cthunkGetPath :: (MonadCData m) => CThunkPtr -> m CStrPtr
-cthunkGetPath = cdataIO . c_nn_thunk_get_path
-
--- | Read a CList pointer from a COMPUTED thunk (val_tag == 6).
-cthunkGetList :: (MonadCData m) => CThunkPtr -> m (Ptr ())
-cthunkGetList = cdataIO . c_nn_thunk_get_list
-
--- | Read a CAttrSet pointer from a COMPUTED thunk (val_tag == 7).
-cthunkGetAttrs :: (MonadCData m) => CThunkPtr -> m (Ptr ())
-cthunkGetAttrs = cdataIO . c_nn_thunk_get_attrs
-
--- | Read a CCtxStr pointer from a COMPUTED thunk (val_tag == 8).
-cthunkGetCtxStr :: (MonadCData m) => CThunkPtr -> m (Ptr ())
-cthunkGetCtxStr = cdataIO . c_nn_thunk_get_ctxstr
-
--- | Read a CLambda pointer from a COMPUTED thunk (val_tag == 9).
-cthunkGetLambda :: (MonadCData m) => CThunkPtr -> m (Ptr ())
-cthunkGetLambda = cdataIO . c_nn_thunk_get_lambda
-
 -- | Read a builtin's index from a COMPUTED thunk (val_tag == 10).
 cthunkGetPrimop :: (MonadCData m) => CThunkPtr -> m Word32
 cthunkGetPrimop = cdataIO . c_nn_thunk_get_primop
-
--- | Read a CPrimopApp pointer from a COMPUTED thunk (val_tag == 11).
-cthunkGetPrimopApp :: (MonadCData m) => CThunkPtr -> m (Ptr ())
-cthunkGetPrimopApp = cdataIO . c_nn_thunk_get_primop_app
 
 -- ---------------------------------------------------------------------------
 -- State transitions

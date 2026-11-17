@@ -20,6 +20,8 @@
 #ifndef NN_LAMBDA_H
 #define NN_LAMBDA_H
 
+#include "nn_tracker.h"
+
 #include <stdint.h>
 
 /* Forward declarations */
@@ -43,10 +45,11 @@ typedef struct nn_formal_entry {
 /* A lambda's shape: its formals type, its ellipsis flag and its formal
  * count in one word, the type in the top two bits, the flag in the bit
  * below them and the count in the rest.  The count is input-reachable
- * (it scales with the source formal list), so nn_lambda_new refuses one
- * past NN_LAMBDA_MAX_FORMALS rather than let it run into the flag bits;
- * the entries array's own size limit already refuses every count above
- * UINT32_MAX / 12, well below it. */
+ * (it scales with the source formal list); nn_lambda_new refuses every
+ * count whose entries would pass the UINT32_MAX byte limit, which is
+ * every count above UINT32_MAX / 12, well below NN_LAMBDA_MAX_FORMALS,
+ * so no count reaches the flag bits (nn_lambda.c checks this at compile
+ * time). */
 #define NN_LAMBDA_COUNT_BITS  29
 #define NN_LAMBDA_MAX_FORMALS ((UINT32_C(1) << NN_LAMBDA_COUNT_BITS) - 1)
 
@@ -74,8 +77,8 @@ typedef char nn_lambda_size_check_[(sizeof(nn_lambda_t) == NN_LAMBDA_BYTES) ? 1 
 /* --- Shape --- */
 
 /* Pack a shape.  The type is taken mod 4, any nonzero flag as 1 and the
- * count mod 2^NN_LAMBDA_COUNT_BITS; nn_lambda_new refuses what does not
- * fit before it packs. */
+ * count mod 2^NN_LAMBDA_COUNT_BITS; nn_lambda_new takes only a type and
+ * a count that fit. */
 uint32_t nn_lambda_shape(uint8_t formals_type, uint8_t allow_extra,
                          uint32_t formal_count);
 
@@ -88,18 +91,17 @@ uint32_t nn_lambda_shape_formal_count(uint32_t shape);
 
 /* Allocate a new lambda closure.  The entries array is allocated
  * internally (formal_count entries).  Fill entries via
- * nn_lambda_set_entry() after construction.
- * Returns NULL on allocation failure, for a formals type past
- * NN_FORMALS_NAMED_SET or a count past NN_LAMBDA_MAX_FORMALS, or if
- * the entries array size would overflow - the caller must check. */
+ * nn_lambda_set_entry() after construction.  formals_type is one of the
+ * NN_FORMALS_* tags, and any other aborts (NN_ASSERT).
+ * Returns NULL on allocation failure, or when the entries would pass
+ * the UINT32_MAX byte limit - the caller must check. */
 nn_lambda_t *nn_lambda_new(struct nn_env *env, uint32_t body_bc_idx,
                            uint8_t formals_type, uint32_t name_sym,
                            uint32_t lambda_name_sym,
                            uint8_t allow_extra, uint32_t formal_count);
 
 /* Set a formal entry at the given index (for construction).
- * idx must be < formal_count: a NULL struct or an index past it aborts
- * (NN_ASSERT). */
+ * idx must be < formal_count: an index past it aborts (NN_ASSERT). */
 void nn_lambda_set_entry(nn_lambda_t *lam, uint32_t idx,
                          uint32_t name_sym, uint32_t has_default,
                          uint32_t default_bc_idx);
@@ -127,11 +129,10 @@ uint32_t nn_lambda_entry_default(const nn_lambda_t *lam, uint32_t idx);
 
 /* --- Census (nn_stats.h) --- */
 
-/* The tracked lambdas, in no particular order: the module's own array,
- * valid until the next lambda is created or nn_lambda_free_all runs.
- * Writes how many it holds to *count and how many it has room for to
- * *capacity. */
-nn_lambda_t *const *nn_lambda_tracked(uint32_t *count, uint32_t *capacity);
+/* Every lambda allocated and not yet freed: the module's own tracker,
+ * whose array moves when the next lambda is created and is freed by
+ * nn_lambda_free_all. */
+const nn_tracker_t *nn_lambda_tracked(void);
 
 /* Bytes a lambda holds from the allocator: its struct and its formal
  * entries. */

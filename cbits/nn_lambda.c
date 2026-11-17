@@ -2,8 +2,8 @@
  * nn_lambda.c - Lambda closure structs for nova-nix.
  *
  * Each nn_lambda_t is a malloc'd struct holding the closure env,
- * body bytecode index, and formals specification.  Tracked in a
- * global array for bulk cleanup at evaluation end.
+ * body bytecode index, and formals specification, tracked
+ * (nn_tracker.h) for bulk cleanup at evaluation end.
  */
 
 #include "nn_lambda.h"
@@ -12,27 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* --- Global tracking for bulk cleanup --- */
-
-static nn_lambda_t **g_tracked = NULL;
-static uint32_t g_tracked_count = 0;
-static uint32_t g_tracked_cap   = 0;
-
-/* Returns 0, or -1 when the tracking array cannot grow. */
-static int nn_lambda_track(nn_lambda_t *lam)
-{
-    if (g_tracked_count >= g_tracked_cap) {
-        if (g_tracked_cap > UINT32_MAX / 2) return -1;
-        uint32_t new_cap = g_tracked_cap ? g_tracked_cap * 2 : 256;
-        nn_lambda_t **new_arr = (nn_lambda_t **)realloc(
-            g_tracked, (size_t)new_cap * sizeof(nn_lambda_t *));
-        if (!new_arr) return -1;
-        g_tracked = new_arr;
-        g_tracked_cap = new_cap;
-    }
-    g_tracked[g_tracked_count++] = lam;
-    return 0;
-}
+/* Every lambda allocated, for bulk cleanup. */
+static nn_tracker_t g_tracked;
 
 /* --- Shape --- */
 
@@ -46,6 +27,25 @@ static int nn_lambda_track(nn_lambda_t *lam)
  * and every formals type fits them. */
 typedef char nn_lambda_type_bits_check_[(NN_LAMBDA_TYPE_SHIFT + 2 == 32) ? 1 : -1];
 typedef char nn_lambda_type_range_check_[(NN_FORMALS_NAMED_SET <= NN_LAMBDA_TYPE_MASK) ? 1 : -1];
+
+/* The most formals whose entries fit the UINT32_MAX byte limit used
+ * across the C layer, which nn_lambda_new keeps a count within.  A C99
+ * compile-time check that every such count fits the shape: */
+#define NN_LAMBDA_ENTRIES_MAX (UINT32_MAX / sizeof(nn_formal_entry_t))
+typedef char nn_lambda_count_range_check_[(NN_LAMBDA_ENTRIES_MAX <= NN_LAMBDA_MAX_FORMALS) ? 1 : -1];
+
+/* Whether `formals_type` is one of the NN_FORMALS_* tags. */
+static int is_formals_type(uint8_t formals_type)
+{
+    switch (formals_type) {
+    case NN_FORMALS_NAME:
+    case NN_FORMALS_SET:
+    case NN_FORMALS_NAMED_SET:
+        return 1;
+    default:
+        return 0;
+    }
+}
 
 uint32_t
 nn_lambda_shape(uint8_t formals_type, uint8_t allow_extra, uint32_t formal_count)
@@ -81,15 +81,14 @@ nn_lambda_new(struct nn_env *env, uint32_t body_bc_idx,
               uint32_t lambda_name_sym,
               uint8_t allow_extra, uint32_t formal_count)
 {
-    /* What the shape cannot hold is refused before it is packed. */
-    if (formals_type > NN_FORMALS_NAMED_SET || formal_count > NN_LAMBDA_MAX_FORMALS) return NULL;
+    NN_ASSERT(is_formals_type(formals_type), "nn_lambda_new: unknown formals type");
 
     /* The count is input-reachable (it scales with the source formal
-     * list); computing the entries size in uint64_t and capping it at
-     * the UINT32_MAX byte limit used across the C layer keeps the
-     * malloc argument from wrapping size_t on any platform. */
-    uint64_t entry_bytes64 = (uint64_t)formal_count * sizeof(nn_formal_entry_t);
-    if (entry_bytes64 > UINT32_MAX) return NULL;
+     * list); refusing one past NN_LAMBDA_ENTRIES_MAX keeps the entries'
+     * bytes within the limit, the malloc argument from wrapping size_t on
+     * any platform, and the count within the shape. */
+    if (formal_count > NN_LAMBDA_ENTRIES_MAX) return NULL;
+    size_t entry_bytes = (size_t)formal_count * sizeof(nn_formal_entry_t);
 
     nn_lambda_t *lam = (nn_lambda_t *)malloc(sizeof(nn_lambda_t));
     if (!lam) return NULL;
@@ -101,17 +100,17 @@ nn_lambda_new(struct nn_env *env, uint32_t body_bc_idx,
     lam->shape           = nn_lambda_shape(formals_type, allow_extra, formal_count);
 
     if (formal_count > 0) {
-        lam->entries = (nn_formal_entry_t *)malloc((size_t)entry_bytes64);
+        lam->entries = (nn_formal_entry_t *)malloc(entry_bytes);
         if (!lam->entries) {
             free(lam);
             return NULL;
         }
-        memset(lam->entries, 0, (size_t)entry_bytes64);
+        memset(lam->entries, 0, entry_bytes);
     } else {
         lam->entries = NULL;
     }
 
-    if (nn_lambda_track(lam) != 0) {
+    if (nn_tracker_add(&g_tracked, lam) != 0) {
         free(lam->entries);
         free(lam);
         return NULL;
@@ -124,25 +123,25 @@ nn_lambda_set_entry(nn_lambda_t *lam, uint32_t idx,
                     uint32_t name_sym, uint32_t has_default,
                     uint32_t default_bc_idx)
 {
-    NN_ASSERT(lam != NULL && lam->entries != NULL && idx < nn_lambda_formal_count(lam),
-              "nn_lambda_set_entry: idx out of bounds");
+    NN_ASSERT(idx < nn_lambda_formal_count(lam), "nn_lambda_set_entry: idx out of bounds");
     lam->entries[idx].name_sym       = name_sym;
     lam->entries[idx].has_default    = has_default;
     lam->entries[idx].default_bc_idx = default_bc_idx;
 }
 
+/* Free a lambda and its formal entries. */
+static void
+lambda_free(void *object)
+{
+    nn_lambda_t *lam = (nn_lambda_t *)object;
+    free(lam->entries);
+    free(lam);
+}
+
 void
 nn_lambda_free_all(void)
 {
-    uint32_t i;
-    for (i = 0; i < g_tracked_count; i++) {
-        free(g_tracked[i]->entries);
-        free(g_tracked[i]);
-    }
-    free(g_tracked);
-    g_tracked = NULL;
-    g_tracked_count = 0;
-    g_tracked_cap = 0;
+    nn_tracker_free_all(&g_tracked, lambda_free);
 }
 
 /* --- Accessors --- */
@@ -192,35 +191,30 @@ nn_lambda_formal_count(const nn_lambda_t *lam)
 uint32_t
 nn_lambda_entry_name(const nn_lambda_t *lam, uint32_t idx)
 {
-    NN_ASSERT(lam != NULL && lam->entries != NULL && idx < nn_lambda_formal_count(lam),
-              "nn_lambda_entry_name: idx out of bounds or no formals");
+    NN_ASSERT(idx < nn_lambda_formal_count(lam), "nn_lambda_entry_name: idx out of bounds");
     return lam->entries[idx].name_sym;
 }
 
 uint32_t
 nn_lambda_entry_has_default(const nn_lambda_t *lam, uint32_t idx)
 {
-    NN_ASSERT(lam != NULL && lam->entries != NULL && idx < nn_lambda_formal_count(lam),
-              "nn_lambda_entry_has_default: idx out of bounds or no formals");
+    NN_ASSERT(idx < nn_lambda_formal_count(lam), "nn_lambda_entry_has_default: idx out of bounds");
     return lam->entries[idx].has_default;
 }
 
 uint32_t
 nn_lambda_entry_default(const nn_lambda_t *lam, uint32_t idx)
 {
-    NN_ASSERT(lam != NULL && lam->entries != NULL && idx < nn_lambda_formal_count(lam),
-              "nn_lambda_entry_default: idx out of bounds or no formals");
+    NN_ASSERT(idx < nn_lambda_formal_count(lam), "nn_lambda_entry_default: idx out of bounds");
     return lam->entries[idx].default_bc_idx;
 }
 
 /* --- Census --- */
 
-nn_lambda_t *const *
-nn_lambda_tracked(uint32_t *count, uint32_t *capacity)
+const nn_tracker_t *
+nn_lambda_tracked(void)
 {
-    *count = g_tracked_count;
-    *capacity = g_tracked_cap;
-    return g_tracked;
+    return &g_tracked;
 }
 
 uint64_t

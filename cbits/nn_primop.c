@@ -2,7 +2,7 @@
  * nn_primop.c - A builtin's partial application for nova-nix.
  *
  * Each nn_primop_app_t is one malloc'd block, its argument cells inline
- * after the header, tracked in a global array for bulk cleanup at
+ * after the header, tracked (nn_tracker.h) for bulk cleanup at
  * evaluation end.
  */
 
@@ -12,31 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* --- Global tracking for bulk cleanup --- */
-
-static nn_primop_app_t **g_tracked = NULL;
-static uint32_t g_tracked_count = 0;
-static uint32_t g_tracked_cap   = 0;
-
-/* The first capacity of the tracking array, which doubles from there. */
-#define NN_PRIMOP_APP_TRACK_INITIAL 256u
-
-/* Returns 0, or -1 when the tracking array cannot grow. */
-static int track(nn_primop_app_t *app)
-{
-    if (g_tracked_count >= g_tracked_cap) {
-        uint32_t cap;
-        nn_primop_app_t **grown;
-        if (g_tracked_cap > UINT32_MAX / 2) return -1;
-        cap = g_tracked_cap ? g_tracked_cap * 2 : NN_PRIMOP_APP_TRACK_INITIAL;
-        grown = (nn_primop_app_t **)realloc(g_tracked, (size_t)cap * sizeof(nn_primop_app_t *));
-        if (!grown) return -1;
-        g_tracked = grown;
-        g_tracked_cap = cap;
-    }
-    g_tracked[g_tracked_count++] = app;
-    return 0;
-}
+/* Every application allocated, for bulk cleanup. */
+static nn_tracker_t g_tracked;
 
 /* --- Lifecycle --- */
 
@@ -46,7 +23,9 @@ nn_primop_app_new(uint32_t primop, uint16_t forced,
 {
     nn_primop_app_t *app;
     size_t arg_bytes;
-    if (taken == 0 || taken > NN_PRIMOP_APP_MAX_ARGS || !args) return NULL;
+    NN_ASSERT(taken > 0 && taken <= NN_PRIMOP_APP_MAX_ARGS,
+              "nn_primop_app_new: an application takes 1 to NN_PRIMOP_APP_MAX_ARGS arguments");
+    NN_ASSERT(args != NULL, "nn_primop_app_new: no argument cells");
     arg_bytes = (size_t)taken * sizeof(struct nn_thunk *);
     app = (nn_primop_app_t *)malloc(sizeof(nn_primop_app_t) + arg_bytes);
     if (!app) return NULL;
@@ -54,7 +33,7 @@ nn_primop_app_new(uint32_t primop, uint16_t forced,
     app->taken = taken;
     app->forced = forced;
     memcpy(app->args, args, arg_bytes);
-    if (track(app) != 0) {
+    if (nn_tracker_add(&g_tracked, app) != 0) {
         free(app);
         return NULL;
     }
@@ -64,12 +43,7 @@ nn_primop_app_new(uint32_t primop, uint16_t forced,
 void
 nn_primop_app_free_all(void)
 {
-    uint32_t i;
-    for (i = 0; i < g_tracked_count; i++) free(g_tracked[i]);
-    free(g_tracked);
-    g_tracked = NULL;
-    g_tracked_count = 0;
-    g_tracked_cap = 0;
+    nn_tracker_free_all(&g_tracked, free);
 }
 
 /* --- Accessors --- */
@@ -101,12 +75,10 @@ nn_primop_app_arg(const nn_primop_app_t *app, uint16_t i)
 
 /* --- Census --- */
 
-nn_primop_app_t *const *
-nn_primop_app_tracked(uint32_t *count, uint32_t *capacity)
+const nn_tracker_t *
+nn_primop_app_tracked(void)
 {
-    *count = g_tracked_count;
-    *capacity = g_tracked_cap;
-    return g_tracked;
+    return &g_tracked;
 }
 
 uint64_t

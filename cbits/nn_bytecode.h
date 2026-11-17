@@ -55,11 +55,12 @@ typedef struct nn_op {
 
 /* --- Lifecycle --- */
 
-/* Initialize the global bytecode store.  op_capacity is initial
- * instruction slots (0 = default 65536).  data_capacity is initial data
- * buffer slots (0 = default 131072).  Both grow automatically.  Outside
- * the init .. destroy window every emitter returns UINT32_MAX. */
-void nn_bytecode_init(uint32_t op_capacity, uint32_t data_capacity);
+/* Initialize the global bytecode store: the instruction array, the data
+ * buffer and the string table, each of which grows as it fills.  Called
+ * only while the store is not live (nn_bytecode_live is 0), as a second
+ * init would leak the live store.  Outside the init .. destroy window
+ * every emitter returns UINT32_MAX. */
+void nn_bytecode_init(void);
 
 /* Nonzero between nn_bytecode_init and nn_bytecode_destroy. */
 int nn_bytecode_live(void);

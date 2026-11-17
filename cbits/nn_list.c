@@ -1,9 +1,10 @@
 /*
  * nn_list.c - Contiguous array of thunk pointers for lists.
  *
- * Each nn_list_t is a small header (malloc'd, tracked) pointing to
- * a contiguous items array (page-allocated via nn_env_alloc_items).
- * Bulk cleanup frees all headers; the page allocator frees items.
+ * Each nn_list_t is a small header (malloc'd and tracked, nn_tracker.h)
+ * pointing to a contiguous items array (page-allocated via
+ * nn_env_alloc_items).  Bulk cleanup frees all headers; the page
+ * allocator frees items.
  */
 
 #include "nn_list.h"
@@ -12,27 +13,8 @@
 
 #include <stdlib.h>
 
-/* --- Global tracking for bulk cleanup --- */
-
-static nn_list_t **g_tracked = NULL;
-static uint32_t g_tracked_count = 0;
-static uint32_t g_tracked_cap   = 0;
-
-/* Returns 0, or -1 when the tracking array cannot grow. */
-static int nn_list_track(nn_list_t *list)
-{
-    if (g_tracked_count >= g_tracked_cap) {
-        if (g_tracked_cap > UINT32_MAX / 2) return -1;
-        uint32_t new_cap = g_tracked_cap ? g_tracked_cap * 2 : 256;
-        nn_list_t **new_arr = (nn_list_t **)realloc(
-            g_tracked, (size_t)new_cap * sizeof(nn_list_t *));
-        if (!new_arr) return -1;
-        g_tracked = new_arr;
-        g_tracked_cap = new_cap;
-    }
-    g_tracked[g_tracked_count++] = list;
-    return 0;
-}
+/* Every header allocated, for bulk cleanup. */
+static nn_tracker_t g_tracked;
 
 /* --- Lifecycle --- */
 
@@ -50,7 +32,7 @@ nn_list_new(nn_list_t **out, uint32_t count)
     list->items = (struct nn_thunk **)nn_env_alloc_items(count);
     list->count = count;
 
-    if (!list->items || nn_list_track(list) != 0) {
+    if (!list->items || nn_tracker_add(&g_tracked, list) != 0) {
         free(list);
         return -1;
     }
@@ -70,7 +52,7 @@ nn_list_drop(nn_list_t **out, const nn_list_t *list, uint32_t n)
 
     rest->items = list->items + n;
     rest->count = list->count - n;
-    if (nn_list_track(rest) != 0) {
+    if (nn_tracker_add(&g_tracked, rest) != 0) {
         free(rest);
         return -1;
     }
@@ -82,14 +64,7 @@ nn_list_drop(nn_list_t **out, const nn_list_t *list, uint32_t n)
 void
 nn_list_free_all(void)
 {
-    uint32_t i;
-    for (i = 0; i < g_tracked_count; i++) {
-        free(g_tracked[i]);
-    }
-    free(g_tracked);
-    g_tracked = NULL;
-    g_tracked_count = 0;
-    g_tracked_cap = 0;
+    nn_tracker_free_all(&g_tracked, free);
 }
 
 /* --- Access --- */
@@ -116,10 +91,8 @@ nn_list_set(nn_list_t *list, uint32_t index, struct nn_thunk *thunk)
 
 /* --- Census --- */
 
-nn_list_t *const *
-nn_list_tracked(uint32_t *count, uint32_t *capacity)
+const nn_tracker_t *
+nn_list_tracked(void)
 {
-    *count = g_tracked_count;
-    *capacity = g_tracked_cap;
-    return g_tracked;
+    return &g_tracked;
 }

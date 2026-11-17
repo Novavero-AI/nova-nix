@@ -65,13 +65,14 @@ typedef struct nn_env {
 #define NN_ENV_SCOPES ((uintptr_t)16)   /* an nn_env_scopes_t */
 #define NN_ENV_COUNT_SHIFT 8
 
-/* What an env with NN_ENV_SCOPES has: a lazy scope, an attribute set
- * whose names it binds (the root env's builtins, a frame whose names
- * are not all static), and its own with-scopes, innermost first, which
- * every env under it that has none of its own sees (nn_env_with_owner).
- * Either may be absent: NULL, and NULL with a count of 0. */
+/* What an env with NN_ENV_SCOPES has: a name table, an attribute set
+ * whose names it binds (the root env's builtins, scopedImport's names
+ * over them, or the static names of a frame that also has dynamic ones),
+ * and its own with-scopes, innermost first, which every env under it
+ * that has none of its own sees (nn_env_with_owner).  Either may be
+ * absent: NULL, and NULL with a count of 0. */
 typedef struct nn_env_scopes {
-    void     *lazy_scope;   /* nn_attrset_t * or NULL */
+    void     *name_table;   /* nn_attrset_t * or NULL */
     void    **with_scopes;  /* with-scope entries or NULL */
     uint32_t  with_count;
 } nn_env_scopes_t;
@@ -96,8 +97,9 @@ typedef char nn_env_count_width_check_[(UINTPTR_MAX >> NN_ENV_COUNT_SHIFT >= UIN
 
 /* Initialize the global env allocator.  Must be called once before
  * any nn_env_* calls (except nn_env_destroy, nn_env_live and
- * nn_env_empty); outside the init .. destroy window every allocating
- * call returns NULL. */
+ * nn_env_empty), and only while none is live: nn_env_destroy ends one
+ * window before the next nn_env_init opens another.  Outside the
+ * init .. destroy window every allocating call returns NULL. */
 void nn_env_init(void);
 
 /* Nonzero between nn_env_init and nn_env_destroy. */
@@ -137,25 +139,29 @@ nn_env_t *nn_env_empty(void);
 
 /* An env of `slot_count` NULL slots under `parent`, or under none for a
  * NULL parent, made at `site`.  Its with-scopes are its parent's.
- * Returns NULL past the allocator's uint32 byte limit, on OOM, or for a
+ * Returns NULL past the allocator's uint32 byte limit or on OOM.  A
  * parent with any of NN_ENV_SHORT_MASK set in its address, which no env
- * has. */
+ * has, aborts (NN_ASSERT). */
 nn_env_t *nn_env_new(uint32_t slot_count, nn_env_t *parent, uint32_t site);
 
-/* nn_env_new for an env with scopes: a lazy scope (or NULL) and its own
- * with-scopes (or NULL and 0, to see its parent's).  Returns NULL for a
- * count above 0 without an array. */
+/* nn_env_new for an env with scopes: a name table (or NULL) and its own
+ * with-scopes (or NULL and 0, to see its parent's).  The env holds the
+ * array itself, not a copy, so envs may share one: once an env holds it,
+ * the only write to an entry is the evaluator's replacing a lazy one by
+ * the set its thunk evaluates to, the same set for every env sharing it.
+ * A count above 0 without an array aborts (NN_ASSERT). */
 nn_env_t *nn_env_new_scoped(uint32_t slot_count, nn_env_t *parent,
-                            void *lazy_scope,
+                            void *name_table,
                             void **with_scopes, uint32_t with_count,
                             uint32_t site);
 
 /* The env a with's body runs in, made at `site`: base's slots, parent
- * and lazy scope, with `scope` prepended (innermost) to the with-scopes
+ * and name table, with `scope` prepended (innermost) to the with-scopes
  * base sees.  The slots are copied, so base's must all be filled, as they
  * are: nothing is evaluated in a frame before tieFrame (Nix.Eval.Types)
  * fills it.  Allocates a with-scopes array one longer than the one base
- * sees. */
+ * sees, which is shorter than UINT32_MAX entries, as every array the
+ * allocator makes is (NN_ASSERT). */
 nn_env_t *nn_env_push_with(nn_env_t *base, void *scope, uint32_t site);
 
 /* --- Accessors --- */
@@ -167,8 +173,8 @@ uint32_t     nn_env_slot_count(const nn_env_t *env);
 nn_env_t    *nn_env_parent(const nn_env_t *env);
 /* The scopes, or NULL for an env without them. */
 const nn_env_scopes_t *nn_env_scopes(const nn_env_t *env);
-/* The lazy scope, or NULL. */
-void        *nn_env_lazy_scope(const nn_env_t *env);
+/* The name table, or NULL. */
+void        *nn_env_name_table(const nn_env_t *env);
 /* The env's own with-scopes and their count, NULL and 0 when it has
  * none of its own; nn_env_with_owner finds the ones it sees. */
 void       **nn_env_with_scopes(const nn_env_t *env);
@@ -181,14 +187,9 @@ uint32_t     nn_env_bytes(const nn_env_t *env);
 
 /* Resolved variable lookup: walk `level` parent hops, then read
  * slots[idx].  Returns the nn_thunk_t* there, or NULL for a NULL env, a
- * negative level or index, a level past the parent chain, an index
- * outside the slots, or a slot not yet filled, which the Haskell boundary
- * raises as CInvariantViolated. */
-void *nn_env_lookup_resolved(const nn_env_t *env, int level, int idx);
-
-/* Walk parent chain to the root env (one without a parent), return its
- * lazy scope.  Returns NULL if the root has no lazy scope. */
-void *nn_env_root_scope(const nn_env_t *env);
+ * level past the parent chain, an index outside the slots, or a slot not
+ * yet filled, which the Haskell boundary raises as CInvariantViolated. */
+void *nn_env_lookup_resolved(const nn_env_t *env, uint32_t level, uint32_t idx);
 
 /* The env whose with-scopes `env` sees: the first on its parent chain,
  * itself included, with with-scopes of its own, or NULL for none.  An env
@@ -196,17 +197,9 @@ void *nn_env_root_scope(const nn_env_t *env);
  * closure gives it its own. */
 nn_env_t *nn_env_with_owner(nn_env_t *env);
 
-/* --- With-scopes array allocation --- */
-
-/* Allocate an arena array of `count` void* pointers for with-scopes of
- * an env at `site`.  All entries initialized to NULL.  Returns NULL if
- * count is 0, if the array size would exceed the allocator's uint32 byte
- * limit, or on OOM - the caller must check. */
-void **nn_env_alloc_with_scopes(uint32_t count, uint32_t site);
-
 /* --- Diagnostics --- */
 
-/* Total bytes allocated across all pages (for memory tracking). */
+/* The bytes the pages have handed out, summed over them. */
 uint64_t nn_env_bytes_allocated(void);
 
 /* --- Census (nn_stats.h) --- */

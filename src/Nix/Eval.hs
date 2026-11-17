@@ -314,7 +314,7 @@ evalBytecode env bcIdx =
     OpResolvedVar -> do
       level <- cbcArg1 bcIdx
       idx <- cbcArg2 bcIdx
-      envLookupResolved (fromIntegral level) (fromIntegral idx) env >>= force
+      envLookupResolved level idx env >>= force
     OpAttrs -> evalBcAttrs env bcIdx
     OpList -> evalBcList env bcIdx
     OpSelect -> evalBcSelect env bcIdx
@@ -836,8 +836,8 @@ frameCaptureSite :: FrameKind -> EnvSite
 frameCaptureSite LetFrame = EnvLetCapture
 frameCaptureSite RecFrame = EnvRecCapture
 
--- | The env of a let\/rec frame whose names are not all static: its
--- bindings are a lazy name-table @scope@ under the enclosing @env@ as
+-- | The env of a let\/rec frame whose names are not all static: a name
+-- table, @scope@, binding its static names, under the enclosing @env@ as
 -- @captureInfo@ trims it ('buildCaptureEnv'), whose with-scopes the frame
 -- sees.  Inlined, as 'tieBindingFrame' is, so that each caller's sites
 -- are constants.
@@ -1089,29 +1089,35 @@ searchPathMiss name = do
 -- Variables
 -- ---------------------------------------------------------------------------
 
+-- | Evaluate a variable the resolver left to a name table ('EVar'):
+-- the value 'envLookup' finds, or upstream's undefined-variable error for
+-- a name no table on the parent chain binds.
 evalVar :: (MonadEval m) => Env -> Text -> m NixValue
 evalVar env name =
   envLookup name env >>= \case
     Just thunk -> force thunk
     Nothing -> throwEvalError (undefinedVariableMessage name)
 
--- | Evaluate a with-scoped variable: check with-scopes first (innermost
--- to outermost), then fall back to the standard name-based lookup
--- (parent chain to builtins).  For trimmed envs ('CapturesWithScopes'),
--- the root scope is already appended to the env's with-scopes
--- ('envWithScopesRaw'), so the with-scope lookup finds builtins without
--- needing a parent chain.
+-- | Evaluate a variable only a with could supply ('EWithVar'): the name in
+-- the with-scopes the env sees, innermost to outermost, or upstream's
+-- undefined-variable error when none has it, as upstream's
+-- @EvalState::lookupVar@ walks a @fromWith@ variable's withs (eval.cc at
+-- 2.24.9).  The resolver makes an 'EWithVar' only of a name no lexical
+-- binding and no global binds, so no other lookup could find it.  A
+-- trimmed closure's env holds the with-scopes it was made under
+-- ('CapturesWithScopes').
 -- Supports both resolved and lazy with-scope entries ('withScopeAt').  A
 -- lazy entry is forced on first lookup and replaced in place by its set
 -- ('resolveWithScopeAt'), so subsequent lookups read the set directly.
 evalWithVar :: (MonadEval m) => Env -> Text -> m NixValue
 evalWithVar env name = do
   (withArr, withCount) <- envWithScopesRaw env
-  evalWithVarScopes env name withArr (fromIntegral withCount) 0
+  evalWithVarScopes name withArr (fromIntegral withCount) 0
 
-evalWithVarScopes :: (MonadEval m) => Env -> Text -> Ptr (Ptr ()) -> Int -> Int -> m NixValue
-evalWithVarScopes env name withArr count idx
-  | idx >= count = evalVar env name
+-- | 'evalWithVar' from the with-scope at an index of the array onward.
+evalWithVarScopes :: (MonadEval m) => Text -> Ptr (Ptr ()) -> Int -> Int -> m NixValue
+evalWithVarScopes name withArr count idx
+  | idx >= count = throwEvalError (undefinedVariableMessage name)
   | otherwise =
       withScopeAt withArr idx >>= \case
         Left scopeThunk -> do
@@ -1126,7 +1132,7 @@ evalWithVarScopes env name withArr count idx
     lookupIn scope =
       attrSetLookup name scope >>= \case
         Just thunk -> force thunk
-        Nothing -> evalWithVarScopes env name withArr count (idx + 1)
+        Nothing -> evalWithVarScopes name withArr count (idx + 1)
 
 -- ---------------------------------------------------------------------------
 -- Formals matching + env helpers (used by evalBcApp, applyValue, etc.)

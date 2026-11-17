@@ -235,7 +235,11 @@ cbcOpcode = cdataIO . c_nn_bc_opcode
 cbcFlags :: (MonadCData m) => Word32 -> m Word8
 cbcFlags = cdataIO . c_nn_bc_flags
 
--- | The inline 16-bit argument of instruction @i@ (e.g. a de Bruijn slot).
+-- | The inline 16-bit argument of instruction @i@: a Boolean literal's
+-- value, the count of a counted payload (string parts, bindings, list
+-- elements, an attribute path's names) or 'spilledCountSentinel' for one
+-- too long to hold ('cbcCountedPayload' reads either), and 0 for every
+-- other instruction.
 cbcShortArg :: (MonadCData m) => Word32 -> m Word16
 cbcShortArg = cdataIO . c_nn_bc_short_arg
 

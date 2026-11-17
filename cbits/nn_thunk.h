@@ -106,12 +106,11 @@ typedef char nn_thunk_ptr_size_check_[(sizeof(void *) >= sizeof(int64_t)) ? 1 : 
 
 /* --- Lifecycle --- */
 
-/* Initialize the global thunk arena.  initial_capacity is the number
- * of thunks to pre-allocate per block (0 uses default: 65536 = 1 MB).
- * Must be called once before any thunk allocation (nn_thunk_new_bc or
- * the computed-value constructors); outside the init .. destroy window
- * every allocator returns NULL. */
-void nn_thunk_init(uint32_t initial_capacity);
+/* Initialize the global thunk arena with its first block.  Called only
+ * while the arena is not live (nn_thunk_live is 0), as a second init
+ * would leak the live arena's blocks, and before any thunk allocation:
+ * outside the init .. destroy window every allocator returns NULL. */
+void nn_thunk_init(void);
 
 /* Nonzero between nn_thunk_init and nn_thunk_destroy. */
 int nn_thunk_live(void);
@@ -131,8 +130,9 @@ void nn_thunk_destroy(void);
 
 /* Allocate a new PENDING thunk with a bytecode index + env payload.
  * Returns a pointer into arena memory, valid until nn_thunk_destroy(),
- * or NULL for a bc_idx of NN_THUNK_NO_CODE.
- * bc_idx is the root instruction index in the bytecode store.
+ * or NULL when the thunk cannot be allocated.
+ * bc_idx is the root instruction index in the bytecode store, never
+ * NN_THUNK_NO_CODE (asserted).
  * env is the nn_env_t * the code runs in.  It must already exist, but
  * its slots need not be filled yet: nothing reads them until the thunk
  * is forced. */
@@ -140,8 +140,8 @@ nn_thunk_t *nn_thunk_new_bc(uint32_t bc_idx, void *env);
 
 /* Allocate a new PENDING thunk deferring the application of the function
  * in `fn` to the argument in `arg`, or, for nn_thunk_new_apply2, to
- * `first` and then the result to `second`.  Returns NULL for a NULL cell,
- * or when the thunk or its cells cannot be allocated. */
+ * `first` and then the result to `second`.  No cell is NULL (asserted).
+ * Returns NULL when the thunk or its cells cannot be allocated. */
 nn_thunk_t *nn_thunk_new_apply1(nn_thunk_t *fn, nn_thunk_t *arg);
 nn_thunk_t *nn_thunk_new_apply2(nn_thunk_t *fn, nn_thunk_t *first, nn_thunk_t *second);
 
@@ -153,8 +153,9 @@ uint32_t nn_thunk_get_bc_idx(const nn_thunk_t *thunk);
 /* Read the form of a PENDING or BLACKHOLE thunk (NN_PENDING_*). */
 uint8_t nn_thunk_pending_form(const nn_thunk_t *thunk);
 
-/* Cell `i` of a PENDING or BLACKHOLE application, the function's at 0,
- * or NULL for a thunk of another form or `i` past its cells. */
+/* Cell `i` of a PENDING or BLACKHOLE application, the function's at 0.
+ * A thunk of another state or form, or `i` past its cells, aborts
+ * (NN_ASSERT). */
 nn_thunk_t *nn_thunk_apply_cell(const nn_thunk_t *thunk, uint32_t i);
 
 /* Allocate pre-COMPUTED thunks with inline scalar values. */
@@ -206,26 +207,21 @@ int nn_thunk_is_static(const nn_thunk_t *thunk);
 /* Read the current state (NN_THUNK_PENDING/COMPUTED/BLACKHOLE). */
 uint8_t nn_thunk_state(const nn_thunk_t *thunk);
 
-/* Read the payload pointer.  Meaning depends on state + val_tag. */
+/* Read the payload pointer.  For a COMPUTED thunk of a C object (val_tag
+ * 4-9 and 11) it is that object, for the reader to cast to the type its
+ * tag names; for a PENDING or BLACKHOLE one, its env or its application's
+ * cells. */
 void *nn_thunk_payload(const nn_thunk_t *thunk);
 
 /* Read the value tag (valid when state == COMPUTED). */
 uint8_t nn_thunk_value_tag(const nn_thunk_t *thunk);
 
-/* Read inline scalar values from a COMPUTED thunk. */
-int64_t nn_thunk_get_int(const nn_thunk_t *thunk);
-double  nn_thunk_get_float(const nn_thunk_t *thunk);
-uint8_t nn_thunk_get_bool(const nn_thunk_t *thunk);
-
-/* Read C-native complex values from a COMPUTED thunk. */
-void    *nn_thunk_get_str(const nn_thunk_t *thunk);
-void    *nn_thunk_get_path(const nn_thunk_t *thunk);
-void    *nn_thunk_get_list(const nn_thunk_t *thunk);
-void    *nn_thunk_get_attrs(const nn_thunk_t *thunk);
-void    *nn_thunk_get_ctxstr(const nn_thunk_t *thunk);
-void    *nn_thunk_get_lambda(const nn_thunk_t *thunk);
+/* Read inline values from a COMPUTED thunk: a scalar or a builtin's
+ * index. */
+int64_t  nn_thunk_get_int(const nn_thunk_t *thunk);
+double   nn_thunk_get_float(const nn_thunk_t *thunk);
+uint8_t  nn_thunk_get_bool(const nn_thunk_t *thunk);
 uint32_t nn_thunk_get_primop(const nn_thunk_t *thunk);
-void    *nn_thunk_get_primop_app(const nn_thunk_t *thunk);
 
 /* --- State transitions --- */
 

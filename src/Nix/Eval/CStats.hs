@@ -8,8 +8,9 @@
 -- ("Nix.Eval.CRoots") among them when it is given 'RootRegistered',
 -- following every C pointer: every value lives in C, so the mark runs in
 -- C alone.  It frees and writes nothing in the data layer.  A process
--- that never takes a census pays for it the env allocator's count of
--- deferred applications' cells and the flag test below.
+-- that never takes a census pays for it the env allocator's count and
+-- bytes of deferred applications' cells, the string arena's count of
+-- strings, and the flag test below.
 --
 -- Once 'countSites' turns counting on, the allocators also count each
 -- environment and attribute set under its site ("Nix.Eval.AllocSite"),
