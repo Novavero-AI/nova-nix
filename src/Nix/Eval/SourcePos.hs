@@ -1,5 +1,6 @@
 -- | Source positions as the evaluator keeps them: a t'PosIdx' stored beside
--- an attribute, read back as a file, line and column on demand.
+-- an attribute, read back as a file, line and column on demand, and
+-- written as upstream's messages write one.
 --
 -- A position is recorded when the construct it belongs to is compiled, as
 -- three words in the bytecode data buffer: the file it is in, one past the
@@ -25,11 +26,13 @@ module Nix.Eval.SourcePos
     -- * Reading back
     RecordedPos (..),
     lookupPos,
+    printPos,
   )
 where
 
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
+import qualified Data.Text as T
 import Data.Word (Word32)
 import Nix.Eval.CBytecode (cbcData, cbcEmitData, cbcEmitText, cbcStringText)
 import Nix.Eval.CData (MonadCData)
@@ -110,3 +113,34 @@ lookupPos (PosIdx idx) = do
     <$> if file == noFile
       then pure (PosInText line column)
       else (\path -> PosInFile path line column) <$> cbcStringText (file - 1)
+
+-- | A position as upstream's messages write one, @Pos::print@ with its
+-- origin (position.cc:69-83 at 2.24.9): its origin, then a colon and its
+-- line, then a colon and its column unless that is 0.  The origin of a
+-- position in a file is the file's path, as upstream shows a file it
+-- reads from the filesystem, and of one in text with no file behind it,
+-- such as an @--expr@ string, @string@ in guillemets, upstream's
+-- @Pos::String@.  'noPos' is upstream's empty @Pos@, at line 0 of @none@
+-- in guillemets.
+printPos :: (MonadCData m) => PosIdx -> m Text
+printPos idx = written <$> lookupPos idx
+  where
+    written (Just (PosInFile path line column)) = located path line column
+    written (Just (PosInText line column)) = located stringOrigin line column
+    written Nothing = located noOrigin 0 0
+    located :: Text -> Int -> Int -> Text
+    located origin line column = origin <> ":" <> T.pack (show line) <> columnPart column
+    columnPart 0 = ""
+    columnPart column = ":" <> T.pack (show column)
+
+-- | The origin upstream writes for a position in text with no file behind
+-- it, such as an @--expr@ string (@Pos::String@, position.cc:75 at
+-- 2.24.9), in guillemets (U+00AB, U+00BB) written as escapes to keep the
+-- source ASCII.
+stringOrigin :: Text
+stringOrigin = "\x00ABstring\x00BB"
+
+-- | The origin upstream writes for a position with none (position.cc:73
+-- at 2.24.9), escaped as 'stringOrigin' is.
+noOrigin :: Text
+noOrigin = "\x00ABnone\x00BB"

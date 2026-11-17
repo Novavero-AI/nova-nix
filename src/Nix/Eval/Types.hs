@@ -31,6 +31,7 @@ module Nix.Eval.Types
     attrSetFromEntries,
     attrSetFromSymbols,
     attrSetFromSymbolEntries,
+    attrSetFromSymbolEntriesSizedFor,
     attrSetFromEntriesSizedFor,
     attrSetMember,
     attrSetNull,
@@ -565,7 +566,8 @@ attrSetRemoveKeys site keys (AttrSet cset) = do
 -- attributes is this one and is allocated nowhere, as upstream's
 -- @allocBindings@ answers a size of 0 with @emptyBindings@
 -- (attr-set.cc:16-17), except a set upstream sizes before it knows it
--- holds nothing ('attrSetFromEntriesSizedFor', 'attrSetRemoveKeys').
+-- holds nothing ('attrSetFromSymbolEntriesSizedFor',
+-- 'attrSetFromEntriesSizedFor', 'attrSetRemoveKeys').
 -- Upstream's printers enter a set by its bindings, so which empty sets
 -- are this one shows where a value is printed.
 emptyAttrSet :: AttrSet
@@ -595,14 +597,23 @@ attrSetFromSymbols site m = AttrSet <$> newFrozenAttrSet site pure (const noPos)
 attrSetFromSymbolEntries :: (MonadCData m) => SetSite -> Map Symbol AttrEntry -> m AttrSet
 attrSetFromSymbolEntries site m = AttrSet <$> newFrozenAttrSet site pure entryPos entryThunk m
 
--- | 'attrSetFromEntries' for a set upstream sizes, before it knows what
--- the set holds, for the given number of attributes: a literal for its
--- names (eval.cc:1193 at 2.24.9), @intersectAttrs@ for the smaller of its
--- arguments (primops.cc:2945).  Upstream's @allocBindings@ shares its
--- empty set only for a size of 0 (attr-set.cc:16-17), so such a set
--- holding nothing is 'emptyAttrSet' when sized for none and an empty set
--- of its own otherwise.  A set holding attributes is made with room for
--- those alone, whatever the size.
+-- | 'attrSetFromSymbolEntries' for a set upstream sizes, before it knows
+-- what the set holds, for the given number of attributes, as it sizes a
+-- literal for its names (eval.cc:1193 at 2.24.9).  Upstream's
+-- @allocBindings@ shares its empty set only for a size of 0
+-- (attr-set.cc:16-17), so such a set holding nothing is 'emptyAttrSet'
+-- when sized for none and an empty set of its own otherwise.  A set
+-- holding attributes is made with room for those alone, whatever the
+-- size.
+attrSetFromSymbolEntriesSizedFor :: (MonadCData m) => SetSite -> Int -> Map Symbol AttrEntry -> m AttrSet
+attrSetFromSymbolEntriesSizedFor site size m
+  | Map.null m && size > 0 = ownEmptyAttrSet site
+  | otherwise = attrSetFromSymbolEntries site m
+
+-- | 'attrSetFromSymbolEntriesSizedFor' over names given as text, which are
+-- interned as 'attrSetFromEntries' interns them, for a set sized as
+-- upstream's @intersectAttrs@ sizes its result, for the smaller of its
+-- arguments (primops.cc:2945 at 2.24.9).
 attrSetFromEntriesSizedFor :: (MonadCData m) => SetSite -> Int -> Map Text AttrEntry -> m AttrSet
 attrSetFromEntriesSizedFor site size m
   | Map.null m && size > 0 = ownEmptyAttrSet site
@@ -639,24 +650,20 @@ newFrozenAttrSet site symbolOf posOf thunkOf m
 -- values are filled via 'fillCAttrSetValues'.  The table is never a
 -- value, so its entries carry no position.  A table of no keys is the
 -- shared empty set, which 'fillCAttrSetValues' finds no key in.
-buildCAttrSetKeys :: (MonadCData m) => [Text] -> m CAttrSet
+buildCAttrSetKeys :: (MonadCData m) => [Symbol] -> m CAttrSet
 buildCAttrSetKeys [] = pure cattrsetEmpty
 buildCAttrSetKeys keys = do
   cset <- cattrsetNew SetScope (length keys)
-  forM_ keys $ \key -> do
-    sym <- symbolIntern key
-    cattrsetInsert cset sym noPos nullPtr
+  forM_ keys $ \sym -> cattrsetInsert cset sym noPos nullPtr
   cattrsetFreeze cset
   pure cset
 
 -- | Fill values into a pre-allocated CAttrSet (two-phase construction).
 -- Looks up each key's index and writes the CThunkPtr at that position.
--- A key the set does not hold is skipped: a frame's name table holds
--- its static names only, so a dynamic name has no entry to fill.
-fillCAttrSetValues :: (MonadCData m) => CAttrSet -> Map Text Thunk -> m ()
+-- A key the set does not hold has no entry to fill and is skipped.
+fillCAttrSetValues :: (MonadCData m) => CAttrSet -> Map Symbol Thunk -> m ()
 fillCAttrSetValues cset thunkMap =
-  forM_ (Map.toList thunkMap) $ \(key, Thunk ptr) -> do
-    sym <- symbolIntern key
+  forM_ (Map.toList thunkMap) $ \(sym, Thunk ptr) -> do
     midx <- cattrsetIndex cset sym
     case midx of
       Just idx -> cattrsetSetValue cset idx ptr
