@@ -167,15 +167,18 @@ runTest name result = case result of
     pure False
 
 -- | Like 'runTest' but for tests that need IO to produce their result.
--- An exception escaping the action becomes one FAIL line instead of
--- aborting the whole suite (which would skip every later group and its
--- cleanup).
+-- A synchronous exception escaping the action becomes one FAIL line
+-- instead of aborting the whole suite (which would skip every later group
+-- and its cleanup).  An asynchronous one, an interrupt or a killed
+-- thread, stops the suite, as it stops any program.
 runTestM :: Text -> IO TestResult -> IO Bool
 runTestM name action = do
   outcome <- try action
-  runTest name $ case outcome of
-    Left (e :: SomeException) -> Fail ("uncaught exception: " <> T.pack (show e))
-    Right result -> result
+  case outcome of
+    Left (e :: SomeException)
+      | Just (_ :: SomeAsyncException) <- fromException e -> throwIO e
+      | otherwise -> runTest name (Fail ("uncaught exception: " <> T.pack (show e)))
+    Right result -> runTest name result
 
 assertEqual :: (Eq a, Show a) => Text -> a -> a -> TestResult
 assertEqual label expected actual
@@ -29497,6 +29500,10 @@ testInterruptsPropagate = do
             st <- testEvalState storeDir root
             outcome <- try (runEvalIO st (writeFetchCache "interrupted-entry" (throw UserInterrupt)))
             pure (interruptPropagated outcome),
+        -- The suite's own harness has a fallback too: a test's FAIL line.
+        runTestM "an interrupt in a test stops the suite, not just that test" $ do
+          outcome <- try (runTestM "interrupted" (throwIO UserInterrupt))
+          pure (interruptPropagated outcome),
         fifoCase "an interrupt unpacking an archive is not a failed unpack" $ do
           let archive = StorePath (T.replicate 32 "f") "stalled.tar"
           outcome <- withStalledFifo (inStore archive) (interruptedAfterStall (runBuiltinUnpack storeDir defaultUnpackLimits (unpacking archive) [("out", root </> "stalled-out")]))
