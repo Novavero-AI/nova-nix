@@ -29,7 +29,6 @@ module Nix.Eval.CEnv
 
     -- * Accessors
     cenvSlots,
-    cenvSlotCount,
     cenvLazyScope,
     cenvParent,
     cenvWithScopes,
@@ -97,9 +96,6 @@ foreign import ccall unsafe "nn_env_push_with"
 
 foreign import ccall unsafe "nn_env_slots"
   c_nn_env_slots :: Ptr NnEnv -> IO (Ptr CThunkPtr)
-
-foreign import ccall unsafe "nn_env_slot_count"
-  c_nn_env_slot_count :: Ptr NnEnv -> IO Word32
 
 foreign import ccall unsafe "nn_env_lazy_scope"
   c_nn_env_lazy_scope :: Ptr NnEnv -> IO (Ptr ())
@@ -176,10 +172,6 @@ cenvPushWith site base scope = cdataIO (c_nn_env_push_with base scope (envSiteIn
 -- | The slots of a C env, inline in it.
 cenvSlots :: (MonadCData m) => Ptr NnEnv -> m (Ptr CThunkPtr)
 cenvSlots = cdataIO . c_nn_env_slots
-
--- | Read the slot count from a C env.
-cenvSlotCount :: (MonadCData m) => Ptr NnEnv -> m Word32
-cenvSlotCount = cdataIO . c_nn_env_slot_count
 
 -- | Read the lazy scope pointer from a C env (NULL if none).
 cenvLazyScope :: (MonadCData m) => Ptr NnEnv -> m (Ptr ())

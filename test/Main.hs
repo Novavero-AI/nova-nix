@@ -25730,7 +25730,31 @@ testCThunk = do
           evalNixIO
             tmpBase
             "let f = builtins.foldl' (a: b: a + b); g = f 10; m = builtins.match \"a(.)\"; t = builtins.tryEval; in [ (g [ 1 2 ]) (g [ ]) (f 0 [ 5 ]) (m \"ab\") (m \"x\") (t (throw \"x\")).success ] == [ 13 10 5 [ \"b\" ] null false ]"
-        pure (assertEqual "result" (Right (VBool True)) result)
+        pure (assertEqual "result" (Right (VBool True)) result),
+      runTestM "a handle equals only the C object it names" $ do
+        one <- evaluated (VInt 1)
+        copy <- evaluated (VInt 1)
+        set <- attrSetFromMap SetLiteral (Map.singleton "a" one)
+        setCopy <- attrSetFromMap SetLiteral (Map.singleton "a" one)
+        list <- clistFromThunks [unThunk one]
+        listCopy <- clistFromThunks [unThunk one]
+        env <- newEnv EnvClosure Nothing [one]
+        envCopy <- newEnv EnvClosure Nothing [one]
+        found <- attrSetLookup "a" set
+        storedSet <- evaluated (VAttrs set) >>= readThunkValue
+        storedList <- evaluated (VList list) >>= readThunkValue
+        pure
+          ( assertEqual "read back from C" (Just one, Just (VAttrs set), Just (VList list)) (found, storedSet, storedList)
+              `andThen` assertEqual "a copy" (False, False, False, False) (one == copy, set == setCopy, list == listCopy, env == envCopy)
+          ),
+      -- No C object lives at the null address, so a show that read one
+      -- would fault here.
+      runTest "a handle shows as its address without reading C memory" $
+        let address = show (nullPtr :: Ptr ())
+         in assertEqual
+              "shown"
+              ("Thunk {unThunk = " <> address <> "}", "AttrSet {unAttrSet = " <> address <> "}", "CList {unCList = " <> address <> "}", "Env " <> address)
+              (show (Thunk nullPtr), show (AttrSet nullPtr), show (CList nullPtr), show (Env nullPtr))
     ]
   where
     -- These cells are never forced, so the shared empty env serves as the

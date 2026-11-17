@@ -91,7 +91,6 @@ module Nix.Eval.Types
     Pending (..),
     readPending,
     evaluated,
-    thunkSameRef,
     thunkToCPtr,
     tieFrame,
 
@@ -162,8 +161,8 @@ import Nix.Eval.Builtin (Builtin, builtinAtIndex, builtinIndex, builtinName)
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetEmpty, cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
-import Nix.Eval.CData (CData (..), MonadCData (..), cdataIO, inspectForDisplay, runCDataPure)
-import Nix.Eval.CEnv (NnEnv, cenvAllocWithScopes, cenvEmpty, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewScoped, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvSlots, cenvWithCount, cenvWithOwner, cenvWithScopes)
+import Nix.Eval.CData (CData (..), MonadCData (..), cdataIO, runCDataPure)
+import Nix.Eval.CEnv (NnEnv, cenvAllocWithScopes, cenvEmpty, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewScoped, cenvParent, cenvPushWith, cenvRootScope, cenvSlots, cenvWithCount, cenvWithOwner, cenvWithScopes)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaLambdaNameSym, clambdaNameSym, clambdaNew, clambdaSetEntry)
 import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
 import Nix.Eval.CPrimop (CPrimopAppPtr, cprimopAppArg, cprimopAppForced, cprimopAppNew, cprimopAppPrimop, cprimopAppTaken)
@@ -239,29 +238,15 @@ bytesToTextLossy = TE.decodeUtf8With lenientDecode
 -- the cell does: 'mkThunkBc' takes a built t'Env', and 'tieFrame' builds a
 -- frame whose bindings point back at it before filling its slots.  A
 -- deferred application's cell ('mkApplyThunk') holds the cells it applies
--- and no env.  Arena pointers remain valid until
--- 'Nix.Eval.CThunk.cthunkDestroy'.
+-- and no env.  A cell lives until the evaluation session ends
+-- ('Nix.Eval.IO.withEvalSession'), and the static cells
+-- ('Nix.Eval.CThunk.cthunkNull' and its kin) for the life of the process.
+--
+-- Two thunks are equal when they are one cell, and 'show' gives the
+-- cell's address.  Neither reads the cell, whose state changes as it is
+-- forced; 'readThunkValue' reads it, in order with the evaluation.
 newtype Thunk = Thunk {unThunk :: CThunkPtr}
-
--- | The cell's state and, once computed, its value, as they stand when
--- the string is forced ('inspectForDisplay').
-instance Show Thunk where
-  show (Thunk ptr) =
-    case inspectForDisplay (cthunkState ptr) of
-      ThunkComputed -> "Thunk (" ++ show (inspectForDisplay (readComputed ptr)) ++ ")"
-      ThunkPending -> "Thunk <pending>"
-      ThunkBlackhole -> "Thunk <blackhole>"
-      _ -> "Thunk <unknown>"
-
--- | Equality: pointer identity fast path, then value comparison for
--- COMPUTED thunks, as they stand when compared ('inspectForDisplay').
--- Only used in tests on non-recursive structures.
-instance Eq Thunk where
-  (Thunk p1) == (Thunk p2)
-    | p1 == p2 = True
-    | otherwise = case inspectForDisplay ((,) <$> readThunkValue (Thunk p1) <*> readThunkValue (Thunk p2)) of
-        (Just v1, Just v2) -> v1 == v2
-        _ -> False
+  deriving (Eq, Show)
 
 -- | Named constants for the C thunk-state byte and value-tag byte, mirroring
 -- the @NN_THUNK_*@ / @NN_VALUE_*@ macros in @cbits\/nn_thunk.h@.  Bidirectional
@@ -459,24 +444,14 @@ data BuiltinArg
 -- Attribute sets (C-backed sorted arrays)
 -- ---------------------------------------------------------------------------
 
--- | Attribute set backed by a C-allocated sorted key-value array.
+-- | An attribute set: a C set (@cbits/nn_attrset.h@) whose entries are
+-- sorted by symbol id, each an interned name, the position it was
+-- defined at and its value's cell, so a lookup is a binary search.
 --
--- All keys are interned symbols; values are CThunkPtrs in a parallel
--- array.  O(log n) binary search on contiguous memory for lookup.
--- Replaces the former EagerAttrs\/LazyAttrs\/MappedAttrs\/CAttrs ADT
--- with a single C-backed representation - all attr set data lives off
--- the GHC heap, dramatically reducing GC pressure for large evaluations.
+-- Two sets are equal when they are one C set, and 'show' gives its
+-- address.  Neither reads the set; 'attrSetToMap' reads its entries.
 newtype AttrSet = AttrSet {unAttrSet :: CAttrSet}
-
--- | The same names bound to equal thunks, as the sets stand when compared
--- ('inspectForDisplay').
-instance Eq AttrSet where
-  a == b = inspectForDisplay ((==) <$> attrSetToMap a <*> attrSetToMap b)
-
-instance Show AttrSet where
-  show (AttrSet cset) =
-    let n = inspectForDisplay (cattrsetSize cset)
-     in "<attrset " ++ show n ++ " entries>"
+  deriving (Eq, Show)
 
 -- | An attribute's value and the position it was defined at, as a set
 -- holds them.
@@ -698,27 +673,11 @@ fillCAttrSetValues cset thunkMap =
 --
 -- * 'envLookupResolved': single C call for 'EResolvedVar'
 -- * 'envLookup': name-based walk for 'EVar' (lazy scope + with-scopes)
+--
+-- Two envs are equal when they are one C env, and 'show' gives its
+-- address.  Neither reads the env.
 newtype Env = Env (Ptr NnEnv)
-
--- | Pointer equality: two envs are equal iff they are the same C struct.
-instance Eq Env where
-  Env p1 == Env p2 = p1 == p2
-
--- | Compact show via C accessors ('inspectForDisplay').
-instance Show Env where
-  show env@(Env envPtr) =
-    let sc = inspectForDisplay (cenvSlotCount envPtr)
-        ls = inspectForDisplay (cenvLazyScope envPtr)
-        par = inspectForDisplay (cenvParent envPtr)
-        wc = inspectForDisplay (snd <$> envWithScopesRaw env)
-     in "Env{"
-          ++ show sc
-          ++ " slots"
-          ++ (if ls /= nullPtr then ", lazyScope" else "")
-          ++ (if par /= nullPtr then ", parent" else "")
-          ++ ", "
-          ++ show wc
-          ++ " withs}"
+  deriving (Eq, Show)
 
 -- | Empty environment (no variables in scope): a C static, one address
 -- for the life of the process.
@@ -1147,12 +1106,6 @@ primopCell builtin args = do
     argumentCell (ArgForced val) = unThunk <$> evaluated val
     argumentCell (ArgDeferred (Thunk cell)) = pure cell
     forced = foldl' (.|.) 0 [bit i | (i, ArgForced _) <- zip [0 ..] args]
-
--- | Check if two thunks share the same memoization cell (C pointer
--- equality): upstream's test of one @Value@'s address against another's,
--- which @==@ makes once both sides are forced.
-thunkSameRef :: Thunk -> Thunk -> Bool
-thunkSameRef (Thunk p1) (Thunk p2) = p1 == p2
 
 -- | Extract the C pointer from a thunk (zero-cost, newtype unwrap).
 thunkToCPtr :: Thunk -> CThunkPtr

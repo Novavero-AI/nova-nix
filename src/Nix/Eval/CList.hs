@@ -47,7 +47,7 @@ import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, nullPtr)
 import Foreign.Storable (peek)
-import Nix.Eval.CData (MonadCData, cdataIO, inspectForDisplay)
+import Nix.Eval.CData (MonadCData, cdataIO)
 import Nix.Eval.CStatus (cStatusFailure)
 import Nix.Eval.CThunk (CThunkPtr)
 
@@ -156,22 +156,14 @@ clistToThunkList cl
 -- CList newtype (wraps CListPtr for use in NixValue ADT)
 -- ---------------------------------------------------------------------------
 
--- | Opaque wrapper around a C-backed list.  Used as the payload of
--- @VList@ in the t'Nix.Eval.Types.NixValue' ADT.  The underlying @nn_list_t*@ is
--- arena-allocated and valid until evaluation end.
+-- | A C list, the payload of @VList@ in t'Nix.Eval.Types.NixValue': an
+-- @nn_list_t@ that lives until the evaluation session ends, or null for
+-- the empty list.
+--
+-- Two lists are equal when they are one C list, and 'show' gives its
+-- address.  Neither reads the list; 'clistThunks' reads its items.
 newtype CList = CList {unCList :: CListPtr}
-
--- | Pointer equality - two CLists are the same if they point to the
--- same C struct.  Deep equality is handled by the evaluator.
-instance Eq CList where
-  CList a == CList b = a == b
-
-instance Show CList where
-  show (CList p)
-    | p == nullPtr = "<list 0>"
-    | otherwise =
-        let n = inspectForDisplay (clistCount p)
-         in "<list " ++ show n ++ ">"
+  deriving (Eq, Show)
 
 -- | The empty CList (null pointer, zero elements).
 emptyCList :: CList
