@@ -20,6 +20,7 @@ module Nix.Eval.Types
     CAttrSet,
     AttrEntry (..),
     attrSetLookup,
+    attrSetLookupSymbol,
     attrSetLookupEntry,
     attrSetKeys,
     firstInSymbolOrder,
@@ -452,11 +453,17 @@ data AttrEntry = AttrEntry
     entryThunk :: {-# UNPACK #-} !Thunk
   }
 
--- | Look up a single key via symbol interning + C binary search.
+-- | The value a set binds to an interned name, found by a binary search
+-- of the C array, which is sorted by symbol.
+attrSetLookupSymbol :: (MonadCData m) => Symbol -> AttrSet -> m (Maybe Thunk)
+attrSetLookupSymbol sym (AttrSet cset) = fmap Thunk <$> cattrsetLookup cset sym
+
+-- | 'attrSetLookupSymbol' for a name given as text, which is interned
+-- first, so a name no symbol holds yet takes its place in symbol order.
 attrSetLookup :: (MonadCData m) => Text -> AttrSet -> m (Maybe Thunk)
-attrSetLookup key (AttrSet cset) = do
+attrSetLookup key attrs = do
   sym <- symbolIntern key
-  fmap Thunk <$> cattrsetLookup cset sym
+  attrSetLookupSymbol sym attrs
 
 -- | 'attrSetLookup' with the attribute's position.
 attrSetLookupEntry :: (MonadCData m) => Text -> AttrSet -> m (Maybe AttrEntry)
@@ -718,7 +725,7 @@ envLookupResolved level idx (Env envPtr) = Thunk <$> cenvLookupResolved envPtr l
 -- trimming keeps the parent chain of every env an 'EVar' is evaluated in,
 -- so the name is found unless the expression was built without the
 -- resolver.
-envLookup :: (MonadCData m) => Text -> Env -> m (Maybe Thunk)
+envLookup :: (MonadCData m) => Symbol -> Env -> m (Maybe Thunk)
 envLookup name (Env envPtr) = walk envPtr
   where
     walk ep = do
@@ -726,7 +733,7 @@ envLookup name (Env envPtr) = walk envPtr
       found <-
         if table == nullPtr
           then pure Nothing
-          else attrSetLookup name (AttrSet (castPtr table))
+          else attrSetLookupSymbol name (AttrSet (castPtr table))
       case found of
         Just thunk -> pure (Just thunk)
         Nothing -> cenvParent ep >>= up

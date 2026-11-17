@@ -24673,6 +24673,37 @@ testBuilderInterningIO = do
   where
     unexpected name = "error: function 'anonymous lambda' called with unexpected argument '" <> name <> "'"
 
+-- | A select interns a name it computes before it forces the value it
+-- selects from, and a has-attribute test after it forces the value it
+-- tests, as upstream's @ExprSelect::eval@ and @ExprOpHasAttr::eval@ call
+-- @getName@, which interns a computed name, on either side of the force
+-- (eval.cc:203-213, :1386-1396 and :1452-1454 at 2.24.9).  The value
+-- forced is a set @listToAttrs@ builds, interning its name as it runs, so
+-- the order of the two names shows which came first.  It is the second
+-- in the path, since the first is forced before any name is read.  Each
+-- case runs in a child, whose symbol table holds neither name.
+testSelectInterningIO :: IO [Bool]
+testSelectInterningIO = do
+  putStrLn "eval/select-interning-io"
+  sequence
+    [ internsNamesOnly
+        "a select interns a computed name before it forces the value it selects from"
+        "{ s = builtins.listToAttrs [ { name = \"z\" + \"b\"; value = 1; } ]; }.s.${\"z\" + \"a\"} or null"
+        names
+        ["za", "zb"],
+      internsNamesOnly
+        "a has-attribute test interns a computed name after it forces the value it tests"
+        "{ s = builtins.listToAttrs [ { name = \"z\" + \"b\"; value = 1; } ]; } ? s.${\"z\" + \"a\"}"
+        names
+        ["zb", "za"],
+      emits
+        "a name a select computes precedes a name the value it selects from interns"
+        "builtins.seq ({ s = builtins.listToAttrs [ { name = \"z\" + \"b\"; value = 1; } ]; }.s.${\"z\" + \"a\"} or null) (({ }: null) (builtins.listToAttrs [ { name = \"z\" + \"b\"; value = 1; } { name = \"z\" + \"a\"; value = 2; } ]))"
+        ["error: function 'anonymous lambda' called with unexpected argument 'za'"]
+    ]
+  where
+    names = ["s", "builtins", "listToAttrs", "name", "value", "za", "zb"]
+
 -- | A string's bytes are made once and shared by every cell that holds
 -- the string, as upstream copies a @Value@ with the pointer to its bytes
 -- (value.hh at 2.24.9), where a copy per cell would grow the string arena
@@ -28616,6 +28647,7 @@ runSuite = do
           testCallErrorsIO,
           testStringsOffSymbolsIO,
           testBuilderInterningIO,
+          testSelectInterningIO,
           testStringSharing,
           testTraceVerboseOff,
           testStorePathLinksIO,
