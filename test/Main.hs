@@ -24160,14 +24160,19 @@ testPhase4 = do
           [(Just (VStr "" _), Just (VStr "/some/path" _))] -> Pass
           [_] -> Fail "wrong prefix/path for plain"
           _ -> Fail "expected one entry",
-      -- ESearchPath desugars to __findFile __nixPath "name" during resolution
+      -- A search path parses as the call __findFile __nixPath "name", as
+      -- upstream's parser makes it.
       runTest "parse <nixpkgs>" $
         assertParse "search path" "<nixpkgs>" (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "nixpkgs"])),
       runTest "parse <nixpkgs/lib>" $
         assertParse "search path with subpath" "<nixpkgs/lib>" (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "nixpkgs/lib"])),
-      -- ESearchPath eval (should fail in pure mode since no search paths)
+      -- The test evaluator has no search path, so the lookup misses.
       runTest "eval <nixpkgs> fails without path" $
         assertEvalFail "search path not found" "<nixpkgs>",
+      -- Upstream's parser makes __findFile a variable of the call, so a
+      -- binding of it in scope is the function a search path calls.
+      runTest "a search path calls the __findFile in scope" $
+        assertEval "findFile in scope" "let __findFile = path: name: name; in <foo>" (mkStr "foo"),
       -- Dynamic attribute keys.  A key of a plain string is a name, so
       -- each key here that is not a variable concatenates to stay dynamic.
       runTest "dynamic key basic" $
@@ -27232,16 +27237,6 @@ testBytecodeCompile = do
                       <> " pathLen="
                       <> T.pack (show pathLen)
                   )
-          ),
-      -- ESearchPath is desugared by resolver to __findFile __nixPath "name",
-      -- so the compiler sees an EApp chain, not a raw ESearchPath.
-      runTestM "compile desugared search path" $ do
-        idx <- compileExpr (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "nixpkgs"]))
-        op <- cbcOpcode idx
-        pure
-          ( if op == OpApp
-              then Pass
-              else Fail ("expected OpApp, got op=" <> T.pack (show op))
           ),
       runTestM "op_count grows after compilation" $ do
         before <- cbcOpCount

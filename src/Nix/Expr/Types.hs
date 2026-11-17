@@ -254,8 +254,6 @@ data Expr
     EUnary !UnaryOp !Expr
   | -- | Binary operator application.
     EBinary !BinaryOp !Expr !Expr
-  | -- | Search path lookup: @\<nixpkgs\>@ is @ESearchPath "nixpkgs"@.
-    ESearchPath !Text
   | -- | @__curPos@, at the position it is written.  Upstream's parser reads
     -- that identifier as a position wherever it is an expression, never as
     -- a variable (@expr_simple@, parser.y at 2.24.9), so no binding of the

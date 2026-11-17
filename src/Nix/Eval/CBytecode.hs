@@ -72,7 +72,6 @@ module Nix.Eval.CBytecode
     pattern OpAssert,
     pattern OpUnary,
     pattern OpBinary,
-    pattern OpSearchPath,
     pattern OpPathStr,
     pattern OpPos,
 
@@ -381,10 +380,6 @@ pattern OpAssert = 20
 pattern OpUnary, OpBinary :: Word8
 pattern OpUnary = 21
 pattern OpBinary = 22
-
--- | Search-path opcode: an angle-bracket path lookup like @\<nixpkgs\>@.
-pattern OpSearchPath :: Word8
-pattern OpSearchPath = 23
 
 -- | Interpolated-path opcode: a path holding an antiquotation, such as
 -- @.\/a\/${x}@, whose string parts begin with the path's literal head.
