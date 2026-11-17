@@ -7,7 +7,7 @@
  *
  * The items array is allocated via nn_env_alloc_items (page-based bump
  * allocator).  The nn_list_t header is malloc'd and tracked for bulk
- * cleanup via nn_list_free_all().  Both are freed at evaluation end.
+ * cleanup via nn_list_free_all().  Both are freed at arena teardown.
  *
  * Lists are immutable after construction: allocate with nn_list_new,
  * fill via nn_list_set, then read with nn_list_get/nn_list_count.

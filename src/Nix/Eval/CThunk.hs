@@ -10,14 +10,14 @@
 -- BLACKHOLE; if forced again before completion, infinite recursion
 -- is detected (matching C++ Nix behavior).
 --
+-- In an evaluation session ('Nix.Eval.IO.withEvalSession'):
+--
 -- @
--- cthunkInit 0
 -- ptr <- cthunkNewBc bcIdx envPtr
 -- cthunkState ptr  -- 0 (PENDING)
 -- cthunkMarkBlackhole ptr  -- True (was PENDING)
 -- cthunkSetComputedInt ptr 42  -- True (was not yet COMPUTED)
 -- cthunkState ptr  -- 1 (COMPUTED)
--- cthunkDestroy
 -- @
 module Nix.Eval.CThunk
   ( -- * Opaque handle
@@ -486,8 +486,8 @@ cthunkMarkPending ptr = cdataIO (accepted <$> c_nn_thunk_mark_pending ptr)
 
 -- The setters below store a value in a thunk that is not yet COMPUTED and
 -- answer 'True', or leave a COMPUTED thunk as it was and answer 'False'.
--- The pending payload they overwrite is an env pointer the env arena
--- owns, so nothing is handed back.
+-- The pending payload they overwrite is an env or an application's
+-- cells, which the env pages own, so nothing is handed back.
 
 -- | Store an inline int64.
 cthunkSetComputedInt :: (MonadCData m) => CThunkPtr -> Int64 -> m Bool
@@ -543,7 +543,7 @@ accepted :: CInt -> Bool
 accepted = (/= 0)
 
 -- ---------------------------------------------------------------------------
--- Arena diagnostics / cleanup
+-- Arena diagnostics
 -- ---------------------------------------------------------------------------
 
 -- | Total thunks allocated in the arena.

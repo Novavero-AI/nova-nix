@@ -418,7 +418,7 @@ instance Monad EvalIO where
 {-# SPECIALIZE selectAttrPath :: Text -> NixValue -> EvalIO (Either Text NixValue) #-}
 
 -- The environment each scopedImport builds over the base one, here too:
--- left to the flags, it ran on the dictionary-passing code.
+-- left to the flags, it runs on the dictionary-passing code.
 {-# SPECIALIZE builtinEnvWithScope :: Env -> [(Text, Thunk)] -> EvalIO Env #-}
 
 -- ---------------------------------------------------------------------------
@@ -932,8 +932,8 @@ instance MonadEval EvalIO where
         -- taking the BLACKHOLE branch above and aborting with a bogus "infinite
         -- recursion".  Mirrors C++ Nix forceValue: catch (...) { restore; throw }.
         -- A genuine self-recursion still rethrows its NixAbortError, which
-        -- escapes tryEval exactly as before.  Storing the value is inside the
-        -- restore too, since copying or marshalling it can fail.  The
+        -- escapes tryEval.  Storing the value is inside the restore too,
+        -- since copying or marshalling it can fail.  The
         -- restore's own answer is not needed: it refuses only a thunk that is
         -- no longer BLACKHOLE, which a later force already handles, and the
         -- exception in flight is the one to report.
@@ -1385,8 +1385,7 @@ statSource = void . Dir.pathIsSymbolicLink
 -- | A source path's NAR, its root lstat'ed first as upstream's dumpPath
 -- begins.  A regular file's only access in the walk is its read, so a
 -- failure there is the read's.  A failure below a directory keeps GHC's
--- text until nova-cache's walk names the access that failed
--- (Novavero-AI/nova-cache#80).
+-- text until nova-cache's walk names the access that failed.
 serialiseSource :: Text -> NAR.CaseHack -> FilePath -> EvalIO NAR.NarEntry
 serialiseSource path caseHack resolved = do
   isLink <- sourceIO StatPath path (Dir.pathIsSymbolicLink resolved)

@@ -10,11 +10,11 @@
 -- it was interned in, which decides the order of a set's attributes, so
 -- a string value is never interned: its bytes live in "Nix.Eval.CStr".
 --
+-- In an evaluation session ('Nix.Eval.IO.withEvalSession'):
+--
 -- @
--- symbolInit 8192
 -- sym <- symbolIntern "name"
 -- symbolText sym   -- "name"
--- symbolInit destroys and re-creates; call once per evaluation.
 -- @
 module Nix.Eval.Symbol
   ( -- * Symbol type

@@ -2281,10 +2281,9 @@ builtinDiscardContext value = mkStrBytes . fst <$> coerceToStringInterp value
 
 -- | @builtins.unsafeDiscardOutputDependency@ - downgrade all-outputs (DrvDeep)
 -- references to a plain (Opaque) reference on the same @.drv@ path, and KEEP
--- derivation-output (Built) references unchanged, matching upstream.  It
--- formerly dropped both kinds and kept only plain references, losing the
--- @.drv@ reference the downgrade must preserve.  'Set.map' also folds a
--- downgraded element into an existing plain reference on the same path.
+-- derivation-output (Built) references unchanged, matching upstream.
+-- 'Set.map' also folds a downgraded element into an existing plain
+-- reference on the same path.
 builtinDiscardOutputDep :: (MonadEval m) => NixValue -> m NixValue
 builtinDiscardOutputDep value = do
   (s, StringContext ctx) <- coerceToStringInterp value
@@ -2526,8 +2525,6 @@ bitwise op a b = VInt <$> (op <$> expectInt a <*> expectInt b)
 builtinMapAttrs :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
 builtinMapAttrs funcArg (VAttrs attrs) =
   -- Each attr value is a deferred @f key val@, forced only on demand.
-  -- Eagerly builds all thunks via attrSetMapWithKey - with C arena thunks
-  -- (~16 bytes each), this keeps all data off the GHC heap.
   do
     fnThunk <- argAsThunk funcArg
     VAttrs <$> attrSetMapWithKey SetMapAttrs (deferApply2 fnThunk) attrs
@@ -2654,7 +2651,7 @@ builtinReplaceStrings _ _ other =
 -- entries).  A memo of a pure function, so the one process-wide table is
 -- safe to create outside any monad: a pattern compiles to the same regex
 -- whether the cache answers or the compiler does.  It holds no C memory,
--- so the collector over the C data layer has nothing in it to see.
+-- so no root of the C data layer is in it.
 {-# NOINLINE regexCacheRef #-}
 regexCacheRef :: IORef (Map BS.ByteString RE.Regex)
 regexCacheRef = unsafePerformIO (newIORef Map.empty)

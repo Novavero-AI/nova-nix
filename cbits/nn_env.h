@@ -131,7 +131,8 @@ uint64_t nn_env_app_bytes(void);
 /* --- Env constructors (all arena-allocated) --- */
 
 /* Return a pointer to the global empty env: no slots, no parent, no
- * scopes.  Valid until nn_env_destroy().  Do not modify it. */
+ * scopes.  A static, valid in and outside every init .. destroy window.
+ * Do not modify it. */
 nn_env_t *nn_env_empty(void);
 
 /* An env of `slot_count` NULL slots under `parent`, or under none for a

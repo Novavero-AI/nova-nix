@@ -10,12 +10,12 @@
 -- code, so a value a literal evaluates to can point at one rather than
 -- copy it.
 --
+-- In an evaluation session ('Nix.Eval.IO.withEvalSession'):
+--
 -- @
--- cbcInit 0 0
 -- idx <- cbcEmit OpLitInt 0 0 42 0 0
--- cbcOpcode idx   -- NN_OP_LIT_INT (0)
+-- cbcOpcode idx   -- OpLitInt (0)
 -- cbcArg1 idx     -- 42
--- cbcDestroy
 -- @
 module Nix.Eval.CBytecode
   ( -- * Lifecycle

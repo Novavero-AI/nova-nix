@@ -6,7 +6,7 @@
  * no per-string malloc/free).  Symbols are 1-indexed uint32_t
  * values; 0 is the invalid sentinel.
  *
- * The table doubles when load exceeds 75%.  Deletion is not
+ * The table doubles before its load reaches 75%.  Deletion is not
  * supported - symbols live for the entire evaluation lifetime.
  */
 
@@ -157,7 +157,8 @@ void nn_symbol_init(uint32_t initial_capacity)
 
     memset(&g_sym, 0, sizeof(g_sym));
 
-    /* Entry array (1-indexed, so allocate cap+1 but we just use cap). */
+    /* Entry 0 is unused, so cap entries hold cap - 1 symbols before
+     * entries_reserve grows the array. */
     g_sym.entries_cap = cap;
     g_sym.entries = (nn_symbol_entry_t *)calloc(
         (size_t)cap, sizeof(nn_symbol_entry_t));

@@ -28,8 +28,8 @@
 
 /* --- Types --- */
 
-/* An interned symbol: index into the global symbol table.
- * 0 is reserved as the invalid/empty sentinel. */
+/* An interned symbol: index into the global symbol table.  0 is the
+ * invalid sentinel; the empty string interns as an ordinary symbol. */
 typedef uint32_t nn_symbol_t;
 
 /* Invalid symbol constant. */
@@ -66,20 +66,15 @@ void nn_symbol_destroy(void);
  * is refused before any byte of str is read. */
 nn_symbol_t nn_symbol_intern(const char *str, size_t len);
 
-/* Return the string data for a symbol.  The pointer is valid until
- * nn_symbol_destroy().  Returns NULL for NN_SYMBOL_INVALID. */
+/* Return the string data for a symbol, valid until the next
+ * nn_symbol_intern (which can move the table's bytes) or
+ * nn_symbol_destroy().  Returns NULL for NN_SYMBOL_INVALID and for an id
+ * the table does not hold. */
 const char *nn_symbol_text(nn_symbol_t sym);
 
 /* Return the byte length of a symbol's string.
- * Returns 0 for NN_SYMBOL_INVALID. */
+ * Returns 0 for NN_SYMBOL_INVALID and for an id the table does not hold. */
 size_t nn_symbol_len(nn_symbol_t sym);
-
-/* --- Comparison --- */
-
-/* Symbols are equal iff their uint32_t values are equal.
- * No function call needed - just use == directly.
- * This macro exists for documentation purposes. */
-#define nn_symbol_eq(a, b) ((a) == (b))
 
 /* --- Diagnostics --- */
 

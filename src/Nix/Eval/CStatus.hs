@@ -6,15 +6,19 @@
 -- list constructors and the attribute set insert.  Each covers two
 -- causes a caller needs to tell apart: the call ran outside an
 -- evaluation session ('Nix.Eval.IO.withEvalSession'), so the sub-arena
--- has no memory, or the arena is live and could not grow.  Only the C side knows which, so the failure path asks it
--- once, through @nn_arena_live@, and raises a 'CStatusError' that names
--- the C entry point.  The question is asked only after a failure, so
--- the hot path pays the sentinel comparison and nothing more.
+-- has no memory, or the arena is live and could not grow.  Only the C
+-- side knows which, so the failure path asks it once, through
+-- @nn_arena_live@, and raises a 'CStatusError' that names the C entry
+-- point.  The question is asked only after a failure, so the hot path
+-- pays the sentinel comparison and nothing more.
 --
--- The thunk state transitions report a third kind of refusal: a thunk
--- not in the state the transition needs.  The boundary only asks for a
--- transition it has just made valid, so that refusal is a defect in this
--- library, raised as 'CInvariantViolated' rather than carried on.
+-- A third kind of failure is a defect in this library: an answer from
+-- the C side that its own invariants rule out.  A thunk refuses a state
+-- transition the boundary had just made valid, a cell holds a state,
+-- tag, form or builtin index nothing produces, an index the compiler or
+-- resolver chose holds nothing, or a string stored from text holds bytes
+-- that are not UTF-8.  Each is raised as 'CInvariantViolated' rather
+-- than carried on.
 module Nix.Eval.CStatus
   ( -- * Errors
     CStatusError (..),
@@ -57,10 +61,9 @@ data CStatusError
   | -- | The arena is live and the allocation itself failed: exhaustion,
     -- or a size the C side rejects.  The second field is the detail.
     CAllocationFailed !String !String
-  | -- | The C side refused a state transition the boundary had just made
-    -- valid, or reported a state no transition produces.  A defect in
-    -- this library, never a resource failure; the second field says
-    -- which state was wrong.
+  | -- | The C side gave an answer this library's invariants rule out
+    -- (see the module header).  A defect in this library, never a
+    -- resource failure; the second field says what was wrong.
     CInvariantViolated !String !String
   deriving (Eq, Show)
 
@@ -93,7 +96,8 @@ cStatusFailure site detail = do
   live <- arenaLive
   throwIO (if live then CAllocationFailed site detail else ArenaNotInitialized site)
 
--- | Raise 'CInvariantViolated' for a transition @site@ refused.  Unlike
+-- | Raise 'CInvariantViolated' for an answer from @site@ that this
+-- library's invariants rule out.  Unlike
 -- 'cStatusFailure' it does not ask whether the arena is live: the caller
 -- holds a cell the arena handed out, so liveness is not the question.
 cInvariantViolated :: String -> String -> IO a

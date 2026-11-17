@@ -6,12 +6,16 @@
 -- whole, with nothing in GHC's heap to release.  The module is internal to
 -- the library: no caller sets the arena up or tears it down.
 --
--- Outside a session the C layer has no memory to hand out, and every path
--- into it ('Nix.Builtins.builtinEnv', 'Nix.Eval.eval', 'Nix.Eval.force',
--- the value constructors) raises 'Nix.Eval.CStatus.ArenaNotInitialized'
--- naming the C entry point that refused, rather than dereferencing state
--- that does not exist.  Parsing ("Nix.Parser") is pure and needs no
--- arena.  The @null@, @true@, @false@ and empty list cells and each
+-- Outside a session the sub-arenas have no memory to hand out, and every
+-- path that allocates from one ('Nix.Builtins.builtinEnv', 'Nix.Eval.eval',
+-- 'Nix.Eval.force', the value constructors that make a cell or intern a
+-- name) raises 'Nix.Eval.CStatus.ArenaNotInitialized' naming the C entry
+-- point that refused, rather than dereferencing state that does not
+-- exist.  The tracked objects (sets, list headers, lambdas, strings with
+-- context, partial applications) are malloc'd, so the binding modules'
+-- own constructors for them work outside a session, and the next
+-- teardown frees what they made.  Parsing ("Nix.Parser") is pure and
+-- needs no arena.  The @null@, @true@, @false@ and empty list cells and each
 -- builtin's own cell are C statics outside every arena, so forcing one
 -- needs no session and survives every one.
 module Nix.Eval.Arena
@@ -43,8 +47,8 @@ foreign import ccall unsafe "nn_attrset_free_all"
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
--- | Initialize all C data layer arenas.  Call once before evaluation.
--- Initializes: symbol table, string arena, thunk arena, env slot
+-- | Initialize all C data layer arenas, as the outermost evaluation
+-- session starts: symbol table, string arena, thunk arena, env slot
 -- allocator, bytecode store.  The new symbol table interns upstream's
 -- startup names ('startupSymbols') before anything else can, so that a
 -- name gets the symbol upstream's would.

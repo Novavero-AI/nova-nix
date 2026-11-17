@@ -2,9 +2,9 @@
  * nn_env.c - C-native evaluation environments.
  *
  * Arena-allocated envs (nn_env.h), with-scope arrays, list items arrays
- * and deferred applications' cells.  Pages are 256 KB each, allocated on
- * demand as a linked list.
- * Each allocation bumps a pointer within the current page.
+ * and deferred applications' cells.  Pages are NN_ENV_PAGE_SIZE bytes, or
+ * a request's own size when it is larger, allocated on demand as a linked
+ * list.  Each allocation bumps a pointer within the current page.
  *
  * All memory is freed in bulk via nn_env_destroy().
  */
@@ -71,7 +71,8 @@ static uint64_t g_total_bytes = 0;
 static uint64_t g_app_count = 0;
 static uint64_t g_app_bytes = 0;
 
-/* Global empty env - initialized in nn_env_init, valid until destroy. */
+/* The empty env: a zeroed static that nothing writes, valid in and
+ * outside every init .. destroy window. */
 static nn_env_t g_empty_env;
 
 /* --- Internal helpers --- */
@@ -249,9 +250,6 @@ nn_env_init(void)
     g_total_bytes = 0;
     g_app_count = 0;
     g_app_bytes = 0;
-
-    /* Initialize global empty env */
-    memset(&g_empty_env, 0, sizeof(g_empty_env));
 }
 
 int
