@@ -3,10 +3,9 @@
 -- Wraps @cbits/nn_list.c@: a flat array of @nn_thunk_t*@ pointers, 8
 -- bytes an element against the ~48 of the cons cells of a @[Thunk]@.
 --
--- Lists are immutable after construction: allocate with 'clistNew',
--- fill with 'clistSet', then read with 'clistGet'/'clistCount'.
--- The headers are freed in bulk via 'clistFreeAll' at arena teardown,
--- and the items arrays with the env pages that hold them.
+-- Lists are immutable after construction: 'clistFromThunks' builds one
+-- and 'clistThunks' reads its items.  The headers are freed in bulk at
+-- arena teardown, and the items arrays with the env pages that hold them.
 --
 -- 'nullPtr' is the empty list, so the C constructors report failure
 -- through a status of their own rather than a NULL, and every one is
@@ -26,18 +25,8 @@ module Nix.Eval.CList
     clistIndex,
     clistDrop,
 
-    -- * Lifecycle
-    clistNew,
-    clistFreeAll,
-
-    -- * Access
-    clistCount,
-    clistGet,
-    clistSet,
-
     -- * Conversion
     thunkListToCList,
-    clistToThunkList,
   )
 where
 
@@ -63,9 +52,6 @@ type CListPtr = Ptr NnList
 
 foreign import ccall unsafe "nn_list_new"
   c_nn_list_new :: Ptr CListPtr -> Word32 -> IO CInt
-
-foreign import ccall unsafe "nn_list_free_all"
-  c_nn_list_free_all :: IO ()
 
 foreign import ccall unsafe "nn_list_count"
   c_nn_list_count :: CListPtr -> IO Word32
@@ -96,11 +82,6 @@ clistNew count = cdataIO $ alloca $ \out -> do
 checkedListStatus :: String -> CInt -> IO ()
 checkedListStatus site status =
   unless (status == 0) (cStatusFailure site "list allocation failed")
-
--- | Free all tracked list headers (arena-style cleanup).
--- Items arrays are freed by the env page allocator.
-clistFreeAll :: IO ()
-clistFreeAll = c_nn_list_free_all
 
 -- ---------------------------------------------------------------------------
 -- Access

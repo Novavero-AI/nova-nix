@@ -87,8 +87,6 @@ module Nix.Eval
     decodeFetchCache,
 
     -- * Builtin definitions
-    BuiltinDef (..),
-    ArgMode (..),
     listedBuiltins,
 
     -- * Platform
@@ -210,7 +208,6 @@ import Nix.Eval.Types
     resolveWithScopeAt,
     runPureEval,
     storePathOrThrow,
-    thunkToCPtr,
     tieFrame,
     typeName,
     typeOfValue,
@@ -623,7 +620,7 @@ evalBcList :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcList env bcIdx0 = do
   (count, dataOff) <- countedPayload1 bcIdx0
   children <- mapM (\i -> cbcData (dataOff + fromIntegral i) >>= cheapThunkBc env) [0 .. count - 1]
-  VList <$> clistFromThunks (map thunkToCPtr children)
+  VList <$> clistFromThunks (map unThunk children)
 
 -- | Evaluate a function application from bytecode.  A source application
 -- ('EApp') evaluates the function position outside the call frame and
@@ -1273,7 +1270,7 @@ valuesList values = mapM evaluated values >>= thunksList
 
 -- | A list of thunks.
 thunksList :: (MonadCData m) => [Thunk] -> m NixValue
-thunksList thunks = VList <$> clistFromThunks (map thunkToCPtr thunks)
+thunksList thunks = VList <$> clistFromThunks (map unThunk thunks)
 
 -- | A list's elements, as thunks.
 listThunks :: (MonadCData m) => CList -> m [Thunk]
@@ -3052,7 +3049,7 @@ deepForce = void . forceInside Set.empty
       | Set.member cell entered = pure entered
       | otherwise = force thunk >>= forceInside (Set.insert cell entered)
       where
-        cell = thunkToCPtr thunk
+        cell = unThunk thunk
 
 -- | @builtins.seq a b@ - evaluate @a@ to WHNF, then return @b@.
 builtinSeq :: (MonadEval m) => NixValue -> NixValue -> m NixValue

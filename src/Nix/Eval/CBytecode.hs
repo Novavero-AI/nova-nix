@@ -18,11 +18,7 @@
 -- cbcArg1 idx     -- 42
 -- @
 module Nix.Eval.CBytecode
-  ( -- * Lifecycle
-    cbcInit,
-    cbcDestroy,
-
-    -- * Emit
+  ( -- * Emit
     cbcEmit,
     cbcEmitData,
     cbcEmitString,
@@ -142,12 +138,6 @@ import Nix.Eval.CStr (CStrPtr, cstrBytes, cstrText)
 -- FFI imports (all unsafe - no callbacks, fast data access)
 -- ---------------------------------------------------------------------------
 
-foreign import ccall unsafe "nn_bytecode_init"
-  c_nn_bytecode_init :: Word32 -> Word32 -> IO ()
-
-foreign import ccall unsafe "nn_bytecode_destroy"
-  c_nn_bytecode_destroy :: IO ()
-
 foreign import ccall unsafe "nn_bc_emit"
   c_nn_bc_emit :: Word8 -> Word8 -> Word16 -> Word32 -> Word32 -> Word32 -> IO Word32
 
@@ -186,19 +176,6 @@ foreign import ccall unsafe "nn_bc_op_count"
 
 foreign import ccall unsafe "nn_bc_data_count"
   c_nn_bc_data_count :: IO Word32
-
--- ---------------------------------------------------------------------------
--- Lifecycle
--- ---------------------------------------------------------------------------
-
--- | Initialize the global bytecode store.  Call once before evaluation.
--- Arguments are capacity hints (0 = defaults: 65536 ops, 131072 data).
-cbcInit :: Word32 -> Word32 -> IO ()
-cbcInit = c_nn_bytecode_init
-
--- | Destroy the global bytecode store, freeing all memory.
-cbcDestroy :: IO ()
-cbcDestroy = c_nn_bytecode_destroy
 
 -- ---------------------------------------------------------------------------
 -- Emit

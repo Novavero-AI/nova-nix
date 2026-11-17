@@ -5,8 +5,7 @@
 -- specification.  A thunk holds one under tag 9, so a closure takes
 -- nothing on GHC's heap.
 --
--- Lambda structs are tracked for bulk cleanup via 'clambdaFreeAll'
--- at evaluation end.
+-- Lambda structs are tracked and freed in bulk at arena teardown.
 module Nix.Eval.CLambda
   ( -- * Opaque handle
     NnLambda,
@@ -15,7 +14,6 @@ module Nix.Eval.CLambda
     -- * Lifecycle
     clambdaNew,
     clambdaSetEntry,
-    clambdaFreeAll,
 
     -- * Accessors
     clambdaEnv,
@@ -57,9 +55,6 @@ foreign import ccall unsafe "nn_lambda_new"
 
 foreign import ccall unsafe "nn_lambda_set_entry"
   c_nn_lambda_set_entry :: CLambdaPtr -> Word32 -> Word32 -> Word32 -> Word32 -> IO ()
-
-foreign import ccall unsafe "nn_lambda_free_all"
-  c_nn_lambda_free_all :: IO ()
 
 foreign import ccall unsafe "nn_lambda_env"
   c_nn_lambda_env :: CLambdaPtr -> IO (Ptr NnEnv)
@@ -122,10 +117,6 @@ clambdaNew env body formalsType nameSym lambdaNameSym allowExtra formalCount =
 -- | Set a formal entry at the given index.
 clambdaSetEntry :: (MonadCData m) => CLambdaPtr -> Word32 -> Word32 -> Word32 -> Word32 -> m ()
 clambdaSetEntry lam idx nameSym hasDefault defaultIdx = cdataIO (c_nn_lambda_set_entry lam idx nameSym hasDefault defaultIdx)
-
--- | Free all tracked lambda structs (arena-style cleanup).
-clambdaFreeAll :: IO ()
-clambdaFreeAll = c_nn_lambda_free_all
 
 -- ---------------------------------------------------------------------------
 -- Accessors

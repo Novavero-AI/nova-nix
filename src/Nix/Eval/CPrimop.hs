@@ -4,8 +4,7 @@
 -- under @NN_VALUE_PRIMOP_APP@, so a partial application, like every
 -- other value, lives in C and holds nothing in GHC's heap.
 --
--- Applications are tracked for bulk cleanup via 'cprimopAppFreeAll' at
--- arena teardown.
+-- Applications are tracked and freed in bulk at arena teardown.
 module Nix.Eval.CPrimop
   ( -- * Opaque handle
     NnPrimopApp,
@@ -13,7 +12,6 @@ module Nix.Eval.CPrimop
 
     -- * Lifecycle
     cprimopAppNew,
-    cprimopAppFreeAll,
 
     -- * Accessors
     cprimopAppPrimop,
@@ -43,9 +41,6 @@ type CPrimopAppPtr = Ptr NnPrimopApp
 foreign import ccall unsafe "nn_primop_app_new"
   c_nn_primop_app_new :: Word32 -> Word16 -> Ptr CThunkPtr -> Word16 -> IO CPrimopAppPtr
 
-foreign import ccall unsafe "nn_primop_app_free_all"
-  c_nn_primop_app_free_all :: IO ()
-
 foreign import ccall unsafe "nn_primop_app_primop"
   c_nn_primop_app_primop :: CPrimopAppPtr -> IO Word32
 
@@ -70,10 +65,6 @@ cprimopAppNew :: (MonadCData m) => Word32 -> Word16 -> [CThunkPtr] -> m CPrimopA
 cprimopAppNew primop forced args =
   cdataIO $ withArrayLen args $ \taken argsPtr ->
     checkedCPtr "nn_primop_app_new" =<< c_nn_primop_app_new primop forced argsPtr (fromIntegral taken)
-
--- | Free every tracked application (arena teardown).
-cprimopAppFreeAll :: IO ()
-cprimopAppFreeAll = c_nn_primop_app_free_all
 
 -- ---------------------------------------------------------------------------
 -- Accessors

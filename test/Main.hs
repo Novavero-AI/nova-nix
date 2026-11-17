@@ -51,7 +51,7 @@ import Data.Tuple (swap)
 import Data.Word (Word16, Word32, Word64, Word8)
 import qualified Database.SQLite.Simple as SQL
 import Foreign.C.Error (Errno (..), eACCES, eISDIR, eNOENT, eNOTDIR)
-import Foreign.C.Types (CChar, CSize (..))
+import Foreign.C.Types (CChar, CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, WordPtr, castPtr, nullPtr, plusPtr, ptrToWordPtr)
 import Foreign.Storable (peekElemOff, poke, sizeOf)
@@ -84,12 +84,12 @@ import Nix.Eval.CBytecode (attrkeyStatic, binaryAdd, captureNone, captureSlots, 
 import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
 import Nix.Eval.CEnv (cenvLazyScope, cenvNew, cenvNewScoped, cenvParent)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsType, clambdaNew, clambdaShape, clambdaShapeAllowExtra, clambdaShapeFormalCount, clambdaShapeFormalsType)
-import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistNew, clistThunks, thunkListToCList)
+import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistThunks, thunkListToCList)
 import Nix.Eval.CRoots (crootsAddThunk)
 import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
 import Nix.Eval.CStatus (CStatusError (..), arenaLive)
 import Nix.Eval.CStr (cstrNew)
-import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkCount, cthunkGet, cthunkGetBool, cthunkGetCtxStr, cthunkGetInt, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkPrimop, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetBool, cthunkGetCtxStr, cthunkGetInt, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkPrimop, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, reassembleInt64)
@@ -25347,6 +25347,12 @@ withOversizedBytes use =
 foreign import ccall unsafe "nn_symbol_intern"
   c_nn_symbol_intern :: Ptr CChar -> CSize -> IO Word32
 
+-- | The list constructor itself, for the one refusal no list reaches: a
+-- list is built from the cells it holds, and no test can hold the half a
+-- billion a refused count needs.
+foreign import ccall unsafe "nn_list_new"
+  c_nn_list_new :: Ptr (Ptr ()) -> Word32 -> IO CInt
+
 -- | Intern an oversized name through the C entry point, answering what it
 -- returns.
 internOversizedSymbol :: IO Word32
@@ -25382,9 +25388,10 @@ testArenaGuard = do
     sequence
       [ liveRefusal "an env whose slots pass UINT32_MAX bytes" "nn_env_new" (void (tieFrame EnvLet Nothing slotCountPastUInt32 (const (pure [])))),
         -- The list's items come from the same pages, so the same count is
-        -- refused there and must surface as a list failure, where a NULL
-        -- return would read as the empty list.
-        liveRefusal "a list past UINT32_MAX slot bytes" "nn_list_new" (void (clistNew (fromIntegral slotCountPastUInt32))),
+        -- refused there, with a status: a NULL would read as the empty list.
+        runTestM "live arena: a list past UINT32_MAX slot bytes is refused with a status" $ do
+          status <- alloca (\out -> c_nn_list_new out (fromIntegral slotCountPastUInt32))
+          pure (assertEqual "status" (-1) status),
         -- A length a string's uint32_t cannot hold, refused rather than
         -- truncated to a shorter string, in the value arena and in the
         -- code's.
@@ -25702,44 +25709,13 @@ testCThunk = do
               then Pass
               else Fail ("accepted=" <> T.pack (show (marked, stored)) <> " values=" <> T.pack (show values))
           ),
-      runTestM "count tracks allocations" $ do
-        countBefore <- cthunkCount
-        _ <- cthunkNewBc 0 pendingEnv
-        _ <- cthunkNewBc 0 pendingEnv
-        _ <- cthunkNewComputedInt 0
-        countAfter <- cthunkCount
-        let delta = countAfter - countBefore
-        pure (assertEqual "delta" 3 delta),
-      runTestM "get retrieves by index" $ do
-        countBefore <- cthunkCount
-        ptr <- cthunkNewBc 0 pendingEnv
-        retrieved <- cthunkGet countBefore
-        stateOrig <- cthunkState ptr
-        stateRetrieved <- cthunkState retrieved
-        pure
-          ( if ptr == retrieved && stateOrig == stateRetrieved
-              then Pass
-              else Fail "get returned wrong pointer"
-          ),
+      -- Past the arena's first block, so allocation chains new ones and
+      -- every cell keeps its own value across them.
       runTestM "stress: 100k thunks" $ do
-        countBefore <- cthunkCount
-        mapM_ (\_ -> cthunkNewBc 0 pendingEnv) [(1 :: Int) .. 100000]
-        countAfter <- cthunkCount
-        let delta = countAfter - countBefore
-        -- Spot-check: retrieve one from the middle
-        midPtr <- cthunkGet (countBefore + 50000)
-        midState <- cthunkState midPtr
-        pure
-          ( if delta == 100000 && midState == 0
-              then Pass
-              else
-                Fail
-                  ( "delta="
-                      <> T.pack (show delta)
-                      <> " midState="
-                      <> T.pack (show midState)
-                  )
-          ),
+        let values = [1 .. 100000]
+        cells <- mapM cthunkNewComputedInt values
+        held <- mapM cthunkGetInt cells
+        pure (assertEqual "cells holding their own value" (length values) (length (filter id (zipWith (==) held values)))),
       runTestM "every builtin's own cell holds that builtin, with no argument taken" $ do
         held <- mapM (\builtin -> (,) builtin <$> (cthunkPrimop (builtinIndex builtin) >>= readThunkValue . Thunk)) [minBound .. maxBound]
         let wrong = [builtinName builtin | (builtin, value) <- held, value /= Just (VBuiltin builtin [])]

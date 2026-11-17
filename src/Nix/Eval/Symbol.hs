@@ -21,10 +21,6 @@ module Nix.Eval.Symbol
     Symbol (..),
     invalidSymbolId,
 
-    -- * Lifecycle
-    symbolInit,
-    symbolDestroy,
-
     -- * Core operations
     symbolIntern,
     symbolText,
@@ -60,12 +56,6 @@ invalidSymbolId = 0
 -- FFI imports (unsafe - these never call back to Haskell)
 -- ---------------------------------------------------------------------------
 
-foreign import ccall unsafe "nn_symbol_init"
-  c_nn_symbol_init :: Word32 -> IO ()
-
-foreign import ccall unsafe "nn_symbol_destroy"
-  c_nn_symbol_destroy :: IO ()
-
 foreign import ccall unsafe "nn_symbol_intern"
   c_nn_symbol_intern :: Ptr CChar -> CSize -> IO Word32
 
@@ -77,21 +67,6 @@ foreign import ccall unsafe "nn_symbol_len"
 
 foreign import ccall unsafe "nn_symbol_count"
   c_nn_symbol_count :: IO Word32
-
--- ---------------------------------------------------------------------------
--- Lifecycle
--- ---------------------------------------------------------------------------
-
--- | Initialize the global symbol table, destroying a live one first.
--- Call once before evaluation.  @capacity@ is a hint for the expected
--- number of unique symbols.  Pass 0 to use the default (4096).
-symbolInit :: Word32 -> IO ()
-symbolInit = c_nn_symbol_init
-
--- | Destroy the global symbol table, freeing all C-side memory.
--- All t'Symbol' values become invalid after this call.
-symbolDestroy :: IO ()
-symbolDestroy = c_nn_symbol_destroy
 
 -- ---------------------------------------------------------------------------
 -- Core operations
@@ -116,7 +91,7 @@ checkedSymbol sid
   | otherwise = pure (Symbol sid)
 
 -- The reads below are pure ('readImmutable'): a symbol's bytes do not
--- change once interned, until 'symbolDestroy'.  They can move, since the
+-- change once interned, until arena teardown.  They can move, since the
 -- table grows its byte storage with @realloc@ as later strings are
 -- interned, and a read takes their address before it copies them, so no
 -- intern may run between the two: the layer is used from one thread at a

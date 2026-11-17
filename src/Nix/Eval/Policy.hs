@@ -23,7 +23,6 @@ module Nix.Eval.Policy
     EvalPolicy (..),
     unrestrictedPolicy,
     pathsRestricted,
-    modeInformation,
 
     -- * Allowed paths
     AllowedPaths,
@@ -40,7 +39,6 @@ module Nix.Eval.Policy
     isAllowedUri,
     uriAccess,
     fileUrlPrefix,
-    forbiddenUriMessage,
   )
 where
 
