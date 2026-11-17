@@ -76,9 +76,8 @@ void nn_ctxstr_free_all(void);
 
 /* --- Element setters --- */
 
-/* idx must be < ctx_count.  A NULL struct or out-of-range idx is
- * dropped (asserts in debug builds) rather than writing out of
- * bounds - the bound stays live under NDEBUG. */
+/* idx must be < ctx_count: a NULL struct or an index past it aborts
+ * (NN_ASSERT). */
 
 void nn_ctxstr_set_plain(nn_ctxstr_t *s, uint32_t idx,
                          nn_str_t *sp_hash, nn_str_t *sp_name);
@@ -95,8 +94,8 @@ void nn_ctxstr_set_all_outputs(nn_ctxstr_t *s, uint32_t idx,
 nn_str_t *nn_ctxstr_text(const nn_ctxstr_t *s);
 uint32_t  nn_ctxstr_ctx_count(const nn_ctxstr_t *s);
 
-/* Element reads with idx >= ctx_count return 0 or NULL (asserts in debug
- * builds) rather than reading out of bounds. */
+/* Element reads take idx < ctx_count: a NULL struct or an index past it
+ * aborts (NN_ASSERT). */
 uint8_t   nn_ctxstr_elem_tag(const nn_ctxstr_t *s, uint32_t idx);
 nn_str_t *nn_ctxstr_elem_hash(const nn_ctxstr_t *s, uint32_t idx);
 nn_str_t *nn_ctxstr_elem_name(const nn_ctxstr_t *s, uint32_t idx);

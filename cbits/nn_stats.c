@@ -154,12 +154,11 @@ void nn_stats_count_sites(void)
     nn_stats_counting = 1;
 }
 
-/* A site the evaluator never numbers is a defect in it: asserted, and
- * counted nowhere in a build without asserts. */
+/* A site the evaluator never numbers is a defect in it, and aborts
+ * (NN_ASSERT). */
 void nn_stats_count_env(uint32_t site, uint32_t slots, uint64_t bytes)
 {
     NN_ASSERT(site < NN_STATS_ENV_SITES, "nn_stats_count_env: unknown site");
-    if (site >= NN_STATS_ENV_SITES) return;
     sites.env_count[site]++;
     sites.env_slots[site] += slots;
     sites.env_bytes[site] += bytes;
@@ -169,14 +168,12 @@ void nn_stats_count_env(uint32_t site, uint32_t slots, uint64_t bytes)
 void nn_stats_count_env_bytes(uint32_t site, uint64_t bytes)
 {
     NN_ASSERT(site < NN_STATS_ENV_SITES, "nn_stats_count_env_bytes: unknown site");
-    if (site >= NN_STATS_ENV_SITES) return;
     sites.env_bytes[site] += bytes;
 }
 
 void nn_stats_count_set(uint32_t site, uint64_t bytes, int shareable)
 {
     NN_ASSERT(site < NN_STATS_SET_SITES, "nn_stats_count_set: unknown site");
-    if (site >= NN_STATS_SET_SITES) return;
     sites.set_count[site]++;
     sites.set_bytes[site] += bytes;
     if (shareable) sites.set_shareable[site]++;

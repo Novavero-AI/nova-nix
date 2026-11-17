@@ -2646,7 +2646,20 @@ testFrameKnots = do
         pure $ case outcome of
           Left (CInvariantViolated site _) -> assertEqual "site" "nn_env_lookup_resolved" site
           Left other -> Fail ("expected CInvariantViolated, got " <> T.pack (show other))
-          Right _ -> Fail "the unfilled slot was read as a thunk"
+          Right _ -> Fail "the unfilled slot was read as a thunk",
+      -- A level past the parent chain, an index past the slots and a level
+      -- that reaches C negative hold nothing either, and refuse the same
+      -- way.
+      runTestM "a resolved lookup past the env's parents or slots raises CInvariantViolated" $ do
+        cell <- evaluated VNull
+        env <- newEnv EnvClosure Nothing [cell]
+        -- A level read from a bytecode word past INT_MAX reaches C negative.
+        let corruptLevel = fromIntegral (maxBound :: Word32)
+        outcomes <- mapM (\(level, idx) -> try (envLookupResolved level idx env)) [(1, 0), (0, 1), (corruptLevel, 0)]
+        let site = \case
+              Left (CInvariantViolated at _) -> Just at
+              _ -> Nothing
+        pure (assertEqual "sites" (replicate 3 (Just "nn_env_lookup_resolved")) (map site outcomes))
     ]
   where
     dynamicLetLater =
@@ -24698,7 +24711,14 @@ testStringSharing = do
         cell <- cheapThunkBc emptyEnv idx
         held <- cthunkGetStr (unThunk cell)
         value <- readThunkValue cell
-        pure (assertEqual "the code's string" code held `andThen` assertEqual "value" (Just (mkStr "zuri:shared")) value)
+        pure (assertEqual "the code's string" code held `andThen` assertEqual "value" (Just (mkStr "zuri:shared")) value),
+      -- Only a corrupt store names a string no emit returned.
+      runTestM "a string index no emit returned raises CInvariantViolated" $ do
+        outcome <- try (cbcString maxBound)
+        pure $ case outcome of
+          Left (CInvariantViolated site _) -> assertEqual "site" "nn_bc_string" site
+          Left other -> Fail ("expected CInvariantViolated, got " <> T.pack (show other))
+          Right _ -> Fail "an index no emit returned read as a string"
     ]
   where
     allSame xs = and (zipWith (==) xs (drop 1 xs))

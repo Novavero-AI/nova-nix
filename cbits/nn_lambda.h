@@ -98,9 +98,8 @@ nn_lambda_t *nn_lambda_new(struct nn_env *env, uint32_t body_bc_idx,
                            uint8_t allow_extra, uint32_t formal_count);
 
 /* Set a formal entry at the given index (for construction).
- * idx must be < formal_count.  A NULL struct or out-of-range idx is
- * dropped (asserts in debug builds) rather than writing out of
- * bounds - the bound stays live under NDEBUG. */
+ * idx must be < formal_count: a NULL struct or an index past it aborts
+ * (NN_ASSERT). */
 void nn_lambda_set_entry(nn_lambda_t *lam, uint32_t idx,
                          uint32_t name_sym, uint32_t has_default,
                          uint32_t default_bc_idx);
@@ -120,9 +119,8 @@ uint32_t       nn_lambda_lambda_name_sym(const nn_lambda_t *lam);
 uint8_t        nn_lambda_allow_extra(const nn_lambda_t *lam);
 uint32_t       nn_lambda_formal_count(const nn_lambda_t *lam);
 
-/* Read formal entry fields by index (must be < formal_count).
- * Out-of-range reads return 0 (asserts in debug builds) rather than
- * reading out of bounds. */
+/* Read formal entry fields by index, which must be < formal_count: an
+ * index past it aborts (NN_ASSERT). */
 uint32_t nn_lambda_entry_name(const nn_lambda_t *lam, uint32_t idx);
 uint32_t nn_lambda_entry_has_default(const nn_lambda_t *lam, uint32_t idx);
 uint32_t nn_lambda_entry_default(const nn_lambda_t *lam, uint32_t idx);

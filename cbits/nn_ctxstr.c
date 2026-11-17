@@ -78,16 +78,11 @@ nn_ctxstr_free_all(void)
 
 /* --- Element setters --- */
 
-/* Element bounds stay live under NDEBUG: the fill index derives from
- * input-sized data crossing the FFI, so a violated bound must drop the
- * write, not run past the sized array. */
-
 void
 nn_ctxstr_set_plain(nn_ctxstr_t *s, uint32_t idx,
                     nn_str_t *sp_hash, nn_str_t *sp_name)
 {
     NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_set_plain: idx out of bounds");
-    if (s == NULL || idx >= s->ctx_count) return;
     s->ctx[idx].tag = NN_SCE_PLAIN;
     s->ctx[idx].sp_hash = sp_hash;
     s->ctx[idx].sp_name = sp_name;
@@ -100,7 +95,6 @@ nn_ctxstr_set_drv_output(nn_ctxstr_t *s, uint32_t idx,
                          nn_str_t *output)
 {
     NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_set_drv_output: idx out of bounds");
-    if (s == NULL || idx >= s->ctx_count) return;
     s->ctx[idx].tag = NN_SCE_DRV_OUTPUT;
     s->ctx[idx].sp_hash = sp_hash;
     s->ctx[idx].sp_name = sp_name;
@@ -112,7 +106,6 @@ nn_ctxstr_set_all_outputs(nn_ctxstr_t *s, uint32_t idx,
                           nn_str_t *sp_hash, nn_str_t *sp_name)
 {
     NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_set_all_outputs: idx out of bounds");
-    if (s == NULL || idx >= s->ctx_count) return;
     s->ctx[idx].tag = NN_SCE_ALL_OUTPUTS;
     s->ctx[idx].sp_hash = sp_hash;
     s->ctx[idx].sp_name = sp_name;
@@ -133,14 +126,10 @@ nn_ctxstr_ctx_count(const nn_ctxstr_t *s)
     return s->ctx_count;
 }
 
-/* Element reads keep their bound live under NDEBUG (see setters);
- * a violated bound returns 0 or NULL rather than reading out of bounds. */
-
 uint8_t
 nn_ctxstr_elem_tag(const nn_ctxstr_t *s, uint32_t idx)
 {
     NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_elem_tag: idx out of bounds");
-    if (s == NULL || idx >= s->ctx_count) return 0;
     return s->ctx[idx].tag;
 }
 
@@ -148,7 +137,6 @@ nn_str_t *
 nn_ctxstr_elem_hash(const nn_ctxstr_t *s, uint32_t idx)
 {
     NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_elem_hash: idx out of bounds");
-    if (s == NULL || idx >= s->ctx_count) return NULL;
     return s->ctx[idx].sp_hash;
 }
 
@@ -156,7 +144,6 @@ nn_str_t *
 nn_ctxstr_elem_name(const nn_ctxstr_t *s, uint32_t idx)
 {
     NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_elem_name: idx out of bounds");
-    if (s == NULL || idx >= s->ctx_count) return NULL;
     return s->ctx[idx].sp_name;
 }
 
@@ -164,7 +151,6 @@ nn_str_t *
 nn_ctxstr_elem_output(const nn_ctxstr_t *s, uint32_t idx)
 {
     NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_elem_output: idx out of bounds");
-    if (s == NULL || idx >= s->ctx_count) return NULL;
     return s->ctx[idx].output;
 }
 

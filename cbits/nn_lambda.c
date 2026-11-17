@@ -124,12 +124,8 @@ nn_lambda_set_entry(nn_lambda_t *lam, uint32_t idx,
                     uint32_t name_sym, uint32_t has_default,
                     uint32_t default_bc_idx)
 {
-    /* Bound stays live under NDEBUG: the fill index derives from
-     * input-sized data crossing the FFI, so a violated bound must drop
-     * the write, not run past the sized array. */
     NN_ASSERT(lam != NULL && lam->entries != NULL && idx < nn_lambda_formal_count(lam),
               "nn_lambda_set_entry: idx out of bounds");
-    if (lam == NULL || lam->entries == NULL || idx >= nn_lambda_formal_count(lam)) return;
     lam->entries[idx].name_sym       = name_sym;
     lam->entries[idx].has_default    = has_default;
     lam->entries[idx].default_bc_idx = default_bc_idx;
@@ -193,15 +189,11 @@ nn_lambda_formal_count(const nn_lambda_t *lam)
     return nn_lambda_shape_formal_count(lam->shape);
 }
 
-/* Entry reads keep their bound live under NDEBUG (see set_entry);
- * a violated bound returns 0 rather than reading out of bounds. */
-
 uint32_t
 nn_lambda_entry_name(const nn_lambda_t *lam, uint32_t idx)
 {
     NN_ASSERT(lam != NULL && lam->entries != NULL && idx < nn_lambda_formal_count(lam),
               "nn_lambda_entry_name: idx out of bounds or no formals");
-    if (lam == NULL || lam->entries == NULL || idx >= nn_lambda_formal_count(lam)) return 0;
     return lam->entries[idx].name_sym;
 }
 
@@ -210,7 +202,6 @@ nn_lambda_entry_has_default(const nn_lambda_t *lam, uint32_t idx)
 {
     NN_ASSERT(lam != NULL && lam->entries != NULL && idx < nn_lambda_formal_count(lam),
               "nn_lambda_entry_has_default: idx out of bounds or no formals");
-    if (lam == NULL || lam->entries == NULL || idx >= nn_lambda_formal_count(lam)) return 0;
     return lam->entries[idx].has_default;
 }
 
@@ -219,7 +210,6 @@ nn_lambda_entry_default(const nn_lambda_t *lam, uint32_t idx)
 {
     NN_ASSERT(lam != NULL && lam->entries != NULL && idx < nn_lambda_formal_count(lam),
               "nn_lambda_entry_default: idx out of bounds or no formals");
-    if (lam == NULL || lam->entries == NULL || idx >= nn_lambda_formal_count(lam)) return 0;
     return lam->entries[idx].default_bc_idx;
 }
 

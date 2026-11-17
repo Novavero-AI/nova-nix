@@ -11,7 +11,6 @@
  */
 
 #include "nn_symbol.h"
-#include "nn_assert.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -207,8 +206,8 @@ nn_symbol_t nn_symbol_intern(const char *str, size_t len)
     /* An empty string arrives from Haskell's zero-copy marshalling as
      * (NULL, 0).  memcpy/memcmp require valid pointers even for a zero
      * length, so normalize at the boundary.  Empty symbols are reachable
-     * from evaluated input ({ "" = 1; }), so the branch survives release
-     * builds. */
+     * from evaluated input ({ "" = 1; }), so this is a case to handle, not
+     * an invariant to assert. */
     if (len == 0) {
         str = "";
     }
