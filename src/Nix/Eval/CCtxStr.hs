@@ -16,7 +16,6 @@ module Nix.Eval.CCtxStr
 
     -- * Lifecycle
     cctxstrNew,
-    cctxstrFreeAll,
 
     -- * Element setters
     cctxstrSetPlain,
@@ -50,9 +49,6 @@ type CCtxStrPtr = Ptr NnCtxStr
 
 foreign import ccall unsafe "nn_ctxstr_new"
   c_nn_ctxstr_new :: CStrPtr -> Word32 -> IO CCtxStrPtr
-
-foreign import ccall unsafe "nn_ctxstr_free_all"
-  c_nn_ctxstr_free_all :: IO ()
 
 foreign import ccall unsafe "nn_ctxstr_set_plain"
   c_nn_ctxstr_set_plain :: CCtxStrPtr -> Word32 -> CStrPtr -> CStrPtr -> IO ()
@@ -91,10 +87,6 @@ foreign import ccall unsafe "nn_ctxstr_elem_output"
 -- element array size would overflow - the caller must check.
 cctxstrNew :: (MonadCData m) => CStrPtr -> Word32 -> m CCtxStrPtr
 cctxstrNew text ctxCount = cdataIO (c_nn_ctxstr_new text ctxCount)
-
--- | Free all tracked nn_ctxstr_t allocations (arena-style cleanup).
-cctxstrFreeAll :: IO ()
-cctxstrFreeAll = c_nn_ctxstr_free_all
 
 -- ---------------------------------------------------------------------------
 -- Element setters

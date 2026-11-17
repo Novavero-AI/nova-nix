@@ -17,10 +17,6 @@ module Nix.Eval.CStr
     NnStr,
     CStrPtr,
 
-    -- * Lifecycle
-    cstrInit,
-    cstrDestroy,
-
     -- * Making
     cstrNew,
     cstrFromText,
@@ -54,12 +50,6 @@ type CStrPtr = Ptr NnStr
 -- FFI imports (all unsafe - no callbacks)
 -- ---------------------------------------------------------------------------
 
-foreign import ccall unsafe "nn_str_init"
-  c_nn_str_init :: IO ()
-
-foreign import ccall unsafe "nn_str_destroy"
-  c_nn_str_destroy :: IO ()
-
 foreign import ccall unsafe "nn_str_new"
   c_nn_str_new :: Ptr CChar -> CSize -> IO CStrPtr
 
@@ -68,18 +58,6 @@ foreign import ccall unsafe "nn_str_len"
 
 foreign import ccall unsafe "nn_str_bytes"
   c_nn_str_bytes :: CStrPtr -> IO (Ptr CChar)
-
--- ---------------------------------------------------------------------------
--- Lifecycle
--- ---------------------------------------------------------------------------
-
--- | Start the value arena, ending a live one first.
-cstrInit :: IO ()
-cstrInit = c_nn_str_init
-
--- | End the value arena, freeing every string it made.
-cstrDestroy :: IO ()
-cstrDestroy = c_nn_str_destroy
 
 -- ---------------------------------------------------------------------------
 -- Making

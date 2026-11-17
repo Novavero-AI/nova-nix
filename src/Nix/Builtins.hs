@@ -51,7 +51,7 @@ import qualified Nix.Eval.Builtin as Builtin
 import Nix.Eval.CData (MonadCData, cdataIO)
 import Nix.Eval.CStatus (cInvariantViolated)
 import Nix.Eval.CThunk (cthunkPrimop)
-import Nix.Eval.Types (AttrSet, EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newScopeEnv, thunkToCPtr)
+import Nix.Eval.Types (AttrSet, EvalPolicy (..), cheapThunk, clistFromThunks, mkStr, mkStrBytes, newScopeEnv)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames)
 import Nix.Parser (SourceOrigin (..), parseNixWithScope, parsedExpr)
 import Nix.Store.Path (defaultStoreDirText)
@@ -144,7 +144,7 @@ standardEntries policy timestamp searchPaths =
       ("storeDir", evaluated (mkStr defaultStoreDirText)),
       ("nixVersion", evaluated (mkStr targetNixVersion)),
       ("langVersion", evaluated (VInt 6)),
-      ("nixPath", clistFromThunks (map thunkToCPtr searchPaths) >>= evaluated . VList),
+      ("nixPath", clistFromThunks (map unThunk searchPaths) >>= evaluated . VList),
       ("derivation", derivationWrapper)
     ]
       ++ [("currentTime", evaluated (VInt timestamp)) | not (epPureEval policy)]

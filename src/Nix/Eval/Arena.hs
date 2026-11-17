@@ -24,24 +24,49 @@ module Nix.Eval.Arena
   )
 where
 
-import Nix.Eval.CBytecode (cbcDestroy, cbcInit)
-import Nix.Eval.CCtxStr (cctxstrFreeAll)
-import Nix.Eval.CEnv (cenvDestroy, cenvInit)
-import Nix.Eval.CLambda (clambdaFreeAll)
-import Nix.Eval.CList (clistFreeAll)
-import Nix.Eval.CPrimop (cprimopAppFreeAll)
-import Nix.Eval.CRoots (crootsClear)
-import Nix.Eval.CStr (cstrDestroy, cstrInit)
-import Nix.Eval.CThunk (cthunkDestroy, cthunkInit)
+import Data.Word (Word32)
 import Nix.Eval.StartupSymbols (startupSymbols)
-import Nix.Eval.Symbol (symbolDestroy, symbolInit, symbolIntern)
+import Nix.Eval.Symbol (symbolIntern)
 
 -- ---------------------------------------------------------------------------
--- FFI import for bulk CAttrSet cleanup
+-- The C lifecycle, which only this module calls
 -- ---------------------------------------------------------------------------
 
-foreign import ccall unsafe "nn_attrset_free_all"
-  cattrsetFreeAll :: IO ()
+foreign import ccall unsafe "nn_symbol_init" c_nn_symbol_init :: Word32 -> IO ()
+
+foreign import ccall unsafe "nn_symbol_destroy" c_nn_symbol_destroy :: IO ()
+
+foreign import ccall unsafe "nn_str_init" c_nn_str_init :: IO ()
+
+foreign import ccall unsafe "nn_str_destroy" c_nn_str_destroy :: IO ()
+
+foreign import ccall unsafe "nn_thunk_init" c_nn_thunk_init :: Word32 -> IO ()
+
+foreign import ccall unsafe "nn_thunk_destroy" c_nn_thunk_destroy :: IO ()
+
+foreign import ccall unsafe "nn_env_init" c_nn_env_init :: IO ()
+
+foreign import ccall unsafe "nn_env_destroy" c_nn_env_destroy :: IO ()
+
+foreign import ccall unsafe "nn_bytecode_init" c_nn_bytecode_init :: Word32 -> Word32 -> IO ()
+
+foreign import ccall unsafe "nn_bytecode_destroy" c_nn_bytecode_destroy :: IO ()
+
+foreign import ccall unsafe "nn_roots_clear" c_nn_roots_clear :: IO ()
+
+foreign import ccall unsafe "nn_ctxstr_free_all" c_nn_ctxstr_free_all :: IO ()
+
+foreign import ccall unsafe "nn_lambda_free_all" c_nn_lambda_free_all :: IO ()
+
+foreign import ccall unsafe "nn_primop_app_free_all" c_nn_primop_app_free_all :: IO ()
+
+foreign import ccall unsafe "nn_list_free_all" c_nn_list_free_all :: IO ()
+
+foreign import ccall unsafe "nn_attrset_free_all" c_nn_attrset_free_all :: IO ()
+
+-- | The capacity hint that asks a C arena for its default size.
+defaultCapacity :: Word32
+defaultCapacity = 0
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle
@@ -54,12 +79,12 @@ foreign import ccall unsafe "nn_attrset_free_all"
 -- name gets the symbol upstream's would.
 arenaInit :: IO ()
 arenaInit = do
-  symbolInit 0
+  c_nn_symbol_init defaultCapacity
   mapM_ symbolIntern startupSymbols
-  cstrInit
-  cthunkInit 0
-  cenvInit
-  cbcInit 0 0
+  c_nn_str_init
+  c_nn_thunk_init defaultCapacity
+  c_nn_env_init
+  c_nn_bytecode_init defaultCapacity defaultCapacity
 
 -- | Destroy all C arenas: the registered roots, the tracked objects
 -- (strings with context, lambdas, partial applications, lists, sets),
@@ -76,14 +101,14 @@ arenaInit = do
 -- before the teardown is not used after it.
 arenaDestroy :: IO ()
 arenaDestroy = do
-  crootsClear
-  cctxstrFreeAll
-  clambdaFreeAll
-  cprimopAppFreeAll
-  clistFreeAll
-  cattrsetFreeAll
-  cbcDestroy
-  cenvDestroy
-  cthunkDestroy
-  cstrDestroy
-  symbolDestroy
+  c_nn_roots_clear
+  c_nn_ctxstr_free_all
+  c_nn_lambda_free_all
+  c_nn_primop_app_free_all
+  c_nn_list_free_all
+  c_nn_attrset_free_all
+  c_nn_bytecode_destroy
+  c_nn_env_destroy
+  c_nn_thunk_destroy
+  c_nn_str_destroy
+  c_nn_symbol_destroy

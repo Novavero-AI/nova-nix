@@ -2,8 +2,7 @@
 --
 -- Wraps @cbits/nn_env.c@ - arena-allocated @nn_env_t@ envs that hold
 -- their slots inline, and a parent, a lazy scope and with-scopes when
--- they have them.  All memory is freed in bulk via 'cenvDestroy' at
--- evaluation end.
+-- they have them.  All memory is freed in bulk at arena teardown.
 --
 -- An env is a word and its slots (@cbits/nn_env.h@).  One of one to
 -- seven slots and no scopes keeps its parent in that word, as upstream's
@@ -16,10 +15,6 @@
 module Nix.Eval.CEnv
   ( -- * Opaque C type
     NnEnv,
-
-    -- * Lifecycle
-    cenvInit,
-    cenvDestroy,
 
     -- * Env constructors
     cenvEmpty,
@@ -61,12 +56,6 @@ data NnEnv
 -- ---------------------------------------------------------------------------
 -- FFI imports (all unsafe - no callbacks, fast operations)
 -- ---------------------------------------------------------------------------
-
-foreign import ccall unsafe "nn_env_init"
-  c_nn_env_init :: IO ()
-
-foreign import ccall unsafe "nn_env_destroy"
-  c_nn_env_destroy :: IO ()
 
 -- The empty env is a C static, one address for the life of the process,
 -- so this import is pure, as the null and Boolean cells of
@@ -120,19 +109,6 @@ foreign import ccall unsafe "nn_env_with_owner"
 
 foreign import ccall unsafe "nn_env_alloc_with_scopes"
   c_nn_env_alloc_with_scopes :: Word32 -> Word32 -> IO (Ptr (Ptr ()))
-
--- ---------------------------------------------------------------------------
--- Lifecycle
--- ---------------------------------------------------------------------------
-
--- | Initialize the global env allocator.  Call once before evaluation.
-cenvInit :: IO ()
-cenvInit = c_nn_env_init
-
--- | Destroy the global env allocator, freeing all page memory.
--- All env and array pointers become invalid after this call.
-cenvDestroy :: IO ()
-cenvDestroy = c_nn_env_destroy
 
 -- ---------------------------------------------------------------------------
 -- Env constructors

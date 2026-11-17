@@ -14,7 +14,6 @@ module Nix.Eval.CRoots
     RootsMark,
     crootsMark,
     crootsRelease,
-    crootsClear,
   )
 where
 
@@ -41,9 +40,6 @@ foreign import ccall unsafe "nn_roots_mark"
 foreign import ccall unsafe "nn_roots_release"
   c_nn_roots_release :: Word32 -> Word32 -> IO ()
 
-foreign import ccall unsafe "nn_roots_clear"
-  c_nn_roots_clear :: IO ()
-
 -- | The registry's size at a point, to release back to.
 data RootsMark = RootsMark !Word32 !Word32
 
@@ -65,10 +61,6 @@ crootsAddThunk cell = cdataIO (c_nn_roots_add_thunk cell >>= registered "nn_root
 -- | Register an environment as a root.
 crootsAddEnv :: (MonadCData m) => Ptr NnEnv -> m ()
 crootsAddEnv env = cdataIO (c_nn_roots_add_env env >>= registered "nn_roots_add_env")
-
--- | Forget every root (arena teardown).
-crootsClear :: IO ()
-crootsClear = c_nn_roots_clear
 
 -- | Raise the failure of a registration the registry could not hold.
 registered :: String -> CInt -> IO ()

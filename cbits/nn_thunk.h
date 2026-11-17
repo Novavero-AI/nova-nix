@@ -259,15 +259,6 @@ int nn_thunk_set_computed_lambda(nn_thunk_t *thunk, void *lambda);
 int nn_thunk_set_computed_primop(nn_thunk_t *thunk, uint32_t primop);
 int nn_thunk_set_computed_primop_app(nn_thunk_t *thunk, void *app);
 
-/* --- Arena diagnostics --- */
-
-/* Total thunks allocated across all blocks. */
-uint32_t nn_thunk_count(void);
-
-/* Get a thunk by global index (0-based, across all blocks, in allocation
- * order), or NULL when index >= nn_thunk_count().  O(blocks) per call. */
-nn_thunk_t *nn_thunk_get(uint32_t index);
-
 /* --- Census (nn_stats.h) --- */
 
 /* The arena's blocks, oldest first: for each of the first `max`, its

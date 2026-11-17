@@ -42,11 +42,8 @@ module Nix.Eval.IO
     allowEvalPath,
 
     -- * Errors
-    EvalErrorKind (..),
     EvalFailure (..),
     renderEvalFailure,
-    NixEvalError (..),
-    NixAbortError (..),
   )
 where
 

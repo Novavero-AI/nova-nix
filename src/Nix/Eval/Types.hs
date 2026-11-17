@@ -55,8 +55,6 @@ module Nix.Eval.Types
     mkStr,
     mkStrBytes,
     bytesToTextLossy,
-    marshalStringContext,
-    unmarshalStringContext,
 
     -- * Environment
     Env (..),
@@ -70,7 +68,6 @@ module Nix.Eval.Types
     buildCaptureEnv,
     withScopeAt,
     resolveWithScopeAt,
-    withScopesForCapture,
     envWithScopesRaw,
 
     -- * Eval-time formals (re-exported from EvalFormals)
@@ -80,7 +77,6 @@ module Nix.Eval.Types
     -- * Thunk operations
     compile,
     compileSource,
-    mkThunk,
     cheapThunk,
     cheapThunkBc,
     mkThunkBc,
@@ -89,12 +85,10 @@ module Nix.Eval.Types
     Pending (..),
     readPending,
     evaluated,
-    thunkToCPtr,
     tieFrame,
 
     -- * Lambda marshalling
     marshalLambda,
-    unmarshalLambdaValue,
 
     -- * Display
     typeName,
@@ -1102,10 +1096,6 @@ primopCell builtin args = do
     argumentCell (ArgDeferred (Thunk cell)) = pure cell
     forced = foldl' (.|.) 0 [bit i | (i, ArgForced _) <- zip [0 ..] args]
 
--- | Extract the C pointer from a thunk (zero-cost, newtype unwrap).
-thunkToCPtr :: Thunk -> CThunkPtr
-thunkToCPtr (Thunk ptr) = ptr
-
 -- | The C object a cell holding a string value points at.
 data StringCell
   = -- | A context-free string's bytes.
@@ -1285,7 +1275,7 @@ tieFrame site parent slotCount mkThunks = do
 fillSlots :: (MonadCData m) => Env -> [Thunk] -> m ()
 fillSlots (Env envPtr) thunks = do
   slots <- cenvSlots envPtr
-  cdataIO (zipWithM_ (\i thunk -> pokeElemOff slots i (thunkToCPtr thunk)) [0 ..] thunks)
+  cdataIO (zipWithM_ (\i thunk -> pokeElemOff slots i (unThunk thunk)) [0 ..] thunks)
 
 -- | Reject the NULL a C constructor answers when it cannot allocate,
 -- raising 'Nix.Eval.CStatus.CStatusError' naming the entry point.

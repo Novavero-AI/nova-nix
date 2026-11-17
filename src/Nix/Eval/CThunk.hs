@@ -24,10 +24,6 @@ module Nix.Eval.CThunk
     NnThunk,
     CThunkPtr,
 
-    -- * Lifecycle
-    cthunkInit,
-    cthunkDestroy,
-
     -- * Allocation
     cthunkNewBc,
     cthunkNewApply1,
@@ -84,10 +80,6 @@ module Nix.Eval.CThunk
     cthunkSetComputedLambda,
     cthunkSetComputedPrimop,
     cthunkSetComputedPrimopApp,
-
-    -- * Arena diagnostics / cleanup
-    cthunkCount,
-    cthunkGet,
   )
 where
 
@@ -108,12 +100,6 @@ type CThunkPtr = Ptr NnThunk
 -- ---------------------------------------------------------------------------
 -- FFI imports (all unsafe - no callbacks, fast data access)
 -- ---------------------------------------------------------------------------
-
-foreign import ccall unsafe "nn_thunk_init"
-  c_nn_thunk_init :: Word32 -> IO ()
-
-foreign import ccall unsafe "nn_thunk_destroy"
-  c_nn_thunk_destroy :: IO ()
 
 foreign import ccall unsafe "nn_thunk_new_bc"
   c_nn_thunk_new_bc :: Word32 -> Ptr () -> IO CThunkPtr
@@ -266,33 +252,12 @@ foreign import ccall unsafe "nn_thunk_set_computed_primop"
 foreign import ccall unsafe "nn_thunk_set_computed_primop_app"
   c_nn_thunk_set_computed_primop_app :: CThunkPtr -> Ptr () -> IO CInt
 
-foreign import ccall unsafe "nn_thunk_count"
-  c_nn_thunk_count :: IO Word32
-
-foreign import ccall unsafe "nn_thunk_get"
-  c_nn_thunk_get :: Word32 -> IO CThunkPtr
-
--- ---------------------------------------------------------------------------
--- Lifecycle
--- ---------------------------------------------------------------------------
-
--- | Initialize the global thunk arena.  Call once before evaluation.
--- @capacity@ is a hint for thunks per block (0 uses default: 65536).
-cthunkInit :: Word32 -> IO ()
-cthunkInit = c_nn_thunk_init
-
--- | Destroy the global thunk arena, freeing its blocks.  Every
--- 'CThunkPtr' into the arena becomes invalid after this call; the shared
--- cells do not.
-cthunkDestroy :: IO ()
-cthunkDestroy = c_nn_thunk_destroy
-
 -- ---------------------------------------------------------------------------
 -- Allocation
 -- ---------------------------------------------------------------------------
 
 -- Every allocator below rejects the C side's NULL through 'checkedCPtr':
--- outside the 'cthunkInit' .. 'cthunkDestroy' window that is the only
+-- outside the arena's init .. destroy window that is the only
 -- answer the arena gives, and a NULL that flowed on would fault at the
 -- next state read instead of raising 'Nix.Eval.CStatus.ArenaNotInitialized'.
 
@@ -541,16 +506,3 @@ cthunkSetComputedPrimopApp ptr app = cdataIO (accepted <$> c_nn_thunk_set_comput
 -- refused it.
 accepted :: CInt -> Bool
 accepted = (/= 0)
-
--- ---------------------------------------------------------------------------
--- Arena diagnostics
--- ---------------------------------------------------------------------------
-
--- | Total thunks allocated in the arena.
-cthunkCount :: IO Word32
-cthunkCount = c_nn_thunk_count
-
--- | Get a thunk by global index, in allocation order.
--- Returns 'Foreign.Ptr.nullPtr' if index is out of range.
-cthunkGet :: Word32 -> IO CThunkPtr
-cthunkGet = c_nn_thunk_get

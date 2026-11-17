@@ -31,7 +31,6 @@ module Nix.Eval.CallDepth
     defaultMaxCallDepth,
     topLevelCallDepth,
     enterCallFrame,
-    maxCallDepthExceeded,
   )
 where
 

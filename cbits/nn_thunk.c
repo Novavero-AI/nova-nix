@@ -36,7 +36,6 @@ struct nn_thunk_block {
 struct nn_thunk_arena {
     struct nn_thunk_block *head;           /* first block (for iteration) */
     struct nn_thunk_block *current;        /* newest block (for allocation) */
-    uint32_t               total;          /* total thunks across all blocks */
     uint32_t               block_capacity; /* slots per new block */
 };
 
@@ -75,7 +74,6 @@ arena_alloc(struct nn_thunk_arena *arena)
     }
     nn_thunk_t *t = &arena->current->slots[arena->current->count];
     arena->current->count++;
-    arena->total++;
     return t;
 }
 
@@ -107,7 +105,6 @@ nn_thunk_init(uint32_t initial_capacity)
 
     g_arena->head = first;
     g_arena->current = first;
-    g_arena->total = 0;
     g_arena->block_capacity = cap;
 }
 
@@ -638,30 +635,6 @@ nn_thunk_set_computed_primop_app(nn_thunk_t *thunk, void *app)
     thunk->val_tag = NN_VALUE_PRIMOP_APP;
     thunk->payload = app;
     return 1;
-}
-
-/* --- Arena diagnostics --- */
-
-uint32_t
-nn_thunk_count(void)
-{
-    return g_arena ? g_arena->total : 0;
-}
-
-nn_thunk_t *
-nn_thunk_get(uint32_t index)
-{
-    if (!g_arena || index >= g_arena->total) return NULL;
-
-    struct nn_thunk_block *block = g_arena->head;
-    while (block) {
-        if (index < block->count) {
-            return &block->slots[index];
-        }
-        index -= block->count;
-        block = block->next;
-    }
-    return NULL;  /* unreachable if index < total */
 }
 
 /* --- Census --- */
