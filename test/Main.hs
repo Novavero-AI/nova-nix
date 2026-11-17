@@ -38,6 +38,7 @@ import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe, mapMaybe, maybeToList)
+import Data.Ord (Down (..))
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -53,7 +54,6 @@ import Foreign.C.Error (Errno (..), eACCES, eISDIR, eNOENT, eNOTDIR)
 import Foreign.C.Types (CChar, CSize (..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, WordPtr, castPtr, nullPtr, plusPtr, ptrToWordPtr)
-import Foreign.StablePtr (StablePtr, castPtrToStablePtr, castStablePtrToPtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Foreign.Storable (peekElemOff, poke, sizeOf)
 import qualified GHC.Foreign as GHCForeign
 import GHC.IO.Encoding (getFileSystemEncoding, mkTextEncoding, setFileSystemEncoding)
@@ -25446,152 +25446,90 @@ testSymbol = do
 -- C attribute set (FFI)
 -- ---------------------------------------------------------------------------
 
--- | Cast a StablePtr to CThunkPtr for CAttrSet tests.
--- CAttrSet stores void* - we use StablePtrs as opaque values in tests.
-spToCPtr :: StablePtr a -> CThunkPtr
-spToCPtr = castPtr . castStablePtrToPtr
-
--- | Cast a CThunkPtr back to StablePtr for CAttrSet test verification.
-cptrToSp :: CThunkPtr -> StablePtr a
-cptrToSp = castPtrToStablePtr . castPtr
-
 testCAttrSet :: IO [Bool]
 testCAttrSet = do
   putStrLn "cattrset"
   sequence
-    [ runTestM "new/free" $ do
-        _set <- cattrsetNew SetLiteral 16
-        -- set freed as the session ends (nn_attrset_free_all)
-        pure Pass,
+    [ runTestM "a new set holds no entries" $ do
+        set <- cattrsetNew SetLiteral 16
+        cattrsetFreeze set
+        n <- cattrsetSize set
+        pure (assertEqual "size" 0 n),
       runTestM "insert + freeze + lookup" $ do
         set <- cattrsetNew SetLiteral 4
         kName <- symbolIntern "name"
         kVer <- symbolIntern "version"
-        valName <- newStablePtr ("hello" :: Text)
-        valVer <- newStablePtr ("1.0" :: Text)
-        cattrsetInsert set kName noPos (spToCPtr valName)
-        cattrsetInsert set kVer noPos (spToCPtr valVer)
+        nameCell <- textCell "hello"
+        verCell <- textCell "1.0"
+        cattrsetInsert set kName noPos nameCell
+        cattrsetInsert set kVer noPos verCell
         cattrsetFreeze set
         result <- cattrsetLookup set kName
-        case result of
-          Nothing -> do
-            -- set freed as the session ends (nn_attrset_free_all)
-            freeStablePtr valName
-            freeStablePtr valVer
-            pure (Fail "lookup returned Nothing")
-          Just cptr -> do
-            val <- deRefStablePtr (cptrToSp cptr) :: IO Text
-            -- set freed as the session ends (nn_attrset_free_all)
-            freeStablePtr valName
-            freeStablePtr valVer
-            pure (assertEqual "lookup name" "hello" val),
+        pure (assertEqual "lookup name" (Just nameCell) result),
       runTestM "lookup missing key returns Nothing" $ do
         set <- cattrsetNew SetLiteral 4
         kFoo <- symbolIntern "foo"
         kBar <- symbolIntern "bar"
-        sp <- newStablePtr ("x" :: Text)
-        cattrsetInsert set kFoo noPos (spToCPtr sp)
+        cattrsetInsert set kFoo noPos cthunkNull
         cattrsetFreeze set
         result <- cattrsetLookup set kBar
-        -- set freed as the session ends (nn_attrset_free_all)
-        freeStablePtr sp
-        pure (case result of Nothing -> Pass; Just _ -> Fail "expected Nothing"),
+        pure (assertEqual "lookup bar" Nothing result),
       runTestM "size after freeze" $ do
         set <- cattrsetNew SetLiteral 4
-        k1 <- symbolIntern "a"
-        k2 <- symbolIntern "b"
-        k3 <- symbolIntern "c"
-        sp <- newStablePtr (42 :: Int)
-        cattrsetInsert set k1 noPos (spToCPtr sp)
-        cattrsetInsert set k2 noPos (spToCPtr sp)
-        cattrsetInsert set k3 noPos (spToCPtr sp)
+        keys <- mapM symbolIntern ["a", "b", "c"]
+        mapM_ (\key -> cattrsetInsert set key noPos cthunkNull) keys
         cattrsetFreeze set
         n <- cattrsetSize set
-        -- set freed as the session ends (nn_attrset_free_all)
-        freeStablePtr sp
         pure (assertEqual "size" 3 n),
       runTestM "duplicate keys: last writer wins" $ do
         set <- cattrsetNew SetLiteral 4
         kName <- symbolIntern "name"
-        sp1 <- newStablePtr ("first" :: Text)
-        sp2 <- newStablePtr ("second" :: Text)
-        cattrsetInsert set kName noPos (spToCPtr sp1)
-        cattrsetInsert set kName noPos (spToCPtr sp2)
+        first <- textCell "first"
+        second <- textCell "second"
+        cattrsetInsert set kName noPos first
+        cattrsetInsert set kName noPos second
         cattrsetFreeze set
         n <- cattrsetSize set
         result <- cattrsetLookup set kName
-        val <- case result of
-          Nothing -> pure "MISSING"
-          Just cptr -> deRefStablePtr (cptrToSp cptr)
-        -- set freed as the session ends (nn_attrset_free_all)
-        freeStablePtr sp1
-        freeStablePtr sp2
-        pure
-          ( if n == 1 && val == ("second" :: Text)
-              then Pass
-              else Fail ("size=" <> T.pack (show n) <> " val=" <> val)
-          ),
+        pure (assertEqual "size and value" (1, Just second) (n, result)),
+      -- Inserted from the highest symbol id down, so freeze has to sort.
       runTestM "keys returned sorted" $ do
         set <- cattrsetNew SetLiteral 8
-        -- Insert in reverse order; after freeze keys should be sorted by symbol ID
-        k1 <- symbolIntern "zzz"
-        k2 <- symbolIntern "aaa"
-        k3 <- symbolIntern "mmm"
-        sp <- newStablePtr (0 :: Int)
-        cattrsetInsert set k1 noPos (spToCPtr sp)
-        cattrsetInsert set k2 noPos (spToCPtr sp)
-        cattrsetInsert set k3 noPos (spToCPtr sp)
+        inserted <- mapM symbolIntern ["zzz", "aaa", "mmm"]
+        mapM_ (\key -> cattrsetInsert set key noPos cthunkNull) (sortOn Down inserted)
         cattrsetFreeze set
         keys <- cattrsetKeys set
-        -- set freed as the session ends (nn_attrset_free_all)
-        freeStablePtr sp
-        -- Keys should be sorted by symbol ID (ascending)
-        let ids = map unSymbol keys
-            sorted = ids == foldl (\acc x -> acc ++ [x]) [] (Set.toAscList (Set.fromList ids))
-        pure (if sorted then Pass else Fail ("unsorted: " <> T.pack (show ids))),
+        pure (assertEqual "keys" (sort inserted) keys),
       runTestM "union right-biased" $ do
         setA <- cattrsetNew SetLiteral 4
         setB <- cattrsetNew SetLiteral 4
         kX <- symbolIntern "x"
         kY <- symbolIntern "y"
         kZ <- symbolIntern "z"
-        spA <- newStablePtr ("fromA" :: Text)
-        spB <- newStablePtr ("fromB" :: Text)
-        spZ <- newStablePtr ("onlyA" :: Text)
-        cattrsetInsert setA kX noPos (spToCPtr spA)
-        cattrsetInsert setA kZ noPos (spToCPtr spZ)
-        cattrsetInsert setB kX noPos (spToCPtr spB)
-        cattrsetInsert setB kY noPos (spToCPtr spB)
+        fromA <- textCell "fromA"
+        fromB <- textCell "fromB"
+        onlyA <- textCell "onlyA"
+        onlyB <- textCell "onlyB"
+        cattrsetInsert setA kX noPos fromA
+        cattrsetInsert setA kZ noPos onlyA
+        cattrsetInsert setB kX noPos fromB
+        cattrsetInsert setB kY noPos onlyB
         cattrsetFreeze setA
         cattrsetFreeze setB
         merged <- cattrsetUnion SetUpdate setA setB
         n <- cattrsetSize merged
-        resultX <- cattrsetLookup merged kX
-        valX <- case resultX of
-          Nothing -> pure "MISSING"
-          Just cptr -> deRefStablePtr (cptrToSp cptr)
-        -- sets freed as the session ends (nn_attrset_free_all)
-        freeStablePtr spA
-        freeStablePtr spB
-        freeStablePtr spZ
-        pure
-          ( if n == 3 && valX == ("fromB" :: Text)
-              then Pass
-              else Fail ("size=" <> T.pack (show n) <> " x=" <> valX)
-          ),
+        found <- mapM (cattrsetLookup merged) [kX, kY, kZ]
+        pure (assertEqual "size and entries" (3, map Just [fromB, onlyB, onlyA]) (n, found)),
       runTestM "stress: 10k entries" $ do
         set <- cattrsetNew SetLiteral 1024
-        sp <- newStablePtr (0 :: Int)
         syms <- mapM (\i -> symbolIntern ("key_" <> T.pack (show (i :: Int)))) [1 .. 10000]
-        mapM_ (\sym -> cattrsetInsert set sym noPos (spToCPtr sp)) syms
+        mapM_ (\sym -> cattrsetInsert set sym noPos cthunkNull) syms
         cattrsetFreeze set
         n <- cattrsetSize set
         -- Spot-check a lookup from the middle of the key range
         hit <- case drop 5000 syms of
           middleSym : _ -> cattrsetLookup set middleSym
           [] -> pure Nothing
-        -- set freed as the session ends (nn_attrset_free_all)
-        freeStablePtr sp
         pure
           ( if n == 10000 && isJust hit
               then Pass
@@ -25601,14 +25539,12 @@ testCAttrSet = do
       -- index of an absent key is the C side's NN_ATTRSET_NOT_FOUND.
       runTestM "index finds each key at its sorted position and none for an absent key" $ do
         set <- cattrsetNew SetLiteral 0
-        sp <- newStablePtr (0 :: Int)
         syms <- mapM (\i -> symbolIntern ("index_" <> T.pack (show (i :: Int)))) [1 .. 100]
-        mapM_ (\sym -> cattrsetInsert set sym noPos (spToCPtr sp)) syms
+        mapM_ (\sym -> cattrsetInsert set sym noPos cthunkNull) syms
         cattrsetFreeze set
         absent <- symbolIntern "index_absent"
         found <- mapM (cattrsetIndex set) (sort syms)
         missing <- cattrsetIndex set absent
-        freeStablePtr sp
         pure
           ( if found == map Just [0 .. 99] && isNothing missing
               then Pass
@@ -25623,11 +25559,10 @@ testCAttrSet = do
       -- pass the 64-entry switch.
       runTestM "positions follow their entries through freeze, union and removal" $ do
         pool <- mapM (\i -> symbolIntern ("pos_" <> T.pack (show (i :: Int)))) [1 .. 100]
-        sp <- newStablePtr (0 :: Int)
         let genInserts = QC.listOf ((,) <$> QC.elements pool <*> QC.arbitrary)
             build inserts = do
               set <- cattrsetNew SetLiteral 0
-              mapM_ (\(key, pos) -> cattrsetInsert set key (PosIdx pos) (spToCPtr sp)) inserts
+              mapM_ (\(key, pos) -> cattrsetInsert set key (PosIdx pos) cthunkNull) inserts
               cattrsetFreeze set
               pure set
             property =
@@ -25642,11 +25577,11 @@ testCAttrSet = do
                       rightModel = Map.fromList right
                   pure (actual QC.=== [leftModel, Map.union rightModel leftModel, Map.withoutKeys leftModel (Set.fromList removed)])
         result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
-        -- sets freed as the session ends (nn_attrset_free_all)
-        freeStablePtr sp
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
     ]
   where
+    -- A new cell per call, so a lookup's answer identifies the entry it found.
+    textCell text = unThunk <$> evaluated (mkStr text)
     entryPositions set = do
       n <- cattrsetSize set
       entries <- mapM (\i -> (,) <$> cattrsetGetKey set i <*> (unPosIdx <$> cattrsetGetPos set i)) (takeWhile (< n) [0 ..])
