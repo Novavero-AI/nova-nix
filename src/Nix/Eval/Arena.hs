@@ -66,7 +66,7 @@ arenaInit = do
 -- A second 'arenaInit' starts the evaluator afresh: no constant of the
 -- program points into the memory freed here, since an evaluation
 -- session builds its base environment and @derivation@ wrapper as it
--- starts ('Nix.Eval.IO.newEvalState'), and the @null@, @true@, @false@
+-- starts ('Nix.Eval.IO.withEvalSession'), and the @null@, @true@, @false@
 -- and empty list cells and the builtins' own cells are C statics that
 -- survive every cycle.  A session's own values do not: one started
 -- before the teardown is not used after it.
