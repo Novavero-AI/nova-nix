@@ -9,10 +9,17 @@
 -- instructions; a binding refers to its position there by the index
 -- "Nix.Eval.SourcePos" records it at.
 --
--- The operator, formals, capture and binding decoders answer a tag this
--- module never writes, which only a corrupt store holds, with a failure
--- for the evaluator to report.  The store hands each tag back as a whole
--- byte or word, so no type on the decoding side can rule such a tag out.
+-- The operator, formals and capture decoders and the binding fold answer
+-- a tag this module never writes, which only a corrupt store holds, with
+-- a failure for the evaluator to report.  The store hands each tag back
+-- as a whole byte or word, so no type on the decoding side can rule such
+-- a tag out.
+--
+-- A set's or a let's bindings and a closure's captured slots are read by
+-- folds over the data buffer each time their code runs, so no list of
+-- them is built.  A binding list's words start with the names it binds
+-- counted, so the evaluator knows a frame's layout and a set's size
+-- before it reads a binding.
 --
 -- Compiling writes the bytecode store and interns names, so it runs in an
 -- evaluation session ('Nix.Eval.IO.withEvalSession').
@@ -25,11 +32,18 @@ module Nix.Eval.Compile
     encodeBinaryOp,
     decodeBinaryOp,
     decodeBcFormals,
+    BcCaptureInfo (..),
+    BcCapturedSlots (..),
     decodeBcCaptureInfo,
-    BcBinding (..),
-    BcInheritedName (..),
-    BcAttrKey (..),
+    foldBcCapturedSlots,
+    BcBindings (..),
+    BcBindingCounts (..),
     decodeBcBindings,
+    BcBinding (..),
+    BcInheritedNames (..),
+    BcInheritedName (..),
+    foldBcBindings,
+    foldBcInheritedNames,
     reassembleInt64,
     reassembleDouble,
   )
@@ -379,11 +393,17 @@ compileWith recorder = go
     -- Bindings (shared by EAttrs and ELet)
     -- -----------------------------------------------------------------
 
-    -- \| The flat data words for a binding list; the caller emits them
-    -- (with the count, via emitCounted) so a spilled count can precede
-    -- them contiguously.
+    -- \| The flat data words for a binding list: the names it binds
+    -- statically and the bindings with a dynamic name, counted
+    -- ('bindingNameCounts'), then each binding's words.  The caller emits
+    -- them (with the count, via emitCounted) so a spilled count can
+    -- precede them contiguously.
     compileBindingWords :: [Binding] -> IO [Word32]
-    compileBindingWords bindings = concat <$> mapM compileOneBinding bindings
+    compileBindingWords bindings = do
+      let BcBindingCounts names dynamics = bindingNameCounts bindings
+      namesWord <- countArg "binding set with static names" names
+      dynamicsWord <- countArg "binding set with dynamic names" dynamics
+      (\bindingWords -> namesWord : dynamicsWord : concat bindingWords) <$> mapM compileOneBinding bindings
 
     -- \| A function bound to a static name is named by it, as upstream's
     -- @addAttr@ names the value of an attribute path's last name
@@ -636,106 +656,168 @@ decodeFormalEntries n off = do
   rest <- decodeFormalEntries (n - 1) (off + 3)
   pure (EvalFormal (symbolText (Symbol nameSym)) defMaybe : rest)
 
--- | Decode capture info from the bytecode data buffer, or answer the tag
--- at @dataOff@ when it is none of 'captureNone', 'captureSlots' and
--- 'captureWithScopes'.
-decodeBcCaptureInfo :: (MonadCData m) => Word32 -> m (Either Word32 CaptureInfo)
+-- ---------------------------------------------------------------------------
+-- Capture info reading (for evalBcLambda, evalBcAttrs and evalBcLet)
+-- ---------------------------------------------------------------------------
+
+-- | A closure's or frame's capture info, its captured slots left in the
+-- data buffer for 'foldBcCapturedSlots' to read.
+data BcCaptureInfo
+  = -- | The closure runs in the env it is made in ('NoCaptureInfo').
+    BcNoCaptureInfo
+  | -- | The closure runs in an env of the captured slots alone
+    -- ('Captures').
+    BcCaptures !BcCapturedSlots
+  | -- | The closure runs in an env of the captured slots that sees the
+    -- with-scopes of the env it is made in ('CapturesWithScopes').
+    BcCapturesWithScopes !BcCapturedSlots
+
+-- | The slots a closure captures: their count and the data offset of the
+-- first one's (level, index) pair.
+data BcCapturedSlots = BcCapturedSlots !Int !Word32
+
+-- | The capture info at a data offset, or the tag there when it is none
+-- of 'captureNone', 'captureSlots' and 'captureWithScopes'.
+decodeBcCaptureInfo :: (MonadCData m) => Word32 -> m (Either Word32 BcCaptureInfo)
 decodeBcCaptureInfo dataOff = cbcData dataOff >>= decodeTagged
   where
     decodeTagged tag
-      | tag == captureNone = pure (Right NoCaptureInfo)
-      | tag == captureSlots = Right . Captures <$> capturedPairs
-      | tag == captureWithScopes = Right . CapturesWithScopes <$> capturedPairs
+      | tag == captureNone = pure (Right BcNoCaptureInfo)
+      | tag == captureSlots = Right . BcCaptures <$> capturedSlots
+      | tag == captureWithScopes = Right . BcCapturesWithScopes <$> capturedSlots
       | otherwise = pure (Left tag)
-    capturedPairs = do
+    capturedSlots = do
       count <- cbcData (dataOff + 1)
-      decodePairs (fromIntegral count) (dataOff + 2)
+      pure (BcCapturedSlots (fromIntegral count) (dataOff + 2))
 
--- | Decode (level, idx) pairs from the data buffer.
-decodePairs :: (MonadCData m) => Int -> Word32 -> m [(Int, Int)]
-decodePairs 0 _ = pure []
-decodePairs n off = do
-  level <- cbcData off
-  idx <- cbcData (off + 1)
-  rest <- decodePairs (n - 1) (off + 2)
-  pure ((fromIntegral level, fromIntegral idx) : rest)
+-- | Fold over captured slots, first to last, each given as the resolved
+-- level and index the slot is read from in the env the closure is made
+-- in.  Each pair's words are read as the fold reaches them.
+{-# INLINE foldBcCapturedSlots #-}
+foldBcCapturedSlots :: (MonadCData m) => (acc -> Word32 -> Word32 -> m acc) -> acc -> BcCapturedSlots -> m acc
+foldBcCapturedSlots step start (BcCapturedSlots count dataOff) = go start count dataOff
+  where
+    go !acc 0 !_ = pure acc
+    go !acc n !off = do
+      level <- cbcData off
+      idx <- cbcData (off + 1)
+      next <- step acc level idx
+      go next (n - 1) (off + 2)
 
 -- ---------------------------------------------------------------------------
--- Binding decoding (for evalBcAttrs / evalBcLet)
+-- Binding reading (for evalBcAttrs and evalBcLet)
 -- ---------------------------------------------------------------------------
 
--- | A decoded binding from the bytecode data buffer, each name at the
--- position it was defined at.
+-- | The bindings of a set or a let: their names counted, then their
+-- count, resolved through the short_arg spill, and the data offset of the
+-- first.
+data BcBindings = BcBindings !BcBindingCounts !Int !Word32
+
+-- | How many names bindings bind statically, one for each static key and
+-- inherited variable and one for each name of an @inherit (from)@, and
+-- how many bindings have a dynamic name.
+data BcBindingCounts = BcBindingCounts !Int !Int
+
+-- | The names of a binding list counted, as the compiler writes them at
+-- the head of its words.  The bindings' variables are resolved by slot
+-- exactly when none has a dynamic name, one slot per static name in
+-- declaration order: this must stay in sync with @allStaticSingleKey@
+-- and @lexicalScopeFromBindings@ in "Nix.Expr.Resolve".
+bindingNameCounts :: [Binding] -> BcBindingCounts
+bindingNameCounts = foldl' countOne (BcBindingCounts 0 0)
+  where
+    countOne (BcBindingCounts names dynamics) binding = case binding of
+      NamedBinding _ (StaticKey _) _ -> BcBindingCounts (names + 1) dynamics
+      NamedBinding _ (DynamicKey _) _ -> BcBindingCounts names (dynamics + 1)
+      Inherit {} -> BcBindingCounts (names + 1) dynamics
+      InheritFrom _ inherited -> BcBindingCounts (names + length inherited) dynamics
+
+-- | The bindings in an instruction's counted payload: @count@ bindings,
+-- resolved through the short_arg spill, whose words start at @dataOff@
+-- with their names counted.
+decodeBcBindings :: (MonadCData m) => Int -> Word32 -> m BcBindings
+decodeBcBindings count dataOff = do
+  names <- cbcData dataOff
+  dynamics <- cbcData (dataOff + 1)
+  pure (BcBindings (BcBindingCounts (fromIntegral names) (fromIntegral dynamics)) count (dataOff + 2))
+
+-- | A binding of a set or a let, each name at the position it was
+-- defined at.
 data BcBinding
-  = -- | @key = expr@: its position, the key and the value's bc_idx
-    BcNamed !PosIdx !BcAttrKey !Word32
+  = -- | @name = expr@: its position, the name's symbol and the value's
+    -- bc_idx
+    BcNamed !PosIdx !Word32 !Word32
+  | -- | @${key} = expr@: its position, the bc_idx of the expression the
+    -- name is computed by and the value's bc_idx
+    BcDynamic !PosIdx !Word32 !Word32
   | -- | One name of @inherit x@: its position, its symbol and the bc_idx
     -- of the variable it copies, which is evaluated in the env around the
     -- binding set
     BcInherit !PosIdx !Word32 !Word32
-  | -- | @inherit (from) names@ with from-expr bc_idx and the names
-    BcInheritFrom !Word32 ![BcInheritedName]
+  | -- | @inherit (from) names@: the from-expr's bc_idx and the names,
+    -- which 'foldBcInheritedNames' reads
+    BcInheritFrom !Word32 !BcInheritedNames
+
+-- | The names of an @inherit (from) names@ binding: their count and the
+-- data offset of the first.
+data BcInheritedNames = BcInheritedNames !Int !Word32
 
 -- | One name of an @inherit (from) names@ binding: its position, its
 -- symbol and the bc_idx of the select that reads it from slot 0 of an env
 -- holding the from-value.
 data BcInheritedName = BcInheritedName !PosIdx !Word32 !Word32
 
--- | A binding's attribute key.
-data BcAttrKey
-  = -- | Static key (interned symbol)
-    BcStaticKey !Word32
-  | -- | Dynamic key (bc_idx of expression to evaluate)
-    BcDynamicKey !Word32
-
--- | Decode all bindings from the bytecode data buffer, or answer the
--- first binding tag that is none of 'bindNamed', 'bindInherit' and
--- 'bindInheritFrom'.  @bindCount@ is the number of bindings (already
--- resolved through the short_arg spill by the caller), @off@ is the start
--- offset.
-decodeBcBindings :: (MonadCData m) => Int -> Word32 -> m (Either Word32 [BcBinding])
-decodeBcBindings 0 _ = pure (Right [])
-decodeBcBindings bindCount off = cbcData off >>= decodeTagged
+-- | Fold over bindings, first to last, each read from the data buffer as
+-- the fold reaches it.  The data buffer only grows, so a step may compile
+-- code.  A binding tag that is none of 'bindNamed', 'bindInherit' and
+-- 'bindInheritFrom' ends the fold with @unknownTag@ applied to it.
+--
+-- It is inlined wherever it is given its two functions, as a partial
+-- application of it is.  Each binding is built where the step is applied
+-- to it, so a step that is inlined too (an INLINE pragma on it) takes
+-- the binding's fields apart without allocating it.
+{-# INLINE foldBcBindings #-}
+foldBcBindings :: (MonadCData m) => (Word32 -> m acc) -> (acc -> BcBinding -> m acc) -> acc -> BcBindings -> m acc
+foldBcBindings unknownTag step = foldFrom
   where
-    decodeTagged tag
-      | tag == bindNamed = do
-          key <- decodeAttrKey (off + 1)
-          valBcIdx <- cbcData (off + 3)
-          pos <- cbcData (off + 4)
-          withRest (BcNamed (PosIdx pos) key valBcIdx) (off + 5)
-      | tag == bindInherit = do
-          sym <- cbcData (off + 1)
-          valBcIdx <- cbcData (off + 2)
-          pos <- cbcData (off + 3)
-          withRest (BcInherit (PosIdx pos) sym valBcIdx) (off + 4)
-      | tag == bindInheritFrom = do
-          fromBcIdx <- cbcData (off + 1)
-          nameCount <- cbcData (off + 2)
-          names <- decodeInheritedNames (fromIntegral nameCount) (off + 3)
-          withRest (BcInheritFrom fromBcIdx names) (off + 3 + 3 * nameCount)
-      | otherwise = pure (Left tag)
-    -- Strict in the binding and the result, so each level conses onto
-    -- the decoded rest directly rather than leaving thunks for both.
-    withRest !binding nextOff = do
-      rest <- decodeBcBindings (bindCount - 1) nextOff
-      pure $! (binding :) <$> rest
+    foldFrom start (BcBindings _ count dataOff) = go start count dataOff
+    go !acc 0 !_ = pure acc
+    go !acc n !off = cbcData off >>= stepTagged
+      where
+        stepTagged tag
+          | tag == bindNamed = do
+              isExpr <- cbcData (off + 1)
+              keyWord <- cbcData (off + 2)
+              valBcIdx <- cbcData (off + 3)
+              pos <- PosIdx <$> cbcData (off + 4)
+              if isExpr /= 0
+                then step acc (BcDynamic pos keyWord valBcIdx) >>= continueAt (off + 5)
+                else step acc (BcNamed pos keyWord valBcIdx) >>= continueAt (off + 5)
+          | tag == bindInherit = do
+              sym <- cbcData (off + 1)
+              valBcIdx <- cbcData (off + 2)
+              pos <- PosIdx <$> cbcData (off + 3)
+              step acc (BcInherit pos sym valBcIdx) >>= continueAt (off + 4)
+          | tag == bindInheritFrom = do
+              fromBcIdx <- cbcData (off + 1)
+              nameCount <- cbcData (off + 2)
+              step acc (BcInheritFrom fromBcIdx (BcInheritedNames (fromIntegral nameCount) (off + 3)))
+                >>= continueAt (off + 3 + 3 * nameCount)
+          | otherwise = unknownTag tag
+        continueAt nextOff next = go next (n - 1) nextOff
 
--- | Decode a binding's key: the pair (is_expr, key_or_bc_idx).
-decodeAttrKey :: (MonadCData m) => Word32 -> m BcAttrKey
-decodeAttrKey off = do
-  isExpr <- cbcData off
-  val <- cbcData (off + 1)
-  pure (if isExpr /= 0 then BcDynamicKey val else BcStaticKey val)
-
--- | Decode inherited names: triples of (name_sym, select_bc_idx, pos).
-decodeInheritedNames :: (MonadCData m) => Int -> Word32 -> m [BcInheritedName]
-decodeInheritedNames 0 _ = pure []
-decodeInheritedNames n off = do
-  sym <- cbcData off
-  selectBcIdx <- cbcData (off + 1)
-  pos <- cbcData (off + 2)
-  rest <- decodeInheritedNames (n - 1) (off + 3)
-  pure (BcInheritedName (PosIdx pos) sym selectBcIdx : rest)
+-- | Fold over the names of an @inherit (from)@ binding, first to last.
+{-# INLINE foldBcInheritedNames #-}
+foldBcInheritedNames :: (MonadCData m) => (acc -> BcInheritedName -> m acc) -> acc -> BcInheritedNames -> m acc
+foldBcInheritedNames step start (BcInheritedNames count dataOff) = go start count dataOff
+  where
+    go !acc 0 !_ = pure acc
+    go !acc n !off = do
+      sym <- cbcData off
+      selectBcIdx <- cbcData (off + 1)
+      pos <- cbcData (off + 2)
+      next <- step acc (BcInheritedName (PosIdx pos) sym selectBcIdx)
+      go next (n - 1) (off + 3)
 
 -- ---------------------------------------------------------------------------
 -- Numeric reassembly (from two uint32 halves)

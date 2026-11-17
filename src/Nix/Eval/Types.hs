@@ -69,6 +69,7 @@ module Nix.Eval.Types
     newScopeEnv,
     pushLazyWithScope,
     buildCaptureEnv,
+    buildBcCaptureEnv,
     withScopeAt,
     resolveWithScopeAt,
     envWithScopesRaw,
@@ -131,7 +132,7 @@ module Nix.Eval.Types
   )
 where
 
-import Control.Monad (forM_, zipWithM_)
+import Control.Monad (forM_, void, zipWithM_)
 import Data.Bits (bit, complement, shiftL, testBit, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -166,7 +167,7 @@ import Nix.Eval.CStr (CStrPtr, cstrBytes, cstrFromText, cstrNew, cstrText)
 import Nix.Eval.CThunk (CThunkPtr, cthunkApplyCell, cthunkBool, cthunkEmptyList, cthunkGetBcIdx, cthunkGetBool, cthunkGetFloat, cthunkGetInt, cthunkGetPrimop, cthunkNewApply1, cthunkNewApply2, cthunkNewBc, cthunkNewComputedAttrs, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedPath, cthunkNewComputedPrimop, cthunkNewComputedPrimopApp, cthunkNewComputedStr, cthunkNull, cthunkPayload, cthunkPendingForm, cthunkState, cthunkValueTag, noCode)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
-import Nix.Eval.Compile (compileExpr, compileFormalsToEval, compileParsed)
+import Nix.Eval.Compile (BcCaptureInfo (..), BcCapturedSlots (..), compileExpr, compileFormalsToEval, compileParsed, foldBcCapturedSlots)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), lambdaNameFromSymbol, lambdaNameSymbol)
 import Nix.Eval.Policy (EvalPolicy (..), unrestrictedPolicy)
 import Nix.Eval.SourcePos (PosIdx, noPos)
@@ -858,17 +859,54 @@ cheapThunk env expr = mkThunk env expr
 -- the one 'Captures' makes.
 buildCaptureEnv :: (MonadCData m) => EnvSite -> Env -> CaptureInfo -> m Env
 buildCaptureEnv _ env NoCaptureInfo = pure env
-buildCaptureEnv site env (Captures captureList) =
-  capturedThunks env captureList >>= newEnv site Nothing
-buildCaptureEnv site env (CapturesWithScopes captureList) = do
+buildCaptureEnv site env (Captures captureList) = captureListEnv site env NoWithScopes captureList
+buildCaptureEnv site env (CapturesWithScopes captureList) = captureListEnv site env EnclosingWithScopes captureList
+
+-- | 'buildCaptureEnv' for capture info the bytecode holds: each captured
+-- slot is filled as its pair is read from the data buffer.
+buildBcCaptureEnv :: (MonadCData m) => EnvSite -> Env -> BcCaptureInfo -> m Env
+buildBcCaptureEnv _ env BcNoCaptureInfo = pure env
+buildBcCaptureEnv site env (BcCaptures slots) = capturedSlotsEnv site env NoWithScopes slots
+buildBcCaptureEnv site env (BcCapturesWithScopes slots) = capturedSlotsEnv site env EnclosingWithScopes slots
+
+-- | The with-scopes the env of a closure's captured slots sees.
+data CapturedScopes
+  = -- | None ('Captures').
+    NoWithScopes
+  | -- | Those the env the closure is made in sees ('CapturesWithScopes').
+    EnclosingWithScopes
+
+-- | The env of a closure's captured slots, from a list of their pairs.
+captureListEnv :: (MonadCData m) => EnvSite -> Env -> CapturedScopes -> [(Int, Int)] -> m Env
+captureListEnv site env scopes captureList = do
+  thunks <- capturedThunks env captureList
+  captured <- newCaptureEnv site env scopes (length thunks)
+  fillSlots captured thunks
+  pure captured
+
+-- | The env of a closure's captured slots, from their pairs in the data
+-- buffer.
+capturedSlotsEnv :: (MonadCData m) => EnvSite -> Env -> CapturedScopes -> BcCapturedSlots -> m Env
+capturedSlotsEnv site env scopes slots@(BcCapturedSlots count _) = do
+  captured@(Env capturedPtr) <- newCaptureEnv site env scopes count
+  dest <- cenvSlots capturedPtr
+  let fillSlot i level idx = do
+        Thunk cell <- envLookupResolved level idx env
+        cdataIO (pokeElemOff dest i cell)
+        pure (i + 1)
+  void (foldBcCapturedSlots fillSlot 0 slots)
+  pure captured
+
+-- | An env at a site of empty slots and no parent, for the slots a
+-- closure made in an env captures from it, seeing the with-scopes
+-- 'buildCaptureEnv' describes.
+newCaptureEnv :: (MonadCData m) => EnvSite -> Env -> CapturedScopes -> Int -> m Env
+newCaptureEnv site _ NoWithScopes slotCount = newBlankEnv site Nothing slotCount
+newCaptureEnv site env EnclosingWithScopes slotCount = do
   (withArr, withCount) <- envWithScopesRaw env
   if withCount == 0
-    then buildCaptureEnv site env (Captures captureList)
-    else do
-      thunks <- capturedThunks env captureList
-      trimmed <- Env <$> cenvNewScoped site (fromIntegral (length thunks)) nullPtr nullPtr withArr withCount
-      fillSlots trimmed thunks
-      pure trimmed
+    then newBlankEnv site Nothing slotCount
+    else Env <$> cenvNewScoped site (fromIntegral slotCount) nullPtr nullPtr withArr withCount
 
 -- | The thunks a closure captures, read from the env it is made in by
 -- their resolved level and index.

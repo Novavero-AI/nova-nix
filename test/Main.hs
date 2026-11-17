@@ -92,7 +92,7 @@ import Nix.Eval.CStr (cstrNew)
 import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetBool, cthunkGetInt, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkPrimop, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
-import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, reassembleInt64)
+import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), BcCaptureInfo (..), BcInheritedName (..), BcInheritedNames, compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, foldBcBindings, foldBcCapturedSlots, foldBcInheritedNames, reassembleInt64)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), LambdaName (..))
 import Nix.Eval.IO (EvalFailure (..), EvalState (..), SessionSettings (..), allowEvalPath, evalBaseEnv, newEvalStateWith, nixPathSearchPath, renderEvalFailure, runEvalIO, runEvalIOTraced, withEvalSession)
@@ -26773,18 +26773,43 @@ formalsBack formals = case formals of
   where
     formalBack (EvalFormal name def) = Formal name <$> traverse childExpr def
 
--- | A decoded binding read back as the binding it compiles from.  An
--- inherited name's select is the compiler's own and has no counterpart.
+-- | A binding read from the bytecode read back as the binding it compiles
+-- from.  An inherited name's select is the compiler's own and has no
+-- counterpart.
 bindingBack :: BcBinding -> IO Binding
 bindingBack binding = case binding of
-  BcNamed pos key valIdx -> NamedBinding <$> srcPosBack pos <*> keyBack key <*> childExpr valIdx
+  BcNamed pos sym valIdx -> NamedBinding <$> srcPosBack pos <*> pure (StaticKey (symbolText (Symbol sym))) <*> childExpr valIdx
+  BcDynamic pos keyIdx valIdx -> NamedBinding <$> srcPosBack pos <*> (DynamicKey <$> childExpr keyIdx) <*> childExpr valIdx
   BcInherit pos sym valIdx -> Inherit <$> srcPosBack pos <*> pure (symbolText (Symbol sym)) <*> childExpr valIdx
   BcInheritFrom fromIdx names -> do
     from <- childExpr fromIdx
-    InheritFrom from <$> sequence [(`InheritedName` symbolText (Symbol sym)) <$> srcPosBack pos | BcInheritedName pos sym _ <- names]
+    inherited <- inheritedNameList names
+    InheritFrom from <$> sequence [(`InheritedName` symbolText (Symbol sym)) <$> srcPosBack pos | BcInheritedName pos sym _ <- inherited]
+
+-- | Capture info read from the bytecode read back as the capture info it
+-- compiles from.
+capturesBack :: BcCaptureInfo -> IO CaptureInfo
+capturesBack info = case info of
+  BcNoCaptureInfo -> pure NoCaptureInfo
+  BcCaptures slots -> Captures <$> capturedPairs slots
+  BcCapturesWithScopes slots -> CapturesWithScopes <$> capturedPairs slots
   where
-    keyBack (BcStaticKey sym) = pure (StaticKey (symbolText (Symbol sym)))
-    keyBack (BcDynamicKey idx) = DynamicKey <$> childExpr idx
+    capturedPairs slots = reverse <$> foldBcCapturedSlots (\acc level idx -> pure ((fromIntegral level, fromIntegral idx) : acc)) [] slots
+
+-- | The bindings of a compiled set or let, their names counted.
+compiledBindings :: Word32 -> IO BcBindings
+compiledBindings idx = do
+  (count, dataOff) <- cbcCountedPayload idx =<< cbcArg1 idx
+  decodeBcBindings count dataOff
+
+-- | Bindings in source order, or the first binding tag the compiler never
+-- writes.
+bindingList :: BcBindings -> IO (Either Word32 [BcBinding])
+bindingList = fmap (fmap reverse) . foldBcBindings (pure . Left) (\acc binding -> pure ((binding :) <$> acc)) (Right [])
+
+-- | The names of an @inherit (from)@ binding in source order.
+inheritedNameList :: BcInheritedNames -> IO [BcInheritedName]
+inheritedNameList = fmap reverse . foldBcInheritedNames (\acc name -> pure (name : acc)) []
 
 -- | A closure keeps its formals type, ellipsis flag and formal count in
 -- one word (cbits/nn_lambda.h): the type in the top two bits, the flag
@@ -26879,7 +26904,7 @@ testBytecodeTags = do
           formalsOff <- cbcArg1 idx
           captureOff <- cbcArg3 idx
           decodedFormals <- decodeBcFormals flags formalsOff >>= traverse formalsBack
-          decodedCaptures <- decodeBcCaptureInfo captureOff
+          decodedCaptures <- decodeBcCaptureInfo captureOff >>= traverse capturesBack
           pure ((decodedFormals, decodedCaptures) QC.=== (Just formals, Right captures)),
       -- Upstream's addAttr names the function an attribute path's last
       -- name binds, and ExprLambda::setName the function that is its body
@@ -26890,15 +26915,19 @@ testBytecodeTags = do
             boundBy key = ELet [NamedBinding (testPos 1 1) key outer] (ELit NixNull) NoCaptureInfo
             -- The two names a binding's lambda and its body decode with.
             lambdaNames expr = do
-              idx <- compileExpr expr
-              (count, dataOff) <- cbcCountedPayload idx =<< cbcArg1 idx
-              bindings <- decodeBcBindings count dataOff
+              bindings <- compileExpr expr >>= compiledBindings >>= bindingList
               case bindings of
-                Right [BcNamed _ _ outerIdx] -> do
-                  outerFormals <- formalsAt outerIdx
-                  innerFormals <- formalsAt =<< cbcArg2 outerIdx
-                  pure (lambdaNameOf =<< outerFormals, lambdaNameOf =<< innerFormals)
+                Right [binding]
+                  | Just outerIdx <- boundValue binding -> do
+                      outerFormals <- formalsAt outerIdx
+                      innerFormals <- formalsAt =<< cbcArg2 outerIdx
+                      pure (lambdaNameOf =<< outerFormals, lambdaNameOf =<< innerFormals)
                 _ -> pure (Nothing, Nothing)
+            -- The value a static or a dynamic name is bound to.
+            boundValue = \case
+              BcNamed _ _ valIdx -> Just valIdx
+              BcDynamic _ _ valIdx -> Just valIdx
+              _ -> Nothing
             formalsAt idx = do
               flags <- cbcFlags idx
               decodeBcFormals flags =<< cbcArg1 idx
@@ -26913,16 +26942,23 @@ testBytecodeTags = do
           assertEqual "static" (Just (NamedLambda "f"), Just (NamedLambda "f")) named
             `andThen` assertEqual "dynamic" (Just AnonymousLambda, Just AnonymousLambda) dynamic
             `andThen` assertEqual "unbound" (Just AnonymousLambda) (lambdaNameOf =<< bare),
-      runTestM "a compiled let's bindings and capture info read back as compiled" . quickCheckPasses $
+      runTestM "a compiled let's bindings, their counts and its capture info read back as compiled" . quickCheckPasses $
         QC.forAll ((,) <$> QC.listOf genBinding <*> genCaptureInfo) $ \(bindings, captures) -> QC.ioProperty $ do
           idx <- compileExpr (ELet bindings (ELit NixNull) captures)
-          (count, dataOff) <- cbcCountedPayload idx =<< cbcArg1 idx
-          captureOff <- cbcArg3 idx
-          decodedBindings <- decodeBcBindings count dataOff >>= traverse (traverse bindingBack)
-          decodedCaptures <- decodeBcCaptureInfo captureOff
-          pure ((decodedBindings, decodedCaptures) QC.=== (Right bindings, Right captures))
+          compiled@(BcBindings (BcBindingCounts names dynamics) _ _) <- compiledBindings idx
+          decodedBindings <- bindingList compiled >>= traverse (traverse bindingBack)
+          decodedCaptures <- cbcArg3 idx >>= decodeBcCaptureInfo >>= traverse capturesBack
+          pure ((decodedBindings, (names, dynamics), decodedCaptures) QC.=== (Right bindings, nameCounts bindings, Right captures))
     ]
   where
+    -- The names bindings bind statically, one per static key, inherited
+    -- variable and inherited name, and the bindings with a dynamic name.
+    nameCounts bindings = (sum (map staticNames bindings), length [() | NamedBinding _ (DynamicKey _) _ <- bindings])
+    staticNames = \case
+      NamedBinding _ (StaticKey _) _ -> 1
+      NamedBinding _ (DynamicKey _) _ -> 0
+      Inherit {} -> 1
+      InheritFrom _ inherited -> length inherited
     quickCheckPasses property = do
       result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
       pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
@@ -26986,13 +27022,14 @@ testBytecodeCorrupt = do
       runTestM "an unknown capture info tag in a lambda is a corrupt-bytecode error" $
         lambdaWith formalName unknownTag >>= assertCorruptBytecode "capture info tag",
       runTestM "an unknown capture info tag in a recursive attribute set is a corrupt-bytecode error" $ do
+        bindingsOff <- bindingWords []
         captureOff <- cbcEmitData unknownTag
-        cbcEmit OpAttrs 1 0 0 captureOff 0 >>= assertCorruptBytecode "capture info tag",
+        cbcEmit OpAttrs 1 0 bindingsOff captureOff 0 >>= assertCorruptBytecode "capture info tag",
       runTestM "an unknown binding tag in an attribute set is a corrupt-bytecode error" $ do
-        bindingsOff <- cbcEmitData unknownTag
+        bindingsOff <- bindingWords [unknownTag]
         cbcEmit OpAttrs 0 1 bindingsOff 0 0 >>= assertCorruptBytecode "binding tag",
       runTestM "an unknown binding tag in a let is a corrupt-bytecode error" $ do
-        bindingsOff <- cbcEmitData unknownTag
+        bindingsOff <- bindingWords [unknownTag]
         captureOff <- cbcEmitData captureNone
         body <- literalOne
         cbcEmit OpLet 0 1 bindingsOff body captureOff >>= assertCorruptBytecode "binding tag"
@@ -27006,6 +27043,12 @@ testBytecodeCorrupt = do
       captureOff <- cbcEmitData captureTag
       body <- literalOne
       cbcEmit OpLambda formalsType 0 formalsOff body captureOff
+    -- A binding list's words, built by hand: both of its counts zero,
+    -- then the words given.  Answers the offset of the first.
+    bindingWords payload = do
+      off <- cbcEmitData 0
+      mapM_ cbcEmitData (0 : payload)
+      pure off
 
 -- | An inherited name and whether its select reads that name, as the one
 -- path segment, from slot 0 of the env it runs in.
@@ -27416,20 +27459,18 @@ testBytecodeCompile = do
             )
         op <- cbcOpcode idx
         count <- cbcShortArg idx
-        dataOff <- cbcArg1 idx
-        bindings <- decodeBcBindings 1 dataOff
+        bindings <- compiledBindings idx >>= bindingList
         case bindings of
           Right [BcInheritFrom _ names]
             | op == OpAttrs && count == 1 -> do
-                selects <- mapM inheritedSelect names
+                selects <- inheritedNameList names >>= mapM inheritedSelect
                 pure (assertEqual "inherited names and their selects" [("x", True), ("y", True)] selects)
           _ -> pure (Fail "inherit binding mismatch"),
       -- A plain inherit has no lookup of its own: it carries the variable,
       -- bound like any other, for the evaluator to read in the outer env.
       runTestM "compile plain inherit with the variable it copies" $ do
         idx <- compileExpr (EAttrs False [Inherit (testPos 1 11) "x" (EResolvedVar 0 0)] NoCaptureInfo)
-        dataOff <- cbcArg1 idx
-        bindings <- decodeBcBindings 1 dataOff
+        bindings <- compiledBindings idx >>= bindingList
         case bindings of
           Right [BcInherit _ sym valIdx] -> do
             valOp <- cbcOpcode valIdx
@@ -27452,13 +27493,13 @@ testBytecodeCompile = do
                 ]
                 NoCaptureInfo
             )
-        dataOff <- cbcArg1 idx
-        bindings <- decodeBcBindings 3 dataOff
+        bindings <- compiledBindings idx >>= bindingList
         let positionsOf binding = case binding of
-              BcNamed pos _ _ -> [pos]
-              BcInherit pos _ _ -> [pos]
-              BcInheritFrom _ names -> [pos | BcInheritedName pos _ _ <- names]
-        readBack <- traverse (mapM lookupPos . concatMap positionsOf) bindings
+              BcNamed pos _ _ -> pure [pos]
+              BcDynamic pos _ _ -> pure [pos]
+              BcInherit pos _ _ -> pure [pos]
+              BcInheritFrom _ names -> map (\(BcInheritedName pos _ _) -> pos) <$> inheritedNameList names
+        readBack <- traverse (mapM positionsOf >=> mapM lookupPos . concat) bindings
         pure $
           assertEqual
             "positions read back"
