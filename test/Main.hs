@@ -16,7 +16,7 @@ import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
-import Control.Monad (filterM, foldM, guard, replicateM, replicateM_, unless, void, when, zipWithM, (>=>))
+import Control.Monad (filterM, foldM, guard, replicateM, unless, void, when, zipWithM, (>=>))
 import Control.Monad.Except (runExceptT)
 import Control.Monad.State.Strict (State, evalStateT, get, gets, modify', runState)
 import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
@@ -100,11 +100,11 @@ import Nix.Eval.Operator (evalUpdate)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printSymbol, printValue)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
-import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecorder, noPos, recordPos)
+import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecorder, noPos, printPos, recordPos)
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolCount, symbolIntern, symbolLen, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), Pending (..), attrSetFromEntries, attrSetFromEntriesSizedFor, attrSetKeys, attrSetRemoveKeys, attrSetToMap, buildCaptureEnv, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkApply2Thunk, mkApplyThunk, mkThunkBc, newEnv, newScopeEnv, pushLazyWithScope, readComputed, readPending, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
+import Nix.Eval.Types (AttrSet (..), Env (..), Pending (..), attrSetFromEntries, attrSetFromEntriesSizedFor, attrSetFromSymbolEntriesSizedFor, attrSetKeys, attrSetRemoveKeys, attrSetToMap, buildCaptureEnv, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkApply2Thunk, mkApplyThunk, mkThunkBc, newEnv, newScopeEnv, pushLazyWithScope, readComputed, readPending, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -2174,9 +2174,10 @@ testAllocSites = do
                 keep (attrSetFromMap site Map.empty)
                 keep (attrSetFromEntries site Map.empty)
                 keep (attrSetFromEntriesSizedFor site 0 Map.empty)
+                keep (attrSetFromSymbolEntriesSizedFor site 0 Map.empty)
                 keep (attrSetRemoveKeys site removed emptyAttrSet)
             sets <- readIORef built
-            pure ((sets, fmap sitesSets added) QC.=== (replicate 4 (unAttrSet emptyAttrSet), Right Map.empty)),
+            pure ((sets, fmap sitesSets added) QC.=== (replicate 5 (unAttrSet emptyAttrSet), Right Map.empty)),
       -- Upstream sizes a literal and intersectAttrs' result before it
       -- knows what they hold (eval.cc:1193, primops.cc:2945 at 2.24.9),
       -- and gives bindings of their own to a size above 0.
@@ -2184,7 +2185,8 @@ testAllocSites = do
         quickCheckPasses $
           QC.forAll ((,) <$> QC.arbitraryBoundedEnum <*> QC.chooseInt (1, 4)) $ \(site, size) -> QC.ioProperty $ do
             sets <- newIORef []
-            added <- sitesAdded (replicateM_ 2 (attrSetFromEntriesSizedFor site size Map.empty >>= \set -> modifyIORef' sets (set :)))
+            let keep make = make >>= \set -> modifyIORef' sets (set :)
+            added <- sitesAdded (keep (attrSetFromEntriesSizedFor site size Map.empty) >> keep (attrSetFromSymbolEntriesSizedFor site size Map.empty))
             made <- readIORef sets
             sizes <- mapM attrSetSize made
             let pointers = map unAttrSet made
@@ -14047,13 +14049,44 @@ testEvalFidelity = do
         assertEvalFail "no-bare-fetchurl" "fetchurl",
       runTest "bare toFile is not a global" $
         assertEvalFail "no-bare-tofile" "toFile",
-      -- Dynamic keys colliding with an existing attr are an eval error,
-      -- never a silent last-win merge.  A key of a plain string is a
-      -- name, so each key here concatenates to stay dynamic.
+      -- Upstream's ExprAttrs::eval binds a set's static names first, then
+      -- each dynamic name in source order: it evaluates the name, skips a
+      -- null, interns it, and raises an error naming where a name bound
+      -- so far was defined, before it evaluates the next name
+      -- (eval.cc:1247-1275 at 2.24.9).  A name is defined at its
+      -- attribute path's first token (parser.y:367-380), and a position
+      -- in text with no file is in upstream's string origin
+      -- (position.cc:69-83).  A key of a plain string is a name, so each
+      -- key here concatenates to stay dynamic.
       runTest "dynamic key colliding with static errors" $
-        assertEvalFail "dyn-collide" "{ b = 1; ${\"b\" + \"\"} = 2; }",
+        assertEvalError "dyn-collide" "{ b = 1; ${\"b\" + \"\"} = 2; }" (alreadyDefined "b" "1:3"),
+      -- The name is written as upstream's printIdentifier writes an
+      -- attribute name (print.cc at 2.24.9): one that is no identifier is
+      -- a string literal.
+      runTest "a colliding name that is no identifier is written quoted" $
+        assertEvalError "dyn-collide-quoted" "{ \"a b\" = 1; ${\"a b\" + \"\"} = 2; }" (alreadyDefined "\"a b\"" "1:3"),
       runTest "rec dynamic key colliding with static errors" $
-        assertEvalFail "dyn-collide-rec" "rec { b = 1; p.q = 1; ${\"b\" + \"\"} = 2; }",
+        assertEvalError "dyn-collide-rec" "rec { b = 1; p.q = 1; ${\"b\" + \"\"} = 2; }" (alreadyDefined "b" "1:7"),
+      runTest "a dynamic name collides with a static name written after it, before the next dynamic name is evaluated" $
+        assertEvalError "dyn-collide-static-after" "{ ${\"a\" + \"\"} = 1; ${throw \"y\"} = 2; a = 3; }" (alreadyDefined "a" "1:38"),
+      runTest "a rec set's dynamic name collides with a static name written after it, before the next dynamic name is evaluated" $
+        assertEvalError "dyn-collide-static-after-rec" "rec { ${\"a\" + \"\"} = 1; ${throw \"y\"} = 2; a = 3; }" (alreadyDefined "a" "1:42"),
+      runTest "the first dynamic name in source order to collide is the one named" $
+        assertEvalError "dyn-collide-first" "rec { ${\"b\" + \"\"} = 1; ${\"a\" + \"\"} = 2; a = 3; b = 4; }" (alreadyDefined "b" "1:48"),
+      runTest "two equal dynamic names name where the first was defined" $
+        assertEvalError "dyn-collide-dynamic" "{\n  ${\"a\" + \"\"} = 1;\n  ${\"a\" + \"\"} = 2;\n}" (alreadyDefined "a" "2:3"),
+      runTest "an error in a later dynamic name does not win over an earlier collision" $
+        assertEvalError "dyn-collide-before-error" "{ ${\"a\" + \"\"} = 1; ${\"a\" + \"\"} = 2; ${throw \"later\"} = 3; }" (alreadyDefined "a" "1:3"),
+      runTest "an error in an earlier dynamic name wins over a later collision" $
+        assertEvalError "dyn-error-before-collide" "{ ${throw \"earlier\"} = 1; a = 2; ${\"a\" + \"\"} = 3; }" "earlier",
+      runTest "null dynamic names bind nothing and collide with nothing" $
+        assertEval "dyn-null-twice" "{ ${null} = 1; a = 2; ${null} = 3; } == { a = 2; }" (VBool True)
+          `andThen` assertEval "dyn-null-twice-rec" "rec { ${null} = 1; a = 2; ${null} = 3; } == { a = 2; }" (VBool True),
+      runTest "a collision names a position in a file by the file's path" $
+        assertEqual
+          "dyn-collide-file"
+          (Left ("dynamic attribute 'a' already defined at " <> positionsFile <> ":2:3"))
+          (evalNixInFile "{\n  a = 1;\n  ${\"a\" + \"\"} = 2;\n}"),
       -- Higher-order list builtins pass elements as unforced thunks: an
       -- element the function never inspects may throw without failing.
       runTest "filter does not force elements" $
@@ -14124,6 +14157,12 @@ testEvalFidelity = do
         let misnamed = [builtinName b | b <- [minBound .. maxBound], builtinNamed (builtinName b) /= Just b]
          in if null misnamed then Pass else Fail ("misnamed: " <> T.intercalate ", " misnamed)
     ]
+  where
+    -- Upstream's message for a dynamic name bound before
+    -- (eval.cc:1269 at 2.24.9), the earlier definition at a line and
+    -- column of a test's text, in guillemets (U+00AB, U+00BB) escaped to
+    -- keep the source ASCII.
+    alreadyDefined name lineColumn = "dynamic attribute '" <> name <> "' already defined at \x00ABstring\x00BB:" <> lineColumn
 
 -- | Pure hash decode/digest helpers shared by eval (fixed-output paths) and
 -- the builder (builtin:fetchurl verification).
@@ -24704,6 +24743,34 @@ testSelectInterningIO = do
   where
     names = ["s", "builtins", "listToAttrs", "name", "value", "za", "zb"]
 
+-- | A set interns each dynamic name once it has evaluated it, before it
+-- evaluates the next, as upstream's @ExprAttrs::eval@ does
+-- (eval.cc:1257-1264 at 2.24.9), so dynamic names new to the symbol
+-- table take their places in source order.  The first name in symbol
+-- order is the unexpected argument a call names, so each case runs in a
+-- child process, whose symbol table holds neither name.
+testDynamicAttrInterningIO :: IO [Bool]
+testDynamicAttrInterningIO = do
+  putStrLn "eval/dynamic-attr-interning-io"
+  sequence
+    [ emits
+        "a set interns its dynamic names in source order"
+        "({ }: null) { ${\"z\" + \"b\"} = 1; ${\"z\" + \"a\"} = 2; }"
+        [unexpected "zb"],
+      emits
+        "a rec set interns its dynamic names in source order"
+        "({ }: null) (rec { ${\"z\" + \"b\"} = 1; ${\"z\" + \"a\"} = 2; })"
+        [unexpected "zb"],
+      -- Evaluating the second name interns za as listToAttrs builds its
+      -- set, so zb is first only if it was interned before that.
+      emits
+        "a set interns a dynamic name before it evaluates the next"
+        "({ }: null) { ${\"z\" + \"b\"} = 1; ${builtins.head (builtins.attrNames (builtins.listToAttrs [ { name = \"z\" + \"a\"; value = 1; } ]))} = 2; }"
+        [unexpected "zb"]
+    ]
+  where
+    unexpected name = "error: function 'anonymous lambda' called with unexpected argument '" <> name <> "'"
+
 -- | A string's bytes are made once and shared by every cell that holds
 -- the string, as upstream copies a @Value@ with the pointer to its bytes
 -- (value.hh at 2.24.9), where a copy per cell would grow the string arena
@@ -27388,6 +27455,17 @@ testBytecodeCompile = do
                 QC.ioProperty (recordPos recorder pos >>= lookupPos <&> (QC.=== expected pos))
         result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      -- Upstream's Pos::print with its origin (position.cc:69-83 at
+      -- 2.24.9) writes a file by its path and text with no file as
+      -- string in guillemets, then the line and the column; noPos is its
+      -- empty Pos (nixexpr.cc:608-612), line 0 and column 0, in none in
+      -- guillemets, and a column of 0 is left out.
+      runTestM "a position prints as upstream's messages write it" $ do
+        recorder <- newPosRecorder
+        inFile <- recordPos recorder (SrcPos (SourceFile "/positions/set.nix") 2 3)
+        inText <- recordPos recorder (testPos 12 345)
+        printed <- mapM printPos [inFile, inText, noPos]
+        pure (assertEqual "printed" ["/positions/set.nix:2:3", "\x00ABstring\x00BB:12:345", "\x00ABnone\x00BB:0"] printed),
       runTestM "compile ELambda (FormalSet)" $ do
         idx <-
           compileExpr
@@ -28648,6 +28726,7 @@ runSuite = do
           testStringsOffSymbolsIO,
           testBuilderInterningIO,
           testSelectInterningIO,
+          testDynamicAttrInterningIO,
           testStringSharing,
           testTraceVerboseOff,
           testStorePathLinksIO,
