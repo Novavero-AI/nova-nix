@@ -35,6 +35,7 @@ module Nix.Eval.Symbol
   )
 where
 
+import Control.Exception (throwIO)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Foreign as TF
@@ -42,7 +43,7 @@ import Data.Word (Word32)
 import Foreign.C.Types (CChar, CSize (..))
 import Foreign.Ptr (Ptr, nullPtr)
 import Nix.Eval.CData (MonadCData, cdataIO, readImmutable)
-import Nix.Eval.CStatus (cStatusFailure)
+import Nix.Eval.CStatus (CStatusError (..), arenaLive, cInvariantViolated, cStatusFailure)
 
 -- | An interned symbol - a 'Word32' index into the global symbol table.
 -- Two symbols are equal iff their indices are equal (O(1) comparison).
@@ -121,23 +122,44 @@ checkedSymbol sid
 -- intern may run between the two: the layer is used from one thread at a
 -- time.
 
--- | Retrieve the text of an interned symbol.
--- Returns the original string.  The result is safe to use - it copies
--- from the C arena into a fresh 'Text'.
+-- | The text of an interned symbol, copied out of the table.  The
+-- invalid id reads as no name; an id the table does not hold raises
+-- 'CInvariantViolated' in an evaluation session and
+-- 'ArenaNotInitialized' outside one.
 symbolText :: Symbol -> Text
 symbolText (Symbol sid)
   | sid == invalidSymbolId = T.empty
   | otherwise = readImmutable . cdataIO $ do
       ptr <- c_nn_symbol_text sid
       if ptr == nullPtr
-        then pure T.empty
+        then unheldSymbol "nn_symbol_text" sid
         else do
           len <- c_nn_symbol_len sid
           TF.peekCStringLen (ptr, fromIntegral len)
 
--- | Byte length of a symbol's string.
+-- | Byte length of a symbol's string: 0 for the invalid id, and for an
+-- id the table does not hold the failure 'symbolText' raises.
 symbolLen :: Symbol -> Int
-symbolLen (Symbol sid) = fromIntegral (readImmutable (cdataIO (c_nn_symbol_len sid)))
+symbolLen (Symbol sid)
+  | sid == invalidSymbolId = 0
+  | otherwise = fromIntegral . readImmutable . cdataIO $ do
+      len <- c_nn_symbol_len sid
+      -- The table answers 0 for an id it does not hold, which an empty
+      -- name's length also is, so only a 0 asks the table's count.
+      held <- if len /= 0 then pure True else (sid <=) <$> c_nn_symbol_count
+      if held then pure len else unheldSymbol "nn_symbol_len" sid
+
+-- | Fail for a symbol id the table does not hold, which it reads as an
+-- empty name.  Outside an evaluation session the table holds none, and
+-- the failure is 'ArenaNotInitialized'; within one only a defect makes
+-- such an id, and the failure is 'CInvariantViolated', where the name
+-- would otherwise be wrong far from its cause.
+unheldSymbol :: String -> Word32 -> IO a
+unheldSymbol site sid = do
+  live <- arenaLive
+  if live
+    then cInvariantViolated site ("no symbol " ++ show sid ++ " in the table")
+    else throwIO (ArenaNotInitialized site)
 
 -- ---------------------------------------------------------------------------
 -- Diagnostics
