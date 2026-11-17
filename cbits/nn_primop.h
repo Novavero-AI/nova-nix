@@ -56,7 +56,8 @@ uint32_t nn_primop_app_primop(const nn_primop_app_t *app);
 uint16_t nn_primop_app_taken(const nn_primop_app_t *app);
 uint16_t nn_primop_app_forced(const nn_primop_app_t *app);
 
-/* Argument `i`'s cell, or NULL for `i` past the arguments taken. */
+/* Argument `i`'s cell; `i` must be below the arguments taken, and an
+ * index past them aborts (NN_ASSERT). */
 struct nn_thunk *nn_primop_app_arg(const nn_primop_app_t *app, uint16_t i);
 
 /* --- Census (nn_stats.h) --- */

@@ -92,13 +92,10 @@ nn_primop_app_forced(const nn_primop_app_t *app)
     return app->forced;
 }
 
-/* The bound stays live under NDEBUG: the index crosses the FFI, so a
- * violated bound returns NULL rather than reading past the arguments. */
 struct nn_thunk *
 nn_primop_app_arg(const nn_primop_app_t *app, uint16_t i)
 {
     NN_ASSERT(i < app->taken, "nn_primop_app_arg: index past the arguments taken");
-    if (i >= app->taken) return NULL;
     return app->args[i];
 }
 

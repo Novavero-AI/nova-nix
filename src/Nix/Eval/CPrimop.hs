@@ -91,7 +91,7 @@ cprimopAppTaken = cdataIO . c_nn_primop_app_taken
 cprimopAppForced :: (MonadCData m) => CPrimopAppPtr -> m Word16
 cprimopAppForced = cdataIO . c_nn_primop_app_forced
 
--- | Argument @i@'s cell, or 'Foreign.Ptr.nullPtr' past the arguments
--- taken.
+-- | Argument @i@'s cell.  @i@ is below 'cprimopAppTaken': an index past
+-- it aborts (@NN_ASSERT@ in @nn_primop_app_arg@).
 cprimopAppArg :: (MonadCData m) => CPrimopAppPtr -> Word16 -> m CThunkPtr
 cprimopAppArg app i = cdataIO (c_nn_primop_app_arg app i)

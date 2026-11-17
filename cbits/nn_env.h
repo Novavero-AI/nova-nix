@@ -180,9 +180,10 @@ uint32_t     nn_env_bytes(const nn_env_t *env);
 /* --- Lookup --- */
 
 /* Resolved variable lookup: walk `level` parent hops, then read
- * slots[idx].  Returns the nn_thunk_t* at that position.
- * Caller must ensure level/idx are in bounds (guaranteed by
- * the resolution pass). */
+ * slots[idx].  Returns the nn_thunk_t* there, or NULL for a NULL env, a
+ * negative level or index, a level past the parent chain, an index
+ * outside the slots, or a slot not yet filled, which the Haskell boundary
+ * raises as CInvariantViolated. */
 void *nn_env_lookup_resolved(const nn_env_t *env, int level, int idx);
 
 /* Walk parent chain to the root env (one without a parent), return its

@@ -82,7 +82,7 @@ instance Exception CStatusError where
 
 -- | Reject a NULL from a C allocator before it can flow onward as a
 -- pointer: the C side signals failure deliberately, and the next
--- dereference would be undefined behaviour in a release build.
+-- dereference would be undefined behaviour.
 checkedCPtr :: String -> Ptr a -> IO (Ptr a)
 checkedCPtr site ptr
   | ptr == nullPtr = cStatusFailure site "C allocation failed"

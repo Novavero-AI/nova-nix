@@ -238,8 +238,8 @@ emitFailedSentinel = 0xFFFFFFFF
 
 -- | Reject the failure sentinel before it can flow onward as an index:
 -- the bytecode arrays are global C state, so a failed append leaves
--- nothing to recover, and the read-side bounds on a sentinel index do
--- not survive a release build.
+-- nothing to recover, and the sentinel read back as an index would abort
+-- at the first read's bound (@NN_ASSERT@) instead of raising here.
 checkedEmit :: String -> Word32 -> IO Word32
 checkedEmit site idx
   | idx == emitFailedSentinel = cStatusFailure site "bytecode append failed (allocation failure or index ceiling)"

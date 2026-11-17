@@ -10,7 +10,6 @@
  */
 
 #include "nn_env.h"
-#include "nn_assert.h"
 #include "nn_stats.h"
 
 #include <stdio.h>
@@ -431,23 +430,17 @@ nn_env_bytes(const nn_env_t *env)
 void *
 nn_env_lookup_resolved(const nn_env_t *env, int level, int idx)
 {
-    NN_ASSERT(env != NULL, "nn_env_lookup_resolved: NULL env");
-    if (env == NULL) {
+    if (env == NULL || level < 0) {
         return NULL;
     }
     while (level > 0) {
         const nn_env_t *parent = parent_of(env);
-        NN_ASSERT(parent != NULL, "nn_env_lookup_resolved: parent chain too short for level");
         if (parent == NULL) {
             return NULL;
         }
         env = parent;
         level--;
     }
-    /* The resolver supplies these indices; guard the slot read in release
-       builds too (NDEBUG strips the assert) so a resolver bug surfaces as a
-       NULL rather than an out-of-bounds read past the slots. */
-    NN_ASSERT(idx >= 0 && (uint32_t)idx < slot_count_of(env), "nn_env_lookup_resolved: idx out of bounds");
     if (idx < 0 || (uint32_t)idx >= slot_count_of(env)) {
         return NULL;
     }

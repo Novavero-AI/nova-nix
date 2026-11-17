@@ -182,11 +182,10 @@ uint32_t nn_bc_arg3(uint32_t idx)      { NN_ASSERT(idx < g_op_count, "nn_bc_arg3
 uint32_t nn_bc_data(uint32_t offset)   { NN_ASSERT(offset < g_data_count, "nn_bc_data: offset out of bounds"); return g_data[offset]; }
 
 /* The index comes from a data word or an argument the compiler wrote, so
- * only a corrupt store holds one out of range; the bound stays live under
- * NDEBUG and answers NULL, which the Haskell boundary refuses. */
+ * only a corrupt store holds one out of range; it answers NULL, which the
+ * Haskell boundary raises as CInvariantViolated. */
 nn_str_t *nn_bc_string(uint32_t index)
 {
-    NN_ASSERT(index < g_string_count, "nn_bc_string: index out of bounds");
     return index < g_string_count ? g_strings[index] : NULL;
 }
 

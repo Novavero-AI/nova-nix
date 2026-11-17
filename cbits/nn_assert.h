@@ -5,12 +5,13 @@
 #include <stdlib.h>
 
 /*
- * Debug-mode bounds checking.  Compiles to nothing under NDEBUG.
- * Use for array accesses, index validation, and invariant checks.
+ * An invariant check that holds in every build, NDEBUG or not: a breach
+ * prints its message and site and aborts.  It guards an index or pointer
+ * this library produced itself, where a breach means corrupt state.  An
+ * answer the Haskell boundary checks (a NULL it raises as
+ * CInvariantViolated) is returned instead, not asserted, so that the
+ * defect is reported with its site.
  */
-#ifdef NDEBUG
-#define NN_ASSERT(cond, msg) ((void)0)
-#else
 #define NN_ASSERT(cond, msg) \
     do { \
         if (!(cond)) { \
@@ -19,6 +20,5 @@
             abort(); \
         } \
     } while (0)
-#endif
 
 #endif /* NN_ASSERT_H */
