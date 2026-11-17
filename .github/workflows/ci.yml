@@ -125,6 +125,11 @@ jobs:
           done
           exit $status
 
+      # The release notes are the fragments the assembly script prints, so a
+      # fragment it drops is a change the release leaves out.
+      - name: The assembly script prints every fragment once
+        run: bash scripts/assemble-changelog-cases.sh
+
   hlint:
     name: HLint
     needs: [ascii]
