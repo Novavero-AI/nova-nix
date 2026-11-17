@@ -22,9 +22,11 @@ module Nix.Eval.Types
     attrSetLookup,
     attrSetLookupSymbol,
     attrSetLookupEntry,
+    attrSetLookupSymbolEntry,
     attrSetKeys,
     firstInSymbolOrder,
     attrSetAt,
+    attrSetFoldM,
     attrSetToMap,
     emptyAttrSet,
     attrSetFromMap,
@@ -32,7 +34,6 @@ module Nix.Eval.Types
     attrSetFromSymbols,
     attrSetFromSymbolEntries,
     attrSetFromSymbolEntriesSizedFor,
-    attrSetFromEntriesSizedFor,
     attrSetMember,
     attrSetNull,
     attrSetSize,
@@ -466,12 +467,17 @@ attrSetLookup key attrs = do
   sym <- symbolIntern key
   attrSetLookupSymbol sym attrs
 
--- | 'attrSetLookup' with the attribute's position.
-attrSetLookupEntry :: (MonadCData m) => Text -> AttrSet -> m (Maybe AttrEntry)
-attrSetLookupEntry key (AttrSet cset) = do
-  sym <- symbolIntern key
+-- | 'attrSetLookupSymbol' with the attribute's position.
+attrSetLookupSymbolEntry :: (MonadCData m) => Symbol -> AttrSet -> m (Maybe AttrEntry)
+attrSetLookupSymbolEntry sym (AttrSet cset) = do
   midx <- cattrsetIndex cset sym
   traverse (\idx -> AttrEntry <$> cattrsetGetPos cset idx <*> (Thunk <$> cattrsetGetValue cset idx)) midx
+
+-- | 'attrSetLookup' with the attribute's position.
+attrSetLookupEntry :: (MonadCData m) => Text -> AttrSet -> m (Maybe AttrEntry)
+attrSetLookupEntry key attrs = do
+  sym <- symbolIntern key
+  attrSetLookupSymbolEntry sym attrs
 
 -- | All keys, as symbol text from C, in the C array's order: by interned
 -- symbol, not by name.
@@ -499,6 +505,23 @@ attrSetAt attrs@(AttrSet cset) i = do
       name <- cattrsetGetKey cset idx
       ptr <- cattrsetGetValue cset idx
       pure (Just (name, Thunk ptr))
+
+-- | Fold an action over a set's attributes, each its name and its entry,
+-- first to last in the C array's order, by interned symbol, as upstream
+-- walks the @Attr@s of a set's @Bindings@, which are sorted by @Symbol@
+-- (attr-set.hh:30-33 and :91-95 at 2.24.9).  It reads one entry at a
+-- time and forces the accumulator at each.
+{-# INLINE attrSetFoldM #-}
+attrSetFoldM :: (MonadCData m) => (a -> Symbol -> AttrEntry -> m a) -> a -> AttrSet -> m a
+attrSetFoldM step initial (AttrSet cset) = do
+  size <- cattrsetSize cset
+  let go !acc idx
+        | idx >= size = pure acc
+        | otherwise = do
+            name <- cattrsetGetKey cset idx
+            entry <- AttrEntry <$> cattrsetGetPos cset idx <*> (Thunk <$> cattrsetGetValue cset idx)
+            step acc name entry >>= \next -> go next (idx + 1)
+  go initial 0
 
 -- | Check key membership without materializing thunks.
 attrSetMember :: (MonadCData m) => Text -> AttrSet -> m Bool
@@ -538,11 +561,22 @@ attrSetElems attrs = Map.elems <$> attrSetToMap attrs
 attrSetToAscList :: (MonadCData m) => AttrSet -> m [(Text, Thunk)]
 attrSetToAscList attrs = Map.toAscList <$> attrSetToMap attrs
 
--- | Map an action over all key-value pairs, building a new CAttrSet at a
--- site.  Materializes the source set, runs @f@ on each entry, and
--- rebuilds.
-attrSetMapWithKey :: (MonadCData m) => SetSite -> (Text -> Thunk -> m Thunk) -> AttrSet -> m AttrSet
-attrSetMapWithKey site f attrs = attrSetToMap attrs >>= Map.traverseWithKey f >>= attrSetFromMap site
+-- | A set at a site binding each name of a set to what an action makes
+-- of the name and its value, as upstream's @mapAttrs@ builds its result
+-- (primops.cc:3095-3105 at 2.24.9): the action runs on each attribute in
+-- the order the set holds them ('attrSetFoldM'), and the result is sized
+-- for the set and binds its names, each defined nowhere in source.  An
+-- empty set gives 'emptyAttrSet', as upstream's @allocBindings@ answers
+-- a size of 0 with its shared bindings (attr-set.cc:16-17).
+attrSetMapWithKey :: (MonadCData m) => SetSite -> (Symbol -> Thunk -> m Thunk) -> AttrSet -> m AttrSet
+attrSetMapWithKey site f attrs =
+  attrSetSize attrs >>= \case
+    0 -> pure emptyAttrSet
+    size -> do
+      mapped <- cattrsetNew site size
+      attrSetFoldM (\() name entry -> f name (entryThunk entry) >>= cattrsetInsert mapped name noPos . unThunk) () attrs
+      cattrsetFreeze mapped
+      pure (AttrSet mapped)
 
 -- | Remove a list of keys, returning a new CAttrSet made at a site.
 -- Uses the C-side @nn_attrset_remove_keys@, which scans the keys for
@@ -566,8 +600,7 @@ attrSetRemoveKeys site keys (AttrSet cset) = do
 -- attributes is this one and is allocated nowhere, as upstream's
 -- @allocBindings@ answers a size of 0 with @emptyBindings@
 -- (attr-set.cc:16-17), except a set upstream sizes before it knows it
--- holds nothing ('attrSetFromSymbolEntriesSizedFor',
--- 'attrSetFromEntriesSizedFor', 'attrSetRemoveKeys').
+-- holds nothing ('attrSetFromSymbolEntriesSizedFor', 'attrSetRemoveKeys').
 -- Upstream's printers enter a set by its bindings, so which empty sets
 -- are this one shows where a value is printed.
 emptyAttrSet :: AttrSet
@@ -599,7 +632,8 @@ attrSetFromSymbolEntries site m = AttrSet <$> newFrozenAttrSet site pure entryPo
 
 -- | 'attrSetFromSymbolEntries' for a set upstream sizes, before it knows
 -- what the set holds, for the given number of attributes, as it sizes a
--- literal for its names (eval.cc:1193 at 2.24.9).  Upstream's
+-- literal for its names (eval.cc:1193 at 2.24.9) and @intersectAttrs@'s
+-- result for the smaller of its arguments (primops.cc:2945).  Upstream's
 -- @allocBindings@ shares its empty set only for a size of 0
 -- (attr-set.cc:16-17), so such a set holding nothing is 'emptyAttrSet'
 -- when sized for none and an empty set of its own otherwise.  A set
@@ -609,15 +643,6 @@ attrSetFromSymbolEntriesSizedFor :: (MonadCData m) => SetSite -> Int -> Map Symb
 attrSetFromSymbolEntriesSizedFor site size m
   | Map.null m && size > 0 = ownEmptyAttrSet site
   | otherwise = attrSetFromSymbolEntries site m
-
--- | 'attrSetFromSymbolEntriesSizedFor' over names given as text, which are
--- interned as 'attrSetFromEntries' interns them, for a set sized as
--- upstream's @intersectAttrs@ sizes its result, for the smaller of its
--- arguments (primops.cc:2945 at 2.24.9).
-attrSetFromEntriesSizedFor :: (MonadCData m) => SetSite -> Int -> Map Text AttrEntry -> m AttrSet
-attrSetFromEntriesSizedFor site size m
-  | Map.null m && size > 0 = ownEmptyAttrSet site
-  | otherwise = attrSetFromEntries site m
 
 -- | An empty set at a site that is not 'emptyAttrSet', made with room for
 -- one entry: room for none asks @nn_attrset_new@ for its default room,
@@ -1385,8 +1410,9 @@ class (MonadCData m) => MonadEval m where
   -- computation exactly as upstream's addTextToStore.
   writeToStore :: Text -> ByteString -> [StorePath] -> m Text
 
-  -- | Import a file with a custom scope overlaid on builtins.
-  scopedImportFile :: [(Text, Thunk)] -> Text -> m NixValue
+  -- | Import a file with a set's names bound over the builtins, each to
+  -- its value in the set.
+  scopedImportFile :: AttrSet -> Text -> m NixValue
 
   -- | Read raw bytes from a file.  Used by @builtins.hashFile@.
   readFileBytes :: Text -> m ByteString

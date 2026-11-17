@@ -84,7 +84,7 @@ import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLe
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, uriAccess)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), bytesToTextLossy, evaluated, marshalLambda, pathCell, primopCell, readComputed, readPending, storePathOrThrow, stringCell, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetKeys, bytesToTextLossy, evaluated, marshalLambda, pathCell, primopCell, readComputed, readPending, storePathOrThrow, stringCell, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -414,10 +414,6 @@ instance Monad EvalIO where
 
 {-# SPECIALIZE selectAttrPath :: Text -> NixValue -> EvalIO (Either Text NixValue) #-}
 
--- The environment each scopedImport builds over the base one, here too:
--- left to the flags, it runs on the dictionary-passing code.
-{-# SPECIALIZE builtinEnvWithScope :: Env -> [(Text, Thunk)] -> EvalIO Env #-}
-
 -- ---------------------------------------------------------------------------
 -- MonadEval instance
 -- ---------------------------------------------------------------------------
@@ -652,8 +648,9 @@ instance MonadEval EvalIO where
     policy <- EvalIO (asks esPolicy)
     (target, ioTarget) <- resolveImportTarget baseDir rawPath
     source <- sourceIO ReadFile (T.pack target) (BS.readFile ioTarget)
+    scopeNames <- attrSetKeys scope
     let fileDir = takeDirectory target
-    case parseNixWithScope (Set.union (Set.fromList (map fst scope)) (rootScopeNames policy)) fileDir (SourceFile (T.pack target)) source of
+    case parseNixWithScope (Set.union (Set.fromList scopeNames) (rootScopeNames policy)) fileDir (SourceFile (T.pack target)) source of
       Left err -> rejectSource "scopedImport" target err
       Right parsed -> do
         -- No import cache for scoped imports (different scopes = different results)

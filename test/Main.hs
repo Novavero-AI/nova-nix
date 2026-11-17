@@ -16,7 +16,7 @@ import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
-import Control.Monad (filterM, foldM, guard, replicateM, unless, void, when, zipWithM, (>=>))
+import Control.Monad (filterM, foldM, guard, replicateM, replicateM_, unless, void, when, zipWithM, (>=>))
 import Control.Monad.Except (runExceptT)
 import Control.Monad.State.Strict (State, evalStateT, get, gets, modify', runState)
 import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
@@ -104,7 +104,7 @@ import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecor
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolCount, symbolIntern, symbolLen, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), Pending (..), attrSetFromEntries, attrSetFromEntriesSizedFor, attrSetFromSymbolEntriesSizedFor, attrSetKeys, attrSetRemoveKeys, attrSetToMap, buildCaptureEnv, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkApply2Thunk, mkApplyThunk, mkThunkBc, newEnv, newScopeEnv, pushLazyWithScope, readComputed, readPending, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
+import Nix.Eval.Types (AttrSet (..), Env (..), Pending (..), attrSetFromEntries, attrSetFromSymbolEntriesSizedFor, attrSetKeys, attrSetRemoveKeys, attrSetToMap, buildCaptureEnv, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkApply2Thunk, mkApplyThunk, mkThunkBc, newEnv, newScopeEnv, pushLazyWithScope, readComputed, readPending, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -1056,7 +1056,7 @@ testSharedEmptySet = do
     -- which side it came from.
     operandSet :: Int64 -> UpdateOperand -> IO AttrSet
     operandSet _ SharedEmpty = pure emptyAttrSet
-    operandSet _ OwnEmpty = attrSetFromEntriesSizedFor SetLiteral 1 Map.empty
+    operandSet _ OwnEmpty = attrSetFromSymbolEntriesSizedFor SetLiteral 1 Map.empty
     operandSet side (Holding names) = do
       cells <- mapM (\name -> (name,) <$> evaluated (VInt side)) names
       attrSetFromMap SetLiteral (Map.fromList cells)
@@ -2173,11 +2173,10 @@ testAllocSites = do
               sitesAdded $ do
                 keep (attrSetFromMap site Map.empty)
                 keep (attrSetFromEntries site Map.empty)
-                keep (attrSetFromEntriesSizedFor site 0 Map.empty)
                 keep (attrSetFromSymbolEntriesSizedFor site 0 Map.empty)
                 keep (attrSetRemoveKeys site removed emptyAttrSet)
             sets <- readIORef built
-            pure ((sets, fmap sitesSets added) QC.=== (replicate 5 (unAttrSet emptyAttrSet), Right Map.empty)),
+            pure ((sets, fmap sitesSets added) QC.=== (replicate 4 (unAttrSet emptyAttrSet), Right Map.empty)),
       -- Upstream sizes a literal and intersectAttrs' result before it
       -- knows what they hold (eval.cc:1193, primops.cc:2945 at 2.24.9),
       -- and gives bindings of their own to a size above 0.
@@ -2186,7 +2185,7 @@ testAllocSites = do
           QC.forAll ((,) <$> QC.arbitraryBoundedEnum <*> QC.chooseInt (1, 4)) $ \(site, size) -> QC.ioProperty $ do
             sets <- newIORef []
             let keep make = make >>= \set -> modifyIORef' sets (set :)
-            added <- sitesAdded (keep (attrSetFromEntriesSizedFor site size Map.empty) >> keep (attrSetFromSymbolEntriesSizedFor site size Map.empty))
+            added <- sitesAdded (replicateM_ 2 (keep (attrSetFromSymbolEntriesSizedFor site size Map.empty)))
             made <- readIORef sets
             sizes <- mapM attrSetSize made
             let pointers = map unAttrSet made
@@ -4503,7 +4502,19 @@ testBatch3 = do
         assertEval
           "zipAttrs-collect"
           "builtins.length (builtins.zipAttrsWith (name: vals: vals) [ { a = 1; } { a = 2; } ]).a"
-          (VInt 2)
+          (VInt 2),
+      -- Upstream fills each name's list from the list's sets first to
+      -- last (primops.cc:3158-3163 at 2.24.9).
+      runTest "zipAttrsWith gathers each name's values in list order" $
+        assertEval
+          "zipAttrs-order"
+          "builtins.zipAttrsWith (name: vals: [ name ] ++ vals) [ { zb = 1; a = 2; } { a = 3; } { c = 4; zb = 5; a = 6; } ] == { a = [ \"a\" 2 3 6 ]; c = [ \"c\" 4 ]; zb = [ \"zb\" 1 5 ]; }"
+          (VBool True),
+      runTest "mapAttrs passes each name with its own value" $
+        assertEval
+          "mapAttrs-pairs"
+          "builtins.mapAttrs (name: val: [ name val ]) { zb = 1; a = 2; c = 3; } == { a = [ \"a\" 2 ]; c = [ \"c\" 3 ]; zb = [ \"zb\" 1 ]; }"
+          (VBool True)
     ]
 
 -- ---------------------------------------------------------------------------
@@ -6114,6 +6125,9 @@ testUnsafeGetAttrPos = do
       inFile "an update takes the right side's position with its value" "builtins.unsafeGetAttrPos \"b\" ({\n  a = 1;\n  b = 2;\n} // {\n  b = 3;\n})" (5, 3),
       inFile "removeAttrs keeps the positions it keeps" "builtins.unsafeGetAttrPos \"b\" (builtins.removeAttrs {\n  a = 1;\n  b = 2;\n} [ \"a\" ])" (3, 3),
       inFile "intersectAttrs keeps the right set's position" "builtins.unsafeGetAttrPos \"a\" (builtins.intersectAttrs { a = null; } {\n  a = 1;\n})" (2, 3),
+      -- Upstream walks the left set when it is the smaller, and keeps the
+      -- attribute it finds in the right (primops.cc:2985-2990 at 2.24.9).
+      inFile "intersectAttrs keeps the right set's position when the left is smaller" "builtins.unsafeGetAttrPos \"a\" (builtins.intersectAttrs { a = null; } {\n  a = 1;\n  b = 2;\n})" (2, 3),
       inFile "listToAttrs is at the element's value" "builtins.unsafeGetAttrPos \"k\" (builtins.listToAttrs [ {\n  name = \"k\";\n  value = 1;\n} ])" (3, 3),
       noPosition "mapAttrs makes attributes with none" "builtins.unsafeGetAttrPos \"a\" (builtins.mapAttrs (n: v: v) {\n  a = 1;\n})",
       noPosition "a builtin has none" "builtins.unsafeGetAttrPos \"map\" builtins",
@@ -24771,6 +24785,25 @@ testDynamicAttrInterningIO = do
   where
     unexpected name = "error: function 'anonymous lambda' called with unexpected argument '" <> name <> "'"
 
+-- | @deepSeq@ and @--strict@ force a set's values in the order the set
+-- holds them, as upstream's @forceValueDeep@ walks a set's @Bindings@
+-- (eval.cc:2110-2111 at 2.24.9), which are sorted by @Symbol@
+-- (attr-set.hh:30-33), whose order is the order the symbol table
+-- interned the name in (symbol-table.hh:71).  Upstream's parser interns
+-- a set's names in source order (parser.y:367, :433, :443), so of two
+-- values that fail, the one written first fails first here, where name
+-- order would force the other.  The case runs in a child process, whose
+-- symbol table holds neither name.
+testDeepForceOrderIO :: IO [Bool]
+testDeepForceOrderIO = do
+  putStrLn "eval/deep-force-order-io"
+  sequence
+    [ emits
+        "deepSeq forces a set's values in the order their names were interned"
+        "builtins.deepSeq { zb = throw \"b\"; za = throw \"a\"; } null"
+        ["error: b"]
+    ]
+
 -- | A string's bytes are made once and shared by every cell that holds
 -- the string, as upstream copies a @Value@ with the pointer to its bytes
 -- (value.hh at 2.24.9), where a copy per cell would grow the string arena
@@ -28727,6 +28760,7 @@ runSuite = do
           testBuilderInterningIO,
           testSelectInterningIO,
           testDynamicAttrInterningIO,
+          testDeepForceOrderIO,
           testStringSharing,
           testTraceVerboseOff,
           testStorePathLinksIO,
