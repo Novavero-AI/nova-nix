@@ -105,6 +105,7 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (chr, digitToInt, intToDigit, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, isOctDigit, ord, toUpper)
 import Data.Either (partitionEithers)
+import Data.Foldable (toList)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Int (Int64)
 import Data.List (sort, sortOn)
@@ -163,7 +164,7 @@ import Nix.Eval.Types
     StringContextElement (..),
     Thunk (..),
     attrSetElems,
-    attrSetFromEntriesSizedFor,
+    attrSetFoldM,
     attrSetFromMap,
     attrSetFromSymbolEntries,
     attrSetFromSymbolEntriesSizedFor,
@@ -172,6 +173,7 @@ import Nix.Eval.Types
     attrSetLookup,
     attrSetLookupEntry,
     attrSetLookupSymbol,
+    attrSetLookupSymbolEntry,
     attrSetMapWithKey,
     attrSetMember,
     attrSetNull,
@@ -1783,20 +1785,23 @@ builtinRemoveAttrs (VAttrs _) other =
 builtinRemoveAttrs other _ =
   throwEvalError ("builtins.removeAttrs: expected a set, got " <> typeName other)
 
--- | Upstream's @prim_intersectAttrs@ (primops.cc:2937-3001 at 2.24.9),
--- whose result is sized for the smaller argument: two sets with
--- attributes and no name in common make an empty set of their own.
+-- | Upstream's @prim_intersectAttrs@ (primops.cc:2937-3001 at 2.24.9):
+-- it walks the smaller set, the second when the two are one size, and
+-- finds each name it meets in the other (:2985-2998).  Each attribute it
+-- keeps is the second set's, position included.  The result is sized
+-- for the smaller set, so two sets with attributes and no name in common
+-- make an empty set of their own.
 builtinIntersectAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinIntersectAttrs (VAttrs a) (VAttrs b) =
-  -- Iterate keys of 'a' (typically the smaller set, e.g. functionArgs)
-  -- and point-lookup each in 'b' (typically the large set, e.g. nixpkgs).
-  -- This avoids materializing all thunks in 'b'.  Each attribute is b's,
-  -- position included, as upstream copies it.
-  do
-    keysA <- attrSetKeys a
-    found <- mapM (\k -> fmap (k,) <$> attrSetLookupEntry k b) keysA
-    sizeB <- attrSetSize b
-    VAttrs <$> attrSetFromEntriesSizedFor SetIntersectAttrs (min (length keysA) sizeB) (Map.fromList (catMaybes found))
+builtinIntersectAttrs (VAttrs left) (VAttrs right) = do
+  sizeLeft <- attrSetSize left
+  sizeRight <- attrSetSize right
+  let shared
+        | sizeLeft < sizeRight = attrSetFoldM keepFoundInRight Map.empty left
+        | otherwise = attrSetFoldM keepIfInLeft Map.empty right
+  shared >>= fmap VAttrs . attrSetFromSymbolEntriesSizedFor SetIntersectAttrs (min sizeLeft sizeRight)
+  where
+    keepFoundInRight kept name _ = maybe kept (\entry -> Map.insert name entry kept) <$> attrSetLookupSymbolEntry name right
+    keepIfInLeft kept name entry = maybe kept (const (Map.insert name entry kept)) <$> attrSetLookupSymbol name left
 builtinIntersectAttrs (VAttrs _) other =
   throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
 builtinIntersectAttrs other _ =
@@ -2153,13 +2158,14 @@ deferApply func argThunk = do
   fnThunk <- evaluated func
   mkApplyThunk fnThunk argThunk
 
--- | A thunk deferring @f name value@, as upstream's @mapAttrs@ and
--- @zipAttrsWith@ build one from two nested @mkApp@s ('mkApply2Thunk').
+-- | A thunk deferring @f name value@, the name passed as a string, as
+-- upstream's @mapAttrs@ and @zipAttrsWith@ build one from two nested
+-- @mkApp@s ('mkApply2Thunk').
 -- A builtin that makes one per attribute shares one function cell across
 -- them, as upstream's primops share @args[0]@.
-deferApply2 :: (MonadCData m) => Thunk -> Text -> Thunk -> m Thunk
+deferApply2 :: (MonadCData m) => Thunk -> Symbol -> Thunk -> m Thunk
 deferApply2 fnThunk name valueThunk = do
-  nameThunk <- evaluated (mkStr name)
+  nameThunk <- evaluated (mkStr (symbolText name))
   mkApply2Thunk fnThunk nameThunk valueThunk
 
 -- | The non-copying path coercion: the path text verbatim, no context -
@@ -2533,26 +2539,30 @@ formalsListToAttrs :: (MonadCData m) => [EvalFormal] -> m NixValue
 formalsListToAttrs formals =
   valuesSet SetFunctionArgs (Map.fromList [(efName f, VBool (isJust (efDefault f))) | f <- formals])
 
+-- | Upstream's @prim_zipAttrsWith@ (primops.cc:3123-3180 at 2.24.9): the
+-- list's sets are forced first to last, and each name any of them binds
+-- gathers its values in list order, under the name's symbol.
 builtinZipAttrsWith :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinZipAttrsWith func (VList cl) = do
   attrSets <- listThunks cl >>= mapM forceToAttrSet
   fnThunk <- evaluated func
+  gathered <- foldM (attrSetFoldM gather) Map.empty attrSets
   -- Lazy: each result is a deferred f(name)(values) thunk, not eagerly
   -- evaluated.  Critical for nixpkgs evalModules fixpoint - config is a
   -- self-referencing lazy attrset that must be COMPUTED (holding the lazy
   -- result) before any individual attribute thunks are forced.
-  results <- Map.traverseWithKey (deferZip fnThunk) (mergeAllAttrs attrSets)
-  VAttrs <$> attrSetFromMap SetZipAttrsWith results
+  results <- Map.traverseWithKey (deferZip fnThunk) gathered
+  VAttrs <$> attrSetFromSymbols SetZipAttrsWith results
   where
     forceToAttrSet thunk = do
       val <- force thunk
       case val of
-        VAttrs attrs -> attrSetToMap attrs
+        VAttrs attrs -> pure attrs
         _ -> throwEvalError "builtins.zipAttrsWith: list element must be a set"
-    mergeAllAttrs = foldl' (\acc m -> Map.unionWith (++) acc (Map.map (: []) m)) Map.empty
-    deferZip fnThunk key thunkList = do
-      valueList <- thunksList thunkList >>= evaluated
-      deferApply2 fnThunk key valueList
+    gather seen name entry = pure (Map.alter (Just . maybe (Seq.singleton (entryThunk entry)) (Seq.|> entryThunk entry)) name seen)
+    deferZip fnThunk name values = do
+      valueList <- thunksList (toList values) >>= evaluated
+      deferApply2 fnThunk name valueList
 builtinZipAttrsWith _ other =
   throwEvalError ("builtins.zipAttrsWith: expected a list, got " <> typeName other)
 
@@ -3019,7 +3029,10 @@ builtinDeepSeq first second = deepForce first >> argValue second
 
 -- | Force every value inside a value, through its lists and sets, as
 -- upstream's @forceValueDeep@ does for @builtins.deepSeq@ and
--- @nix-instantiate --eval --strict@ (eval.cc:2099-2131 at 2.24.9).
+-- @nix-instantiate --eval --strict@ (eval.cc:2099-2131 at 2.24.9): a
+-- list's elements first to last, and a set's values in the order the set
+-- holds them, by the symbols of their names (:2110-2111), so of two
+-- values that fail, the one whose name was interned first fails first.
 -- Upstream enters each @Value@ once, so a value reached twice is forced
 -- once and one that holds itself, as a derivation does through its @all@
 -- and output attributes, is not entered without end.  The cell holding
@@ -3031,7 +3044,7 @@ deepForce :: (MonadEval m) => NixValue -> m ()
 deepForce = void . forceInside Set.empty
   where
     forceInside entered (VList cl) = listThunks cl >>= foldM forceCell entered
-    forceInside entered (VAttrs attrs) = attrSetElems attrs >>= foldM forceCell entered
+    forceInside entered (VAttrs attrs) = attrSetFoldM (\seen _ entry -> forceCell seen (entryThunk entry)) entered attrs
     forceInside entered _ = pure entered
     forceCell entered thunk
       | Set.member cell entered = pure entered
@@ -3459,7 +3472,7 @@ builtinScopedImport scopeArg pathVal = do
   p <- coerceToPath "builtins.scopedImport" pathVal
   scopeVal <- argValue scopeArg
   case scopeVal of
-    VAttrs attrs -> attrSetToMap attrs >>= \scope -> scopedImportFile (Map.toList scope) p
+    VAttrs attrs -> scopedImportFile attrs p
     other -> throwEvalError ("builtins.scopedImport: expected a set, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
@@ -4260,13 +4273,15 @@ forceAttrBytes builtin key attrs =
 -- | Force an optional string attribute via full Nix coercion.  A present
 -- but uncoercible (or throwing) value is an error, not 'Nothing'.
 forceOptionalAttrStr :: (MonadEval m) => AttrSet -> Text -> m (Maybe Text)
-forceOptionalAttrStr attrs key =
-  attrSetLookup key attrs >>= \case
-    Nothing -> pure Nothing
-    Just thunk -> do
-      val <- force thunk
-      (s, _ctx) <- coerceToString True force applyValue coercePathVerbatim val
-      Just <$> decodedText "string attribute" s
+forceOptionalAttrStr attrs key = attrSetLookup key attrs >>= traverse forceAttrValueStr
+
+-- | An attribute's value forced and coerced to a string, as
+-- 'forceOptionalAttrStr' reads one it finds.
+forceAttrValueStr :: (MonadEval m) => Thunk -> m Text
+forceAttrValueStr thunk = do
+  val <- force thunk
+  (s, _ctx) <- coerceToString True force applyValue coercePathVerbatim val
+  decodedText "string attribute" s
 
 -- | Force an optional boolean attribute; present but non-boolean is an error,
 -- not a silent coercion.
@@ -5804,8 +5819,7 @@ builtinPath (VAttrs attrs) = do
   -- refusing one it does not take at its turn, and checks for the path
   -- once that loop is done (primops.cc:2569-2592 at 2.24.9).  The order
   -- is by interned symbol, as upstream's attribute sets are sorted.
-  entries <- attrSetKeys attrs >>= traverse (\key -> fmap (key,) <$> attrSetLookup key attrs)
-  args <- foldM (readPathArgument attrs) noPathArguments (catMaybes entries)
+  args <- attrSetFoldM readPathArgument noPathArguments attrs
   pathStr <- maybe (throwEvalError "missing required 'path' attribute in the first argument to builtins.path") pure (paPath args)
   let name = fromMaybe (canonBaseName pathStr) (paName args)
       expectedDigest = paPin args
@@ -5852,15 +5866,17 @@ noPathArguments = PathArguments Nothing Nothing Nothing NarIngestion Nothing
 -- its key (primops.cc:2571-2587 at 2.24.9): @recursive@ as a Boolean
 -- choosing a NAR or a flat copy, and any key it does not take refused
 -- with its message.
-readPathArgument :: (MonadEval m) => AttrSet -> PathArguments -> (Text, Thunk) -> m PathArguments
-readPathArgument attrs args (key, thunk) = case key of
+readPathArgument :: (MonadEval m) => PathArguments -> Symbol -> AttrEntry -> m PathArguments
+readPathArgument args name entry = case key of
   "path" -> (\path -> args {paPath = Just path}) <$> (coerceToPath "builtins.path" =<< force thunk)
-  "name" -> (\named -> args {paName = named}) <$> forceOptionalAttrStr attrs key
+  "name" -> (\named -> args {paName = Just named}) <$> forceAttrValueStr thunk
   "filter" -> (\keep -> args {paFilter = Just keep}) <$> force thunk
   "recursive" -> (\recursive -> args {paMethod = if recursive then NarIngestion else FlatIngestion}) <$> (expectBool =<< force thunk)
   "sha256" -> (\pin -> args {paPin = Just pin}) <$> (pathPin =<< force thunk)
   _ -> throwEvalError ("unsupported argument '" <> key <> "' to 'addPath'")
   where
+    key = symbolText name
+    thunk = entryThunk entry
     pathPin pinVal = case pinVal of
       VStr pin _ -> decodeSha256Pin =<< decodedText "builtins.path" pin
       other -> throwEvalError ("builtins.path: 'sha256' must be a string, got " <> typeName other)
