@@ -2,11 +2,9 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
 
--- | Shared types for the Nix evaluator.
---
--- Extracted into its own module so that "Nix.Eval.Operator",
--- "Nix.Eval.StringInterp", and "Nix.Builtins" can all reference
--- 'NixValue', t'Thunk', and t'Env' without creating import cycles.
+-- | Shared types for the Nix evaluator, in a module of their own so that
+-- "Nix.Eval.Operator", "Nix.Eval.StringInterp", and "Nix.Builtins" can
+-- reference 'NixValue', t'Thunk', and t'Env' without an import cycle.
 module Nix.Eval.Types
   ( -- * Values
     NixValue (.., VStr, VPath),
@@ -160,7 +158,7 @@ import Nix.Derivation (Derivation)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.Builtin (Builtin, builtinAtIndex, builtinIndex, builtinName)
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetEmpty, cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
-import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
+import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, strpartLit, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText)
 import Nix.Eval.CData (CData (..), MonadCData (..), cdataIO, inspectForDisplay, runCDataPure)
 import Nix.Eval.CEnv (NnEnv, cenvAllocWithScopes, cenvEmpty, cenvLazyScope, cenvLookupResolved, cenvNew, cenvNewScoped, cenvParent, cenvPushWith, cenvRootScope, cenvSlotCount, cenvSlots, cenvWithCount, cenvWithOwner, cenvWithScopes)
@@ -284,7 +282,7 @@ pattern PendingApply1Form = 1
 pattern PendingApply2Form = 2
 
 -- | Value-kind tags for the C value layout, mirroring @cbits\/nn_thunk.h@.
--- The tag selects which payload a computed (VALUE) thunk carries.
+-- The tag selects which payload a COMPUTED thunk carries.
 pattern ValueInt, ValueFloat, ValueBool, ValueNull, ValueStr, ValuePath, ValueList, ValueAttrs, ValueCtxStr, ValueLambda, ValuePrimop, ValuePrimopApp :: Word8
 pattern ValueInt = 0
 pattern ValueFloat = 1
@@ -677,8 +675,8 @@ buildCAttrSetKeys keys = do
 
 -- | Fill values into a pre-allocated CAttrSet (two-phase construction).
 -- Looks up each key's index and writes the CThunkPtr at that position.
--- Keys not found in the CAttrSet are silently ignored (should not happen
--- in correct knot-tying code).
+-- A key the set does not hold is skipped: a frame's name table holds
+-- its static names only, so a dynamic name has no entry to fill.
 fillCAttrSetValues :: (MonadCData m) => CAttrSet -> Map Text Thunk -> m ()
 fillCAttrSetValues cset thunkMap =
   forM_ (Map.toList thunkMap) $ \(key, Thunk ptr) -> do
@@ -766,8 +764,9 @@ envLookupResolved level idx (Env envPtr) = do
 -- | Name-based variable lookup: walk the parent chain checking
 -- lazy scopes; fall back to with-scopes (from the starting env).
 --
--- Positional slots are NOT searched here - used only for
--- 'EVar' lookups (let\/rec bindings, builtins, with-scopes).
+-- Positional slots are not searched here.  It serves 'EVar' lookups
+-- (let\/rec bindings, builtins, with-scopes) and a with-scoped lookup
+-- that no with-scope answered (@evalWithVarScopes@).
 envLookup :: (MonadCData m) => Text -> Env -> m (Maybe Thunk)
 envLookup name (Env envPtr) = lexicalLookup envPtr
   where
@@ -791,10 +790,11 @@ envLookup name (Env envPtr) = lexicalLookup envPtr
 -- | Walk with-scopes (C array) innermost to outermost.
 -- Skips tagged lazy entries (bit 0 set) - those are thunk pointers
 -- that can only be resolved by @evalWithVarScopes@ which has monadic
--- 'Nix.Eval.force'.  Defensive: an 'EVar' under a with is either a lexical
+-- 'Nix.Eval.force'.  An 'EVar' under a with is either a lexical
 -- (barrier) binding or a static global, both found on the parent chain
--- before this fallback fires ('EVar' also blocks closure trimming, so
--- the chain is always intact) - but keep it for safety.
+-- before this fallback runs ('EVar' also blocks closure trimming, so the
+-- chain is intact), and a with-scoped lookup reaches it only after
+-- @evalWithVarScopes@ has searched the same scopes.
 lookupWithScopesC :: (MonadCData m) => Text -> Ptr (Ptr ()) -> Word32 -> m (Maybe Thunk)
 lookupWithScopesC name withArr count = go 0
   where
@@ -890,7 +890,7 @@ compileSource parsed = cdataIO (compileParsed parsed)
 mkThunk :: (MonadCData m) => Env -> Expr -> m Thunk
 mkThunk env thunkExpr = compile thunkExpr >>= mkThunkBc env
 
--- | Like 'mkThunk' but avoids C arena allocation for trivial expressions.
+-- | Like 'mkThunk' but makes no pending thunk for trivial expressions.
 -- Resolved variables reuse the existing thunk from the env (no wrapper).
 -- Literals use inline C scalars.
 -- Lambdas compile formals+body to bytecode and produce VLambda directly.
@@ -967,8 +967,8 @@ data Pending
 
 -- | What a PENDING or BLACKHOLE thunk does, as 'mkThunkBc' or
 -- 'mkApplyThunk' and 'mkApply2Thunk' stored it.  Its instruction is read
--- first, so a code thunk, nearly every thunk forced, takes the two reads
--- it took before applications had a form of their own.
+-- first, so a code thunk, nearly every thunk forced, takes two reads:
+-- its instruction and its env.
 readPending :: (MonadCData m) => CThunkPtr -> m Pending
 readPending ptr =
   cthunkGetBcIdx ptr >>= \case
@@ -1060,11 +1060,6 @@ emptyBcList bcIdx = do
   (count, _) <- cbcCountedPayload bcIdx =<< cbcArg1 bcIdx
   pure (count == 0)
 
--- | @NN_STRPART_LIT@ from @cbits/nn_bytecode.h@: a string part that is
--- literal text rather than an interpolation.
-strPartLiteral :: Word32
-strPartLiteral = 0
-
 -- | The string a string expression makes when every part of it is
 -- literal, or 'Nothing' when one is an interpolation and producing the
 -- value is work.  A string with no interpolation is one literal part,
@@ -1094,7 +1089,7 @@ literalStr bcIdx = do
     partIndices 0 _ = pure (Just [])
     partIndices n off = do
       tag <- cbcData off
-      if tag /= strPartLiteral
+      if tag /= strpartLit
         then pure Nothing
         else do
           index <- cbcData (off + 1)
@@ -1582,8 +1577,8 @@ class (MonadCData m) => MonadEval m where
   traceMessage :: Text -> m ()
 
   -- | Force a thunk to a value, with memoization.
-  -- IO evaluators should cache results (via per-thunk @IORef@).
-  -- Pure evaluators re-evaluate each time.
+  -- IO evaluators store the value in the thunk's C cell; pure
+  -- evaluators re-evaluate each time.
   -- The first argument runs what a pending thunk holds ('readPending'),
   -- passed in to break the Eval.Types to Eval circular dependency.
   forceThunk :: (Pending -> m NixValue) -> Thunk -> m NixValue
@@ -1674,14 +1669,15 @@ data PureError = PThrow !Text | PError !Text | PAbort !Text
 
 -- | Pure evaluation monad: given the call depth, a t'CData' action
 -- answering @Either PureError@, so its only effect is the C data layer.
--- IO builtins ('readFile', 'import') are unavailable, and
+-- IO builtins (@builtins.readFile@, @import@) are unavailable, and
 -- everything else evaluates identically to the IO version, the
 -- @max-call-depth@ ceiling included, at its upstream default.  It carries
 -- no filesystem policy: there is no filesystem, environment or network
 -- behind it to gate, so it reports 'unrestrictedPolicy' and every URI
--- check passes.  It never writes a cell it did not allocate: a force
--- reads a thunk and evaluates it without memoizing, so it marks no
--- blackhole either.
+-- check passes.  It writes no cell it did not allocate but a builtin's
+-- static cell, which it fills with the one value that cell ever holds
+-- ('Nix.Eval.CThunk.cthunkPrimop'): a force reads a thunk and evaluates
+-- it without memoizing, so it marks no blackhole either.
 newtype PureEval a = PureEval (CallDepth -> CData (Either PureError a))
 
 instance Functor PureEval where
@@ -1709,9 +1705,10 @@ pureFailure failure = PureEval (\_ -> pure (Left failure))
 
 -- | Run a pure evaluation, flattening the internal error into 'Text': a
 -- failure's message, as t'Nix.Eval.IO.EvalIO' reports it.  The run is a
--- value ('runCDataPure'): the evaluation writes only cells it allocates
--- and the with-scope entries it resolves ("Nix.Eval.CData" says what two
--- runs resolving one entry can show).
+-- value ('runCDataPure'): the evaluation writes only cells it allocates,
+-- the with-scope entries it resolves ("Nix.Eval.CData" says what two
+-- runs resolving one entry can show) and the builtins' static cells it
+-- binds.
 runPureEval :: PureEval a -> Either Text a
 runPureEval action =
   case runCDataPure (runPure action (topLevelCallDepth defaultMaxCallDepth)) of

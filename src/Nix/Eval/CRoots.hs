@@ -1,9 +1,10 @@
 -- | The roots of an evaluation session in the C data layer
 -- (@cbits\/nn_roots.h@): each C object Haskell keeps beyond one
--- evaluation step, registered as it is made, so a mark over the C graph
--- starts from it without the caller naming it ("Nix.Eval.CStats").  A
--- session registers its base environment and search path as it starts,
--- and each imported file's value as the import cache takes it
+-- evaluation step, registered as it is made, so a census given
+-- 'Nix.Eval.CStats.RootRegistered' marks from it without the caller
+-- naming it.  A session registers its base environment as it starts
+-- (its search path is reached through @builtins.nixPath@ in it), and
+-- each imported file's value as the import cache takes it
 -- ("Nix.Eval.IO").  A session forgets the roots registered within it as
 -- it ends ('crootsMark', 'crootsRelease'), and the arena's teardown
 -- forgets them all.

@@ -45,11 +45,8 @@ nn_list_new(nn_list_t **out, uint32_t count)
     nn_list_t *list = (nn_list_t *)malloc(sizeof(nn_list_t));
     if (!list) return -1;
 
-    /* Items array via the env page allocator (O(1) bump allocation).
-     * nn_env_alloc_items returns void**, which we cast to nn_thunk**.
-     * All slots are zero-initialized (NULL pointers).  When tracking
-     * fails the items array stays in its page, which only nn_env_destroy
-     * releases. */
+    /* The items array is zeroed in an env page.  When tracking fails it
+     * stays there, since only nn_env_destroy releases a page. */
     list->items = (struct nn_thunk **)nn_env_alloc_items(count);
     list->count = count;
 

@@ -12,10 +12,6 @@
 #ifndef NN_ARENA_H
 #define NN_ARENA_H
 
-
-/* Bulk-free all tracked attribute sets (called during arena teardown). */
-void nn_attrset_free_all(void);
-
 /* Nonzero when the symbol table, string arena, thunk arena, env
  * allocator and bytecode store are all initialized. */
 int nn_arena_live(void);

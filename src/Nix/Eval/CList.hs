@@ -1,12 +1,12 @@
 -- | C-backed contiguous list of thunk pointers via FFI.
 --
--- Wraps @cbits/nn_list.c@ - a flat array of @nn_thunk_t*@ pointers.
--- Replaces Haskell's @[Thunk]@ (linked-list cons cells, ~48 bytes per
--- element) with a contiguous C array (8 bytes per element).
+-- Wraps @cbits/nn_list.c@: a flat array of @nn_thunk_t*@ pointers, 8
+-- bytes an element against the ~48 of the cons cells of a @[Thunk]@.
 --
 -- Lists are immutable after construction: allocate with 'clistNew',
 -- fill with 'clistSet', then read with 'clistGet'/'clistCount'.
--- All memory is freed in bulk via 'clistFreeAll' at evaluation end.
+-- The headers are freed in bulk via 'clistFreeAll' at arena teardown,
+-- and the items arrays with the env pages that hold them.
 --
 -- 'nullPtr' is the empty list, so the C constructors report failure
 -- through a status of their own rather than a NULL, and every one is

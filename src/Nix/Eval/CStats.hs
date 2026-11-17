@@ -6,10 +6,10 @@
 -- 'takeCensus' counts every object the allocators hold and then marks
 -- from the roots it is given, the session's registered roots
 -- ("Nix.Eval.CRoots") among them when it is given 'RootRegistered',
--- following every C pointer: every value
--- lives in C, so the mark runs in C alone.  It frees and writes nothing
--- in the data layer, and it adds no work to any
--- allocation, so a process that never takes a census pays nothing for it.
+-- following every C pointer: every value lives in C, so the mark runs in
+-- C alone.  It frees and writes nothing in the data layer.  A process
+-- that never takes a census pays for it the env allocator's count of
+-- deferred applications' cells and the flag test below.
 --
 -- Once 'countSites' turns counting on, the allocators also count each
 -- environment and attribute set under its site ("Nix.Eval.AllocSite"),

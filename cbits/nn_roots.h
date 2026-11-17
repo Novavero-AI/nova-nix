@@ -4,11 +4,12 @@
  * A value Haskell keeps beyond one evaluation step points into the C
  * data layer from outside it, where no mark over the C graph can find
  * it.  Each such pointer is registered here when it is made: a session's
- * base environment and search path as the session starts, and an
- * imported file's value as the import cache takes it.  A mark starts
- * from every registered root as well as from the roots its caller names
- * (nn_stats.h), as upstream's collector scans the import cache it keeps
- * in traceable memory (fileEvalCache, eval.hh at 2.24.9).
+ * base environment as the session starts (its search path is reached
+ * through builtins.nixPath in it), and an imported file's value as the
+ * import cache takes it.  A census marks from the registered roots when
+ * its caller names them (nn_stats_root_registered, nn_stats.h), as
+ * upstream's collector scans the import cache it keeps in traceable
+ * memory (fileEvalCache, eval.hh at 2.24.9).
  *
  * Sessions nest, so roots do too: a session marks the registry as it
  * starts and releases back to the mark as it ends, forgetting every root

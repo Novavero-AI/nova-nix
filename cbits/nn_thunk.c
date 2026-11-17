@@ -67,7 +67,6 @@ arena_alloc(struct nn_thunk_arena *arena)
      * this apart from exhaustion. */
     if (!arena) return NULL;
 
-    /* Current block full - allocate a new one */
     if (arena->current->count >= arena->current->capacity) {
         struct nn_thunk_block *block = alloc_block(arena->block_capacity);
         if (!block) return NULL;
@@ -85,7 +84,6 @@ arena_alloc(struct nn_thunk_arena *arena)
 void
 nn_thunk_init(uint32_t initial_capacity)
 {
-    /* Destroy existing arena if re-initializing */
     if (g_arena) {
         nn_thunk_destroy();
     }
@@ -93,9 +91,8 @@ nn_thunk_init(uint32_t initial_capacity)
     uint32_t cap = initial_capacity > 0 ? initial_capacity
                                         : NN_THUNK_DEFAULT_BLOCK_CAPACITY;
 
-    /* An allocation failure here would leave g_arena NULL and the first
-     * thunk allocation would dereference it - fail loudly at startup
-     * instead (same policy as nn_env_init). */
+    /* Fail loudly at startup rather than start with no arena, which
+     * every allocation would then refuse (same policy as nn_env_init). */
     g_arena = (struct nn_thunk_arena *)malloc(sizeof(struct nn_thunk_arena));
     if (!g_arena) {
         fprintf(stderr, "nn_thunk_init: arena alloc failed\n");
@@ -643,7 +640,7 @@ nn_thunk_set_computed_primop_app(nn_thunk_t *thunk, void *app)
     return 1;
 }
 
-/* --- Arena diagnostics / cleanup iteration --- */
+/* --- Arena diagnostics --- */
 
 uint32_t
 nn_thunk_count(void)

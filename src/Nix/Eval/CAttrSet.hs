@@ -1,10 +1,9 @@
 -- | C-backed sorted attribute set via FFI.
 --
--- Wraps @cbits/nn_attrset.c@ - a contiguous sorted array of
--- @(nn_symbol_t, position, void*)@ entries.  Replaces Haskell's
--- @Data.Map.Strict@ for attribute sets, cutting per-entry overhead from
--- ~48 bytes (Map.Bin node) to ~16 bytes (4-byte symbol + 4-byte position
--- + 8-byte pointer).
+-- Wraps @cbits/nn_attrset.c@: parallel arrays of symbols, positions and
+-- values, sorted by symbol, at about 16 bytes an entry (a 4-byte symbol,
+-- a 4-byte position and an 8-byte pointer) against the 48 of a
+-- @Data.Map.Strict@ node.
 --
 -- Construction is two-phase: insert entries, then freeze (sort + dedup).
 -- After freeze, lookup is O(log n) binary search over contiguous memory.

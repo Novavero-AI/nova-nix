@@ -14,7 +14,8 @@
 -- for the evaluator to report.  The store hands each tag back as a whole
 -- byte or word, so no type on the decoding side can rule such a tag out.
 --
--- Must be called after 'Nix.Eval.CBytecode.cbcInit' and 'Nix.Eval.Symbol.symbolInit'.
+-- Compiling writes the bytecode store and interns names, so it runs in an
+-- evaluation session ('Nix.Eval.IO.withEvalSession').
 module Nix.Eval.Compile
   ( compileExpr,
     compileParsed,
@@ -391,9 +392,8 @@ compileWith recorder = go
     -- (parser-state.hh:176-177 at 2.24.9).  Upstream names a function
     -- under a dynamic key too, with the name the key evaluates to, each
     -- time it evaluates the set (@ExprAttrs::eval@, eval.cc:1270); a
-    -- name the compiler cannot know, so such a function, and one under a
-    -- key @${"f"}@, which upstream's parser makes static and this one
-    -- keeps dynamic, is anonymous here.
+    -- name the compiler cannot know, so such a function is anonymous
+    -- here.
     compileOneBinding :: Binding -> IO [Word32]
     compileOneBinding (NamedBinding pos key expr) = do
       (keyKind, keyWord) <- compileAttrKey key

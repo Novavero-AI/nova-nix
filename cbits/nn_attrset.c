@@ -47,18 +47,6 @@ static int nn_attrset_track(nn_attrset_t *set)
     return 0;
 }
 
-void nn_attrset_free_all(void)
-{
-    uint32_t i;
-    for (i = 0; i < g_tracked_count; i++) {
-        nn_attrset_free(g_tracked[i]);
-    }
-    free(g_tracked);
-    g_tracked = NULL;
-    g_tracked_count = 0;
-    g_tracked_cap = 0;
-}
-
 /* --- Internal representation --- */
 
 struct nn_attrset {
@@ -182,12 +170,25 @@ nn_attrset_t *nn_attrset_new(uint32_t capacity, uint32_t site)
     return set;
 }
 
-void nn_attrset_free(nn_attrset_t *set)
+/* Free a set's arrays and the set, and not its values: they are cells
+ * the thunk arena owns. */
+static void attrset_free(nn_attrset_t *set)
 {
-    if (!set) return;
     free(set->keys);
     free(set->values);
     free(set);
+}
+
+void nn_attrset_free_all(void)
+{
+    uint32_t i;
+    for (i = 0; i < g_tracked_count; i++) {
+        attrset_free(g_tracked[i]);
+    }
+    free(g_tracked);
+    g_tracked = NULL;
+    g_tracked_count = 0;
+    g_tracked_cap = 0;
 }
 
 static nn_attrset_t g_empty_set = { NULL, NULL, NULL, 0, 0, 1 };
@@ -426,8 +427,7 @@ nn_attrset_t *nn_attrset_remove_keys(
     uint32_t i;
 
     for (i = 0; i < set->count; i++) {
-        /* Linear scan of removal keys - fine for small removal lists.
-         * For large removal lists, sort them and merge-scan instead. */
+        /* Each entry scans the removal keys: entries * keys comparisons. */
         uint32_t j;
         int skip = 0;
         for (j = 0; j < key_count; j++) {

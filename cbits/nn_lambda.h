@@ -8,12 +8,10 @@
  *
  * Formals are stored as a type tag (Name/Set/NamedSet) plus an array
  * of (symbol, has_default, default_bc_idx) entries for set patterns.
- * Interned symbols avoid any string allocation - pointer equality
- * for name comparison.
+ * Names are interned symbols, compared as integers.
  *
- * Lambda structs are malloc'd and tracked for bulk cleanup via
- * nn_lambda_free_all().  Formal entry arrays use malloc (small, typ.
- * 1-20 entries).  All freed at evaluation end.
+ * Lambda structs and their formal entry arrays are malloc'd, and each
+ * lambda is tracked for bulk cleanup via nn_lambda_free_all().
  *
  * Lifecycle: constructed during evaluation, freed via
  * nn_lambda_free_all() at arena teardown.  Not thread-safe.

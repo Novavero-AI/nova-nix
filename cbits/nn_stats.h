@@ -2,13 +2,13 @@
  * nn_stats.h - A census of the C data layer: what it holds by kind, and
  * what a set of roots reaches.
  *
- * The census reads what the allocators keep anyway (the thunk blocks, the
- * env pages and the count of deferred applications' cells in them, the
+ * The census reads what the allocators keep (the thunk blocks, the env
+ * pages and the count of deferred applications' cells in them, the
  * tracked sets, list headers, lambdas, builtins' partial applications and
- * strings with context, the string arena's blocks, the symbol table), so
- * a process
- * that never takes one pays nothing for it beyond the test of
- * nn_stats_counting below.
+ * strings with context, the string arena's blocks, the symbol table).  Of
+ * those, only the count of applications' cells is kept for the census
+ * alone, so a process that never takes one pays for it that count and the
+ * test of nn_stats_counting below.
  *
  * A census is a session.  nn_stats_begin counts what is allocated and
  * indexes every object; the caller names roots and calls nn_stats_mark,

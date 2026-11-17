@@ -259,7 +259,7 @@ int nn_thunk_set_computed_lambda(nn_thunk_t *thunk, void *lambda);
 int nn_thunk_set_computed_primop(nn_thunk_t *thunk, uint32_t primop);
 int nn_thunk_set_computed_primop_app(nn_thunk_t *thunk, void *app);
 
-/* --- Arena diagnostics / cleanup iteration --- */
+/* --- Arena diagnostics --- */
 
 /* Total thunks allocated across all blocks. */
 uint32_t nn_thunk_count(void);

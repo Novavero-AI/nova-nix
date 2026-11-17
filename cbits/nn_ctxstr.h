@@ -70,8 +70,8 @@ typedef struct nn_ctxstr {
  * must check. */
 nn_ctxstr_t *nn_ctxstr_new(nn_str_t *text, uint32_t ctx_count);
 
-/* Free all tracked nn_ctxstr_t allocations.  Called during arena
- * teardown, after thunk iteration but before env/symbol cleanup. */
+/* Free all tracked nn_ctxstr_t allocations.  Called once at arena
+ * teardown. */
 void nn_ctxstr_free_all(void);
 
 /* --- Element setters --- */

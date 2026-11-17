@@ -1,10 +1,10 @@
 /*
  * nn_attrset.h - Sorted symbol-keyed attribute set for nova-nix.
  *
- * A contiguous sorted array of (symbol, position, slot) entries, against
- * the 48 bytes per node of the pointer-chasing balanced tree Haskell's
- * Data.Map.Strict would take.  Binary search for O(log n) lookup; linear
- * scan for iteration.
+ * Parallel arrays of symbols, positions and values, sorted by symbol
+ * (nn_attrset.c draws the layout), against the 48 bytes per node of the
+ * pointer-chasing balanced tree Haskell's Data.Map.Strict would take.
+ * Binary search for O(log n) lookup; linear scan for iteration.
  *
  * Construction is two-phase:
  *   1. nn_attrset_new(cap) + nn_attrset_insert() - append unsorted
@@ -24,12 +24,9 @@
  * Positions travel with their entries through freeze, union and key
  * removal.
  *
- * Lifecycle: arena-managed.  Every set is tracked at creation and bulk-freed
- * by nn_attrset_free_all at evaluation teardown; nn_attrset_free is that
- * teardown's per-set primitive and must not be called on a tracked set (it
- * would then be double-freed by nn_attrset_free_all).
- * Values are NOT freed by nn_attrset_free: they are cells of the thunk
- * arena, which frees them.
+ * Lifecycle: arena-managed.  Every set is tracked at creation and
+ * bulk-freed by nn_attrset_free_all at arena teardown, which frees no
+ * value: the values are cells the thunk arena owns.
  *
  * Every constructor names its site, the construct or builtin that makes
  * the set (nn_stats.h), under which the census counts it.
@@ -72,10 +69,6 @@ typedef struct nn_attrset nn_attrset_t;
  * failure. */
 nn_attrset_t *nn_attrset_new(uint32_t capacity, uint32_t site);
 
-/* Free the attribute set structure.  Does NOT free the values, which the
- * thunk arena owns. */
-void nn_attrset_free(nn_attrset_t *set);
-
 /* The shared empty set: frozen, no entries, and no arrays behind it.  A
  * file-scope static, not tracked and never freed, so it has one address
  * in every evaluation and outside all of them.  Nothing writes it: it is
@@ -109,7 +102,8 @@ void *nn_attrset_lookup(const nn_attrset_t *set, nn_symbol_t key);
 uint32_t nn_attrset_index(const nn_attrset_t *set, nn_symbol_t key);
 
 /* Update the value at a known index.  Index must be valid (0 <= idx < count).
- * Used for lazy materialization: slot starts NULL, gets filled on first force. */
+ * Fills a frame's name table, built with NULL values before its thunks
+ * exist. */
 void nn_attrset_set_value(nn_attrset_t *set, uint32_t idx, void *value);
 
 /* Return the value at a known index. */
@@ -143,17 +137,15 @@ void nn_attrset_free_all(void);
  * `b` (keys in `b` override `a`, positions with them).  Both inputs must
  * be frozen.
  * The result is returned frozen and is arena-tracked (freed by
- * nn_attrset_free_all) - do NOT pass it to nn_attrset_free.  Returns
- * NULL when the union would pass NN_ATTRSET_MAX_ENTRIES or an
- * allocation fails. */
+ * nn_attrset_free_all).  Returns NULL when the union would pass
+ * NN_ATTRSET_MAX_ENTRIES or an allocation fails. */
 nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b,
                                uint32_t site);
 
 /* Create a new set at `site` with the given keys removed.  Input must be
  * frozen.
  * The result is returned frozen and is arena-tracked (freed by
- * nn_attrset_free_all) - do NOT pass it to nn_attrset_free.  Returns
- * NULL when an allocation fails. */
+ * nn_attrset_free_all).  Returns NULL when an allocation fails. */
 nn_attrset_t *nn_attrset_remove_keys(
     const nn_attrset_t *set,
     const nn_symbol_t *keys,
