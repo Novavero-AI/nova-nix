@@ -3,9 +3,7 @@
 #
 # Transitional.  The seed stdenv (../seed-stdenv) replaces it, and this
 # directory and ../bootstrap are deleted once the seed ladder builds every
-# package this stdenv builds, which needs GCC on the ladder for C++, x86_64
-# output, MinGW-w64's headers and runtime, and binutils' objdump for the
-# fixup phase's DLL bundling.  Until then it is the package set's stdenv,
+# package this stdenv builds.  Until then it is the package set's stdenv,
 # which CI's E2E (Windows), publish and public-cache jobs build GNU Hello
 # with.
 #
