@@ -171,6 +171,7 @@ import Nix.Eval.Types
     attrSetKeys,
     attrSetLookup,
     attrSetLookupEntry,
+    attrSetLookupSymbol,
     attrSetMapWithKey,
     attrSetMember,
     attrSetNull,
@@ -305,12 +306,8 @@ evalBytecode env bcIdx =
     OpStr -> evalBcStr env bcIdx
     OpIndStr -> evalBcIndStr env bcIdx
     OpPathStr -> evalBcPathStr env bcIdx
-    OpVar -> do
-      sym <- cbcArg1 bcIdx
-      evalVar env (symbolText (Symbol sym))
-    OpWithVar -> do
-      sym <- cbcArg1 bcIdx
-      evalWithVar env (symbolText (Symbol sym))
+    OpVar -> cbcArg1 bcIdx >>= evalVar env . Symbol
+    OpWithVar -> cbcArg1 bcIdx >>= evalWithVar env . Symbol
     OpResolvedVar -> do
       level <- cbcArg1 bcIdx
       idx <- cbcArg2 bcIdx
@@ -718,7 +715,7 @@ evalBcSelect env bcIdx0 = do
   result <- walkBcAttrPath env pathLen pathOff (pure targetVal)
   case result of
     PathFound val -> pure val
-    PathMissing name -> orDefault (throwEvalError ("attribute '" <> printSymbol name <> "' missing"))
+    PathMissing name -> orDefault (throwEvalError ("attribute '" <> printSymbol (symbolText name) <> "' missing"))
     PathNotASet val -> orDefault (addErrorTrace (pure "while selecting an attribute") (expectedFailure "a set" val))
   where
     orDefault failure = do
@@ -733,33 +730,36 @@ evalBcHasAttr env bcIdx0 = do
   targetVal <- evalBytecode env targetIdx
   VBool <$> hasBcAttrPath env pathLen pathOff targetVal
 
--- | Resolve one attr-path element (two words at @off@) to its key text.
--- A dynamic key is read as upstream's select and has-attr read one
--- (@getName@, eval.cc:210 at 2.24.9), null refused with the rest.
-resolveBcAttrKey :: (MonadEval m) => Env -> Word32 -> m Text
+-- | Resolve one attr-path element (two words at @off@) to the name it
+-- selects.  A static name is the symbol the bytecode holds.  A computed
+-- one is read and interned as upstream's select and has-attr read and
+-- intern one (@getName@, eval.cc:203-213 at 2.24.9), null refused with
+-- the rest.
+resolveBcAttrKey :: (MonadEval m) => Env -> Word32 -> m Symbol
 resolveBcAttrKey env off = do
   isExpr <- cbcData off
   keyVal <- cbcData (off + 1)
   if isExpr /= 0
-    then evalBytecode env keyVal >>= attrNameOf "dynamic attribute key"
-    else pure (symbolText (Symbol keyVal))
+    then evalBytecode env keyVal >>= attrNameOf "dynamic attribute key" >>= symbolIntern
+    else pure (Symbol keyVal)
 
 -- | Where a select's walk down its attribute path ended.
 data PathWalk
   = -- | Every name found: the value at the end, forced.
     PathFound !NixValue
   | -- | A set the path goes into lacks this name.
-    PathMissing !Text
+    PathMissing !Symbol
   | -- | A value the path goes into is not a set.
     PathNotASet !NixValue
 
 -- | Walk an attribute path stored in the bytecode data buffer.
 -- Each element is two words: (is_expr, key_or_bc_idx).  Each step reads
--- its name, then forces the value it selects from, then looks the name
--- up, and the value found is forced at the next step or at the end, the
--- order upstream's @ExprSelect::eval@ keeps (eval.cc:1383-1411 at
--- 2.24.9), so a name that fails to evaluate fails before the value it
--- selects from.
+-- its name, interning one it computes, then forces the value it selects
+-- from, then looks the name up, and the value found is forced at the
+-- next step or at the end, the order upstream's @ExprSelect::eval@ keeps
+-- (eval.cc:1383-1411 at 2.24.9), so a name that fails to evaluate fails
+-- before the value it selects from, and a computed name takes its symbol
+-- before any name that forcing the value interns.
 walkBcAttrPath :: (MonadEval m) => Env -> Int -> Word32 -> m NixValue -> m PathWalk
 walkBcAttrPath _ 0 _ current = PathFound <$> current
 walkBcAttrPath env n off current = do
@@ -767,7 +767,7 @@ walkBcAttrPath env n off current = do
   val <- current
   case val of
     VAttrs attrs ->
-      attrSetLookup key attrs >>= \case
+      attrSetLookupSymbol key attrs >>= \case
         Just thunk -> walkBcAttrPath env (n - 1) (off + 2) (force thunk)
         Nothing -> pure (PathMissing key)
     _ -> pure (PathNotASet val)
@@ -780,7 +780,7 @@ hasBcAttrPath _ 0 _ _ = pure True
 hasBcAttrPath env n off val = case val of
   VAttrs attrs -> do
     key <- resolveBcAttrKey env off
-    attrSetLookup key attrs >>= \case
+    attrSetLookupSymbol key attrs >>= \case
       Just thunk
         | n == 1 -> pure True
         | otherwise -> do
@@ -1059,11 +1059,11 @@ bcBindingIsStatic (BcInheritFrom _ _) = True
 -- | Evaluate a variable the resolver left to a name table ('EVar'):
 -- the value 'envLookup' finds, or upstream's undefined-variable error for
 -- a name no table on the parent chain binds.
-evalVar :: (MonadEval m) => Env -> Text -> m NixValue
+evalVar :: (MonadEval m) => Env -> Symbol -> m NixValue
 evalVar env name =
   envLookup name env >>= \case
     Just thunk -> force thunk
-    Nothing -> throwEvalError (undefinedVariableMessage name)
+    Nothing -> throwEvalError (undefinedVariableMessage (symbolText name))
 
 -- | Evaluate a variable only a with could supply ('EWithVar'): the name in
 -- the with-scopes the env sees, innermost to outermost, or upstream's
@@ -1076,15 +1076,15 @@ evalVar env name =
 -- Supports both resolved and lazy with-scope entries ('withScopeAt').  A
 -- lazy entry is forced on first lookup and replaced in place by its set
 -- ('resolveWithScopeAt'), so subsequent lookups read the set directly.
-evalWithVar :: (MonadEval m) => Env -> Text -> m NixValue
+evalWithVar :: (MonadEval m) => Env -> Symbol -> m NixValue
 evalWithVar env name = do
   (withArr, withCount) <- envWithScopesRaw env
   evalWithVarScopes name withArr (fromIntegral withCount) 0
 
 -- | 'evalWithVar' from the with-scope at an index of the array onward.
-evalWithVarScopes :: (MonadEval m) => Text -> Ptr (Ptr ()) -> Int -> Int -> m NixValue
+evalWithVarScopes :: (MonadEval m) => Symbol -> Ptr (Ptr ()) -> Int -> Int -> m NixValue
 evalWithVarScopes name withArr count idx
-  | idx >= count = throwEvalError (undefinedVariableMessage name)
+  | idx >= count = throwEvalError (undefinedVariableMessage (symbolText name))
   | otherwise =
       withScopeAt withArr idx >>= \case
         Left scopeThunk -> do
@@ -1097,7 +1097,7 @@ evalWithVarScopes name withArr count idx
         Right scope -> lookupIn scope
   where
     lookupIn scope =
-      attrSetLookup name scope >>= \case
+      attrSetLookupSymbol name scope >>= \case
         Just thunk -> force thunk
         Nothing -> evalWithVarScopes name withArr count (idx + 1)
 
