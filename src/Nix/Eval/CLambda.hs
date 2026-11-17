@@ -1,3 +1,5 @@
+{-# LANGUAGE PatternSynonyms #-}
+
 -- | C-backed lambda closure structs via FFI.
 --
 -- Wraps @cbits/nn_lambda.c@ - a malloc'd struct holding the closure
@@ -32,6 +34,11 @@ module Nix.Eval.CLambda
     clambdaShapeFormalsType,
     clambdaShapeAllowExtra,
     clambdaShapeFormalCount,
+
+    -- * Formals types
+    pattern FormalsName,
+    pattern FormalsSet,
+    pattern FormalsNamedSet,
   )
 where
 
@@ -39,6 +46,7 @@ import Data.Word (Word32, Word8)
 import Foreign.Ptr (Ptr)
 import Nix.Eval.CData (MonadCData, cdataIO)
 import Nix.Eval.CEnv (NnEnv)
+import Nix.Eval.CStatus (checkedCPtr)
 
 -- | Phantom type for C-side @nn_lambda_t@.
 data NnLambda
@@ -107,12 +115,12 @@ foreign import ccall unsafe "nn_lambda_shape_formal_count"
 -- its env, body, formals type, binding name symbol, the function's own
 -- name symbol ('Nix.Eval.EvalFormals.lambdaNameSymbol'), ellipsis flag
 -- and formal count.  Fill entries via 'clambdaSetEntry' after
--- construction.  Returns 'Foreign.Ptr.nullPtr' on allocation failure, for
--- a formals type or count 'clambdaShape' cannot hold, or if the entries
--- array size would overflow - the caller must check.
+-- construction.  The NULL @nn_lambda_new@ answers when it refuses
+-- (@cbits/nn_lambda.h@ says when) is raised as
+-- 'Nix.Eval.CStatus.CStatusError'.
 clambdaNew :: (MonadCData m) => Ptr NnEnv -> Word32 -> Word8 -> Word32 -> Word32 -> Word8 -> Word32 -> m CLambdaPtr
 clambdaNew env body formalsType nameSym lambdaNameSym allowExtra formalCount =
-  cdataIO (c_nn_lambda_new env body formalsType nameSym lambdaNameSym allowExtra formalCount)
+  cdataIO (checkedCPtr "nn_lambda_new" =<< c_nn_lambda_new env body formalsType nameSym lambdaNameSym allowExtra formalCount)
 
 -- | Set a formal entry at the given index.
 clambdaSetEntry :: (MonadCData m) => CLambdaPtr -> Word32 -> Word32 -> Word32 -> Word32 -> m ()
@@ -130,7 +138,8 @@ clambdaEnv = cdataIO . c_nn_lambda_env
 clambdaBody :: (MonadCData m) => CLambdaPtr -> m Word32
 clambdaBody = cdataIO . c_nn_lambda_body
 
--- | Read the formals type (0=Name, 1=Set, 2=NamedSet).
+-- | Read the formals type: 'FormalsName', 'FormalsSet' or
+-- 'FormalsNamedSet'.
 clambdaFormalsType :: (MonadCData m) => CLambdaPtr -> m Word8
 clambdaFormalsType = cdataIO . c_nn_lambda_formals_type
 
@@ -170,7 +179,7 @@ clambdaEntryDefault lam idx = cdataIO (c_nn_lambda_entry_default lam idx)
 -- | The word a closure keeps its formals type, ellipsis flag and formal
 -- count in (@nn_lambda_shape@): the type taken mod 4, any nonzero flag as
 -- 1 and the count mod 2^29, the widths @cbits\/nn_lambda.h@ gives them.
--- 'clambdaNew' refuses a type or count that does not fit.
+-- 'clambdaNew' takes only a type and a count that fit.
 clambdaShape :: Word8 -> Word8 -> Word32 -> Word32
 clambdaShape = c_nn_lambda_shape
 
@@ -185,3 +194,16 @@ clambdaShapeAllowExtra = c_nn_lambda_shape_allow_extra
 -- | The formal count a shape holds.
 clambdaShapeFormalCount :: Word32 -> Word32
 clambdaShapeFormalCount = c_nn_lambda_shape_formal_count
+
+-- ---------------------------------------------------------------------------
+-- Formals types
+-- ---------------------------------------------------------------------------
+
+-- | The formals types of a closure, mirroring the @NN_FORMALS_*@ macros
+-- in @cbits\/nn_lambda.h@, with which they stay in lockstep: a plain
+-- name (@x: body@), a set pattern (@{ a, b }: body@) and a named set
+-- pattern (@x\@{ a, b }: body@).
+pattern FormalsName, FormalsSet, FormalsNamedSet :: Word8
+pattern FormalsName = 0
+pattern FormalsSet = 1
+pattern FormalsNamedSet = 2

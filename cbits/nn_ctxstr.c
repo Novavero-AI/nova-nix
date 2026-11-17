@@ -2,8 +2,8 @@
  * nn_ctxstr.c - Context-bearing string allocation and tracking.
  *
  * Each nn_ctxstr_t is a single contiguous malloc (header + flexible
- * array of nn_sce_t elements).  Pointers are tracked in a global
- * dynamic array for bulk cleanup via nn_ctxstr_free_all().
+ * array of nn_sce_t elements), tracked (nn_tracker.h) for bulk cleanup
+ * via nn_ctxstr_free_all().
  */
 
 #include "nn_ctxstr.h"
@@ -12,32 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* --- Tracking array --- */
-
-#define NN_CTXSTR_INITIAL_CAPACITY 256u
-
-static nn_ctxstr_t **g_tracked = NULL;
-static uint32_t      g_tracked_count = 0;
-static uint32_t      g_tracked_capacity = 0;
-
-/* Returns 0, or -1 when the tracking array cannot grow. */
-static int
-track(nn_ctxstr_t *s)
-{
-    if (g_tracked_count >= g_tracked_capacity) {
-        if (g_tracked_capacity > UINT32_MAX / 2) return -1;
-        uint32_t new_cap = g_tracked_capacity == 0
-                               ? NN_CTXSTR_INITIAL_CAPACITY
-                               : g_tracked_capacity * 2;
-        nn_ctxstr_t **new_arr = (nn_ctxstr_t **)realloc(
-            g_tracked, (size_t)new_cap * sizeof(nn_ctxstr_t *));
-        if (!new_arr) return -1;
-        g_tracked = new_arr;
-        g_tracked_capacity = new_cap;
-    }
-    g_tracked[g_tracked_count++] = s;
-    return 0;
-}
+/* Every string allocated, for bulk cleanup. */
+static nn_tracker_t g_tracked;
 
 /* --- Lifecycle --- */
 
@@ -56,7 +32,7 @@ nn_ctxstr_new(nn_str_t *text, uint32_t ctx_count)
     s->text = text;
     s->ctx_count = ctx_count;
     memset(s->ctx, 0, (size_t)ctx_count * sizeof(nn_sce_t));
-    if (track(s) != 0) {
+    if (nn_tracker_add(&g_tracked, s) != 0) {
         free(s);
         return NULL;
     }
@@ -66,14 +42,7 @@ nn_ctxstr_new(nn_str_t *text, uint32_t ctx_count)
 void
 nn_ctxstr_free_all(void)
 {
-    uint32_t i;
-    for (i = 0; i < g_tracked_count; i++) {
-        free(g_tracked[i]);
-    }
-    free(g_tracked);
-    g_tracked = NULL;
-    g_tracked_count = 0;
-    g_tracked_capacity = 0;
+    nn_tracker_free_all(&g_tracked, free);
 }
 
 /* --- Element setters --- */
@@ -82,7 +51,7 @@ void
 nn_ctxstr_set_plain(nn_ctxstr_t *s, uint32_t idx,
                     nn_str_t *sp_hash, nn_str_t *sp_name)
 {
-    NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_set_plain: idx out of bounds");
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_set_plain: idx out of bounds");
     s->ctx[idx].tag = NN_SCE_PLAIN;
     s->ctx[idx].sp_hash = sp_hash;
     s->ctx[idx].sp_name = sp_name;
@@ -94,7 +63,7 @@ nn_ctxstr_set_drv_output(nn_ctxstr_t *s, uint32_t idx,
                          nn_str_t *sp_hash, nn_str_t *sp_name,
                          nn_str_t *output)
 {
-    NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_set_drv_output: idx out of bounds");
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_set_drv_output: idx out of bounds");
     s->ctx[idx].tag = NN_SCE_DRV_OUTPUT;
     s->ctx[idx].sp_hash = sp_hash;
     s->ctx[idx].sp_name = sp_name;
@@ -105,7 +74,7 @@ void
 nn_ctxstr_set_all_outputs(nn_ctxstr_t *s, uint32_t idx,
                           nn_str_t *sp_hash, nn_str_t *sp_name)
 {
-    NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_set_all_outputs: idx out of bounds");
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_set_all_outputs: idx out of bounds");
     s->ctx[idx].tag = NN_SCE_ALL_OUTPUTS;
     s->ctx[idx].sp_hash = sp_hash;
     s->ctx[idx].sp_name = sp_name;
@@ -129,39 +98,37 @@ nn_ctxstr_ctx_count(const nn_ctxstr_t *s)
 uint8_t
 nn_ctxstr_elem_tag(const nn_ctxstr_t *s, uint32_t idx)
 {
-    NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_elem_tag: idx out of bounds");
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_elem_tag: idx out of bounds");
     return s->ctx[idx].tag;
 }
 
 nn_str_t *
 nn_ctxstr_elem_hash(const nn_ctxstr_t *s, uint32_t idx)
 {
-    NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_elem_hash: idx out of bounds");
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_elem_hash: idx out of bounds");
     return s->ctx[idx].sp_hash;
 }
 
 nn_str_t *
 nn_ctxstr_elem_name(const nn_ctxstr_t *s, uint32_t idx)
 {
-    NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_elem_name: idx out of bounds");
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_elem_name: idx out of bounds");
     return s->ctx[idx].sp_name;
 }
 
 nn_str_t *
 nn_ctxstr_elem_output(const nn_ctxstr_t *s, uint32_t idx)
 {
-    NN_ASSERT(s != NULL && idx < s->ctx_count, "nn_ctxstr_elem_output: idx out of bounds");
+    NN_ASSERT(idx < s->ctx_count, "nn_ctxstr_elem_output: idx out of bounds");
     return s->ctx[idx].output;
 }
 
 /* --- Census --- */
 
-nn_ctxstr_t *const *
-nn_ctxstr_tracked(uint32_t *count, uint32_t *capacity)
+const nn_tracker_t *
+nn_ctxstr_tracked(void)
 {
-    *count = g_tracked_count;
-    *capacity = g_tracked_capacity;
-    return g_tracked;
+    return &g_tracked;
 }
 
 uint64_t

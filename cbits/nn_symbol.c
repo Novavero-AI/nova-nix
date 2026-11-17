@@ -18,18 +18,22 @@
 
 /* --- Configuration --- */
 
-#define NN_SYMBOL_DEFAULT_CAPACITY   4096
-#define NN_SYMBOL_MAX_INITIAL        (UINT32_C(1) << 30)  /* slot table is twice this */
+#define NN_SYMBOL_INITIAL_CAPACITY   4096u
 #define NN_SYMBOL_LOAD_PERCENT         75
 #define NN_SYMBOL_ARENA_INITIAL  (256 * 1024)  /* 256 KB */
 
+/* The slot table starts at twice the entries, and its mask needs a power
+ * of two.  C99-compatible compile-time check: */
+typedef char nn_symbol_capacity_check_[
+    ((NN_SYMBOL_INITIAL_CAPACITY & (NN_SYMBOL_INITIAL_CAPACITY - 1)) == 0) ? 1 : -1];
+
 /* --- Internal types --- */
 
-/* Per-symbol metadata stored in a flat array indexed by symbol ID. */
+/* Per-symbol metadata stored in a flat array indexed by symbol ID.  The
+ * hash lives in the symbol's slot, where a probe compares it. */
 typedef struct {
     uint32_t offset;    /* byte offset into string arena */
     uint32_t len;       /* byte length of the string */
-    uint32_t hash;      /* cached FNV-1a hash */
 } nn_symbol_entry_t;
 
 /* Hash table slot: maps hash -> symbol ID.  Empty slots have id == 0. */
@@ -141,31 +145,18 @@ static int slots_grow(void)
 
 /* --- Public API --- */
 
-void nn_symbol_init(uint32_t initial_capacity)
+void nn_symbol_init(void)
 {
-    if (g_sym.slots) nn_symbol_destroy();
-
-    uint32_t cap = NN_SYMBOL_DEFAULT_CAPACITY;
-    if (initial_capacity > cap) {
-        /* Round up to a power of two.  The hint is clamped so that the
-         * rounding and the slot table's doubling cannot wrap uint32_t. */
-        uint32_t want = initial_capacity < NN_SYMBOL_MAX_INITIAL
-                            ? initial_capacity : NN_SYMBOL_MAX_INITIAL;
-        while (cap < want) cap *= 2;
-    }
-
-    memset(&g_sym, 0, sizeof(g_sym));
-
-    /* Entry 0 is unused, so cap entries hold cap - 1 symbols before
-     * entries_reserve grows the array. */
-    g_sym.entries_cap = cap;
+    /* Entry 0 is unused, so the entries hold one symbol fewer than their
+     * capacity before entries_reserve grows the array. */
+    g_sym.entries_cap = NN_SYMBOL_INITIAL_CAPACITY;
     g_sym.entries = (nn_symbol_entry_t *)calloc(
-        (size_t)cap, sizeof(nn_symbol_entry_t));
+        (size_t)g_sym.entries_cap, sizeof(nn_symbol_entry_t));
     if (!g_sym.entries) { fprintf(stderr, "nn_symbol_init: entries alloc failed\n"); abort(); }
     g_sym.count = 0;
 
     /* Hash table at 2x entries for low load factor. */
-    g_sym.slots_cap = cap * 2;
+    g_sym.slots_cap = NN_SYMBOL_INITIAL_CAPACITY * 2;
     g_sym.slots_mask = g_sym.slots_cap - 1;
     g_sym.slots = (nn_slot_t *)calloc(
         (size_t)g_sym.slots_cap, sizeof(nn_slot_t));
@@ -203,11 +194,11 @@ nn_symbol_t nn_symbol_intern(const char *str, size_t len)
      * Refused here, before a byte of str is read. */
     if ((uint64_t)len > UINT32_MAX) return NN_SYMBOL_INVALID;
 
-    /* An empty string arrives from Haskell's zero-copy marshalling as
-     * (NULL, 0).  memcpy/memcmp require valid pointers even for a zero
-     * length, so normalize at the boundary.  Empty symbols are reachable
-     * from evaluated input ({ "" = 1; }), so this is a case to handle, not
-     * an invariant to assert. */
+    /* (NULL, 0) is the empty string (nn_symbol.h), and memcpy/memcmp
+     * require valid pointers even for a zero length, so an empty string
+     * is read from a literal instead.  Empty symbols are reachable from
+     * evaluated input ({ "" = 1; }), so this is a case to handle, not an
+     * invariant to assert. */
     if (len == 0) {
         str = "";
     }
@@ -255,7 +246,6 @@ nn_symbol_t nn_symbol_intern(const char *str, size_t len)
 
     g_sym.entries[new_id].offset = offset;
     g_sym.entries[new_id].len = (uint32_t)len;
-    g_sym.entries[new_id].hash = hash;
 
     g_sym.slots[idx].hash = hash;
     g_sym.slots[idx].id = new_id;

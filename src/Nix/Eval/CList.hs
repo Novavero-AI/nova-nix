@@ -177,15 +177,16 @@ clistIndex cl@(CList p) i = do
 -- result is a new header over this list's C array (@nn_list_drop@), so it
 -- costs the same whatever the length; sharing the array cannot be
 -- observed, because a list is never written after construction.
+-- @nn_list_drop@ answers the empty list for a count at or past the
+-- length, so a count past its @uint32_t@ is clamped to the largest one,
+-- at or past every length.
 clistDrop :: (MonadCData m) => Int -> CList -> m CList
 clistDrop n cl@(CList p)
   | n <= 0 = pure cl
-  | otherwise = do
-      len <- clistLen cl
-      if n >= len
-        then pure emptyCList
-        else CList <$> cdataIO (alloca dropInto)
+  | otherwise = CList <$> cdataIO (alloca dropInto)
   where
+    count = fromIntegral (min n countCeiling)
+    countCeiling = fromIntegral (maxBound :: Word32)
     dropInto out = do
-      checkedListStatus "nn_list_drop" =<< c_nn_list_drop out p (fromIntegral n)
+      checkedListStatus "nn_list_drop" =<< c_nn_list_drop out p count
       peek out

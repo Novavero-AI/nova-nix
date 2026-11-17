@@ -9,9 +9,9 @@
  * strings, so a pointer finds its bit by a binary search over regions;
  * the code's strings are indexed only to be placed, as code is not
  * marked.  Sets, list headers, lambdas, builtins' partial applications
- * and strings with context are each their own allocation: an object index sorts a copy of the module's
- * tracking array and gives each object a bit, found by a binary search
- * for its address.
+ * and strings with context are each their own allocation: an object
+ * index sorts a copy of the module's tracker (nn_tracker.h) and gives
+ * each object a bit, found by a binary search for its address.
  * Addresses are compared as uintptr_t, since C orders pointers only
  * within one object.
  *
@@ -108,7 +108,6 @@ static struct {
     nn_region_index_t code_strings;
 
     nn_items_t *items;
-    uint32_t    item_count;
     uint64_t    items_bytes;
     uint32_t   *list_items;   /* per list in index order: its items array */
 
@@ -325,19 +324,19 @@ static void region_free(nn_region_index_t *r)
 
 /* --- Object index --- */
 
-/* Room for `count` objects and their bits.  The caller writes each
- * object's address and then sorts them (object_sort).  Returns 0 or -1. */
-static int object_alloc(nn_object_index_t *o, uint32_t count)
+/* Index a module's tracked objects: their addresses, sorted, and a bit
+ * each.  The tracker's array counts as overhead.  Returns 0 or -1. */
+static int object_build(nn_object_index_t *o, const nn_tracker_t *tracker)
 {
-    o->count = count;
-    o->objects = (uintptr_t *)malloc((size_t)count * sizeof(uintptr_t) + 1);
-    o->bits = bitmap_new(count);
-    return o->objects && o->bits ? 0 : -1;
-}
-
-static void object_sort(nn_object_index_t *o)
-{
+    uint32_t i;
+    g.overhead_bytes += (uint64_t)tracker->capacity * sizeof(void *);
+    o->count = tracker->count;
+    o->objects = (uintptr_t *)malloc((size_t)o->count * sizeof(uintptr_t) + 1);
+    o->bits = bitmap_new(o->count);
+    if (!o->objects || !o->bits) return -1;
+    for (i = 0; i < o->count; i++) o->objects[i] = (uintptr_t)tracker->objects[i];
     qsort(o->objects, o->count, sizeof(uintptr_t), cmp_address);
+    return 0;
 }
 
 /* The position of the object at `p`.  Returns 1 and writes *pos, or 0. */
@@ -411,15 +410,12 @@ static int index_pages(void)
 /* Index the list headers and group them by the items array they share. */
 static int index_lists(void)
 {
-    uint32_t count, capacity, i, k;
-    nn_list_t *const *tracked = nn_list_tracked(&count, &capacity);
+    uint32_t count, i, k;
     nn_header_end_t *ends;
-    g.overhead_bytes += (uint64_t)capacity * sizeof(nn_list_t *);
+    if (object_build(&g.lists, nn_list_tracked()) != 0) return -1;
+    count = g.lists.count;
     g.allocated_count[NN_STATS_LISTS] = count;
     g.allocated_bytes[NN_STATS_LISTS] = (uint64_t)count * sizeof(nn_list_t);
-    if (object_alloc(&g.lists, count) != 0) return -1;
-    for (i = 0; i < count; i++) g.lists.objects[i] = (uintptr_t)tracked[i];
-    object_sort(&g.lists);
 
     ends = (nn_header_end_t *)malloc((size_t)count * sizeof(nn_header_end_t) + 1);
     g.items = (nn_items_t *)malloc((size_t)count * sizeof(nn_items_t) + 1);
@@ -448,7 +444,6 @@ static int index_lists(void)
         }
         g.list_items[ends[i].pos] = k - 1;
     }
-    g.item_count = k;
     g.allocated_bytes[NN_STATS_LISTS] += g.items_bytes;
     free(ends);
     return 0;
@@ -456,62 +451,42 @@ static int index_lists(void)
 
 static int index_sets(void)
 {
-    uint32_t count, capacity, i;
-    nn_attrset_t *const *tracked = nn_attrset_tracked(&count, &capacity);
-    g.overhead_bytes += (uint64_t)capacity * sizeof(nn_attrset_t *);
-    g.allocated_count[NN_STATS_ATTRSETS] = count;
-    if (object_alloc(&g.sets, count) != 0) return -1;
-    for (i = 0; i < count; i++) {
-        g.allocated_bytes[NN_STATS_ATTRSETS] += nn_attrset_bytes(tracked[i]);
-        g.sets.objects[i] = (uintptr_t)tracked[i];
-    }
-    object_sort(&g.sets);
-    return 0;
+    const nn_tracker_t *tracked = nn_attrset_tracked();
+    uint32_t i;
+    g.allocated_count[NN_STATS_ATTRSETS] = tracked->count;
+    for (i = 0; i < tracked->count; i++)
+        g.allocated_bytes[NN_STATS_ATTRSETS] += nn_attrset_bytes((const nn_attrset_t *)tracked->objects[i]);
+    return object_build(&g.sets, tracked);
 }
 
 static int index_lambdas(void)
 {
-    uint32_t count, capacity, i;
-    nn_lambda_t *const *tracked = nn_lambda_tracked(&count, &capacity);
-    g.overhead_bytes += (uint64_t)capacity * sizeof(nn_lambda_t *);
-    g.allocated_count[NN_STATS_LAMBDAS] = count;
-    if (object_alloc(&g.lambdas, count) != 0) return -1;
-    for (i = 0; i < count; i++) {
-        g.allocated_bytes[NN_STATS_LAMBDAS] += nn_lambda_bytes(tracked[i]);
-        g.lambdas.objects[i] = (uintptr_t)tracked[i];
-    }
-    object_sort(&g.lambdas);
-    return 0;
+    const nn_tracker_t *tracked = nn_lambda_tracked();
+    uint32_t i;
+    g.allocated_count[NN_STATS_LAMBDAS] = tracked->count;
+    for (i = 0; i < tracked->count; i++)
+        g.allocated_bytes[NN_STATS_LAMBDAS] += nn_lambda_bytes((const nn_lambda_t *)tracked->objects[i]);
+    return object_build(&g.lambdas, tracked);
 }
 
 static int index_primop_apps(void)
 {
-    uint32_t count, capacity, i;
-    nn_primop_app_t *const *tracked = nn_primop_app_tracked(&count, &capacity);
-    g.overhead_bytes += (uint64_t)capacity * sizeof(nn_primop_app_t *);
-    g.allocated_count[NN_STATS_PRIMOP_APPS] = count;
-    if (object_alloc(&g.primop_apps, count) != 0) return -1;
-    for (i = 0; i < count; i++) {
-        g.allocated_bytes[NN_STATS_PRIMOP_APPS] += nn_primop_app_bytes(tracked[i]);
-        g.primop_apps.objects[i] = (uintptr_t)tracked[i];
-    }
-    object_sort(&g.primop_apps);
-    return 0;
+    const nn_tracker_t *tracked = nn_primop_app_tracked();
+    uint32_t i;
+    g.allocated_count[NN_STATS_PRIMOP_APPS] = tracked->count;
+    for (i = 0; i < tracked->count; i++)
+        g.allocated_bytes[NN_STATS_PRIMOP_APPS] += nn_primop_app_bytes((const nn_primop_app_t *)tracked->objects[i]);
+    return object_build(&g.primop_apps, tracked);
 }
 
 static int index_ctxstrs(void)
 {
-    uint32_t count, capacity, i;
-    nn_ctxstr_t *const *tracked = nn_ctxstr_tracked(&count, &capacity);
-    g.overhead_bytes += (uint64_t)capacity * sizeof(nn_ctxstr_t *);
-    g.allocated_count[NN_STATS_CTXSTRS] = count;
-    if (object_alloc(&g.ctxstrs, count) != 0) return -1;
-    for (i = 0; i < count; i++) {
-        g.allocated_bytes[NN_STATS_CTXSTRS] += nn_ctxstr_bytes(tracked[i]);
-        g.ctxstrs.objects[i] = (uintptr_t)tracked[i];
-    }
-    object_sort(&g.ctxstrs);
-    return 0;
+    const nn_tracker_t *tracked = nn_ctxstr_tracked();
+    uint32_t i;
+    g.allocated_count[NN_STATS_CTXSTRS] = tracked->count;
+    for (i = 0; i < tracked->count; i++)
+        g.allocated_bytes[NN_STATS_CTXSTRS] += nn_ctxstr_bytes((const nn_ctxstr_t *)tracked->objects[i]);
+    return object_build(&g.ctxstrs, tracked);
 }
 
 /* Index an arena's strings, a bit per NN_STR_ALIGNMENT bytes its blocks
@@ -832,27 +807,25 @@ static void enter_thunk(const nn_thunk_t *t)
     case NN_VALUE_NULL:
         break;
     case NN_VALUE_STR:
-        reach_string((const nn_str_t *)nn_thunk_get_str(t));
-        break;
     case NN_VALUE_PATH:
-        reach_string((const nn_str_t *)nn_thunk_get_path(t));
+        reach_string((const nn_str_t *)nn_thunk_payload(t));
         break;
     case NN_VALUE_LIST:
-        reach(NN_STATS_LISTS, nn_thunk_get_list(t));
+        reach(NN_STATS_LISTS, nn_thunk_payload(t));
         break;
     case NN_VALUE_ATTRS:
-        reach(NN_STATS_ATTRSETS, nn_thunk_get_attrs(t));
+        reach(NN_STATS_ATTRSETS, nn_thunk_payload(t));
         break;
     case NN_VALUE_CTXSTR:
-        reach(NN_STATS_CTXSTRS, nn_thunk_get_ctxstr(t));
+        reach(NN_STATS_CTXSTRS, nn_thunk_payload(t));
         break;
     case NN_VALUE_LAMBDA:
-        reach(NN_STATS_LAMBDAS, nn_thunk_get_lambda(t));
+        reach(NN_STATS_LAMBDAS, nn_thunk_payload(t));
         break;
     case NN_VALUE_PRIMOP:
         break;
     case NN_VALUE_PRIMOP_APP:
-        reach(NN_STATS_PRIMOP_APPS, nn_thunk_get_primop_app(t));
+        reach(NN_STATS_PRIMOP_APPS, nn_thunk_payload(t));
         break;
     default:
         g.unplaced++;
@@ -870,7 +843,7 @@ static void enter_env(const nn_env_t *env)
     for (i = 0; i < slot_count; i++) reach(NN_STATS_THUNKS, env->slots[i]);
     reach(NN_STATS_ENVS, nn_env_parent(env));
     if (!scopes) return;
-    reach(NN_STATS_ATTRSETS, scopes->lazy_scope);
+    reach(NN_STATS_ATTRSETS, scopes->name_table);
     if (reach_array(scopes->with_scopes, scopes->with_count)) {
         for (i = 0; i < scopes->with_count; i++) {
             uintptr_t entry = (uintptr_t)scopes->with_scopes[i];
@@ -918,7 +891,7 @@ static void enter_lambda(const nn_lambda_t *lam)
     reach(NN_STATS_ENVS, lam->env);
     reach_symbol(lam->name_sym);
     reach_symbol(lam->lambda_name_sym);
-    for (i = 0; i < formals && lam->entries; i++) reach_symbol(lam->entries[i].name_sym);
+    for (i = 0; i < formals; i++) reach_symbol(lam->entries[i].name_sym);
 }
 
 static void enter_primop_app(const nn_primop_app_t *app)

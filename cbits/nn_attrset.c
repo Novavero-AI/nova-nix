@@ -25,27 +25,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* --- Global tracking for bulk cleanup --- */
-
-static nn_attrset_t **g_tracked = NULL;
-static uint32_t g_tracked_count = 0;
-static uint32_t g_tracked_cap   = 0;
-
-/* Returns 0, or -1 when the tracking array cannot grow. */
-static int nn_attrset_track(nn_attrset_t *set)
-{
-    if (g_tracked_count >= g_tracked_cap) {
-        if (g_tracked_cap > UINT32_MAX / 2) return -1;
-        uint32_t new_cap = g_tracked_cap ? g_tracked_cap * 2 : 256;
-        nn_attrset_t **new_arr = (nn_attrset_t **)realloc(
-            g_tracked, (size_t)new_cap * sizeof(nn_attrset_t *));
-        if (!new_arr) return -1;
-        g_tracked = new_arr;
-        g_tracked_cap = new_cap;
-    }
-    g_tracked[g_tracked_count++] = set;
-    return 0;
-}
+/* Every set allocated, for bulk cleanup. */
+static nn_tracker_t g_tracked;
 
 /* --- Internal representation --- */
 
@@ -146,7 +127,7 @@ static nn_attrset_t *attrset_alloc(uint32_t capacity)
     set->capacity = capacity;
     set->frozen = 0;
 
-    if (!set->keys || !set->values || nn_attrset_track(set) != 0) {
+    if (!set->keys || !set->values || nn_tracker_add(&g_tracked, set) != 0) {
         free(set->keys);
         free(set->values);
         free(set);
@@ -172,8 +153,9 @@ nn_attrset_t *nn_attrset_new(uint32_t capacity, uint32_t site)
 
 /* Free a set's arrays and the set, and not its values: they are cells
  * the thunk arena owns. */
-static void attrset_free(nn_attrset_t *set)
+static void attrset_free(void *object)
 {
+    nn_attrset_t *set = (nn_attrset_t *)object;
     free(set->keys);
     free(set->values);
     free(set);
@@ -181,14 +163,7 @@ static void attrset_free(nn_attrset_t *set)
 
 void nn_attrset_free_all(void)
 {
-    uint32_t i;
-    for (i = 0; i < g_tracked_count; i++) {
-        attrset_free(g_tracked[i]);
-    }
-    free(g_tracked);
-    g_tracked = NULL;
-    g_tracked_count = 0;
-    g_tracked_cap = 0;
+    nn_tracker_free_all(&g_tracked, attrset_free);
 }
 
 static nn_attrset_t g_empty_set = { NULL, NULL, NULL, 0, 0, 1 };
@@ -202,7 +177,7 @@ nn_attrset_t *nn_attrset_empty(void)
 
 int nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value, uint32_t pos)
 {
-    if (set->frozen) return -1;
+    NN_ASSERT(!set->frozen, "nn_attrset_insert: the set is frozen");
     if (set->count >= set->capacity && grow(set) != 0) return -1;
     set->keys[set->count] = key;
     set->positions[set->count] = pos;
@@ -211,108 +186,85 @@ int nn_attrset_insert(nn_attrset_t *set, nn_symbol_t key, void *value, uint32_t 
     return 0;
 }
 
+/* Sets of at most this many entries are sorted by insertion, which needs
+ * no allocation; larger ones by qsort over tagged entries. */
+#define NN_ATTRSET_INSERTION_SORT_MAX 64u
+
+/* Insertion-sort the entries by key.  The sort is stable: entries with
+ * one key keep the order they were inserted in. */
+static void insertion_sort(nn_attrset_t *set)
+{
+    uint32_t i;
+    for (i = 1; i < set->count; i++) {
+        nn_symbol_t key = set->keys[i];
+        uint32_t pos = set->positions[i];
+        void *value = set->values[i];
+        uint32_t j = i;
+        while (j > 0 && set->keys[j - 1] > key) {
+            set->keys[j] = set->keys[j - 1];
+            set->positions[j] = set->positions[j - 1];
+            set->values[j] = set->values[j - 1];
+            j--;
+        }
+        set->keys[j] = key;
+        set->positions[j] = pos;
+        set->values[j] = value;
+    }
+}
+
+/* Sort the entries by key with qsort.  qsort is not stable, so each
+ * entry is tagged with its insertion index, which orders the entries of
+ * one key and makes the sort stable.  Returns 0, or -1 with the set
+ * unchanged when the tags cannot be allocated. */
+static int tagged_sort(nn_attrset_t *set)
+{
+    uint32_t i;
+    nn_tagged_entry_t *tagged = (nn_tagged_entry_t *)malloc(
+        (size_t)set->count * sizeof(nn_tagged_entry_t));
+    if (!tagged) return -1;
+    for (i = 0; i < set->count; i++) {
+        tagged[i].key = set->keys[i];
+        tagged[i].idx = i;
+        tagged[i].pos = set->positions[i];
+        tagged[i].value = set->values[i];
+    }
+    qsort(tagged, set->count, sizeof(nn_tagged_entry_t), cmp_tagged);
+    for (i = 0; i < set->count; i++) {
+        set->keys[i] = tagged[i].key;
+        set->positions[i] = tagged[i].pos;
+        set->values[i] = tagged[i].value;
+    }
+    free(tagged);
+    return 0;
+}
+
 void nn_attrset_freeze(nn_attrset_t *set)
 {
+    uint32_t write = 0;
+    uint32_t read;
+
     if (set->frozen) return;
 
-    if (set->count <= 1) {
-        set->frozen = 1;
-        return;
+    /* Stable, so the last insert of a repeated key sorts last of its run.
+     * A large set whose tags cannot be allocated is sorted by insertion,
+     * slower and in place. */
+    if (set->count <= NN_ATTRSET_INSERTION_SORT_MAX || tagged_sort(set) != 0) {
+        insertion_sort(set);
     }
 
-    /*
-     * Sort by key.  We need last-writer-wins for duplicates, but qsort
-     * isn't stable.  Strategy: tag each entry with its insertion index,
-     * sort by (key, index), then dedup keeping the highest index per key.
-     *
-     * For small sets (<= 64), use a simple insertion sort that IS stable
-     * (avoids the malloc overhead of tagging).
-     */
-    if (set->count <= 64) {
-        /* Stable insertion sort. */
-        uint32_t i, j;
-        for (i = 1; i < set->count; i++) {
-            nn_symbol_t tmpk = set->keys[i];
-            uint32_t tmpp = set->positions[i];
-            void *tmpv = set->values[i];
-            j = i;
-            while (j > 0 && set->keys[j - 1] > tmpk) {
-                set->keys[j] = set->keys[j - 1];
-                set->positions[j] = set->positions[j - 1];
-                set->values[j] = set->values[j - 1];
-                j--;
-            }
-            set->keys[j] = tmpk;
-            set->positions[j] = tmpp;
-            set->values[j] = tmpv;
+    /* Keep the last entry of each run of one key. */
+    for (read = 0; read < set->count; read++) {
+        if (read + 1 < set->count && set->keys[read] == set->keys[read + 1]) {
+            continue;
         }
-    } else {
-        /*
-         * Large set: tag entries with insertion index, qsort by (key, index),
-         * then strip tags.  This gives stable sort semantics.
-         */
-        nn_tagged_entry_t *tagged = (nn_tagged_entry_t *)malloc(
-            (size_t)set->count * sizeof(nn_tagged_entry_t));
-        if (!tagged) {
-            /* Fallback: in-place insertion sort for large sets when malloc
-             * fails.  Falls through to the dedup block below. */
-            for (uint32_t i = 1; i < set->count; i++) {
-                nn_symbol_t key = set->keys[i];
-                uint32_t pos = set->positions[i];
-                void *val = set->values[i];
-                uint32_t j = i;
-                while (j > 0 && set->keys[j-1] > key) {
-                    set->keys[j] = set->keys[j-1];
-                    set->positions[j] = set->positions[j-1];
-                    set->values[j] = set->values[j-1];
-                    j--;
-                }
-                set->keys[j] = key;
-                set->positions[j] = pos;
-                set->values[j] = val;
-            }
-        } else {
-            uint32_t i;
-            for (i = 0; i < set->count; i++) {
-                tagged[i].key = set->keys[i];
-                tagged[i].idx = i;
-                tagged[i].pos = set->positions[i];
-                tagged[i].value = set->values[i];
-            }
-
-            /* Sort by key, break ties by insertion index (ascending). */
-            qsort(tagged, set->count, sizeof(nn_tagged_entry_t), cmp_tagged);
-
-            for (i = 0; i < set->count; i++) {
-                set->keys[i] = tagged[i].key;
-                set->positions[i] = tagged[i].pos;
-                set->values[i] = tagged[i].value;
-            }
-            free(tagged);
+        if (write != read) {
+            set->keys[write] = set->keys[read];
+            set->positions[write] = set->positions[read];
+            set->values[write] = set->values[read];
         }
+        write++;
     }
-
-    /* Dedup: keep last occurrence of each key (last-writer-wins).
-     * After stable sort, duplicates are adjacent with the last insert
-     * at the highest index position. */
-    {
-        uint32_t write = 0;
-        uint32_t read;
-        for (read = 0; read < set->count; read++) {
-            /* If next entry has the same key, skip this one (keep the later one). */
-            if (read + 1 < set->count && set->keys[read] == set->keys[read + 1]) {
-                continue;
-            }
-            if (write != read) {
-                set->keys[write] = set->keys[read];
-                set->positions[write] = set->positions[read];
-                set->values[write] = set->values[read];
-            }
-            write++;
-        }
-        set->count = write;
-    }
-
+    set->count = write;
     set->frozen = 1;
 }
 
@@ -369,8 +321,7 @@ const nn_symbol_t *nn_attrset_keys_ptr(const nn_attrset_t *set)
 nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b,
                                uint32_t site)
 {
-    /* The merge-join below assumes both inputs are sorted; every set this
-     * module produces is frozen (hence sorted), so guard it in debug. */
+    /* The merge-join below needs both inputs sorted, as a frozen set is. */
     NN_ASSERT(a->frozen && b->frozen, "nn_attrset_union: inputs must be frozen");
     /* Merge-join: all keys from both, b wins on conflict.  The sum of two
      * uint32_t counts needs 33 bits; sized at the ceiling instead, the
@@ -447,11 +398,9 @@ nn_attrset_t *nn_attrset_remove_keys(
 
 /* --- Census --- */
 
-nn_attrset_t *const *nn_attrset_tracked(uint32_t *count, uint32_t *capacity)
+const nn_tracker_t *nn_attrset_tracked(void)
 {
-    *count = g_tracked_count;
-    *capacity = g_tracked_cap;
-    return g_tracked;
+    return &g_tracked;
 }
 
 uint64_t nn_attrset_bytes(const nn_attrset_t *set)

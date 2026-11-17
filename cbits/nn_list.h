@@ -24,6 +24,8 @@
 #ifndef NN_LIST_H
 #define NN_LIST_H
 
+#include "nn_tracker.h"
+
 #include <stdint.h>
 
 /* Forward declaration - nn_thunk_t is defined in nn_thunk.h */
@@ -74,12 +76,11 @@ void nn_list_set(nn_list_t *list, uint32_t index, struct nn_thunk *thunk);
 
 /* --- Census (nn_stats.h) --- */
 
-/* The tracked headers, in no particular order: the module's own array,
- * valid until the next header is created or nn_list_free_all runs.
- * Writes how many it holds to *count and how many it has room for to
- * *capacity.  A header nn_list_drop made shares its source's items array
- * and ends where the source ends, so headers that end at one address
- * share one array, which the longest of them spans. */
-nn_list_t *const *nn_list_tracked(uint32_t *count, uint32_t *capacity);
+/* Every header allocated and not yet freed: the module's own tracker,
+ * whose array moves when the next header is created and is freed by
+ * nn_list_free_all.  A header nn_list_drop made shares its source's
+ * items array and ends where the source ends, so headers that end at one
+ * address share one array, which the longest of them spans. */
+const nn_tracker_t *nn_list_tracked(void);
 
 #endif /* NN_LIST_H */

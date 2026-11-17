@@ -20,9 +20,9 @@
 
 /* --- Constants --- */
 
-#define NN_BC_DEFAULT_OP_CAPACITY    65536u
-#define NN_BC_DEFAULT_DATA_CAPACITY 131072u
-#define NN_BC_STRING_INITIAL_CAPACITY 4096u
+#define NN_BC_OP_INITIAL_CAPACITY      65536u
+#define NN_BC_DATA_INITIAL_CAPACITY   131072u
+#define NN_BC_STRING_INITIAL_CAPACITY   4096u
 
 /* --- Global state --- */
 
@@ -41,22 +41,22 @@ static nn_str_arena_t  g_string_arena;
 
 /* --- Lifecycle --- */
 
-void nn_bytecode_init(uint32_t op_capacity, uint32_t data_capacity)
+void nn_bytecode_init(void)
 {
-    if (g_ops) nn_bytecode_destroy();
-
-    if (op_capacity == 0)   op_capacity   = NN_BC_DEFAULT_OP_CAPACITY;
-    if (data_capacity == 0) data_capacity = NN_BC_DEFAULT_DATA_CAPACITY;
-
-    g_ops         = (nn_op_t *)malloc((size_t)op_capacity * sizeof(nn_op_t));
+    g_ops         = (nn_op_t *)malloc((size_t)NN_BC_OP_INITIAL_CAPACITY * sizeof(nn_op_t));
     if (!g_ops) { fprintf(stderr, "nn_bytecode_init: ops alloc failed\n"); abort(); }
     g_op_count    = 0;
-    g_op_capacity = op_capacity;
+    g_op_capacity = NN_BC_OP_INITIAL_CAPACITY;
 
-    g_data          = (uint32_t *)malloc((size_t)data_capacity * sizeof(uint32_t));
+    g_data          = (uint32_t *)malloc((size_t)NN_BC_DATA_INITIAL_CAPACITY * sizeof(uint32_t));
     if (!g_data) { fprintf(stderr, "nn_bytecode_init: data alloc failed\n"); abort(); }
     g_data_count    = 0;
-    g_data_capacity = data_capacity;
+    g_data_capacity = NN_BC_DATA_INITIAL_CAPACITY;
+
+    g_strings         = (nn_str_t **)malloc((size_t)NN_BC_STRING_INITIAL_CAPACITY * sizeof(nn_str_t *));
+    if (!g_strings) { fprintf(stderr, "nn_bytecode_init: strings alloc failed\n"); abort(); }
+    g_string_count    = 0;
+    g_string_capacity = NN_BC_STRING_INITIAL_CAPACITY;
 }
 
 int nn_bytecode_live(void)
@@ -85,52 +85,22 @@ void nn_bytecode_destroy(void)
 
 /* --- Internal: grow arrays --- */
 
-static int ensure_op_space(void)
+/* Room for one more element in an array of *cap elements of `size`
+ * bytes, `count` of them used: the array, or the array moved to double
+ * its capacity.  NULL, leaving the array and *cap as they were, for no
+ * array (before nn_bytecode_init or after nn_bytecode_destroy), when
+ * doubling would pass UINT32_MAX elements, or when the allocator
+ * refuses.  A capacity stops at 2^31, so UINT32_MAX, the emitters'
+ * failure answer, is never an index. */
+static void *reserve(void *items, uint32_t count, uint32_t *cap, size_t size)
 {
-    /* No store before nn_bytecode_init or after nn_bytecode_destroy.
-     * Doubling a zero capacity would realloc to zero bytes and the
-     * emit would then write past it. */
-    if (!g_ops) return -1;
-    if (g_op_count < g_op_capacity) return 0;
-    uint32_t new_cap = g_op_capacity * 2;
-    if (new_cap < g_op_capacity) return -1; /* overflow guard */
-    nn_op_t *new_ops = (nn_op_t *)realloc(g_ops, (size_t)new_cap * sizeof(nn_op_t));
-    if (!new_ops) return -1;
-    g_ops = new_ops;
-    g_op_capacity = new_cap;
-    return 0;
-}
-
-static int ensure_data_space(void)
-{
-    if (!g_data) return -1;
-    if (g_data_count < g_data_capacity) return 0;
-    uint32_t new_cap = g_data_capacity * 2;
-    if (new_cap < g_data_capacity) return -1; /* overflow guard */
-    uint32_t *new_data = (uint32_t *)realloc(g_data, (size_t)new_cap * sizeof(uint32_t));
-    if (!new_data) return -1;
-    g_data = new_data;
-    g_data_capacity = new_cap;
-    return 0;
-}
-
-/* Room for one more string table entry.  The table starts on the first
- * string, and UINT32_MAX is never an index, as it is the emitters'
- * failure answer. */
-static int ensure_string_space(void)
-{
-    if (!g_ops) return -1;
-    if (g_string_count < g_string_capacity) return 0;
-    if (g_string_capacity > UINT32_MAX / 2) return -1;
-    uint32_t new_cap = g_string_capacity == 0
-                           ? NN_BC_STRING_INITIAL_CAPACITY
-                           : g_string_capacity * 2;
-    nn_str_t **new_strings = (nn_str_t **)realloc(
-        g_strings, (size_t)new_cap * sizeof(nn_str_t *));
-    if (!new_strings) return -1;
-    g_strings = new_strings;
-    g_string_capacity = new_cap;
-    return 0;
+    void *grown;
+    if (!items) return NULL;
+    if (count < *cap) return items;
+    if (*cap > UINT32_MAX / 2) return NULL;
+    grown = realloc(items, (size_t)*cap * 2 * size);
+    if (grown) *cap *= 2;
+    return grown;
 }
 
 /* --- Emit --- */
@@ -138,7 +108,9 @@ static int ensure_string_space(void)
 uint32_t nn_bc_emit(uint8_t opcode, uint8_t flags, uint16_t short_arg,
                     uint32_t arg1, uint32_t arg2, uint32_t arg3)
 {
-    if (ensure_op_space() != 0) return UINT32_MAX;
+    nn_op_t *ops = (nn_op_t *)reserve(g_ops, g_op_count, &g_op_capacity, sizeof(nn_op_t));
+    if (!ops) return UINT32_MAX;
+    g_ops = ops;
     uint32_t idx = g_op_count++;
     nn_op_t *op  = &g_ops[idx];
     op->opcode    = opcode;
@@ -152,7 +124,9 @@ uint32_t nn_bc_emit(uint8_t opcode, uint8_t flags, uint16_t short_arg,
 
 uint32_t nn_bc_emit_data(uint32_t value)
 {
-    if (ensure_data_space() != 0) return UINT32_MAX;
+    uint32_t *data = (uint32_t *)reserve(g_data, g_data_count, &g_data_capacity, sizeof(uint32_t));
+    if (!data) return UINT32_MAX;
+    g_data = data;
     uint32_t offset = g_data_count++;
     g_data[offset]  = value;
     return offset;
@@ -160,7 +134,9 @@ uint32_t nn_bc_emit_data(uint32_t value)
 
 uint32_t nn_bc_emit_string(const char *bytes, size_t len)
 {
-    if (ensure_string_space() != 0) return UINT32_MAX;
+    nn_str_t **strings = (nn_str_t **)reserve(g_strings, g_string_count, &g_string_capacity, sizeof(nn_str_t *));
+    if (!strings) return UINT32_MAX;
+    g_strings = strings;
     nn_str_t *s = nn_str_arena_new(&g_string_arena, bytes, len);
     if (!s) return UINT32_MAX;
     uint32_t index = g_string_count++;

@@ -31,7 +31,8 @@ int nn_roots_add_thunk(struct nn_thunk *thunk);
 int nn_roots_add_env(struct nn_env *env);
 
 /* How many roots of each kind are registered, and the one at an index
- * below that count, in the order they were registered; NULL past it. */
+ * below that count, in the order they were registered.  An index past
+ * the count aborts (NN_ASSERT). */
 uint32_t nn_roots_thunk_count(void);
 uint32_t nn_roots_env_count(void);
 struct nn_thunk *nn_roots_thunk(uint32_t index);

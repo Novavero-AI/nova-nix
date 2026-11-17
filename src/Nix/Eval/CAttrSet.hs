@@ -8,9 +8,10 @@
 -- Construction is two-phase: insert entries, then freeze (sort + dedup).
 -- After freeze, lookup is O(log n) binary search over contiguous memory.
 --
--- Values are opaque @CThunkPtr@ handles stored as @void*@ on the C side.
--- The C side never dereferences them.  Thunk lifetimes are managed by
--- the thunk arena; attribute set cleanup only frees the key\/value arrays.
+-- Values are 'CThunkPtr' cells stored as @void*@ on the C side.  The set
+-- never dereferences them, and the census ("Nix.Eval.CStats") follows
+-- them.  The thunk arena owns the cells, so freeing a set frees its own
+-- arrays alone.
 --
 -- Every constructor names its 'SetSite', under which the census counts
 -- the set.  'cattrsetEmpty' is the one set no constructor makes: the
@@ -145,15 +146,18 @@ cattrsetNew site expected = cdataIO (checkedCPtr "nn_attrset_new" =<< c_nn_attrs
 -- Construction
 -- ---------------------------------------------------------------------------
 
--- | Insert a key-value pair defined at a position.  Call before freeze.
--- The value is a CThunkPtr cast to Ptr () - C never dereferences it.
+-- | Insert a key-value pair defined at a position, into a set not yet
+-- frozen: a frozen one aborts in C.
+-- The value is a 'CThunkPtr' cast to @Ptr ()@: the set never dereferences
+-- it, and the census follows it.
 cattrsetInsert :: (MonadCData m) => CAttrSet -> Symbol -> PosIdx -> CThunkPtr -> m ()
 cattrsetInsert set (Symbol sym) (PosIdx pos) ptr = cdataIO $ do
   status <- c_nn_attrset_insert set sym (castPtr ptr) pos
   unless (status == 0) $
-    cStatusFailure "nn_attrset_insert" "the attribute set is frozen or cannot grow (allocation failure or its 4294967295-entry ceiling)"
+    cStatusFailure "nn_attrset_insert" "the attribute set cannot grow (allocation failure or its 4294967295-entry ceiling)"
 
--- | Sort and deduplicate.  Must be called once before any queries.
+-- | Sort the entries and keep the last insert of a repeated key, which a
+-- lookup needs.  Freezing a frozen set does nothing.
 cattrsetFreeze :: (MonadCData m) => CAttrSet -> m ()
 cattrsetFreeze = cdataIO . c_nn_attrset_freeze
 

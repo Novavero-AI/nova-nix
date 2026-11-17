@@ -1,3 +1,5 @@
+{-# LANGUAGE PatternSynonyms #-}
+
 -- | C-backed context-bearing strings via FFI.
 --
 -- Wraps @cbits/nn_ctxstr.c@ - a string with its StringContext stored
@@ -29,12 +31,18 @@ module Nix.Eval.CCtxStr
     cctxstrElemHash,
     cctxstrElemName,
     cctxstrElemOutput,
+
+    -- * Element tags
+    pattern ScePlain,
+    pattern SceDrvOutput,
+    pattern SceAllOutputs,
   )
 where
 
 import Data.Word (Word32, Word8)
 import Foreign.Ptr (Ptr)
 import Nix.Eval.CData (MonadCData, cdataIO)
+import Nix.Eval.CStatus (checkedCPtr)
 import Nix.Eval.CStr (CStrPtr)
 
 -- | Phantom type for C-side @nn_ctxstr_t@.
@@ -83,10 +91,11 @@ foreign import ccall unsafe "nn_ctxstr_elem_output"
 
 -- | Allocate a new context string over its text's bytes with space for
 -- @ctxCount@ elements, which the caller fills via the set functions.
--- Returns 'Foreign.Ptr.nullPtr' on allocation failure or if the
--- element array size would overflow - the caller must check.
+-- The NULL @nn_ctxstr_new@ answers when it refuses
+-- (@cbits/nn_ctxstr.h@ says when) is raised as
+-- 'Nix.Eval.CStatus.CStatusError'.
 cctxstrNew :: (MonadCData m) => CStrPtr -> Word32 -> m CCtxStrPtr
-cctxstrNew text ctxCount = cdataIO (c_nn_ctxstr_new text ctxCount)
+cctxstrNew text ctxCount = cdataIO (checkedCPtr "nn_ctxstr_new" =<< c_nn_ctxstr_new text ctxCount)
 
 -- ---------------------------------------------------------------------------
 -- Element setters
@@ -119,7 +128,8 @@ cctxstrText = cdataIO . c_nn_ctxstr_text
 cctxstrCtxCount :: (MonadCData m) => CCtxStrPtr -> m Word32
 cctxstrCtxCount = cdataIO . c_nn_ctxstr_ctx_count
 
--- | The tag of context element @i@ (plain / drv-output / all-outputs).
+-- | The tag of context element @i@: 'ScePlain', 'SceDrvOutput' or
+-- 'SceAllOutputs'.
 cctxstrElemTag :: (MonadCData m) => CCtxStrPtr -> Word32 -> m Word8
 cctxstrElemTag ptr idx = cdataIO (c_nn_ctxstr_elem_tag ptr idx)
 
@@ -134,3 +144,16 @@ cctxstrElemName ptr idx = cdataIO (c_nn_ctxstr_elem_name ptr idx)
 -- | The output name of context element @i@ (drv-output elements only).
 cctxstrElemOutput :: (MonadCData m) => CCtxStrPtr -> Word32 -> m CStrPtr
 cctxstrElemOutput ptr idx = cdataIO (c_nn_ctxstr_elem_output ptr idx)
+
+-- ---------------------------------------------------------------------------
+-- Element tags
+-- ---------------------------------------------------------------------------
+
+-- | The tags of a string context element, mirroring the @NN_SCE_*@ macros
+-- in @cbits\/nn_ctxstr.h@, with which they stay in lockstep: a plain
+-- store path (@SCPlain@), a derivation's output (@SCDrvOutput@) and all
+-- of a derivation's outputs (@SCAllOutputs@).
+pattern ScePlain, SceDrvOutput, SceAllOutputs :: Word8
+pattern ScePlain = 0
+pattern SceDrvOutput = 1
+pattern SceAllOutputs = 2

@@ -53,8 +53,8 @@ import qualified Database.SQLite.Simple as SQL
 import Foreign.C.Error (Errno (..), eACCES, eISDIR, eNOENT, eNOTDIR)
 import Foreign.C.Types (CChar, CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca)
-import Foreign.Ptr (Ptr, WordPtr, castPtr, nullPtr, plusPtr, ptrToWordPtr)
-import Foreign.Storable (peekElemOff, poke, sizeOf)
+import Foreign.Ptr (Ptr, WordPtr, castPtr, nullPtr, ptrToWordPtr)
+import Foreign.Storable (Storable, peekByteOff, peekElemOff, poke, pokeByteOff, sizeOf)
 import qualified GHC.Foreign as GHCForeign
 import GHC.IO.Encoding (getFileSystemEncoding, mkTextEncoding, setFileSystemEncoding)
 import GHC.IO.Exception (IOErrorType (..), IOException (..))
@@ -82,14 +82,14 @@ import qualified Nix.Eval.Builtin as Builtin
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
 import Nix.Eval.CBytecode (attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcEmitString, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, cbcString, cbcStringText, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
-import Nix.Eval.CEnv (cenvLazyScope, cenvNew, cenvNewScoped, cenvParent)
+import Nix.Eval.CEnv (cenvNameTable, cenvParent)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsType, clambdaNew, clambdaShape, clambdaShapeAllowExtra, clambdaShapeFormalCount, clambdaShapeFormalsType)
 import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistThunks, thunkListToCList)
 import Nix.Eval.CRoots (crootsAddThunk)
 import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
 import Nix.Eval.CStatus (CStatusError (..), arenaLive)
 import Nix.Eval.CStr (cstrNew)
-import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetBool, cthunkGetCtxStr, cthunkGetInt, cthunkGetPath, cthunkGetStr, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkPrimop, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetBool, cthunkGetInt, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkPrimop, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcAttrKey (..), BcBinding (..), BcInheritedName (..), compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, reassembleInt64)
@@ -104,7 +104,7 @@ import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecor
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolCount, symbolIntern, symbolLen, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), Pending (..), attrSetFromEntries, attrSetFromEntriesSizedFor, attrSetKeys, attrSetRemoveKeys, attrSetToMap, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkApply2Thunk, mkApplyThunk, mkThunkBc, newEnv, newScopeEnv, pushLazyWithScope, readComputed, readPending, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
+import Nix.Eval.Types (AttrSet (..), Env (..), Pending (..), attrSetFromEntries, attrSetFromEntriesSizedFor, attrSetKeys, attrSetRemoveKeys, attrSetToMap, buildCaptureEnv, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkApply2Thunk, mkApplyThunk, mkThunkBc, newEnv, newScopeEnv, pushLazyWithScope, readComputed, readPending, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -1043,14 +1043,10 @@ testSharedEmptySet = do
                       (mergedEntries, unAttrSet merged `elem` map unAttrSet [left, right])
                         QC.=== (Map.union rightEntries leftEntries, False)
               other -> pure (QC.counterexample ("update gave " <> show other) False),
-      runTestM "the shared empty set holds nothing and refuses an insert" $ do
-        sym <- symbolIntern "a"
-        refused <- try (cattrsetInsert (unAttrSet emptyAttrSet) sym noPos cthunkNull)
+      runTestM "the shared empty set holds nothing" $ do
         size <- attrSetSize emptyAttrSet
         keys <- attrSetKeys emptyAttrSet
-        pure $ case refused of
-          Left (_ :: CStatusError) -> assertEqual "size and keys" (0, []) (size, keys)
-          Right () -> Fail "an insert into the shared empty set was accepted"
+        pure (assertEqual "size and keys" (0, []) (size, keys))
     ]
   where
     quickCheckPasses property = do
@@ -1719,7 +1715,7 @@ censusPointerBytes = 8
 primopAppHeaderBytes :: Word64
 primopAppHeaderBytes = 8
 
--- | The bytes of an env's word and of the scopes an env with a lazy scope
+-- | The bytes of an env's word and of the scopes an env with a name table
 -- or with-scopes has: @NN_ENV_WORD_BYTES@ and @NN_ENV_SCOPES_BYTES@ of
 -- @cbits/nn_env.h@.  Its slots, and a parent after a header, take a
 -- pointer each.
@@ -2240,14 +2236,14 @@ testAllocSites = do
         [(EnvWith, EnvSiteFigures 1 0 40)]
         [(SetLiteral, SetSiteFigures 1 0 56)],
       -- The with's variable makes closure trimming give the let a capture
-      -- with with-scopes of its own: the builtins scope, one entry.  The
-      -- let's frame sits under that capture, and the with's env copies
-      -- the frame's slot and parent, with an array of its own scope and
-      -- the capture's entry.
+      -- holding the with-scopes the root env sees, which are none, so the
+      -- capture is a bare header.  The let's frame sits under that
+      -- capture, and the with's env copies the frame's slot and parent,
+      -- with an array of its own scope.
       sitesTest
         "a with's env holds and counts the slots it copies from the env it is made in"
         "let b = 2; in with { a = 1; }; a + b"
-        [(EnvLet, EnvSiteFigures 1 1 16), (EnvLetCapture, EnvSiteFigures 1 0 40), (EnvWith, EnvSiteFigures 1 1 64)]
+        [(EnvLet, EnvSiteFigures 1 1 16), (EnvLetCapture, EnvSiteFigures 1 0 8), (EnvWith, EnvSiteFigures 1 1 56)]
         [(SetLiteral, SetSiteFigures 1 0 56)],
       sitesTest
         "an update with an empty operand makes no set, and the empty literal is the shared empty set"
@@ -2274,7 +2270,7 @@ testAllocSites = do
         "builtins.deepSeq { ${null} = 1; } null"
         []
         [(SetLiteral, SetSiteFigures 1 0 56)],
-      -- The frame binds its names through a lazy scope: an env of a
+      -- The frame binds its names through a name table: an env of a
       -- header, a parent and its scopes, 8, 8 and 24 bytes.  Its name
       -- table holds no static name, so it is the shared empty set and no
       -- scope set is made.
@@ -2381,9 +2377,9 @@ data EnvStep
   | -- | An env with no parent holding this many cells, as a trimmed
     -- closure's.
     StepParentless !Int
-  | -- | An env under the previous one that binds a lazy scope, as a
+  | -- | An env under the previous one that binds a name table, as a
     -- frame whose names are not all static.
-    StepScope
+    StepNameTable
   | -- | The previous env under a with whose set is not evaluated yet.
     StepWith
   deriving (Show)
@@ -2393,7 +2389,7 @@ genEnvStep =
   QC.oneof
     [ StepChild <$> QC.chooseInt (0, envShortMax + 2),
       StepParentless <$> QC.chooseInt (0, envShortMax + 2),
-      pure StepScope,
+      pure StepNameTable,
       pure StepWith
     ]
 
@@ -2405,9 +2401,9 @@ data EnvModel = EnvModel
     modelSlots :: ![CThunkPtr],
     -- | Its parent, when it has one.
     modelParent :: !(Maybe EnvModel),
-    -- | Its lazy scope, when it has one: the set and the cell of its one
+    -- | Its name table, when it has one: the set and the cell of its one
     -- value.
-    modelScope :: !(Maybe (Ptr (), CThunkPtr)),
+    modelNameTable :: !(Maybe (Ptr (), CThunkPtr)),
     -- | The cells behind the with-scope entries it sees, innermost first.
     modelWithCells :: ![CThunkPtr],
     -- | The cells behind the entries of its own with-scope array, none
@@ -2427,8 +2423,8 @@ envStep prev step = case step of
     env <- newEnv EnvCall (Just (modelEnv prev)) (map Thunk cells)
     pure (EnvModel env cells (Just prev) Nothing (modelWithCells prev) [] (childEnvBytes n))
   StepParentless n -> parentlessModel n
-  StepScope -> do
-    (set@(AttrSet cset), value) <- oneNameScope
+  StepNameTable -> do
+    (set@(AttrSet cset), value) <- oneNameTable
     env <- newScopeEnv EnvLet (Just (modelEnv prev)) set
     pure (EnvModel env [] (Just prev) (Just (castPtr cset, value)) (modelWithCells prev) [] (envWordBytes + censusPointerBytes + envScopesBytes))
   StepWith -> do
@@ -2439,7 +2435,7 @@ envStep prev step = case step of
     let withs = cell : modelWithCells prev
         parentBytes = maybe 0 (const censusPointerBytes) (modelParent prev)
         slotBytes = censusPointerBytes * genericLength (modelSlots prev)
-    pure (EnvModel env (modelSlots prev) (modelParent prev) (modelScope prev) withs withs (envWordBytes + slotBytes + parentBytes + envScopesBytes + censusPointerBytes * genericLength withs))
+    pure (EnvModel env (modelSlots prev) (modelParent prev) (modelNameTable prev) withs withs (envWordBytes + slotBytes + parentBytes + envScopesBytes + censusPointerBytes * genericLength withs))
 
 -- | A model of an env with no parent holding this many fresh cells.
 parentlessModel :: Int -> IO EnvModel
@@ -2452,10 +2448,10 @@ parentlessModel n = do
 newCells :: Int -> IO [CThunkPtr]
 newCells n = mapM cthunkNewComputedInt (take n [1 ..])
 
--- | A set binding one name, to stand for a lazy scope, and the cell of
+-- | A set binding one name, to stand for a name table, and the cell of
 -- its value.
-oneNameScope :: IO (AttrSet, CThunkPtr)
-oneNameScope = do
+oneNameTable :: IO (AttrSet, CThunkPtr)
+oneNameTable = do
   value <- cthunkNewComputedInt 0
   set <- attrSetFromMap SetScope (Map.singleton "x" (Thunk value))
   pure (set, value)
@@ -2466,7 +2462,7 @@ observeEnv :: EnvModel -> IO ([CThunkPtr], Maybe Env, [WordPtr])
 observeEnv model = observe (modelEnv model)
   where
     observe env@(Env ptr) = do
-      slots <- mapM (\i -> unThunk <$> envLookupResolved 0 i env) [0 .. length (modelSlots model) - 1]
+      slots <- mapM (\i -> unThunk <$> envLookupResolved 0 (fromIntegral i) env) [0 .. length (modelSlots model) - 1]
       parent <- cenvParent ptr
       (arr, count) <- envWithScopesRaw env
       withs <- mapM (fmap ptrToWordPtr . peekElemOff arr) [0 .. fromIntegral count - 1]
@@ -2485,15 +2481,15 @@ expectedEnv model =
 
 -- | What a census from an env reaches by the model: the envs on its
 -- parent chain and their bytes, the distinct cells in their slots, own
--- with-scope arrays and lazy scopes, and the distinct lazy scopes.
+-- with-scope arrays and name tables, and the distinct name tables.
 expectedReach :: EnvModel -> (Figures, Figures, Maybe Word64)
 expectedReach final = (envs, thunks, Just (fromIntegral (Set.size sets)))
   where
     reachable = final : unfoldr (fmap (\parent -> (parent, parent)) . modelParent) final
     envs = Figures (Just (genericLength reachable)) (sum (map modelBytes reachable))
-    cells = Set.fromList (concatMap (\m -> modelSlots m ++ modelOwnWithCells m ++ maybe [] (pure . snd) (modelScope m)) reachable)
+    cells = Set.fromList (concatMap (\m -> modelSlots m ++ modelOwnWithCells m ++ maybe [] (pure . snd) (modelNameTable m)) reachable)
     thunks = Figures (Just (fromIntegral (Set.size cells))) (fromIntegral (Set.size cells) * censusCellBytes)
-    sets = Set.fromList (mapMaybe (fmap fst . modelScope) reachable)
+    sets = Set.fromList (mapMaybe (fmap fst . modelNameTable) reachable)
 
 -- | The layout of @cbits/nn_env.h@: what each kind of env holds, the
 -- with-scopes it sees through its parents, and the bytes it takes, which
@@ -2508,8 +2504,8 @@ testEnvLayout = do
         -- A call's: one slot under a parent, here one of two slots.
         callParent <- parentlessModel 2
         call <- envStep callParent (StepChild 1)
-        -- A root's: a lazy scope and no parent.
-        root <- oneNameScope >>= newScopeEnv EnvRoot Nothing . fst
+        -- A root's: a name table and no parent.
+        root <- oneNameTable >>= newScopeEnv EnvRoot Nothing . fst
         -- A with's: a copy of the two slots of the env it is made in and
         -- a with-scope array of one entry, its own.
         withEnv <- envStep callParent StepWith
@@ -2544,18 +2540,16 @@ testEnvLayout = do
               pure $
                 (observed, reach <$> taken)
                   QC.=== (map expectedEnv (toList chain), Right (expectedReach (NE.head chain), 0)),
-      -- A count without its array would send a with's copy and every with
-      -- lookup through NULL.
-      runTestM "an env with with-scopes counted and no array is refused" $ do
-        refused <- cenvNewScoped EnvRoot 0 nullPtr nullPtr nullPtr 1
-        pure (assertEqual "env" nullPtr refused),
-      -- A short env's word holds its parent's address with its slot count
-      -- in the low bits, so a parent with any of them set would read
-      -- back as another env and count.
-      runTestM "an env under a parent whose address is not an env's is refused" $ do
-        Env parent <- modelEnv <$> parentlessModel 1
-        refused <- mapM (\n -> cenvNew EnvCall n (parent `plusPtr` 1)) [1, fromIntegral envShortMax + 1]
-        pure (assertEqual "envs" [nullPtr, nullPtr] refused)
+      -- The closure's env holds the array itself, and a lazy entry one
+      -- env replaces by its set is replaced for the other.
+      runTestM "a trimmed closure under a with holds the with-scopes array the env it is made in sees" $ do
+        cell <- cthunkNewComputedInt 0
+        base <- modelEnv <$> parentlessModel 1
+        withEnv <- pushLazyWithScope (Thunk cell) base
+        closure <- buildCaptureEnv EnvClosure withEnv (CapturesWithScopes [(0, 0)])
+        seen <- envWithScopesRaw withEnv
+        held <- envWithScopesRaw closure
+        pure (assertEqual "with-scopes" seen held)
     ]
   where
     quickCheckPasses property = do
@@ -2639,7 +2633,7 @@ testFrameKnots = do
       runTestM "tieFrame answers the cells it filled the slots with" $ do
         codes <- mapM (compileExpr . ELit . NixInt) [1, 2, 3]
         (frame, thunks) <- tieFrame EnvLet Nothing (length codes) (\env -> mapM (mkThunkBc env) codes)
-        slotted <- mapM (\i -> unThunk <$> envLookupResolved 0 i frame) [0 .. length codes - 1]
+        slotted <- mapM (\i -> unThunk <$> envLookupResolved 0 (fromIntegral i) frame) [0 .. length codes - 1]
         pure (assertEqual "cells" slotted (map unThunk thunks)),
       -- A frame's slots are empty until tieFrame fills them, and C answers
       -- NULL for an empty one; a thunk made by reading one would fault at
@@ -2650,15 +2644,12 @@ testFrameKnots = do
           Left (CInvariantViolated site _) -> assertEqual "site" "nn_env_lookup_resolved" site
           Left other -> Fail ("expected CInvariantViolated, got " <> T.pack (show other))
           Right _ -> Fail "the unfilled slot was read as a thunk",
-      -- A level past the parent chain, an index past the slots and a level
-      -- that reaches C negative hold nothing either, and refuse the same
-      -- way.
+      -- A level past the parent chain and an index past the slots hold
+      -- nothing either, and refuse the same way.
       runTestM "a resolved lookup past the env's parents or slots raises CInvariantViolated" $ do
         cell <- evaluated VNull
         env <- newEnv EnvClosure Nothing [cell]
-        -- A level read from a bytecode word past INT_MAX reaches C negative.
-        let corruptLevel = fromIntegral (maxBound :: Word32)
-        outcomes <- mapM (\(level, idx) -> try (envLookupResolved level idx env)) [(1, 0), (0, 1), (corruptLevel, 0)]
+        outcomes <- mapM (\(level, idx) -> try (envLookupResolved level idx env)) [(1, 0), (0, 1), (maxBound, 0)]
         let site = \case
               Left (CInvariantViolated at _) -> Just at
               _ -> Nothing
@@ -2906,6 +2897,27 @@ testEvalWith = do
           "with-rec"
           "with { a = 1; }; rec { b = a + 1; c = b + 1; }.c"
           (VInt 3),
+      -- A rec binds its static names alone, as upstream's ExprAttrs::bindVars
+      -- does (nixexpr.cc at 2.24.9): a name only a dynamic key gives is a
+      -- with-variable, and no with has it.  The key interpolates more than
+      -- a plain string, which upstream's parser and this one read as a
+      -- static name.
+      runTest "a with-variable named only by a rec's dynamic key is undefined" $
+        assertEvalError
+          "with-rec-dynamic"
+          "rec { ${\"x\" + \"\"} = 1; y = with {}; x; }.y"
+          "undefined variable 'x'",
+      -- A with-variable in a trimmed closure is looked up in the withs
+      -- inside it and the withs around it, and in nothing else.
+      runTest "a with-variable no with has is undefined in a trimmed closure" $
+        assertEvalError
+          "with-trimmed-inner-miss"
+          "let b = 1; f = a: with {}; [ a b zzz ]; in builtins.elemAt (f 1) 2"
+          "undefined variable 'zzz'"
+          `andThen` assertEvalError
+            "with-trimmed-outer-miss"
+            "with { y = 2; }; let b = 1; f = a: [ a b y zzz ]; r = f 1; in builtins.seq (builtins.elemAt r 2) (builtins.elemAt r 3)"
+            "undefined variable 'zzz'",
       -- AST test: parse "with a; b" produces EWithVar
       runTest "parse with produces EWithVar" $
         assertRight "with-ast" (parsedExpr <$> parseNixWithScope (withGlobals ["a"]) testBaseDir testOrigin "with a; b") $ \case
@@ -24687,10 +24699,10 @@ testStringSharing = do
             cells <- clistThunks list
             case cells of
               [s1, s2, c1, c2, p1, p2, l1, l2] -> do
-                strs <- mapM cthunkGetStr [s1, s2]
-                literals <- mapM cthunkGetStr [l1, l2]
-                ctxs <- mapM cthunkGetCtxStr [c1, c2]
-                paths <- mapM cthunkGetPath [p1, p2]
+                strs <- mapM cthunkPayload [s1, s2]
+                literals <- mapM cthunkPayload [l1, l2]
+                ctxs <- mapM cthunkPayload [c1, c2]
+                paths <- mapM cthunkPayload [p1, p2]
                 pure $
                   assertEqual "string" True (allSame strs)
                     `andThen` assertEqual "literal" True (allSame literals)
@@ -24703,7 +24715,7 @@ testStringSharing = do
         (_, dataOff) <- cbcCountedPayload idx =<< cbcArg1 idx
         code <- cbcData (dataOff + 1) >>= cbcString
         cells <- replicateM 2 (cheapThunkBc emptyEnv idx)
-        held <- mapM (cthunkGetStr . unThunk) cells
+        held <- mapM (fmap castPtr . cthunkPayload . unThunk) cells
         values <- mapM readThunkValue cells
         pure $
           assertEqual "the code's string" [code, code] held
@@ -24712,7 +24724,7 @@ testStringSharing = do
         idx <- compileExpr (ELit (NixUri "zuri:shared"))
         code <- cbcArg1 idx >>= cbcString
         cell <- cheapThunkBc emptyEnv idx
-        held <- cthunkGetStr (unThunk cell)
+        held <- castPtr <$> cthunkPayload (unThunk cell)
         value <- readThunkValue cell
         pure (assertEqual "the code's string" code held `andThen` assertEqual "value" (Just (mkStr "zuri:shared")) value),
       -- Only a corrupt store names a string no emit returned.
@@ -26641,8 +26653,8 @@ bindingBack binding = case binding of
 -- | A closure keeps its formals type, ellipsis flag and formal count in
 -- one word (cbits/nn_lambda.h): the type in the top two bits, the flag
 -- below it and the count in the 29 bits left.  Each field reads back as
--- packed at both ends of its range, and a type or count the word cannot
--- hold is refused before anything is allocated.
+-- packed at both ends of its range, and a count the word cannot hold is
+-- refused before anything is allocated.
 testLambdaShape :: IO [Bool]
 testLambdaShape = do
   putStrLn "cbits/lambda-shape"
@@ -26658,22 +26670,63 @@ testLambdaShape = do
         assertEqual "flag" 1 (clambdaShapeAllowExtra (clambdaShape 2 255 0)),
       runTestM "a closure reads back the shape it was made with" $ do
         lam <- clambdaNew nullPtr 0 2 0 0 1 3
-        if lam == nullPtr
-          then pure (Fail "a closure of three formals was refused")
-          else do
-            formalsType <- clambdaFormalsType lam
-            flag <- clambdaAllowExtra lam
-            count <- clambdaFormalCount lam
-            pure (assertEqual "shape" (2, 1, 3) (formalsType, flag, count)),
-      runTestM "a count or type the shape cannot hold is refused" $ do
-        refused <-
-          sequence
+        formalsType <- clambdaFormalsType lam
+        flag <- clambdaAllowExtra lam
+        count <- clambdaFormalCount lam
+        pure (assertEqual "shape" (2, 1, 3) (formalsType, flag, count)),
+      runTestM "a count the shape cannot hold is refused" $ do
+        outcomes <-
+          mapM
+            try
             [ clambdaNew nullPtr 0 1 0 0 0 (maxFormals + 1),
-              clambdaNew nullPtr 0 1 0 0 0 maxBound,
-              clambdaNew nullPtr 0 3 0 0 0 0
+              clambdaNew nullPtr 0 1 0 0 0 maxBound
             ]
-        pure (assertEqual "refused" [True, True, True] (map (== nullPtr) refused))
+        let site = \case
+              Left (CAllocationFailed at _) -> Just at
+              _ -> Nothing
+        pure (assertEqual "refusals" (replicate 2 (Just "nn_lambda_new")) (map site outcomes))
     ]
+
+-- | A closure's formals type and a string context element's tag each
+-- hold one of the values the C side names (@NN_FORMALS_*@ and
+-- @NN_SCE_*@).  Only memory written past the library holds another, so
+-- each test writes one in place, at the field's offset in the struct
+-- cbits/nn_lambda.h or cbits/nn_ctxstr.h lays out, and restores the
+-- field once the read has refused it.
+testUnknownTags :: IO [Bool]
+testUnknownTags = do
+  putStrLn "cbits/unknown-tags"
+  sequence
+    [ runTestM "a closure whose shape holds no formals type raises CInvariantViolated" $ do
+        cell <- evaluated (VLambda emptyEnv (EFName "x") 0)
+        lam <- cthunkPayload (unThunk cell)
+        outcome <- withFieldAt lam lambdaShapeOffset (clambdaShape unnamedTag 0 0) (readComputed (unThunk cell))
+        pure (assertEqual "site" (Just "nn_lambda_formals_type") (violatedAt outcome)),
+      runTestM "a string context element with no known tag raises CInvariantViolated" $ do
+        cell <- evaluated (VStr "ztext" (StringContext (Set.singleton (SCPlain (StorePath censusStoreHash "zname")))))
+        ctxstr <- cthunkPayload (unThunk cell)
+        outcome <- withFieldAt ctxstr firstElementOffset unnamedTag (readComputed (unThunk cell))
+        pure (assertEqual "site" (Just "nn_ctxstr_elem_tag") (violatedAt outcome))
+    ]
+  where
+    -- No NN_FORMALS_* or NN_SCE_* tag is 3, the one value of a shape's
+    -- two bits of formals type the tags leave unnamed.
+    unnamedTag = 3 :: Word8
+    pointerBytes = sizeOf (nullPtr :: Ptr ())
+    -- An nn_lambda_t's shape follows its two pointers and three words.
+    lambdaShapeOffset = 2 * pointerBytes + 3 * sizeOf (0 :: Word32)
+    -- An nn_ctxstr_t's elements follow its text pointer and its count,
+    -- padded to their pointer alignment, and an element's tag is its
+    -- first byte.
+    firstElementOffset = 2 * pointerBytes
+    withFieldAt :: (Storable a) => Ptr () -> Int -> a -> IO b -> IO (Either CStatusError b)
+    withFieldAt ptr offset value act = do
+      original <- peekByteOff ptr offset
+      pokeByteOff ptr offset (value `asTypeOf` original)
+      try act `finally` pokeByteOff ptr offset original
+    violatedAt = \case
+      Left (CInvariantViolated site _) -> Just site
+      _ -> Nothing
 
 testBytecodeTags :: IO [Bool]
 testBytecodeTags = do
@@ -28052,8 +28105,8 @@ testStaticGlobalsSync = do
   where
     rootEnvNames policy = do
       Env envPtr <- builtinEnv policy 0 []
-      scopePtr <- cenvLazyScope envPtr
-      Set.fromList <$> attrSetKeys (AttrSet (castPtr scopePtr))
+      tablePtr <- cenvNameTable envPtr
+      Set.fromList <$> attrSetKeys (AttrSet (castPtr tablePtr))
     assertSameNames label expected actual =
       assertEqual
         (label <> ": (missing, extra)")
@@ -28660,6 +28713,7 @@ runSuite = do
           testBytecodeCompile,
           testBytecodeTags,
           testLambdaShape,
+          testUnknownTags,
           testBytecodeCorrupt,
           testBytecodeCountSpill,
           testBytecodePerElement,

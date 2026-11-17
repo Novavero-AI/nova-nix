@@ -117,7 +117,6 @@ static int            g_live;
 
 void nn_str_init(void)
 {
-    nn_str_destroy();
     g_live = 1;
 }
 

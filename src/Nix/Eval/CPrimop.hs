@@ -59,8 +59,8 @@ foreign import ccall unsafe "nn_primop_app_arg"
 
 -- | A partial application of the builtin at an index to the cells of the
 -- arguments it has taken, first to last, with bit @i@ of the mask set
--- when argument @i@ was taken forced.  The C side refuses no argument and
--- more than the mask has bits, which a partial application never has.
+-- when argument @i@ was taken forced.  No argument, or more than the
+-- mask has bits, aborts in C; a partial application never has either.
 cprimopAppNew :: (MonadCData m) => Word32 -> Word16 -> [CThunkPtr] -> m CPrimopAppPtr
 cprimopAppNew primop forced args =
   cdataIO $ withArrayLen args $ \taken argsPtr ->

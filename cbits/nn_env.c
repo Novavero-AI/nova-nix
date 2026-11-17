@@ -10,6 +10,7 @@
  */
 
 #include "nn_env.h"
+#include "nn_assert.h"
 #include "nn_stats.h"
 
 #include <stdio.h>
@@ -66,7 +67,6 @@ typedef char nn_env_short_max_check_[(NN_ENV_SHORT_MAX == NN_ENV_SHORT_MASK) ? 1
 
 static struct nn_env_page *g_first_page = NULL;
 static struct nn_env_page *g_current_page = NULL;
-static uint64_t g_total_bytes = 0;
 static uint64_t g_app_count = 0;
 static uint64_t g_app_bytes = 0;
 
@@ -124,7 +124,6 @@ nn_env_alloc_raw(uint32_t bytes)
     void *result = g_current_page->data + g_current_page->used;
     memset(result, 0, bytes);
     g_current_page->used += bytes;
-    g_total_bytes += bytes;
     return result;
 }
 
@@ -217,8 +216,9 @@ env_alloc(uint32_t slot_count, nn_env_t *parent, const nn_env_scopes_t *scopes,
                      : (parent ? NN_ENV_PARENT : 0) | (scopes ? NN_ENV_SCOPES : 0);
     uint64_t bytes = env_shape_bytes(slot_count, fields);
     /* A parent's low bits would read back as a slot count.  No env's
-     * address has them set, so a parent that does is corrupt input. */
-    if ((uintptr_t)parent & NN_ENV_SHORT_MASK) return NULL;
+     * address has them set, so a parent that does is corrupt state. */
+    NN_ASSERT(((uintptr_t)parent & NN_ENV_SHORT_MASK) == 0,
+              "env_alloc: parent address with NN_ENV_SHORT_MASK bits set");
     if (bytes > UINT32_MAX) return NULL;
     nn_env_t *env = (nn_env_t *)nn_env_alloc_raw((uint32_t)bytes);
     if (!env) return NULL;
@@ -239,14 +239,9 @@ env_alloc(uint32_t slot_count, nn_env_t *parent, const nn_env_scopes_t *scopes,
 void
 nn_env_init(void)
 {
-    if (g_first_page) {
-        nn_env_destroy();
-    }
-
     g_first_page = alloc_page(NN_ENV_PAGE_SIZE);
     if (!g_first_page) { fprintf(stderr, "nn_env_init: page alloc failed\n"); abort(); }
     g_current_page = g_first_page;
-    g_total_bytes = 0;
     g_app_count = 0;
     g_app_bytes = 0;
 }
@@ -268,7 +263,6 @@ nn_env_destroy(void)
     }
     g_first_page = NULL;
     g_current_page = NULL;
-    g_total_bytes = 0;
     g_app_count = 0;
     g_app_bytes = 0;
 }
@@ -306,6 +300,23 @@ nn_env_app_bytes(void)
     return g_app_bytes;
 }
 
+/* --- With-scopes arrays --- */
+
+/* An array of `count` with-scope entries for an env at `site`, all NULL,
+ * or NULL for none, for one past the allocator's uint32 byte limit or on
+ * OOM. */
+static void **
+nn_env_alloc_with_scopes(uint32_t count, uint32_t site)
+{
+    void **withs = nn_env_alloc_pointers(count);
+    /* nn_env_alloc_pointers refused every count whose bytes pass
+     * UINT32_MAX, and a whole number of pointers is a whole number of
+     * NN_ENV_ALIGNMENT units. */
+    if (withs && nn_stats_counting)
+        nn_stats_count_env_bytes(site, (uint64_t)count * sizeof(void *));
+    return withs;
+}
+
 /* --- Env constructors --- */
 
 nn_env_t *
@@ -322,15 +333,16 @@ nn_env_new(uint32_t slot_count, nn_env_t *parent, uint32_t site)
 
 nn_env_t *
 nn_env_new_scoped(uint32_t slot_count, nn_env_t *parent,
-                  void *lazy_scope,
+                  void *name_table,
                   void **with_scopes, uint32_t with_count,
                   uint32_t site)
 {
     nn_env_scopes_t scopes;
     /* A count without its array would send nn_env_push_with's copy and
-     * every with lookup through NULL; refuse it as corrupt input. */
-    if (with_count > 0 && with_scopes == NULL) return NULL;
-    scopes.lazy_scope = lazy_scope;
+     * every with lookup through NULL. */
+    NN_ASSERT(with_count == 0 || with_scopes != NULL,
+              "nn_env_new_scoped: a with-scope count without an array");
+    scopes.name_table = name_table;
     scopes.with_scopes = with_scopes;
     scopes.with_count = with_count;
     return env_alloc(slot_count, parent, &scopes, site);
@@ -342,10 +354,10 @@ nn_env_push_with(nn_env_t *base, void *scope, uint32_t site)
     const nn_env_t *owner = nn_env_with_owner(base);
     uint32_t outer = owner ? nn_env_with_count(owner) : 0;
 
-    /* The increment must not wrap.  Counts anywhere near this bound
-     * cannot allocate anyway (the array alloc caps at UINT32_MAX
-     * bytes), so this is the formal guard, not a reachable limit. */
-    if (outer == UINT32_MAX) return NULL;
+    /* Every with-scopes array is one nn_env_alloc_with_scopes made, of
+     * fewer than UINT32_MAX entries, so the increment does not wrap. */
+    NN_ASSERT(outer < UINT32_MAX,
+              "nn_env_push_with: with-scope count at UINT32_MAX");
     uint32_t new_count = outer + 1;
     void **new_withs = nn_env_alloc_with_scopes(new_count, site);
     if (!new_withs) return NULL;
@@ -359,7 +371,7 @@ nn_env_push_with(nn_env_t *base, void *scope, uint32_t site)
 
     uint32_t slot_count = slot_count_of(base);
     nn_env_t *env = nn_env_new_scoped(slot_count, parent_of(base),
-                                      nn_env_lazy_scope(base),
+                                      nn_env_name_table(base),
                                       new_withs, new_count, site);
     if (!env) return NULL;
     if (slot_count > 0) {
@@ -398,10 +410,10 @@ nn_env_scopes(const nn_env_t *env)
 }
 
 void *
-nn_env_lazy_scope(const nn_env_t *env)
+nn_env_name_table(const nn_env_t *env)
 {
     const nn_env_scopes_t *scopes = nn_env_scopes(env);
-    return scopes ? scopes->lazy_scope : NULL;
+    return scopes ? scopes->name_table : NULL;
 }
 
 void **
@@ -428,9 +440,9 @@ nn_env_bytes(const nn_env_t *env)
 /* --- Lookup --- */
 
 void *
-nn_env_lookup_resolved(const nn_env_t *env, int level, int idx)
+nn_env_lookup_resolved(const nn_env_t *env, uint32_t level, uint32_t idx)
 {
-    if (env == NULL || level < 0) {
+    if (env == NULL) {
         return NULL;
     }
     while (level > 0) {
@@ -441,20 +453,10 @@ nn_env_lookup_resolved(const nn_env_t *env, int level, int idx)
         env = parent;
         level--;
     }
-    if (idx < 0 || (uint32_t)idx >= slot_count_of(env)) {
+    if (idx >= slot_count_of(env)) {
         return NULL;
     }
     return env->slots[idx];
-}
-
-void *
-nn_env_root_scope(const nn_env_t *env)
-{
-    const nn_env_t *parent;
-    while ((parent = parent_of(env)) != NULL) {
-        env = parent;
-    }
-    return nn_env_lazy_scope(env);
 }
 
 nn_env_t *
@@ -466,26 +468,17 @@ nn_env_with_owner(nn_env_t *env)
     return env;
 }
 
-/* --- With-scopes array allocation --- */
-
-void **
-nn_env_alloc_with_scopes(uint32_t count, uint32_t site)
-{
-    void **withs = nn_env_alloc_pointers(count);
-    /* nn_env_alloc_pointers refused every count whose bytes pass
-     * UINT32_MAX, and a whole number of pointers is a whole number of
-     * NN_ENV_ALIGNMENT units. */
-    if (withs && nn_stats_counting)
-        nn_stats_count_env_bytes(site, (uint64_t)count * sizeof(void *));
-    return withs;
-}
-
 /* --- Diagnostics --- */
 
 uint64_t
 nn_env_bytes_allocated(void)
 {
-    return g_total_bytes;
+    uint64_t bytes = 0;
+    struct nn_env_page *page;
+    for (page = g_first_page; page; page = page->next) {
+        bytes += page->used;
+    }
+    return bytes;
 }
 
 /* --- Census --- */

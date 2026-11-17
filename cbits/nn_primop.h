@@ -20,6 +20,8 @@
 #ifndef NN_PRIMOP_H
 #define NN_PRIMOP_H
 
+#include "nn_tracker.h"
+
 #include <stdint.h>
 
 struct nn_thunk;
@@ -41,9 +43,10 @@ typedef struct nn_primop_app {
 /* --- Lifecycle --- */
 
 /* A partial application of `primop` to the `taken` cells at `args`.
- * Returns NULL on allocation failure, or for no argument or more than
- * NN_PRIMOP_APP_MAX_ARGS: a builtin with none taken is a NN_VALUE_PRIMOP
- * cell, not an application. */
+ * Returns NULL on allocation failure.  `taken` is 1 to
+ * NN_PRIMOP_APP_MAX_ARGS, and `args` holds that many cells: a count
+ * outside that range, or NULL `args`, aborts (NN_ASSERT).  A builtin
+ * with none taken is a NN_VALUE_PRIMOP cell, not an application. */
 nn_primop_app_t *nn_primop_app_new(uint32_t primop, uint16_t forced,
                                    struct nn_thunk *const *args, uint16_t taken);
 
@@ -62,11 +65,10 @@ struct nn_thunk *nn_primop_app_arg(const nn_primop_app_t *app, uint16_t i);
 
 /* --- Census (nn_stats.h) --- */
 
-/* The tracked applications, in no particular order: the module's own
- * array, valid until the next application is made or
- * nn_primop_app_free_all runs.  Writes how many it holds to *count and
- * how many it has room for to *capacity. */
-nn_primop_app_t *const *nn_primop_app_tracked(uint32_t *count, uint32_t *capacity);
+/* Every application allocated and not yet freed: the module's own
+ * tracker, whose array moves when the next application is made and is
+ * freed by nn_primop_app_free_all. */
+const nn_tracker_t *nn_primop_app_tracked(void);
 
 /* Bytes an application holds from the allocator. */
 uint64_t nn_primop_app_bytes(const nn_primop_app_t *app);

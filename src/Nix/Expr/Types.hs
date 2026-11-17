@@ -161,8 +161,8 @@ data CaptureInfo
     NoCaptureInfo
   | -- | Sorted list of @(level, index)@ pairs to extract from the parent env.
     Captures ![(Int, Int)]
-  | -- | Like 'Captures', but the trimmed env must preserve its with-scopes
-    -- ('Nix.Eval.Types.envWithScopesRaw'), with builtins appended, so that
+  | -- | Like 'Captures', but the trimmed env keeps the with-scopes of the
+    -- env it is made in ('Nix.Eval.Types.envWithScopesRaw'), so that
     -- 'EWithVar' references can still be resolved.
     CapturesWithScopes ![(Int, Int)]
   deriving (Eq, Show)
@@ -271,6 +271,6 @@ data Expr
     -- Produced by 'Nix.Expr.Resolve.resolveVars' for names inside
     -- a @with@ body that are not found in any lexical scope.
     -- At runtime, looked up in the env's with-scopes
-    -- ('Nix.Eval.Types.envWithScopesRaw'), with builtins as the fallback.
+    -- ('Nix.Eval.Types.envWithScopesRaw'), and undefined when none has it.
     EWithVar !Text
   deriving (Eq, Show)

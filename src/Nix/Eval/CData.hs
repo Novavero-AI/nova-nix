@@ -45,7 +45,8 @@
 -- other action does.
 module Nix.Eval.CData
   ( -- * Actions
-    CData (..),
+    CData,
+    runCData,
     MonadCData (..),
     cdataIO,
 
@@ -60,10 +61,17 @@ import System.IO.Unsafe (unsafeDupablePerformIO, unsafePerformIO)
 -- | An action on the C data layer: an FFI call into @cbits/@, or a peek
 -- or poke of memory the layer handed out.  Nothing else is wrapped, so a
 -- function whose result is a t'CData' touches nothing but that memory.
--- The constructor is used by the modules that bind the layer and by
--- "Nix.Eval.Types", which composes their calls.
-newtype CData a = CData {runCData :: IO a}
+-- The constructor is not exported: the modules that bind the layer make
+-- an action with 'cdataIO', and 'runCData', 'readImmutable' and
+-- 'runCDataPure' run one.
+newtype CData a = CData (IO a)
   deriving (Functor, Applicative, Monad)
+
+-- | Run an action in 'IO', for the 'MonadCData' instance of a monad over
+-- 'IO'.
+runCData :: CData a -> IO a
+runCData (CData io) = io
+{-# INLINE runCData #-}
 
 -- | A monad that runs C data-layer actions in sequence with its own.
 -- The evaluator's monads ('Nix.Eval.Types.MonadEval') are instances, and
