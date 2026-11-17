@@ -22,8 +22,12 @@ if [ "$onDiskCount" -eq 0 ]; then
   exit 1
 fi
 
-# Fragments named by git, oldest commit first, filtered to the ones that still
-# exist: a file added and later renamed or removed is still named by the log.
+# Fragments named by git, oldest commit first, each at the first commit that
+# added its name, filtered to the ones that still exist.  --no-renames lists a
+# rename as its old name removed and its new name added, so a renamed fragment
+# is ordered by its rename; git's default would list the old name alone, which
+# no longer exists.  A fragment removed and added again is named twice and kept
+# once.
 ordered=""
 orderedCount=0
 while IFS= read -r fragment; do
@@ -32,8 +36,9 @@ while IFS= read -r fragment; do
     orderedCount=$((orderedCount + 1))
   fi
 done < <(
-  git log --reverse --diff-filter=A --format= --name-only -- "$fragmentDir" \
-    | grep -E "^${fragmentDir}/.*\.md$" || true
+  git log --reverse --no-renames --diff-filter=A --format= --name-only -- "$fragmentDir" \
+    | grep -E "^${fragmentDir}/.*\.md$" \
+    | awk '!seen[$0]++' || true
 )
 
 if [ "$orderedCount" -ne "$onDiskCount" ]; then
