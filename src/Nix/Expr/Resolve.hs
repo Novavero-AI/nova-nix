@@ -35,7 +35,6 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as TE
 import Nix.Expr.Types
 import System.FilePath (isRelative, (</>))
 
@@ -135,18 +134,6 @@ resolve stack expr = case expr of
     EAssert <$> resolve stack cond <*> resolve stack body
   EUnary op operand -> EUnary op <$> resolve stack operand
   EBinary op l r -> EBinary op <$> resolve stack l <*> resolve stack r
-  -- Desugar: <name> becomes __findFile __nixPath "name"
-  -- Matches C++ Nix's parser desugaring.  __findFile and __nixPath are
-  -- in the root scope (Builtins.hs), so they resolve via name-based
-  -- lookup at runtime.  This ensures closure trimming captures the
-  -- implicit builtins dependency.
-  ESearchPath name ->
-    resolve
-      stack
-      ( EApp
-          (EApp (EVar "__findFile") (EVar "__nixPath"))
-          (EStr [StrLit (TE.encodeUtf8 name)])
-      )
   where
     recAttrs resolved = EAttrs True resolved NoCaptureInfo
     letIn resolved body = ELet resolved body NoCaptureInfo
@@ -502,7 +489,6 @@ resolveRelativePaths dir = goExpr
       EAssert cond body -> EAssert (goExpr cond) (goExpr body)
       EUnary op e -> EUnary op (goExpr e)
       EBinary op l r -> EBinary op (goExpr l) (goExpr r)
-      ESearchPath _ -> expr
 
     goPart part = case part of
       StrLit _ -> part

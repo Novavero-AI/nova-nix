@@ -438,7 +438,7 @@ parseAtom = do
     TokUri u -> advance >> pure (ELit (NixUri u))
     TokPath p -> advance >> pure (ELit (NixPath p))
     TokPathInterpStart headPiece -> advance >> EPathStr headPiece <$> parsePathParts
-    TokSearchPath p -> advance >> pure (ESearchPath p)
+    TokSearchPath name -> advance >> pure (searchPathCall name)
     TokIdent name
       | name == curPosIdentifier -> EPos <$> currentPos <* advance
       -- Upstream interns a variable's name where it reads it
@@ -467,6 +467,22 @@ parseAtom = do
 -- name: an @inherit@ copies a variable of any name, @__curPos@ included.
 curPosIdentifier :: Text
 curPosIdentifier = "__curPos"
+
+-- | The call a search path @\<name\>@ parses as, @__findFile __nixPath
+-- "name"@, as upstream's parser makes it (the @SPATH@ rule of
+-- @expr_simple@, parser.y at 2.24.9).  Both are variables, so a binding
+-- of either in scope is the one the call uses.  Upstream interns both
+-- names as its evaluator starts ("Nix.Eval.StartupSymbols"), so the
+-- parser notes neither for the interning order.
+searchPathCall :: Text -> Expr
+searchPathCall name =
+  EApp (EApp (EVar findFileVariable) (EVar nixPathVariable)) (EStr [StrLit (TE.encodeUtf8 name)])
+
+-- | The variables a search path's call names: upstream's @findFile@ and
+-- @nixPath@ symbols.
+findFileVariable, nixPathVariable :: Text
+findFileVariable = "__findFile"
+nixPathVariable = "__nixPath"
 
 -- ---------------------------------------------------------------------------
 -- Strings

@@ -48,7 +48,6 @@ module Nix.Parser
   ( -- * Parsing
     parseNix,
     parseNixWithScope,
-    parseNixFile,
 
     -- * Parsed source
     ParsedSource,
@@ -72,7 +71,6 @@ import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Lazy as BL
 import Data.Set (Set)
 import Data.Text (Text)
-import qualified Data.Text as T
 import Data.Word (Word32, Word8)
 import Nix.Expr.ClosureTrim (trimClosures)
 import Nix.Expr.Resolve (resolveRelativePaths, resolveVars, staticGlobalNames)
@@ -81,7 +79,6 @@ import Nix.Parser.Expr (parseTopLevel)
 import Nix.Parser.Internal (ParseState (..), runParser)
 import Nix.Parser.Lexer (positionAfter, tokenize)
 import Nix.Parser.ParseError (ParseError (..))
-import System.FilePath (takeDirectory)
 
 -- | Source the parser has read: its expression, and the names in it in
 -- the order upstream's parser interns them (its @symbols.create@ calls,
@@ -152,10 +149,6 @@ parseNixWithScope scope baseDir origin source = do
   (expr, final) <- first SyntaxError (runParser parseTopLevel st)
   resolved <- first UndefinedVariable (resolveVars scope expr)
   pure (ParsedSource (reverse (psNames final)) (resolveRelativePaths baseDir (trimClosures resolved)))
-
--- | Parse a @.nix@ file from disk.
-parseNixFile :: FilePath -> IO (Either SourceError ParsedSource)
-parseNixFile path = parseNix (takeDirectory path) (SourceFile (T.pack path)) <$> BS.readFile path
 
 -- ---------------------------------------------------------------------------
 -- Encoding detection

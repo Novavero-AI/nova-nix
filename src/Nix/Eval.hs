@@ -130,7 +130,7 @@ import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAtt
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.Builtin (Builtin, builtinName)
 import qualified Nix.Eval.Builtin as Builtin
-import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, cbcStringText, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpPos, pattern OpResolvedVar, pattern OpSearchPath, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpPos, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (MonadCData)
 import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CStr (cstrText)
@@ -361,7 +361,6 @@ evalBytecode env bcIdx =
                 OpNot -> operate
         Nothing -> corruptBytecode "unary operator tag" flags_
     OpBinary -> evalBcBinary env bcIdx
-    OpSearchPath -> cbcArg1 bcIdx >>= cbcStringText >>= evalSearchPath env
     OpPos -> cbcArg1 bcIdx >>= positionValue . PosIdx
     opcode -> corruptBytecode "opcode" opcode
 
@@ -1052,38 +1051,6 @@ bcBindingIsStatic (BcNamed _ (BcStaticKey _) _) = True
 bcBindingIsStatic (BcNamed {}) = False
 bcBindingIsStatic (BcInherit {}) = True
 bcBindingIsStatic (BcInheritFrom _ _) = True
-
--- ---------------------------------------------------------------------------
--- Search paths (<nixpkgs>, <nixpkgs/lib>)
--- ---------------------------------------------------------------------------
-
--- | Evaluate a search path expression.
--- Desugars to @builtins.findFile builtins.nixPath "name"@ - exactly how
--- real Nix handles @\<name\>@ expressions.
-evalSearchPath :: (MonadEval m) => Env -> Text -> m NixValue
-evalSearchPath env name = do
-  builtinsVal <- evalVar env "builtins"
-  case builtinsVal of
-    VAttrs builtinsAttrs ->
-      attrSetLookup "nixPath" builtinsAttrs >>= \case
-        Just nixPathThunk -> do
-          nixPathVal <- force nixPathThunk
-          builtinFindFile nixPathVal (mkStr name)
-        Nothing -> searchPathMiss name
-    _ -> searchPathMiss name
-
--- | A lookup that matched no entry.  A CATCHABLE error (upstream raises
--- ThrownError here): nixpkgs' impure.nix wraps @<nixpkgs-overlays>@ in
--- @tryEval@ and relies on catching the miss.  The wording is upstream's
--- @findFile@: under @pure-eval@ the search path is empty by construction,
--- and the message says so instead of pointing at @NIX_PATH@.
-searchPathMiss :: (MonadEval m) => Text -> m a
-searchPathMiss name = do
-  policy <- evalPolicy
-  throwCatchableError $
-    if epPureEval policy
-      then "cannot look up '<" <> name <> ">' in pure evaluation mode (use '--impure' to override)"
-      else "file '" <> name <> "' was not found in the Nix search path (add it using $NIX_PATH or -I)"
 
 -- ---------------------------------------------------------------------------
 -- Variables
@@ -3386,6 +3353,19 @@ forceSearchEntry thunk = do
         _ -> throwEvalError "builtins.findFile: 'path' must be a string or path"
       pure (prefix, path)
     _ -> throwEvalError "builtins.findFile: search path entry must be a set"
+
+-- | A lookup that matched no entry.  A CATCHABLE error (upstream raises
+-- ThrownError here): nixpkgs' impure.nix wraps @<nixpkgs-overlays>@ in
+-- @tryEval@ and relies on catching the miss.  The wording is upstream's
+-- @findFile@: under @pure-eval@ the search path is empty by construction,
+-- and the message says so instead of pointing at @NIX_PATH@.
+searchPathMiss :: (MonadEval m) => Text -> m a
+searchPathMiss name = do
+  policy <- evalPolicy
+  throwCatchableError $
+    if epPureEval policy
+      then "cannot look up '<" <> name <> ">' in pure evaluation mode (use '--impure' to override)"
+      else "file '" <> name <> "' was not found in the Nix search path (add it using $NIX_PATH or -I)"
 
 -- | Iterate search path entries, checking for a match.  A miss is
 -- 'searchPathMiss'.  The existence probe is the policy-gated one: a
