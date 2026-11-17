@@ -125,9 +125,9 @@ void nn_stats_allocated(uint64_t *counts, uint64_t *bytes);
  * text. */
 uint64_t nn_stats_overhead_bytes(void);
 
-/* Bytes the bytecode store holds, its strings included.  Code is never
- * freed, so the mark does not look at it, and a string of the code's
- * that a value points at is placed and not counted. */
+/* Bytes the bytecode store holds, its strings included.  Code is freed
+ * only as the session ends, so the mark does not look at it, and a string
+ * of the code's that a value points at is placed and not counted. */
 uint64_t nn_stats_code_bytes(void);
 
 /* --- The mark --- */

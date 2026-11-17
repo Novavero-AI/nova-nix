@@ -1,32 +1,28 @@
-# Stress test: pure function-application + thunk pressure
+# Stress test: function calls, attribute selections and thunk forces
 #
-# Targets the top allocators from cost-center profiling:
-#   evalApp (19.3%), forceThunk (11.4%), evalSelect (8.0%), evalIf (6.5%)
-#
-# Creates millions of function calls, attr selections, and thunk forces
-# without needing file imports.
+# Millions of each, with no file imports.
 #
 # Run: cabal run nova-nix -- eval stress.nix +RTS -s -M2G
 
 let
-  # --- Layer 1: Function call chains (evalApp + matchFormals) ---
+  # --- Layer 1: Function call chains ---
 
-  # Simple lambda: x: body - tests FormalName path
+  # A plain argument: x: body
   apply1 = f: x: f x;
   apply2 = f: x: f (f x);
   compose = f: g: x: f (g x);
 
-  # Set-pattern lambda: { a, b, ... }: body - tests FormalSet path
+  # A set pattern: { a, b, ... }: body
   addFields = { a, b, ... }: a + b;
   mergeWith = f: { a, b, ... }: f a b;
 
   # --- Layer 2: Recursive computation (deep thunk chains) ---
 
-  # Each call creates: argThunk (IORef), Env, SmallArray
+  # Each call makes an argument thunk and an environment
   sum = n: if n <= 0 then 0 else n + sum (n - 1);
   fib = n: if n <= 1 then n else fib (n - 1) + fib (n - 2);
 
-  # --- Layer 3: Attr set construction + selection (evalSelect) ---
+  # --- Layer 3: Attribute set construction and selection ---
 
   mkPkg = i: rec {
     pname = "pkg-${builtins.toString i}";
@@ -45,13 +41,13 @@ let
 
   n = 100000;
 
-  # genList creates n thunks via mkThunk
+  # genList makes n deferred applications
   packages = builtins.genList mkPkg n;
 
-  # map creates n thunks via deferApply
+  # map makes n deferred applications
   names = map (p: p.fullName) packages;
 
-  # filter creates thunks + forces evalIf per element
+  # filter forces its predicate for each element
   shortNames = builtins.filter (name: builtins.stringLength name < 20) names;
 
   # --- Layer 5: Recursive attr set (the nixpkgs-like pattern) ---
@@ -67,5 +63,5 @@ let
   ) pkgSet;
 
 in
-  # Force everything: this triggers millions of evalApp + forceThunk + evalSelect
+  # Force everything
   (builtins.length shortNames) + (builtins.length (builtins.attrNames overlaid)) + (sum 5000)
