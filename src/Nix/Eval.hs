@@ -108,7 +108,7 @@ import Data.Either (partitionEithers)
 import Data.Foldable (toList)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Int (Int64)
-import Data.List (sort, sortOn)
+import Data.List (sort)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
@@ -163,6 +163,7 @@ import Nix.Eval.Types
     StringContext (..),
     StringContextElement (..),
     Thunk (..),
+    attrSetAt,
     attrSetElems,
     attrSetFoldM,
     attrSetFromMap,
@@ -197,7 +198,6 @@ import Nix.Eval.Types
     envWithScopesRaw,
     evaluated,
     fillCAttrSetValues,
-    firstInSymbolOrder,
     heldString,
     mkApply2Thunk,
     mkApplyThunk,
@@ -1152,15 +1152,15 @@ matchFormalSet :: (MonadEval m) => Env -> LambdaName -> [EvalFormal] -> Bool -> 
 matchFormalSet closureEnv lambdaName formals allowExtra argVal atThunk =
   case argVal of
     VAttrs attrs -> do
-      formalValues <- formalSlots lambdaName attrs formals
-      checkExtraKeys lambdaName formals allowExtra attrs
+      slots <- formalSlots lambdaName attrs formals
+      unless allowExtra (checkExtraKeys lambdaName formals (length [() | Given _ <- slots]) attrs)
       let atSlot = maybeToList atThunk
       (formalEnv, _) <-
         tieFrame
           EnvCallFormals
           (Just closureEnv)
-          (length atSlot + length formalValues)
-          (\frame -> (atSlot ++) <$> mapM ($ frame) formalValues)
+          (length atSlot + length slots)
+          (\frame -> (atSlot ++) <$> mapM (slotThunk frame) slots)
       pure formalEnv
     _ ->
       callSiteError
@@ -1179,39 +1179,55 @@ matchFormalSet closureEnv lambdaName formals allowExtra argVal atThunk =
 callSiteError :: (MonadEval m) => m a -> m a
 callSiteError = addErrorTrace (pure "from call site")
 
--- | With no ellipsis, the first of the set's attributes in symbol order
--- that no formal names fails the call, as upstream walks the set's
--- @Bindings@ (eval.cc:1567-1584 at 2.24.9).  The message names the
--- function as its binding spells it and the argument as a symbol prints
--- ('printSymbol'), as upstream passes the one as a string and the other
--- as a symbol.
-checkExtraKeys :: (MonadEval m) => LambdaName -> [EvalFormal] -> Bool -> AttrSet -> m ()
-checkExtraKeys _ _ True _ = pure ()
-checkExtraKeys lambdaName formals False attrs = do
-  actual <- attrSetKeys attrs
-  case filter (`notElem` map efName formals) actual of
-    [] -> pure ()
-    (k : _) -> callSiteError (throwEvalError ("function '" <> lambdaNameText lambdaName <> "' called with unexpected argument '" <> printSymbol k <> "'"))
+-- | With no ellipsis, a set holding an attribute that no formal names
+-- fails the call, as upstream checks it (eval.cc:1565-1586 at 2.24.9):
+-- no two formals share a name, so the set holds one exactly when fewer of
+-- its attributes fill a formal than it holds, and only then is the set
+-- walked for the first such in symbol order, as upstream walks its
+-- @Bindings@.  The message names the function as its binding spells it
+-- and the argument as a symbol prints ('printSymbol'), as upstream passes
+-- the one as a string and the other as a symbol.
+checkExtraKeys :: (MonadEval m) => LambdaName -> [EvalFormal] -> Int -> AttrSet -> m ()
+checkExtraKeys lambdaName formals given attrs = do
+  size <- attrSetSize attrs
+  when (given /= size) (unexpectedFrom 0)
+  where
+    unexpectedFrom i =
+      attrSetAt attrs i >>= \case
+        Just (name, _)
+          | name `elem` map efName formals -> unexpectedFrom (i + 1)
+          | otherwise -> callSiteError (throwEvalError ("function '" <> lambdaNameText lambdaName <> "' called with unexpected argument '" <> printSymbol (symbolText name) <> "'"))
+        Nothing -> pure ()
 
--- | Each formal's slot as a function of the env its default is evaluated
--- in: the argument's own thunk, or a thunk of the default there.  A
--- formal with neither fails the call, the first such in symbol order
--- named, as upstream sorts a set pattern's formals by symbol
--- (@validateFormals@, parser-state.hh:186-189 at 2.24.9) and stops at the
--- first it cannot fill (eval.cc:1546-1557).
-formalSlots :: (MonadEval m) => LambdaName -> AttrSet -> [EvalFormal] -> m [Env -> m Thunk]
+-- | What fills a formal's slot at a call.
+data FormalSlot
+  = -- | The argument's attribute of the formal's name.
+    Given !Thunk
+  | -- | The formal's default, by its bytecode index.
+    Defaulted !Word32
+
+-- | The thunk a slot holds in the env a call's defaults are evaluated in.
+slotThunk :: (MonadCData m) => Env -> FormalSlot -> m Thunk
+slotThunk _ (Given thunk) = pure thunk
+slotThunk frame (Defaulted defBcIdx) = mkThunkBc frame defBcIdx
+
+-- | What fills each formal's slot, found by the formal's symbol.  A
+-- formal with neither an attribute nor a default fails the call, the
+-- first such in symbol order named, as upstream sorts a set pattern's
+-- formals by symbol (@validateFormals@, parser-state.hh:186-189 at
+-- 2.24.9) and stops at the first it cannot fill (eval.cc:1546-1557).
+formalSlots :: (MonadEval m) => LambdaName -> AttrSet -> [EvalFormal] -> m [FormalSlot]
 formalSlots lambdaName attrs formals = do
   slots <- mapM formalSlot formals
   case partitionEithers slots of
     ([], found) -> pure found
-    (name : names, _) -> do
-      first <- firstInSymbolOrder (name :| names)
-      callSiteError (throwEvalError ("function '" <> lambdaNameText lambdaName <> "' called without required argument '" <> printSymbol first <> "'"))
+    (name : names, _) ->
+      callSiteError (throwEvalError ("function '" <> lambdaNameText lambdaName <> "' called without required argument '" <> printSymbol (symbolText (minimum (name :| names))) <> "'"))
   where
     formalSlot (EvalFormal name defBcIdx) =
-      attrSetLookup name attrs >>= \case
-        Just thunk -> pure (Right (const (pure thunk)))
-        Nothing -> pure (maybe (Left name) (Right . flip mkThunkBc) defBcIdx)
+      attrSetLookupSymbol name attrs >>= \case
+        Just thunk -> pure (Right (Given thunk))
+        Nothing -> pure (maybe (Left name) (Right . Defaulted) defBcIdx)
 
 -- ---------------------------------------------------------------------------
 -- Builtin definitions
@@ -2541,7 +2557,8 @@ formalsToAttrs (EFNamedSet _ _ formals _) = formalsListToAttrs formals
 
 formalsListToAttrs :: (MonadCData m) => [EvalFormal] -> m NixValue
 formalsListToAttrs formals =
-  valuesSet SetFunctionArgs (Map.fromList [(efName f, VBool (isJust (efDefault f))) | f <- formals])
+  traverse evaluated (Map.fromList [(efName f, VBool (isJust (efDefault f))) | f <- formals])
+    >>= fmap VAttrs . attrSetFromSymbols SetFunctionArgs
 
 -- | Upstream's @prim_zipAttrsWith@ (primops.cc:3123-3180 at 2.24.9): the
 -- list's sets are forced first to last, and each name any of them binds
@@ -5764,14 +5781,15 @@ xmlDerivationIdentity attrs = do
 -- the ellipsis as its attributes.
 formalsToXML :: Int -> EvalFormals -> BB.Builder
 formalsToXML depth formals = case formals of
-  EFName name -> xmlEmpty depth "varpat" [("name", TE.encodeUtf8 name)]
+  EFName name -> xmlEmpty depth "varpat" [("name", symbolBytes name)]
   EFSet _ entries ellipsis -> attrsPattern (ellipsisAttr ellipsis) entries
-  EFNamedSet _ name entries ellipsis -> attrsPattern (ellipsisAttr ellipsis <> [("name", TE.encodeUtf8 name)]) entries
+  EFNamedSet _ name entries ellipsis -> attrsPattern (ellipsisAttr ellipsis <> [("name", symbolBytes name)]) entries
   where
+    symbolBytes = TE.encodeUtf8 . symbolText
     ellipsisAttr ellipsis = [("ellipsis", "1") | ellipsis]
     attrsPattern attrs entries =
       xmlOpen depth "attrspat" attrs
-        <> foldMap (\formal -> xmlEmpty (depth + 1) "attr" [("name", TE.encodeUtf8 (efName formal))]) (sortOn efName entries)
+        <> foldMap (\name -> xmlEmpty (depth + 1) "attr" [("name", name)]) (sort (map (symbolBytes . efName) entries))
         <> xmlClose depth "attrspat"
 
 -- | An element with children: the opening tag, what the children write one

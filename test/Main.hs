@@ -92,7 +92,7 @@ import Nix.Eval.CStr (cstrNew)
 import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetBool, cthunkGetInt, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkPrimop, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
-import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), BcCaptureInfo (..), BcInheritedName (..), BcInheritedNames, compileExpr, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, foldBcBindings, foldBcCapturedSlots, foldBcInheritedNames, reassembleInt64)
+import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), BcCaptureInfo (..), BcInheritedName (..), BcInheritedNames, compileExpr, compileFormalsToEval, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, foldBcBindings, foldBcCapturedSlots, foldBcInheritedNames, reassembleInt64)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), LambdaName (..))
 import Nix.Eval.IO (EvalFailure (..), EvalState (..), SessionSettings (..), allowEvalPath, evalBaseEnv, newEvalStateWith, nixPathSearchPath, renderEvalFailure, runEvalIO, runEvalIOTraced, withEvalSession)
@@ -25343,8 +25343,40 @@ testCallErrorsIO = do
       fails "a select names a missing keyword attribute as a string" "{ a = 1; }.\"if\"" (EvalFailure [] "attribute '\"if\"' missing"),
       fails "a select names the missing empty attribute as a string" "{ a = 1; }.\"\"" (EvalFailure [] "attribute '\"\"' missing"),
       fails "a select names a missing dynamic attribute as a string" "{ a = 1; }.${\"1x\"}" (EvalFailure [] "attribute '\"1x\"' missing"),
-      runTestIO "a select into a value that is not a set takes its default" tmpBase "{ a = 1; }.a.b or 2" (VInt 2)
+      runTestIO "a select into a value that is not a set takes its default" tmpBase "{ a = 1; }.a.b or 2" (VInt 2),
+      runTestM "a set pattern's call fails at the first missing argument, else at the first unexpected one, in symbol order" . quickCheckPasses $
+        QC.forAll genCall $ \(formals, ellipsis, args) -> QC.ioProperty $ do
+          result <- evalNixIOTraced tmpBase (callSource formals ellipsis args)
+          firstMissing <- firstBySymbol [name | (name, False) <- formals, name `notElem` args]
+          firstUnexpected <- firstBySymbol [name | name <- args, name `notElem` map fst formals]
+          let expected = case (firstMissing, firstUnexpected) of
+                (Just name, _) -> Left (missing "anonymous lambda" name)
+                (Nothing, Just name) | not ellipsis -> Left (unexpected name)
+                _ -> Right (VInt 0)
+          pure (result QC.=== expected)
     ]
+  where
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    -- Formals, each with a default or without, whether an ellipsis
+    -- follows them, and the names of the attributes passed, all drawn
+    -- from one pool and written in any order.
+    genCall = do
+      let pool = ["pa", "pb", "pc", "pd", "pe"]
+      formals <- QC.sublistOf pool >>= QC.shuffle >>= traverse (\name -> (name,) <$> QC.arbitrary)
+      ellipsis <- QC.arbitrary
+      args <- QC.sublistOf pool >>= QC.shuffle
+      pure (formals, ellipsis, args)
+    callSource formals ellipsis args =
+      "({ "
+        <> T.intercalate ", " ([if hasDefault then name <> " ? 0" else name | (name, hasDefault) <- formals] ++ ["..." | ellipsis])
+        <> " }: 0) { "
+        <> T.concat [name <> " = 0; " | name <- args]
+        <> "}"
+    -- The name with the least symbol, the one a set holding them all
+    -- holds first.
+    firstBySymbol names = fmap snd . listToMaybe . sortOn fst <$> traverse (\name -> (,name) <$> symbolIntern name) names
 
 -- | @deepSeq@, @trace@ and @warn@ finish with their first argument before
 -- they force their second (primops.cc at 2.24.9), however the second
@@ -26763,15 +26795,15 @@ srcPosBack idx =
 -- | Decoded formals read back as the parser's formals they compile from.
 formalsBack :: EvalFormals -> IO Formals
 formalsBack formals = case formals of
-  EFName name -> pure (FormalName name)
+  EFName name -> pure (FormalName (symbolText name))
   EFSet _ entries ellipsis -> do
     back <- traverse formalBack entries
     pure (FormalSet back ellipsis)
   EFNamedSet _ name entries ellipsis -> do
     back <- traverse formalBack entries
-    pure (FormalNamedSet name back ellipsis)
+    pure (FormalNamedSet (symbolText name) back ellipsis)
   where
-    formalBack (EvalFormal name def) = Formal name <$> traverse childExpr def
+    formalBack (EvalFormal name def) = Formal (symbolText name) <$> traverse childExpr def
 
 -- | A binding read from the bytecode read back as the binding it compiles
 -- from.  An inherited name's select is the compiler's own and has no
@@ -26859,7 +26891,8 @@ testUnknownTags = do
   putStrLn "cbits/unknown-tags"
   sequence
     [ runTestM "a closure whose shape holds no formals type raises CInvariantViolated" $ do
-        cell <- evaluated (VLambda emptyEnv (EFName "x") 0)
+        name <- symbolIntern "x"
+        cell <- evaluated (VLambda emptyEnv (EFName name) 0)
         lam <- cthunkPayload (unThunk cell)
         outcome <- withFieldAt lam lambdaShapeOffset (clambdaShape unnamedTag 0 0) (readComputed (unThunk cell))
         pure (assertEqual "site" (Just "nn_lambda_formals_type") (violatedAt outcome)),
@@ -26906,6 +26939,12 @@ testBytecodeTags = do
           decodedFormals <- decodeBcFormals flags formalsOff >>= traverse formalsBack
           decodedCaptures <- decodeBcCaptureInfo captureOff >>= traverse capturesBack
           pure ((decodedFormals, decodedCaptures) QC.=== (Just formals, Right captures)),
+      runTestM "a lambda stored in a cell reads back with the symbols it was stored with" . quickCheckPasses $
+        QC.forAll ((,) <$> genFormals <*> QC.oneof [pure Nothing, Just <$> genName]) $ \(formals, binding) -> QC.ioProperty $ do
+          name <- maybe (pure AnonymousLambda) (fmap NamedLambda . symbolIntern) binding
+          lambda <- (\stored -> VLambda emptyEnv stored 0) . namedBy name <$> compileFormalsToEval formals
+          cell <- evaluated lambda
+          (QC.=== lambda) <$> readComputed (unThunk cell),
       -- Upstream's addAttr names the function an attribute path's last
       -- name binds, and ExprLambda::setName the function that is its body
       -- (parser-state.hh:176-177, nixexpr.cc:573-577 at 2.24.9).
@@ -26938,8 +26977,9 @@ testBytecodeTags = do
         named <- lambdaNames (boundBy (StaticKey "f"))
         dynamic <- lambdaNames (boundBy (DynamicKey (ELit (NixInt 0))))
         bare <- formalsAt =<< compileExpr inner
+        f <- NamedLambda <$> symbolIntern "f"
         pure $
-          assertEqual "static" (Just (NamedLambda "f"), Just (NamedLambda "f")) named
+          assertEqual "static" (Just f, Just f) named
             `andThen` assertEqual "dynamic" (Just AnonymousLambda, Just AnonymousLambda) dynamic
             `andThen` assertEqual "unbound" (Just AnonymousLambda) (lambdaNameOf =<< bare),
       runTestM "a compiled let's bindings, their counts and its capture info read back as compiled" . quickCheckPasses $
@@ -26951,6 +26991,11 @@ testBytecodeTags = do
           pure ((decodedBindings, (names, dynamics), decodedCaptures) QC.=== (Right bindings, nameCounts bindings, Right captures))
     ]
   where
+    -- A set pattern under the name a binding gives it.
+    namedBy name = \case
+      EFSet _ entries ellipsis -> EFSet name entries ellipsis
+      EFNamedSet _ arg entries ellipsis -> EFNamedSet name arg entries ellipsis
+      plain@(EFName _) -> plain
     -- The names bindings bind statically, one per static key, inherited
     -- variable and inherited name, and the bindings with a dynamic name.
     nameCounts bindings = (sum (map staticNames bindings), length [() | NamedBinding _ (DynamicKey _) _ <- bindings])

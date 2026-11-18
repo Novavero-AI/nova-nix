@@ -24,7 +24,6 @@ module Nix.Eval.Types
     attrSetLookupEntry,
     attrSetLookupSymbolEntry,
     attrSetKeys,
-    firstInSymbolOrder,
     attrSetAt,
     attrSetFoldM,
     attrSetToMap,
@@ -137,8 +136,6 @@ import Data.Bits (bit, complement, shiftL, testBit, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Int (Int64)
-import Data.List.NonEmpty (NonEmpty)
-import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -484,14 +481,6 @@ attrSetLookupEntry key attrs = do
 -- symbol, not by name.
 attrSetKeys :: (MonadCData m) => AttrSet -> m [Text]
 attrSetKeys (AttrSet cset) = map symbolText <$> cattrsetKeys cset
-
--- | The name with the least symbol, the one a set holding them all would
--- hold first ('attrSetKeys').  A name not yet interned is interned here,
--- as 'attrSetLookup' interns a key it looks up.
-firstInSymbolOrder :: (MonadCData m) => NonEmpty Text -> m Text
-firstInSymbolOrder names = do
-  symbols <- traverse symbolIntern names
-  pure (snd (NE.head (NE.sortWith fst (NE.zip symbols names))))
 
 -- | The name and value at an index of the C array, which holds a set's
 -- attributes in interned-symbol order; 'Nothing' outside it.  A walk by
@@ -1155,32 +1144,28 @@ pathCell :: (MonadCData m) => Text -> HeldBytes -> m CStrPtr
 pathCell _ (HeldStr str) = pure str
 pathCell path _ = cstrFromText path
 
--- | Marshal Env + EvalFormals + body bc_idx to a C nn_lambda_t.
+-- | Marshal Env + EvalFormals + body bc_idx to a C nn_lambda_t, which
+-- holds each name as the symbol the formals hold.
 marshalLambda :: (MonadCData m) => Ptr NnEnv -> EvalFormals -> Word32 -> m (Ptr ())
 marshalLambda envPtr formals bodyBcIdx = case formals of
-  EFName name -> do
-    Symbol nameSym <- symbolIntern name
+  EFName (Symbol nameSym) -> do
     lam <- clambdaNew envPtr bodyBcIdx FormalsName nameSym invalidSymbolId 0 0
     pure (castPtr lam)
   EFSet lambdaName entries allowExtra -> do
-    lambdaSym <- lambdaNameSymbol lambdaName
     let count = fromIntegral (length entries) :: Word32
         extraFlag = if allowExtra then 1 else 0 :: Word8
-    lam <- clambdaNew envPtr bodyBcIdx FormalsSet 0 lambdaSym extraFlag count
+    lam <- clambdaNew envPtr bodyBcIdx FormalsSet invalidSymbolId (lambdaNameSymbol lambdaName) extraFlag count
     fillEntries lam 0 entries
     pure (castPtr lam)
-  EFNamedSet lambdaName name entries allowExtra -> do
-    lambdaSym <- lambdaNameSymbol lambdaName
-    Symbol nameSym <- symbolIntern name
+  EFNamedSet lambdaName (Symbol nameSym) entries allowExtra -> do
     let count = fromIntegral (length entries) :: Word32
         extraFlag = if allowExtra then 1 else 0 :: Word8
-    lam <- clambdaNew envPtr bodyBcIdx FormalsNamedSet nameSym lambdaSym extraFlag count
+    lam <- clambdaNew envPtr bodyBcIdx FormalsNamedSet nameSym (lambdaNameSymbol lambdaName) extraFlag count
     fillEntries lam 0 entries
     pure (castPtr lam)
   where
     fillEntries _ _ [] = pure ()
-    fillEntries lam !idx (EvalFormal name defBcIdx : rest) = do
-      Symbol nameSym <- symbolIntern name
+    fillEntries lam !idx (EvalFormal (Symbol nameSym) defBcIdx : rest) = do
       let (hasDef, defIdx) = case defBcIdx of
             Nothing -> (0, 0)
             Just di -> (1, di)
@@ -1188,7 +1173,8 @@ marshalLambda envPtr formals bodyBcIdx = case formals of
       fillEntries lam (idx + 1) rest
 
 -- | Read a C nn_lambda_t back into VLambda.
--- Reconstructs Env (newtype wrap), EvalFormals (from symbol IDs), body bc_idx.
+-- Reconstructs Env (newtype wrap), EvalFormals (each name the symbol the
+-- closure holds), body bc_idx.
 unmarshalLambdaValue :: (MonadCData m) => Ptr () -> m NixValue
 unmarshalLambdaValue rawPtr = do
   let lamPtr = castPtr rawPtr
@@ -1196,9 +1182,7 @@ unmarshalLambdaValue rawPtr = do
   bodyIdx <- clambdaBody lamPtr
   formalsType <- clambdaFormalsType lamPtr
   formals <- case formalsType of
-    FormalsName -> do
-      nameSym <- clambdaNameSym lamPtr
-      pure (EFName (symbolText (Symbol nameSym)))
+    FormalsName -> EFName . Symbol <$> clambdaNameSym lamPtr
     FormalsSet -> do
       lambdaSym <- clambdaLambdaNameSym lamPtr
       count <- clambdaFormalCount lamPtr
@@ -1211,7 +1195,7 @@ unmarshalLambdaValue rawPtr = do
       count <- clambdaFormalCount lamPtr
       extra <- clambdaAllowExtra lamPtr
       entries <- readLambdaEntries lamPtr count
-      pure (EFNamedSet (lambdaNameFromSymbol lambdaSym) (symbolText (Symbol nameSym)) entries (extra /= 0))
+      pure (EFNamedSet (lambdaNameFromSymbol lambdaSym) (Symbol nameSym) entries (extra /= 0))
     other -> cdataIO (cInvariantViolated "nn_lambda_formals_type" ("no lambda has formals type " ++ show other))
   pure (VLambda (Env envPtr) formals bodyIdx)
   where
@@ -1225,7 +1209,7 @@ unmarshalLambdaValue rawPtr = do
       hasDef <- clambdaEntryHasDefault lamPtr idx
       defIdx <- clambdaEntryDefault lamPtr idx
       let defMaybe = if hasDef /= 0 then Just defIdx else Nothing
-      pure (EvalFormal (symbolText (Symbol nameSym)) defMaybe)
+      pure (EvalFormal (Symbol nameSym) defMaybe)
 
 -- | Marshal payload bytes + StringContext to a C nn_ctxstr_t, each a
 -- string's bytes: the payload as it is, and the StorePath and output-name

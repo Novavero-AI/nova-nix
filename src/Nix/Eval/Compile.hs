@@ -122,7 +122,7 @@ import Nix.Eval.CBytecode
 import Nix.Eval.CData (MonadCData)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), LambdaName (..), lambdaNameFromSymbol, lambdaNameSymbol)
 import Nix.Eval.SourcePos (PosIdx (..), PosRecorder, newPosRecorder, recordPos)
-import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
+import Nix.Eval.Symbol (Symbol (..), symbolIntern)
 import Nix.Expr.Types
   ( AttrKey (..),
     BinaryOp (..),
@@ -352,17 +352,15 @@ compileWith recorder = go
       Symbol sym <- symbolIntern name
       emitWordList [sym]
     compileFormals name (FormalSet formals ellipsis) = do
-      nameWord <- lambdaNameSymbol name
       formalWords <- compileFormalEntries formals
       emitWordList $
-        [nameWord, fi (length formals), if ellipsis then 1 else 0]
+        [lambdaNameSymbol name, fi (length formals), if ellipsis then 1 else 0]
           ++ formalWords
     compileFormals name (FormalNamedSet argName formals ellipsis) = do
-      nameWord <- lambdaNameSymbol name
       Symbol argSym <- symbolIntern argName
       formalWords <- compileFormalEntries formals
       emitWordList $
-        [nameWord, argSym, fi (length formals), if ellipsis then 1 else 0]
+        [lambdaNameSymbol name, argSym, fi (length formals), if ellipsis then 1 else 0]
           ++ formalWords
 
     compileFormalEntries :: [Formal] -> IO [Word32]
@@ -413,13 +411,16 @@ compileWith recorder = go
     -- name the compiler cannot know, so such a function is anonymous
     -- here.
     compileOneBinding :: Binding -> IO [Word32]
-    compileOneBinding (NamedBinding pos key expr) = do
-      (keyKind, keyWord) <- compileAttrKey key
-      valIdx <- case key of
-        StaticKey name -> compileNamed (NamedLambda name) expr
-        DynamicKey _ -> go expr
+    compileOneBinding (NamedBinding pos (StaticKey name) expr) = do
+      sym <- symbolIntern name
+      valIdx <- compileNamed (NamedLambda sym) expr
       posWord <- positionWord pos
-      pure [bindNamed, keyKind, keyWord, valIdx, posWord]
+      pure [bindNamed, attrkeyStatic, unSymbol sym, valIdx, posWord]
+    compileOneBinding (NamedBinding pos (DynamicKey keyExpr) expr) = do
+      keyIdx <- go keyExpr
+      valIdx <- go expr
+      posWord <- positionWord pos
+      pure [bindNamed, attrkeyDynamic, keyIdx, valIdx, posWord]
     compileOneBinding (Inherit pos name var) = do
       sym <- internName name
       valIdx <- go var
@@ -544,20 +545,21 @@ compileWith recorder = go
 
 -- | Compile parser 'Formals' (with 'Maybe Expr' defaults) to eval-time
 -- 'EvalFormals' (with 'Maybe Word32' bc_idx defaults), for a function no
--- binding names.
+-- binding names, interning each name.
 compileFormalsToEval :: Formals -> IO EvalFormals
-compileFormalsToEval (FormalName name) = pure (EFName name)
+compileFormalsToEval (FormalName name) = EFName <$> symbolIntern name
 compileFormalsToEval (FormalSet formals ellipsis) =
   EFSet AnonymousLambda <$> mapM compileOneFormal formals <*> pure ellipsis
 compileFormalsToEval (FormalNamedSet name formals ellipsis) =
-  EFNamedSet AnonymousLambda name <$> mapM compileOneFormal formals <*> pure ellipsis
+  EFNamedSet AnonymousLambda <$> symbolIntern name <*> mapM compileOneFormal formals <*> pure ellipsis
 
+-- | A formal with its default compiled, its name interned after the
+-- default's names, as upstream's parser interns them (parser.y:482-483
+-- at 2.24.9).
 compileOneFormal :: Formal -> IO EvalFormal
 compileOneFormal (Formal name defExpr) = do
-  defBcIdx <- case defExpr of
-    Nothing -> pure Nothing
-    Just expr -> Just <$> compileExpr expr
-  pure (EvalFormal name defBcIdx)
+  defBcIdx <- traverse compileExpr defExpr
+  (`EvalFormal` defBcIdx) <$> symbolIntern name
 
 -- ---------------------------------------------------------------------------
 -- Operator tags (the flags byte of OpUnary and OpBinary)
@@ -626,9 +628,7 @@ decodeBinaryOp tag
 -- evaluated rather than as a thunk.
 decodeBcFormals :: (MonadCData m) => Word8 -> Word32 -> m (Maybe EvalFormals)
 decodeBcFormals flags !dataOff
-  | flags == formalName = do
-      sym <- cbcData dataOff
-      pure (Just (EFName (symbolText (Symbol sym))))
+  | flags == formalName = Just . EFName . Symbol <$> cbcData dataOff
   | flags == formalSet = do
       lambdaSym <- cbcData dataOff
       count <- cbcData (dataOff + 1)
@@ -641,7 +641,7 @@ decodeBcFormals flags !dataOff
       count <- cbcData (dataOff + 2)
       ellipsis <- cbcData (dataOff + 3)
       formals <- decodeFormalEntries (fromIntegral count) (dataOff + 4)
-      pure (Just (EFNamedSet (lambdaNameFromSymbol lambdaSym) (symbolText (Symbol nameSym)) formals (ellipsis /= 0)))
+      pure (Just (EFNamedSet (lambdaNameFromSymbol lambdaSym) (Symbol nameSym) formals (ellipsis /= 0)))
   | otherwise = pure Nothing
 
 -- | Decode a list of formal entries from the data buffer.
@@ -654,7 +654,7 @@ decodeFormalEntries n off = do
   defBcIdx <- cbcData (off + 2)
   let defMaybe = if hasDef /= 0 then Just defBcIdx else Nothing
   rest <- decodeFormalEntries (n - 1) (off + 3)
-  pure (EvalFormal (symbolText (Symbol nameSym)) defMaybe : rest)
+  pure (EvalFormal (Symbol nameSym) defMaybe : rest)
 
 -- ---------------------------------------------------------------------------
 -- Capture info reading (for evalBcLambda, evalBcAttrs and evalBcLet)
