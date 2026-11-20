@@ -1427,7 +1427,7 @@ builtinDef builtin = shape builtin
       -- Attr set higher-order
       Builtin.MapAttrs -> onUseFirst builtinMapAttrs
       Builtin.FunctionArgs -> forced1 builtinFunctionArgs
-      Builtin.ZipAttrsWith -> forced2 builtinZipAttrsWith
+      Builtin.ZipAttrsWith -> onUseSecond builtinZipAttrsWith
       -- String manipulation
       Builtin.Match -> forced2 builtinMatch
       Builtin.Split -> forced2 builtinSplit
@@ -1855,19 +1855,22 @@ catAttrsCollect key = go []
 -- Builtin implementations - list higher-order (arity 2)
 -- ---------------------------------------------------------------------------
 
--- | Force a builtin's function argument, failing unless it is a lambda, a
--- builtin, or a set with @__functor@, as upstream's @forceFunction@ does
--- (eval.cc at 2.24.9).
+-- | Force a builtin's function argument and check it as 'expectFunction'
+-- does.
 forceFunctionArg :: (MonadEval m) => BuiltinArg -> m NixValue
-forceFunctionArg arg = do
-  val <- argValue arg
-  case val of
-    VLambda {} -> pure val
-    VBuiltin _ _ -> pure val
-    VAttrs attrs -> do
-      isFunctor <- attrSetMember "__functor" attrs
-      if isFunctor then pure val else expectedFailure "a function" val
-    other -> expectedFailure "a function" other
+forceFunctionArg = argValue >=> expectFunction
+
+-- | Upstream's @forceFunction@ on a forced value (eval.cc:2202-2216 at
+-- 2.24.9): a lambda, a builtin, or a set with @__functor@, and a failure
+-- for anything else.
+expectFunction :: (MonadEval m) => NixValue -> m NixValue
+expectFunction val = case val of
+  VLambda {} -> pure val
+  VBuiltin _ _ -> pure val
+  VAttrs attrs -> do
+    isFunctor <- attrSetMember "__functor" attrs
+    if isFunctor then pure val else expectedFailure "a function" val
+  other -> expectedFailure "a function" other
 
 -- | @prim_map@ forces the list, returns an empty one as it is, and only
 -- then forces the function (primops.cc at 2.24.9), so
@@ -2561,20 +2564,27 @@ formalsListToAttrs formals =
     >>= fmap VAttrs . attrSetFromSymbols SetFunctionArgs
 
 -- | Upstream's @prim_zipAttrsWith@ (primops.cc:3123-3180 at 2.24.9): the
--- list's sets are forced first to last, and each name any of them binds
--- gathers its values in list order, under the name's symbol.
-builtinZipAttrsWith :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinZipAttrsWith func (VList cl) = do
-  attrSets <- listThunks cl >>= mapM forceToAttrSet
-  fnThunk <- evaluated func
-  gathered <- foldM (attrSetFoldM gather) Map.empty attrSets
-  -- Lazy: each result is a deferred f(name)(values) thunk, not eagerly
-  -- evaluated.  Critical for nixpkgs evalModules fixpoint - config is a
-  -- self-referencing lazy attrset that must be COMPUTED (holding the lazy
-  -- result) before any individual attribute thunks are forced.
-  results <- Map.traverseWithKey (deferZip fnThunk) gathered
-  VAttrs <$> attrSetFromSymbols SetZipAttrsWith results
+-- function is forced and checked as @forceFunction@ checks it before the
+-- list is forced (:3145-3146), so it fails on a first argument that is
+-- not a function whatever the list holds.  The list's sets are forced
+-- first to last, and each name any of them binds gathers its values in
+-- list order, under the name's symbol.
+builtinZipAttrsWith :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinZipAttrsWith func listArg = do
+  _ <- expectFunction func
+  argValue listArg >>= \case
+    VList cl -> listThunks cl >>= mapM forceToAttrSet >>= zipSets
+    other -> throwEvalError ("builtins.zipAttrsWith: expected a list, got " <> typeName other)
   where
+    zipSets attrSets = do
+      fnThunk <- evaluated func
+      gathered <- foldM (attrSetFoldM gather) Map.empty attrSets
+      -- Lazy: each result is a deferred f(name)(values) thunk, not eagerly
+      -- evaluated.  Critical for nixpkgs evalModules fixpoint - config is a
+      -- self-referencing lazy attrset that must be COMPUTED (holding the lazy
+      -- result) before any individual attribute thunks are forced.
+      results <- Map.traverseWithKey (deferZip fnThunk) gathered
+      VAttrs <$> attrSetFromSymbols SetZipAttrsWith results
     forceToAttrSet thunk = do
       val <- force thunk
       case val of
@@ -2584,8 +2594,6 @@ builtinZipAttrsWith func (VList cl) = do
     deferZip fnThunk name values = do
       valueList <- thunksList (toList values) >>= evaluated
       deferApply2 fnThunk name valueList
-builtinZipAttrsWith _ other =
-  throwEvalError ("builtins.zipAttrsWith: expected a list, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - string manipulation
