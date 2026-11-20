@@ -9,12 +9,13 @@
 -- force allocated, what its writes into older cells and with-scopes and
 -- the roots it registered still reach.  'regionFigures' reads the counts
 -- by size of region, and a simulation of collectors that mark only at
--- the closes of regions past a threshold of bytes, freeing single objects
--- or whole blocks of each of several sizes.  It also counts what a close
--- reached after an earlier close found it unreached, which a collector
--- would have freed under a live pointer.  And it simulates, each as a
--- t'Tenure', collectors that tenure what their closes marked and mark it
--- again only where a close marks its region whole.
+-- the closes of regions past a threshold of bytes, freeing single objects,
+-- whole blocks of each of several sizes, or whole lines of a block of each
+-- of two lengths.  It also counts what a close reached after an earlier
+-- close found it unreached, which a collector would have freed under a
+-- live pointer.  And it simulates, each as a t'Tenure', collectors that
+-- tenure what their closes marked and mark it again only where a close
+-- marks its region whole.
 --
 -- Without the census a force pays for it one match on its session's
 -- setting, and the allocators one flag test per block, tracked object
@@ -114,11 +115,12 @@ classCount, classFigures :: Int
 classCount = 48
 classFigures = 6
 
--- | @NN_REGION_THRESHOLDS@, @NN_REGION_GRAINS@ and
--- @NN_REGION_THRESHOLD_FIGURES@: three counts, then a peak per grain.
-thresholdCount, grainCount, thresholdFigures :: Int
+-- | @NN_REGION_THRESHOLDS@, @NN_REGION_GRAINS@, @NN_REGION_BLOCK_GRAINS@
+-- and @NN_REGION_THRESHOLD_FIGURES@: three counts, then a peak per grain.
+thresholdCount, grainCount, blockGrainCount, thresholdFigures :: Int
 thresholdCount = 9
-grainCount = 6
+grainCount = 8
+blockGrainCount = 5
 thresholdFigures = 3 + grainCount
 
 -- | @NN_REGION_TENURE_VARIANTS@, @NN_REGION_TENURE_THRESHOLD@, and
@@ -136,6 +138,11 @@ tenureFigures = 11 + grainCount
 -- @NN_REGION_ENV_PAGE@ and @NN_REGION_STR_BLOCK@.
 bumpKinds :: [CInt]
 bumpKinds = [0, 1, 2]
+
+-- | The bump kind a line grain's bytes are asked for, @NN_REGION_THUNK_BLOCK@:
+-- a line is one size in every kind.
+lineKind :: CInt
+lineKind = 0
 
 -- ---------------------------------------------------------------------------
 -- Running the census
@@ -204,7 +211,8 @@ data Threshold = Threshold
     thresholdEntered :: !Word64,
     thresholdExamined :: !Word64,
     -- | The most bytes held at once, freeing single objects first, then
-    -- freeing whole blocks of each grain's size, largest first.
+    -- freeing whole blocks of each block grain's size, largest first,
+    -- then whole lines of each line grain's size, longest first.
     thresholdPeaks :: ![Word64]
   }
   deriving (Eq, Show)
@@ -350,9 +358,9 @@ regionFigures =
 -- grain, each tenure collector as @regions.tenure BUDGET BYTES CLOSES FULL
 -- ENTERED EXAMINED FULLFREED@ and its peaks, with its records, what it
 -- remembered and held, what it freed that was reached and what was
--- reached once freed on lines of their own after its budget, and each
--- grain from 1 as @regions.grain GRAIN@ and its block bytes for thunk
--- cells, env pages and strings.
+-- reached once freed on lines of their own after its budget, each block
+-- grain as @regions.grain GRAIN@ and its block bytes for thunk cells, env
+-- pages and strings, and each line grain as @regions.line GRAIN BYTES@.
 renderRegionFigures :: RegionFigures -> BS.ByteString
 renderRegionFigures figures =
   BL.toStrict . BB.toLazyByteString $
@@ -367,7 +375,8 @@ renderRegionFigures figures =
       <> foldMap sizeClass (regionClasses figures)
       <> foldMap threshold (regionThresholds figures)
       <> foldMap tenure (regionTenures figures)
-      <> foldMap grain [1 .. fromIntegral grainCount - 1]
+      <> foldMap grain [1 .. fromIntegral blockGrainCount]
+      <> foldMap line [fromIntegral blockGrainCount + 1 .. fromIntegral grainCount - 1]
   where
     field name values =
       BB.byteString name <> foldMap ((BB.char7 ' ' <>) . BB.word64Dec) values <> BB.char7 '\n'
@@ -382,3 +391,4 @@ renderRegionFigures figures =
         <> field "regions.tenure.reached" [tenureBudget t, tenureReached t]
         <> field "regions.tenure.resurrected" [tenureBudget t, tenureResurrected t, tenureResurrectedBytes t]
     grain g = field "regions.grain" (fromIntegral g : [c_nn_region_grain_bytes kind g | kind <- bumpKinds])
+    line g = field "regions.line" [fromIntegral g, c_nn_region_grain_bytes lineKind g]

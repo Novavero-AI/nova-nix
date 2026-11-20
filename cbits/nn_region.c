@@ -64,15 +64,16 @@
 #define NN_REGION_INITIAL 1024u
 #define NN_REGION_ENTRIES_INITIAL 16u
 
-/* Each grain's block is a quarter of the one before: this many bits
- * shorter. */
+/* Each block grain's block is a quarter of the one before: this many
+ * bits shorter. */
 #define NN_REGION_GRAIN_SHIFT 2u
 
 /* Multiplicative hashing's constant, 2^64 divided by the golden ratio. */
 #define NN_REGION_HASH 0x9E3779B97F4A7C15ull
 
-/* The finest grain's blocks must hold whole bytes of marks, and the
- * thresholds must fit in 64 bits. */
+/* An env page's unit is a pointer, a record's flags fit in the low bits
+ * a pointer's alignment leaves clear, and the thresholds fit in 64
+ * bits. */
 typedef char nn_region_env_unit_check_[(NN_ENV_ALIGNMENT == sizeof(void *)) ? 1 : -1];
 typedef char nn_region_record_flags_check_[(sizeof(void *) > NN_REGION_RECORD_FLAGS) ? 1 : -1];
 typedef char nn_region_threshold_check_[(NN_REGION_THRESHOLDS < 30) ? 1 : -1];
@@ -251,7 +252,7 @@ static struct {
     uint32_t  head_count;
     uint32_t  head_cap;
 
-    uint8_t  *live;                 /* scratch: a flag per finest block */
+    uint8_t  *live;                 /* scratch: a flag per finest line */
     uint64_t  live_cap;
 
     /* The close under way; the tenure collector whose mark it is, or -1
@@ -481,18 +482,29 @@ static uint64_t block_used(const block_t *b)
     }
 }
 
-/* Every grain's block holds whole bytes of marks, so the finest does. */
+/* A grain's liveness is read from the finest line's (dead_grains), so
+ * every grain is a whole number of the next: each kind's unit divides the
+ * finest line, each line is twice the next, and each kind's block is a
+ * whole number of the longest line times the block grains' quarterings,
+ * which makes every block grain exact and its smallest a whole number of
+ * the longest line. */
+#define NN_REGION_FINEST_LINE (NN_REGION_LINE_FIRST >> (NN_REGION_LINE_GRAINS - 1))
+#define NN_REGION_BLOCK_MULTIPLE \
+    ((uint64_t)NN_REGION_LINE_FIRST << (NN_REGION_GRAIN_SHIFT * (NN_REGION_BLOCK_GRAINS - 1)))
+typedef char nn_region_line_halves_check_[(NN_REGION_LINE_FIRST % (1u << (NN_REGION_LINE_GRAINS - 1)) == 0) ? 1 : -1];
+typedef char nn_region_thunk_line_check_[(NN_REGION_FINEST_LINE % sizeof(nn_thunk_t) == 0) ? 1 : -1];
+typedef char nn_region_env_line_check_[(NN_REGION_FINEST_LINE % NN_ENV_ALIGNMENT == 0) ? 1 : -1];
+typedef char nn_region_str_line_check_[(NN_REGION_FINEST_LINE % NN_STR_ALIGNMENT == 0) ? 1 : -1];
 typedef char nn_region_thunk_grain_check_[
-    ((NN_THUNK_BLOCK_CELLS >> (NN_REGION_GRAIN_SHIFT * (NN_REGION_GRAINS - 2))) % 8 == 0) ? 1 : -1];
-typedef char nn_region_env_grain_check_[
-    (((NN_ENV_PAGE_SIZE >> (NN_REGION_GRAIN_SHIFT * (NN_REGION_GRAINS - 2))) / NN_ENV_ALIGNMENT) % 8 == 0) ? 1 : -1];
-typedef char nn_region_str_grain_check_[
-    (((NN_STR_BLOCK_BYTES >> (NN_REGION_GRAIN_SHIFT * (NN_REGION_GRAINS - 2))) / NN_STR_ALIGNMENT) % 8 == 0) ? 1 : -1];
+    (((uint64_t)NN_THUNK_BLOCK_CELLS * sizeof(nn_thunk_t)) % NN_REGION_BLOCK_MULTIPLE == 0) ? 1 : -1];
+typedef char nn_region_env_grain_check_[(NN_ENV_PAGE_SIZE % NN_REGION_BLOCK_MULTIPLE == 0) ? 1 : -1];
+typedef char nn_region_str_grain_check_[(NN_STR_BLOCK_BYTES % NN_REGION_BLOCK_MULTIPLE == 0) ? 1 : -1];
 
 uint64_t nn_region_grain_bytes(int kind, uint32_t grain)
 {
     if (grain == 0 || grain >= NN_REGION_GRAINS) return 0;
-    return block_bytes(kind) >> (NN_REGION_GRAIN_SHIFT * (grain - 1));
+    if (grain <= NN_REGION_BLOCK_GRAINS) return block_bytes(kind) >> (NN_REGION_GRAIN_SHIFT * (grain - 1));
+    return (uint64_t)NN_REGION_LINE_FIRST >> (grain - 1 - NN_REGION_BLOCK_GRAINS);
 }
 
 uint64_t nn_region_threshold_bytes(uint32_t k)
@@ -1404,7 +1416,7 @@ static void tenure_mark(frame_t *f, int v, int full)
 
 /* --- Retiring a region --- */
 
-/* The finest blocks a block's part from `from` bytes to `used` covers,
+/* The finest lines a block's part from `from` bytes to `used` covers,
  * from the one numbered *first to below *count, with room in the scratch
  * flags for one each.  Returns 0 or -1. */
 static int live_span(const block_t *blk, uint64_t from, uint64_t used, uint64_t *first, uint64_t *count)
@@ -1421,9 +1433,9 @@ static int live_span(const block_t *blk, uint64_t from, uint64_t used, uint64_t 
     return 0;
 }
 
-/* Add to dead[g] the bytes of each block of grain g wholly in a block's
- * part from `from` bytes to `used` that no scratch flag of a finest block
- * in it says is live. */
+/* Add to dead[g] the bytes of each block or line of grain g wholly in a
+ * block's part from `from` bytes to `used` that no scratch flag of a
+ * finest line in it says is live. */
 static void dead_grains(const block_t *blk, uint64_t from, uint64_t used, uint64_t first, uint64_t count, uint64_t *dead)
 {
     uint64_t finest = nn_region_grain_bytes(blk->kind, NN_REGION_GRAINS - 1);
@@ -1443,8 +1455,8 @@ static void dead_grains(const block_t *blk, uint64_t from, uint64_t used, uint64
 }
 
 /* Retire a block's units from `from` bytes in, the closing region's part
- * of it, and add to dead[g] the bytes of each block of grain g wholly in
- * that part that holds no survivor. */
+ * of it, and add to dead[g] the bytes of each block or line of grain g
+ * wholly in that part that holds no survivor. */
 static int retire_block(block_t *blk, uint64_t from, uint64_t *dead)
 {
     uint64_t unit = unit_bytes(blk->kind);
@@ -1464,8 +1476,8 @@ static int retire_block(block_t *blk, uint64_t from, uint64_t *dead)
 
 /* Tenure collector v's retirement of a block's units from `from` bytes
  * in at a close where it marked (bits_tenure), adding to dead[g] the
- * bytes of each block of grain g wholly in that part in which it has
- * freed every unit; or, at an outermost close, where it takes the
+ * bytes of each block or line of grain g wholly in that part in which it
+ * has freed every unit; or, at an outermost close, where it takes the
  * census's own mark of the whole region, before the census retires it,
  * freeing what that mark left unmarked. */
 static int tenure_retire_block(block_t *blk, uint64_t from, tenure_action_t action, int v, uint64_t *dead,

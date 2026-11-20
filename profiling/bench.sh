@@ -45,7 +45,8 @@
 # A third nova-nix run takes a census of regions under
 # NOVA_NIX_REGION_STATS: at the end of each force, what the force allocated
 # and what still reaches it, and what collectors freeing there would hold
-# at each threshold of bytes and each block size (cbits/nn_region.h).
+# at each threshold of bytes and each block size and line length
+# (cbits/nn_region.h).
 # Upstream's pass runs under NIX_SHOW_STATS.  The attrset-memory benchmark
 # then builds the attribute sets the census reached, as C sets and as sets
 # held in GHC's heap, under the copying and the non-moving collector.
@@ -787,12 +788,14 @@ write_memory() {
 
 # The census of regions as Markdown: its totals, the closes by how much
 # their regions allocated, and the simulated collectors by threshold, each
-# with the most bytes held at once freeing single objects and freeing
-# whole blocks of each size the census tried.
+# with the most bytes held at once freeing single objects, freeing whole
+# blocks of each size the census tried, and freeing whole lines of each
+# length it tried.
 write_regions() {
   local dir="$RESULTS_DIR/memory"
   local regions="$dir/regions/regions.txt"
-  local allocated outside resurrected grains
+  local allocated outside resurrected grains lines label
+  local peaks=("Peak, single objects") aligns=("--:")
   echo "## Regions: $LABEL"
   echo
   if [[ ! -s "$regions" ]]; then
@@ -835,11 +838,16 @@ write_regions() {
   echo
   grains=$(awk '$1 == "regions.grain" {
       printf "%s%s KiB thunks, %s KiB envs, %s KiB strings", sep, $3 / 1024, $4 / 1024, $5 / 1024; sep = "; " }' "$regions")
-  echo "Peaks are the most C bytes held at once.  Blocks, largest first: $grains."
+  lines=$(awk '$1 == "regions.line" { printf "%s%s B", sep, $3; sep = ", " }' "$regions")
+  while read -r label; do
+    peaks+=("$label")
+    aligns+=("--:")
+  done < <(awk '$1 == "regions.grain" { print (blocks++ ? $2 : "Peak, blocks " $2) }
+      $1 == "regions.line" { print (lines++ ? $3 " B" : "Peak, lines " $3 " B") }' "$regions")
+  echo "Peaks are the most C bytes held at once.  Blocks, largest first: $grains.${lines:+  Lines, longest first: $lines.}"
   echo
-  scoreboard_row "Threshold" "Closes that mark" "Objects entered" "Pointers examined" "Peak, single objects" \
-    "Peak, blocks 1" "2" "3" "4" "5"
-  scoreboard_row "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:"
+  scoreboard_row "Threshold" "Closes that mark" "Objects entered" "Pointers examined" "${peaks[@]}"
+  scoreboard_row "--:" "--:" "--:" "--:" "${aligns[@]}"
   awk '$1 == "regions.threshold" {
       t = $2
       label = t == 0 ? "every close" : (t < 1048576 ? t / 1024 " KiB" : t / 1048576 " MiB")
@@ -856,8 +864,8 @@ write_regions() {
     "collector above at the same threshold is beside them."
   echo
   scoreboard_row "Collector" "Closes that mark" "of them marking the whole region" "Objects entered" "Pointers examined" \
-    "Freed by marks of the whole" "Peak, single objects" "Peak, blocks 1" "2" "3" "4" "5"
-  scoreboard_row ":--" "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:"
+    "Freed by marks of the whole" "${peaks[@]}"
+  scoreboard_row ":--" "--:" "--:" "--:" "--:" "--:" "${aligns[@]}"
   awk 'function budget(b) { return b == 0 ? "no budget" : "budget " b / 1048576 " MiB" }
     $1 == "regions.threshold" { row[$2] = $0 }
     $1 == "regions.tenure" { bytes = $3; tenure[++n] = $0 }

@@ -37,9 +37,11 @@
  * allocated at least a threshold of bytes, a smaller one passing what it
  * allocated to the region around it unexamined.  For each threshold it
  * gives the closes that mark, their work, and the most bytes held at
- * once, by grain: freeing every object nothing reaches, or freeing only
+ * once, by grain: freeing every object nothing reaches; freeing only
  * whole blocks that hold nothing reached, at the allocators' block sizes
- * and at each of four sizes a quarter of the one before.
+ * and at each of four sizes a quarter of the one before; or freeing only
+ * the lines of a block that hold nothing reached, as a collector reusing
+ * free lines in place would.
  *
  * A check of the premise.  A unit of a block or a tracked object a close
  * finds unreached is marked as having died, and a later close that
@@ -183,9 +185,16 @@ void nn_region_close(void);
 #define NN_REGION_THRESHOLDS      9
 #define NN_REGION_THRESHOLD_FIRST 4096u
 
-/* Grains: 0 frees single objects; grain g from 1 frees whole blocks of
- * the allocator's block size divided by 4^(g-1). */
-#define NN_REGION_GRAINS 6
+/* Grains: 0 frees single objects; grain g from 1 to
+ * NN_REGION_BLOCK_GRAINS frees whole blocks of the allocator's block size
+ * divided by 4^(g-1); each of the NN_REGION_LINE_GRAINS after them frees
+ * lines, the first of NN_REGION_LINE_FIRST bytes and each after it half
+ * the one before.  A line is a block's bytes from a multiple of its size
+ * in. */
+#define NN_REGION_BLOCK_GRAINS 5
+#define NN_REGION_LINE_GRAINS  2
+#define NN_REGION_LINE_FIRST   256u
+#define NN_REGION_GRAINS       (1 + NN_REGION_BLOCK_GRAINS + NN_REGION_LINE_GRAINS)
 
 /* For each threshold, NN_REGION_THRESHOLD_FIGURES figures: the closes
  * that mark, the objects they entered, the pointers they examined, and
@@ -228,8 +237,8 @@ void nn_region_tenure(uint32_t variant, uint64_t *figures);  /* NN_REGION_TENURE
  * a close marks the region whole, or 0 for none but the outermost. */
 uint64_t nn_region_tenure_budget(uint32_t variant);
 
-/* The bytes of threshold k, and of a block of a bump kind at grain g from
- * 1. */
+/* The bytes of threshold k, and of a block or line of a bump kind at
+ * grain g from 1. */
 uint64_t nn_region_threshold_bytes(uint32_t k);
 uint64_t nn_region_grain_bytes(int kind, uint32_t grain);
 
