@@ -33,7 +33,7 @@ import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
-import Data.List (find, genericLength, inits, intercalate, isPrefixOf, mapAccumL, nub, sort, sortOn, unfoldr)
+import Data.List (find, genericLength, inits, intercalate, isPrefixOf, mapAccumL, nub, sort, sortOn, transpose, unfoldr)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as Map
@@ -85,6 +85,7 @@ import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
 import Nix.Eval.CEnv (cenvNameTable, cenvParent)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsType, clambdaNew, clambdaShape, clambdaShapeAllowExtra, clambdaShapeFormalCount, clambdaShapeFormalsType)
 import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistThunks, thunkListToCList)
+import Nix.Eval.CRegion (RegionCensus (..))
 import Nix.Eval.CRoots (crootsAddThunk)
 import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
 import Nix.Eval.CStatus (CStatusError (..), arenaLive)
@@ -2136,6 +2137,133 @@ appsOfEval baseDir source = do
   after <- censusOf []
   let count census = fromMaybe 0 (figuresCount (kindApps (censusAllocated census)))
   pure (outcome >> ((-) <$> fmap count after <*> fmap count before))
+
+-- | The census of regions ("Nix.Eval.CRegion"), run by @nova-nix eval@ in
+-- a process of its own: the census starts before its arena does.
+testRegionCensus :: IO [Bool]
+testRegionCensus = do
+  putStrLn "eval/region-census"
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-regions"
+      target = root </> "regions.txt"
+      inRoot = bracket_ (forceRemoveIfExists root >> createDirectoryIfMissing True root) (forceRemoveIfExists root)
+      evalWith value args =
+        Proc.readCreateProcessWithExitCode
+          (Proc.proc "cabal" (["run", "-v0", "nova-nix", "--", "eval"] <> args))
+            { Proc.env = Just ((regionVar, value) : filter ((/= regionVar) . fst) ambient)
+            }
+          ""
+      -- The figures the census writes over an evaluation, or why there
+      -- are none.
+      figuresOf args = do
+        (code, _, err) <- evalWith target args
+        written <- Dir.doesFileExist target
+        if code /= ExitSuccess || not written
+          then pure (Left (T.pack ("eval " <> unwords args <> " ended " <> show code <> ": " <> err)))
+          else do
+            figures <- figureLines <$> BS.readFile target
+            Dir.removeFile target
+            pure (Right figures)
+      checked args check = either Fail check <$> figuresOf args
+  sequence
+    [ runTestM "eval writes a census of regions to the file NOVA_NIX_REGION_STATS names, and none when it is empty" $ inRoot $ do
+        let expr = ["--expr", "let a = 1 + 1; b = a + 1; in b"]
+        (code, out, _) <- evalWith target expr
+        figures <- figureLines <$> BS.readFile target
+        Dir.removeFile target
+        (emptyCode, emptyOut, _) <- evalWith "" expr
+        leftOver <- Dir.doesFileExist target
+        pure $
+          assertEqual "printed" (ExitSuccess, "3\n") (code, out)
+            `andThen` assertEqual "with an empty value" (ExitSuccess, out, False) (emptyCode, emptyOut, leftOver)
+            -- Forcing b is a region, and forcing a inside it one more.
+            `andThen` assertEqual "closes" [2] (total "regions.closes" figures)
+            `andThen` assertEqual "depth" [2] (total "regions.depth" figures),
+      runTestM "a loop that forces and drops a value each step holds what one step does, however many steps it runs" $ inRoot $ do
+        short <- figuresOf ["--expr", forcedLoop 50]
+        long <- figuresOf ["--expr", forcedLoop 200]
+        pure $ case (short, long) of
+          (Left why, _) -> Fail why
+          (_, Left why) -> Fail why
+          (Right few, Right many) -> case (heldAtZero few, heldAtZero many, total allocatedName few, total allocatedName many) of
+            ([fewHeld], [manyHeld], [fewAllocated], [manyAllocated]) ->
+              assertEqual "held grows by under a hundredth of what is allocated" True ((manyHeld - fewHeld) * 100 < manyAllocated - fewAllocated)
+                `andThen` orderings few
+                `andThen` orderings many
+            missing -> Fail ("figures missing: " <> T.pack (show missing)),
+      runTestM "a list made by dropping elements keeps the whole items array it is the tail of, which an allocator frees whole" $ inRoot $ do
+        -- r is the last of 999 tails of a list of 1000 elements, and its
+        -- region, the largest, keeps it and so the whole array.
+        let elements = 1000 :: Integer
+        figures <- figuresOf ["--expr", "let t = l: n: if n == 0 then l else t (builtins.tail l) (n - 1); r = t (builtins.genList (x: x) " <> show elements <> ") " <> show (elements - 1) <> "; in builtins.length r"]
+        pure $ case figures of
+          Left why -> Fail why
+          Right found -> case reverse [values | ("regions.class", values) <- found] of
+            (_ : closes : _ : kept : _) : _ ->
+              assertEqual "the largest region is r's alone" 1 closes
+                `andThen` assertEqual "r's region keeps the array's bytes" True (kept >= elements * 8)
+                `andThen` orderings found
+            _ -> Fail "no size class",
+      runTestM "the census places every pointer, resurrects nothing, and its peaks keep their order, over sets, strings, with-scopes and an import" $ inRoot $ do
+        BS.writeFile (root </> "lib.nix") "{ n }: builtins.genList (x: { inherit x; name = \"x${toString x}\"; }) n\n"
+        BS.writeFile (root </> "main.nix") "let lib = import ./lib.nix; in builtins.length (lib { n = 20; }) + (let ys = lib { n = 30; }; in builtins.length ys)\n"
+        results <-
+          traverse
+            (`checked` orderings)
+            [ ["--expr", withScopes],
+              ["--strict", "--expr", setsAndStrings],
+              [root </> "main.nix"]
+            ]
+        pure (foldr andThen Pass results)
+    ]
+  where
+    regionVar = "NOVA_NIX_REGION_STATS"
+    allocatedName = "regions.allocated.bytes"
+    figureLines written =
+      [(name, values) | name : rest <- map BS8.words (BS8.lines written), Just values <- [traverse wholeNumber rest]]
+    wholeNumber value = case BS8.readInteger value of
+      Just (n, rest) | BS.null rest -> Just n
+      _ -> Nothing
+    total name figures = [value | (key, [value]) <- figures, key == name]
+    -- Each threshold's row past its bytes and three counts: its peaks,
+    -- single objects first, then each block size, largest first.
+    peaks figures = [drop 3 rest | ("regions.threshold", _ : rest) <- figures]
+    heldAtZero figures = [held | ("regions.threshold", 0 : _ : _ : _ : held : _) <- figures]
+    -- Each step's value is a binding of its own, so it is forced, and
+    -- what the step allocates dies with its region.
+    forcedLoop :: Int -> String
+    forcedLoop steps =
+      "let r = builtins.foldl' (acc: i: acc + (let n = builtins.length (builtins.genList (x: x * i) 1000); in n)) 0 (builtins.genList (x: x) "
+        <> show steps
+        <> "); in r"
+    withScopes =
+      "let f = n: with rec { xs = builtins.genList (x: x) n; ys = builtins.map (x: x * 2) xs; }; builtins.length ys + builtins.length xs; "
+        <> "in builtins.foldl' (acc: i: acc + (let v = f i; in v)) 0 (builtins.genList (x: x) 30)"
+    setsAndStrings =
+      "let mk = i: { name = \"n${toString i}\"; value = builtins.genList (x: { inherit x; }) 10; }; "
+        <> "s = builtins.listToAttrs (builtins.genList mk 100); "
+        <> "in builtins.attrNames s ++ [ (builtins.length (builtins.concatLists (builtins.attrValues s))) ]"
+    -- What every census satisfies: a collector that marks only past a
+    -- higher threshold frees later and holds no less; freeing whole
+    -- blocks frees less than freeing every object, and a smaller block
+    -- frees at least what a larger one does, as each smaller block nests
+    -- in a larger one.
+    orderings figures =
+      let rows = peaks figures
+          rising values = and (zipWith (<=) values (drop 1 values))
+          falling values = and (zipWith (>=) values (drop 1 values))
+          blocksShrink row = case row of
+            objects : blocks -> falling blocks && all (objects <=) blocks
+            [] -> False
+          classes = [values | ("regions.class", values) <- figures]
+       in assertEqual "unplaced" [0] (total "regions.unplaced" figures)
+            `andThen` assertEqual "resurrected" [0] (total "regions.resurrected.count" figures)
+            `andThen` assertEqual "nine thresholds of six peaks" (replicate 9 6) (map length rows)
+            `andThen` assertEqual "a higher threshold holds no less" True (all rising (transpose rows))
+            `andThen` assertEqual "a smaller block holds no more, and single objects least" True (all blocksShrink rows)
+            `andThen` assertEqual "no class keeps more than it allocated" True (and [kept <= allocated | _ : _ : allocated : kept : _ <- classes])
+            `andThen` assertEqual "every close is in a class" (total "regions.closes" figures) [sum [closes | _ : closes : _ <- classes]]
 
 testAllocSites :: IO [Bool]
 testAllocSites = do
@@ -24574,7 +24702,7 @@ namesOnlyChildFlag = "--names-only-child"
 inTestSession :: IO a -> IO a
 inTestSession action = do
   storeDir <- evalNixIOStoreDir
-  withEvalSession (SessionSettings unrestrictedPolicy (pure []) storeDir testBaseDir) (const action)
+  withEvalSession (SessionSettings unrestrictedPolicy (pure []) storeDir testBaseDir RegionCensusOff) (const action)
 
 -- | The flag that runs 'arenaCycleChild'.
 arenaCycleChildFlag :: String
@@ -29012,6 +29140,7 @@ runSuite = do
           testEvalRecAttrs,
           testFrameKnots,
           testCensus,
+          testRegionCensus,
           testAllocSites,
           testEnvLayout,
           testEvalLists,

@@ -8,6 +8,7 @@
 
 #include "nn_ctxstr.h"
 #include "nn_assert.h"
+#include "nn_region.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,7 @@ nn_ctxstr_new(nn_str_t *text, uint32_t ctx_count)
         free(s);
         return NULL;
     }
+    if (nn_region_census) nn_region_tracked(NN_REGION_CTXSTR, s, g_tracked.count - 1, nn_ctxstr_bytes(s));
     return s;
 }
 

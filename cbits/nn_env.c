@@ -11,15 +11,12 @@
 
 #include "nn_env.h"
 #include "nn_assert.h"
+#include "nn_region.h"
 #include "nn_stats.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* --- Constants --- */
-
-#define NN_ENV_PAGE_SIZE (256u * 1024u)  /* 256 KB per page */
 
 /* --- Internal types --- */
 
@@ -69,6 +66,7 @@ static struct nn_env_page *g_first_page = NULL;
 static struct nn_env_page *g_current_page = NULL;
 static uint64_t g_app_count = 0;
 static uint64_t g_app_bytes = 0;
+static uint64_t g_bytes_allocated = 0;
 
 /* The empty env: a zeroed static that nothing writes, valid in and
  * outside every init .. destroy window. */
@@ -85,6 +83,8 @@ alloc_page(uint32_t capacity)
     page->next = NULL;
     page->used = 0;
     page->capacity = capacity;
+    /* Every page made becomes the one allocation bumps from. */
+    if (nn_region_census) nn_region_block(NN_REGION_ENV_PAGE, page->data, capacity, 1);
     return page;
 }
 
@@ -124,6 +124,7 @@ nn_env_alloc_raw(uint32_t bytes)
     void *result = g_current_page->data + g_current_page->used;
     memset(result, 0, bytes);
     g_current_page->used += bytes;
+    g_bytes_allocated += bytes;
     return result;
 }
 
@@ -244,6 +245,7 @@ nn_env_init(void)
     g_current_page = g_first_page;
     g_app_count = 0;
     g_app_bytes = 0;
+    g_bytes_allocated = 0;
 }
 
 int
@@ -265,6 +267,7 @@ nn_env_destroy(void)
     g_current_page = NULL;
     g_app_count = 0;
     g_app_bytes = 0;
+    g_bytes_allocated = 0;
 }
 
 /* --- List items --- */
@@ -380,6 +383,13 @@ nn_env_push_with(nn_env_t *base, void *scope, uint32_t site)
     return env;
 }
 
+void
+nn_env_resolve_with(void **with_scopes, uint32_t idx, void *set)
+{
+    with_scopes[idx] = set;
+    if (nn_region_census) nn_region_record_with(&with_scopes[idx]);
+}
+
 /* --- Accessors --- */
 
 void **
@@ -473,12 +483,7 @@ nn_env_with_owner(nn_env_t *env)
 uint64_t
 nn_env_bytes_allocated(void)
 {
-    uint64_t bytes = 0;
-    struct nn_env_page *page;
-    for (page = g_first_page; page; page = page->next) {
-        bytes += page->used;
-    }
-    return bytes;
+    return g_bytes_allocated;
 }
 
 /* --- Census --- */
@@ -496,6 +501,14 @@ nn_env_pages(char **data, uint32_t *used, uint32_t max)
         n++;
     }
     return n;
+}
+
+uint64_t
+nn_env_page_used(const char *data)
+{
+    const struct nn_env_page *page = (const struct nn_env_page *)(const void *)(
+        data - offsetof(struct nn_env_page, data));
+    return page->used;
 }
 
 uint64_t

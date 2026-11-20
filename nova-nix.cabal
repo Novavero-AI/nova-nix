@@ -82,6 +82,7 @@ library
     Nix.Eval.CEnv
     Nix.Eval.CLambda
     Nix.Eval.CPrimop
+    Nix.Eval.CRegion
     Nix.Eval.CRoots
     Nix.Eval.CList
     Nix.Eval.CCtxStr
@@ -193,6 +194,8 @@ library
     cbits/nn_lambda.c
     cbits/nn_primop.c
     cbits/nn_roots.c
+    cbits/nn_region.c
+    cbits/nn_graph.c
     cbits/nn_stats.c
     cbits/nn_tracker.c
     cbits/nn_winfs.c

@@ -175,8 +175,9 @@ jobs:
       # fixture's attribute count, so each walk resumes after a spent budget
       # as well as after each failure tryEval cannot catch.  The memory
       # suite then runs on a slice of the fixture: both evaluators' passes
-      # visit the same attributes, and the census places every pointer it
-      # meets.
+      # visit the same attributes, the census places every pointer it
+      # meets, and the census of regions does too and finds nothing reached
+      # after a close found it unreached.
       - name: Check the walk on its fixture
         timeout-minutes: 10
         env:
@@ -192,6 +193,8 @@ jobs:
           memory=profiling/results/fixture/memory
           diff <(sort "$memory/nova-nix/visited.txt") <(sort "$memory/upstream/visited.txt")
           grep -qx 'mark.unplaced 0' "$memory/census/census.txt"
+          grep -qx 'regions.unplaced 0' "$memory/regions/regions.txt"
+          grep -qx 'regions.resurrected.count 0' "$memory/regions/regions.txt"
 
       # The two evaluators walk at once, in one bounded scope.  A process
       # the OOM killer ends there is retried at the attribute it was on, as

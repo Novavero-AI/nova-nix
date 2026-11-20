@@ -8,6 +8,7 @@
 
 #include "nn_lambda.h"
 #include "nn_assert.h"
+#include "nn_region.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -115,6 +116,7 @@ nn_lambda_new(struct nn_env *env, uint32_t body_bc_idx,
         free(lam);
         return NULL;
     }
+    if (nn_region_census) nn_region_tracked(NN_REGION_LAMBDA, lam, g_tracked.count - 1, nn_lambda_bytes(lam));
     return lam;
 }
 

@@ -16,14 +16,12 @@
 #include "nn_thunk.h"
 #include "nn_assert.h"
 #include "nn_env.h"
+#include "nn_region.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* --- Constants --- */
-
-#define NN_THUNK_BLOCK_CAPACITY 65536u  /* 64k thunks = 1 MB */
 
 /* --- Internal types --- */
 
@@ -39,6 +37,7 @@ struct nn_thunk_block {
  * outside the init .. destroy window. */
 static struct nn_thunk_block *g_first_block = NULL;
 static struct nn_thunk_block *g_current_block = NULL;
+static uint64_t g_cells_allocated = 0;
 
 /* --- Internal helpers --- */
 
@@ -47,10 +46,13 @@ alloc_block(void)
 {
     struct nn_thunk_block *block = (struct nn_thunk_block *)malloc(
         sizeof(struct nn_thunk_block)
-        + (size_t)NN_THUNK_BLOCK_CAPACITY * sizeof(nn_thunk_t));
+        + (size_t)NN_THUNK_BLOCK_CELLS * sizeof(nn_thunk_t));
     if (!block) return NULL;
     block->next = NULL;
     block->count = 0;
+    if (nn_region_census)
+        nn_region_block(NN_REGION_THUNK_BLOCK, (const char *)block->slots,
+                        (uint64_t)NN_THUNK_BLOCK_CELLS * sizeof(nn_thunk_t), 1);
     return block;
 }
 
@@ -63,12 +65,13 @@ arena_alloc(void)
      * this apart from exhaustion. */
     if (!g_current_block) return NULL;
 
-    if (g_current_block->count >= NN_THUNK_BLOCK_CAPACITY) {
+    if (g_current_block->count >= NN_THUNK_BLOCK_CELLS) {
         struct nn_thunk_block *block = alloc_block();
         if (!block) return NULL;
         g_current_block->next = block;
         g_current_block = block;
     }
+    g_cells_allocated++;
     return &g_current_block->slots[g_current_block->count++];
 }
 
@@ -85,6 +88,7 @@ nn_thunk_init(void)
         abort();
     }
     g_current_block = g_first_block;
+    g_cells_allocated = 0;
 }
 
 int
@@ -104,6 +108,7 @@ nn_thunk_destroy(void)
     }
     g_first_block = NULL;
     g_current_block = NULL;
+    g_cells_allocated = 0;
 }
 
 /* --- Allocation --- */
@@ -395,8 +400,26 @@ nn_thunk_mark_pending(nn_thunk_t *thunk)
     return 1;
 }
 
+/* Whether a value of this tag holds a pointer into the data layer. */
+static int
+holds_object(uint8_t tag)
+{
+    switch (tag) {
+    case NN_VALUE_INT:
+    case NN_VALUE_FLOAT:
+    case NN_VALUE_BOOL:
+    case NN_VALUE_NULL:
+    case NN_VALUE_PRIMOP:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
 /* Store `payload` under `tag` in a cell not yet COMPUTED: 1, or 0 with
- * the cell unchanged when it already is. */
+ * the cell unchanged when it already is.  A store of an object is a write
+ * of a pointer into a cell that may be older than the force making it,
+ * which a census of regions records (nn_region.h). */
 static int
 set_computed(nn_thunk_t *thunk, uint8_t tag, void *payload)
 {
@@ -404,6 +427,7 @@ set_computed(nn_thunk_t *thunk, uint8_t tag, void *payload)
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = tag;
     thunk->payload = payload;
+    if (nn_region_census && holds_object(tag)) nn_region_record_cell(thunk);
     return 1;
 }
 
@@ -507,7 +531,21 @@ nn_thunk_reserved_bytes(void)
     struct nn_thunk_block *block;
     for (block = g_first_block; block; block = block->next) {
         bytes += sizeof(struct nn_thunk_block)
-               + (uint64_t)NN_THUNK_BLOCK_CAPACITY * sizeof(nn_thunk_t);
+               + (uint64_t)NN_THUNK_BLOCK_CELLS * sizeof(nn_thunk_t);
     }
     return bytes;
+}
+
+uint64_t
+nn_thunk_cells_allocated(void)
+{
+    return g_cells_allocated;
+}
+
+uint64_t
+nn_thunk_block_used(const char *slots)
+{
+    const struct nn_thunk_block *block = (const struct nn_thunk_block *)(const void *)(
+        slots - offsetof(struct nn_thunk_block, slots));
+    return (uint64_t)block->count * sizeof(nn_thunk_t);
 }

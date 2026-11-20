@@ -10,14 +10,11 @@
 
 #include "nn_str.h"
 
+#include "nn_region.h"
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* --- Configuration --- */
-
-#define NN_STR_BLOCK_BYTES ((uint64_t)1 << 20)          /* 1 MiB shared blocks */
-#define NN_STR_LARGE_BYTES (NN_STR_BLOCK_BYTES / 4)     /* past this, a block of its own */
 
 /* --- Blocks --- */
 
@@ -65,6 +62,17 @@ nn_str_t *nn_str_empty(void)
 
 /* --- Arenas --- */
 
+/* The value arena.  The one other arena is the code's (nn_bytecode.h),
+ * whose strings a census of regions places outside every region. */
+static nn_str_arena_t g_values;
+
+static void block_made(const nn_str_arena_t *arena, const nn_str_block_t *b, int current)
+{
+    if (nn_region_census)
+        nn_region_block(arena == &g_values ? NN_REGION_STR_BLOCK : NN_REGION_CODE_BLOCK,
+                        b->data, b->capacity, current);
+}
+
 nn_str_t *nn_str_arena_new(nn_str_arena_t *arena, const char *bytes, size_t len)
 {
     uint64_t need;
@@ -80,6 +88,7 @@ nn_str_t *nn_str_arena_new(nn_str_arena_t *arena, const char *bytes, size_t len)
         if (!b) return NULL;
         b->next = arena->blocks;
         arena->blocks = b;
+        block_made(arena, b, 0);
     } else {
         b = arena->current;
         if (!b || b->capacity - b->used < need) {
@@ -88,6 +97,7 @@ nn_str_t *nn_str_arena_new(nn_str_arena_t *arena, const char *bytes, size_t len)
             b->next = arena->blocks;
             arena->blocks = b;
             arena->current = b;
+            block_made(arena, b, 1);
         }
     }
 
@@ -96,6 +106,7 @@ nn_str_t *nn_str_arena_new(nn_str_arena_t *arena, const char *bytes, size_t len)
     s->len = (uint32_t)len;
     memcpy(s->bytes, bytes, len);
     arena->count++;
+    arena->bytes += need;
     return s;
 }
 
@@ -112,8 +123,7 @@ void nn_str_arena_free(nn_str_arena_t *arena)
 
 /* --- The value arena --- */
 
-static nn_str_arena_t g_values;
-static int            g_live;
+static int g_live;
 
 void nn_str_init(void)
 {
@@ -174,6 +184,12 @@ uint32_t nn_str_arena_blocks(const nn_str_arena_t *arena,
         n++;
     }
     return n;
+}
+
+uint64_t nn_str_block_used(const char *data)
+{
+    const nn_str_block_t *b = (const nn_str_block_t *)(const void *)(data - offsetof(nn_str_block_t, data));
+    return b->used;
 }
 
 uint64_t nn_str_arena_reserved_bytes(const nn_str_arena_t *arena)

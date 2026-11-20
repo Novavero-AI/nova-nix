@@ -8,6 +8,7 @@
 
 #include "nn_primop.h"
 #include "nn_assert.h"
+#include "nn_region.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,8 @@ nn_primop_app_new(uint32_t primop, uint16_t forced,
         free(app);
         return NULL;
     }
+    if (nn_region_census)
+        nn_region_tracked(NN_REGION_PRIMOP_APP, app, g_tracked.count - 1, nn_primop_app_bytes(app));
     return app;
 }
 
