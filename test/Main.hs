@@ -80,7 +80,7 @@ import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.Builtin (Builtin, builtinIndex, builtinName, builtinNamed)
 import qualified Nix.Eval.Builtin as Builtin
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
-import Nix.Eval.CBytecode (attrkeyStatic, binaryAdd, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcEmitString, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, cbcString, cbcStringText, formalName, formalNamedSet, formalSet, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (attrkeyStatic, attrsRec, binaryAdd, bindNamed, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcEmitString, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, cbcString, cbcStringText, formalName, formalNamedSet, formalSet, formalSharedDefault, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
 import Nix.Eval.CEnv (cenvNameTable, cenvParent)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsType, clambdaNew, clambdaShape, clambdaShapeAllowExtra, clambdaShapeFormalCount, clambdaShapeFormalsType)
@@ -92,9 +92,9 @@ import Nix.Eval.CStr (cstrNew)
 import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetBool, cthunkGetInt, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkPrimop, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
-import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), BcCaptureInfo (..), BcInheritedName (..), BcInheritedNames, compileExpr, compileFormalsToEval, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, foldBcBindings, foldBcCapturedSlots, foldBcInheritedNames, reassembleInt64)
+import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), BcCaptureInfo (..), BcInheritedName (..), BcInheritedNames, BcShares (..), SiblingVar (..), compileExpr, compileFormalsToEval, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, foldBcBindings, foldBcCapturedSlots, foldBcInheritedNames, foldBcShares, reassembleInt64, siblingShares)
 import qualified Nix.Eval.Context as Context
-import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), LambdaName (..))
+import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), FormalDefault (..), LambdaName (..))
 import Nix.Eval.IO (EvalFailure (..), EvalState (..), SessionSettings (..), allowEvalPath, evalBaseEnv, newEvalStateWith, nixPathSearchPath, renderEvalFailure, runEvalIO, runEvalIOTraced, withEvalSession)
 import Nix.Eval.Operator (evalUpdate)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
@@ -24817,6 +24817,137 @@ testDeepForceOrderIO = do
         ["error: b"]
     ]
 
+-- | A binding, a list element, a call's argument or a default whose
+-- value is a variable holds the variable's own cell where upstream's
+-- @maybeThunk@ does (eval.cc:1006-1046 at 2.24.9), which @==@ shows of a
+-- function, equal only to itself (eval.cc:2727).  A global and a
+-- variable of an enclosing scope are bound by then, and so is a
+-- recursive set's static name by the time its dynamic ones are bound
+-- (eval.cc:1273).  A variable only a with supplies never is
+-- (eval.cc:869-872).  A recursive set, a @let@ and a set pattern fill
+-- their slots in symbol order, so a variable naming a sibling shares its
+-- cell only when the sibling's name was interned first, and a recursive
+-- set that binds @__overrides@ shares none but an inherited name's
+-- (eval.cc:1214-1218).  Symbol order is the order the symbol table
+-- interned the names in, so each case runs in a child process, whose
+-- table holds none of the names but the globals and interns them in the
+-- order the source gives them, as upstream's parser does; a @let@ that
+-- binds nothing the case uses puts a set pattern's names in the order
+-- the case needs.
+testSharedVariableCellsIO :: IO [Bool]
+testSharedVariableCellsIO = do
+  putStrLn "eval/shared-variable-cells-io"
+  sequence
+    [ evaluatesTo "a set's attribute and a list element share a global's cell" "builtins.catAttrs \"g\" [ { g = map; } ] == [ map ]" "true",
+      evaluatesTo "two list elements share a global's cell" "[ map ] == [ map ]" "true",
+      evaluatesTo "an inherited global shares its cell" "builtins.catAttrs \"map\" [ { inherit map; } ] == [ map ]" "true",
+      evaluatesTo "a dynamic attribute shares a global's cell" "builtins.catAttrs \"g\" [ { ${\"g\" + \"\"} = map; } ] == [ map ]" "true",
+      evaluatesTo "a let binding shares a global's cell" "let m = map; in [ m ] == [ map ]" "true",
+      evaluatesTo "a call's argument shares a global's cell" "(x: [ x ]) map == [ map ]" "true",
+      evaluatesTo "a recursive set's dynamic attribute shares a static sibling's cell" "let s = rec { f = x: x; ${\"g\" + \"\"} = f; }; in builtins.catAttrs \"f\" [ s ] == builtins.catAttrs \"g\" [ s ]" "true",
+      evaluatesTo "a recursive set's attribute shares a sibling's cell bound before it" "let s = rec { f = x: x; g = f; }; in builtins.catAttrs \"f\" [ s ] == builtins.catAttrs \"g\" [ s ]" "true",
+      evaluatesTo "a recursive set's attribute does not share a sibling's cell bound after it" "let s = rec { g = f; f = x: x; }; in builtins.catAttrs \"f\" [ s ] == builtins.catAttrs \"g\" [ s ]" "false",
+      evaluatesTo "a chain of siblings shares the cell at its end" "let s = rec { f = x: x; g = f; h = g; }; in builtins.catAttrs \"f\" [ s ] == builtins.catAttrs \"h\" [ s ]" "true",
+      evaluatesTo "a static attribute of a recursive set with a dynamic name shares a sibling's cell bound before it" "let s = rec { f = x: x; g = f; ${\"h\" + \"\"} = 1; }; in builtins.catAttrs \"f\" [ s ] == builtins.catAttrs \"g\" [ s ]" "true",
+      evaluatesTo "a static attribute of a recursive set with a dynamic name does not share a sibling's cell bound after it" "let s = rec { g = f; f = x: x; ${\"h\" + \"\"} = 1; }; in builtins.catAttrs \"f\" [ s ] == builtins.catAttrs \"g\" [ s ]" "false",
+      -- The inner set's static names are in a name table, whose entry for
+      -- zq is not filled when zp's value is made, and a lookup by name
+      -- passes over an entry not filled yet to the enclosing set's table,
+      -- which binds zq too; zp's value reads its own frame's zq.
+      evaluatesTo "a static attribute of a recursive set with a dynamic name reads the sibling it names, not an enclosing set's attribute of that name" "let zp = 0; in (rec { zq = 1; ${\"d\" + \"\"} = 2; s = rec { zp = zq; zq = x: x; ${\"h\" + \"\"} = 1; }; }).s.zp 5" "5",
+      evaluatesTo "a recursive set's attribute shares the cell of a variable of an enclosing scope" "let f = x: x; in builtins.catAttrs \"g\" [ rec { g = f; } ] == [ f ]" "true",
+      evaluatesTo "a let binding shares the cell of a variable of an enclosing scope" "let f = x: x; in let g = f; in [ f ] == [ g ]" "true",
+      evaluatesTo "a default shares the cell of a variable of an enclosing scope" "let f = x: x; in ({ g ? f }: [ g ] == [ f ]) { }" "true",
+      evaluatesTo "a let binding shares a sibling's cell bound before it" "let f = x: x; g = f; in [ f ] == [ g ]" "true",
+      evaluatesTo "a let binding does not share a sibling's cell bound after it" "let g = f; f = x: x; in [ f ] == [ g ]" "false",
+      evaluatesTo "a default shares the cell of a formal bound before it" "let za = 0; zb = 0; in ({ za, zb ? za }: [ za ] == [ zb ]) { za = x: x; }" "true",
+      evaluatesTo "a default does not share the cell of a formal bound after it" "let zb = 0; za = 0; in ({ za, zb ? za }: [ za ] == [ zb ]) { za = x: x; }" "false",
+      -- Upstream's parser interns a default's variable before the formal
+      -- it defaults (parser.y:280 and :483), so a formal written after
+      -- the default that names it is bound before.
+      evaluatesTo "a default shares the cell of a formal written after it" "({ zb ? za, za }: [ za ] == [ zb ]) { za = x: x; }" "true",
+      evaluatesTo "a let binding shares the cell at the end of a chain declared out of symbol order" "let zl = 0; zm = 0; zn = 0; in let zn = zm; zm = zl; zl = x: x; in [ zl ] == [ zn ]" "true",
+      evaluatesTo "a default shares the cell at the end of a chain declared out of symbol order" "let zr = 0; zt = 0; zx = 0; in ({ zx ? zt, zt ? zr, zr }: [ zr ] == [ zx ]) { zr = x: x; }" "true",
+      -- Comparing the two sets would force the attribute that throws.
+      evaluatesTo "a default naming the @-pattern shares the argument" "(args@{ zz ? args, ... }: [ zz ] == [ args ]) { f = throw \"boom\"; }" "true",
+      evaluatesTo "a default naming a formal the argument holds shares the argument's attribute" "let za = 0; zb = 0; zc = 0; in ({ zc ? zb, zb ? za, za }: [ zb ] == [ zc ]) { za = 1; zb = x: x; }" "true",
+      evaluatesTo "a variable a with supplies does not share its cell" "let s = { f = x: x; }; in with s; builtins.catAttrs \"f\" [ s ] == [ f ]" "false",
+      evaluatesTo "a recursive set that binds __overrides does not share a sibling's cell" "let s = rec { __overrides = { }; f = x: x; g = f; }; in builtins.catAttrs \"f\" [ s ] == builtins.catAttrs \"g\" [ s ]" "false",
+      evaluatesTo "a recursive set that binds __overrides makes a value a thunk of its own" "builtins.catAttrs \"g\" [ rec { __overrides = { }; g = map; } ] == [ map ]" "false",
+      evaluatesTo "a recursive set with a dynamic name that binds __overrides makes a value a thunk of its own" "builtins.catAttrs \"g\" [ rec { __overrides = { }; g = map; ${\"h\" + \"\"} = 1; } ] == [ map ]" "false",
+      evaluatesTo "a recursive set that binds __overrides shares an inherited global's cell" "builtins.catAttrs \"map\" [ rec { __overrides = { }; inherit map; } ] == [ map ]" "true",
+      runTestM "a frame's variables share the cells upstream's binding in symbol order gives them, copied in any order" . quickCheckPasses $
+        QC.forAll genFrame $ \(names, values) ->
+          let slots = zip3 [0 ..] names values
+              nameOf = (`Map.lookup` Map.fromList [(slot, name) | (slot, name, _) <- slots])
+              ownCells = Map.fromList [(slot, slot) | (slot, _, _) <- slots]
+              siblings = [SiblingVar name slot target | (slot, name, Just target) <- slots]
+              shares = siblingShares nameOf siblings
+              shareCell cells (slot, target) = maybe cells (\cell -> Map.insert slot cell cells) (Map.lookup target cells)
+           in (foldl' shareCell ownCells shares, foldl' shareCell ownCells (reverse shares)) QC.=== (upstreamFill slots, upstreamFill slots),
+      -- The compiler decides a frame's shares as it compiles the frame,
+      -- each naming the slot at the end of its chain; names no other
+      -- test interns keep their symbols in the order the code gives them.
+      runTestM "a let's bindings hold their shares, each naming the slot at the end of its chain" $ do
+        let bound name = NamedBinding (testPos 1 1) (StaticKey name)
+        idx <- compileExpr (ELet [bound "zshareA" (ELit (NixInt 1)), bound "zshareB" (EResolvedVar 0 0), bound "zshareC" (EResolvedVar 0 1), bound "zshareD" (EResolvedVar 0 4), bound "zshareE" (ELit NixNull)] (ELit NixNull) NoCaptureInfo)
+        BcBindings _ shares _ _ <- compiledBindings idx
+        pairs <- foldBcShares (\found slot target -> pure ((slot, target) : found)) [] shares
+        pure (assertEqual "shares" [(1, 0), (2, 0)] (reverse pairs)),
+      runTestM "a plain set and a recursive set that binds __overrides hold no shares" $ do
+        let bound name = NamedBinding (testPos 1 1) (StaticKey name)
+            sharesOf expr = compileExpr expr >>= compiledBindings >>= \(BcBindings _ (BcShares count _) _ _) -> pure count
+        plain <- sharesOf (EAttrs False [bound "zshareF" (ELit NixNull), bound "zshareG" (EVar "zshareF")] NoCaptureInfo)
+        overridden <- sharesOf (EAttrs True [bound "__overrides" (EAttrs False [] NoCaptureInfo), bound "zshareH" (ELit NixNull), bound "zshareI" (EResolvedVar 0 1)] NoCaptureInfo)
+        pure (assertEqual "plain" 0 plain `andThen` assertEqual "__overrides" 0 overridden),
+      runTestM "a set pattern's defaults naming its slots share where upstream's do, each naming the slot it reads" $ do
+        let formals =
+              FormalNamedSet
+                "zshareArgs"
+                [ Formal "zshareP" (Just (EResolvedVar 0 4)),
+                  Formal "zshareQ" (Just (EResolvedVar 0 1)),
+                  Formal "zshareR" (Just (EResolvedVar 0 2)),
+                  Formal "zshareS" (Just (EResolvedVar 0 0))
+                ]
+                False
+        idx <- compileExpr (ELambda formals (ELit NixNull) NoCaptureInfo)
+        flags <- cbcFlags idx
+        decoded <- cbcArg1 idx >>= decodeFormals flags
+        defaults <- case decoded of
+          Just (EFNamedSet _ _ entries _) -> traverse (defaultSlot . efDefault) entries
+          _ -> pure []
+        pure (assertEqual "defaults" [("default", 4), ("shared", 1), ("shared", 2), ("shared", 0)] defaults)
+    ]
+  where
+    evaluatesTo label source result = emits label ("builtins.trace (" <> source <> ") null") ["trace: " <> result]
+    -- A default's kind and the slot its code names, a variable of level 0.
+    defaultSlot :: FormalDefault -> IO (Text, Word32)
+    defaultSlot = \case
+      NoDefault -> pure ("none", 0)
+      Default code -> ("default",) <$> cbcArg2 code
+      SharedDefault code -> ("shared",) <$> cbcArg2 code
+    quickCheckPasses property = do
+      outcome <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess outcome then Pass else Fail (T.pack (QC.output outcome)))
+    -- A frame of up to six slots, each binding a name of its own, in any
+    -- symbol order, and each holding either a variable naming one of the
+    -- frame's slots, itself included, or some other value.
+    genFrame = do
+      size <- QC.choose (1, 6)
+      names <- QC.shuffle (map Symbol [1 .. fromIntegral size])
+      values <- QC.vectorOf size (QC.oneof [pure Nothing, Just <$> QC.choose (0, size - 1)])
+      pure (names, values)
+    -- Upstream's loop over a frame's slots, each its number, its name and
+    -- the slot its variable names: the slots filled one at a time in
+    -- symbol order, a variable taking the cell of the slot it names when
+    -- that slot is filled and a thunk of its own when it is not, and any
+    -- other value a cell of its own, each cell named by the slot it was
+    -- made for.
+    upstreamFill :: [(Int, Symbol, Maybe Int)] -> Map.Map Int Int
+    upstreamFill slots = foldl' fill Map.empty (sortOn (\(_, name, _) -> name) slots)
+      where
+        fill env (slot, _, value) = Map.insert slot (fromMaybe slot (value >>= (`Map.lookup` env))) env
+
 -- | A string's bytes are made once and shared by every cell that holds
 -- the string, as upstream copies a @Value@ with the pointer to its bytes
 -- (value.hh at 2.24.9), where a copy per cell would grow the string arena
@@ -26805,6 +26936,11 @@ srcPosBack idx =
     Just (PosInText line column) -> testPos line column
     _ -> testPos 0 0
 
+-- | A lambda's formals decoded from the bytecode ('decodeBcFormals'),
+-- failing on a default kind the compiler never writes.
+decodeFormals :: Word8 -> Word32 -> IO (Maybe EvalFormals)
+decodeFormals = decodeBcFormals (\kind -> ioError (userError ("a formal's default has kind " <> show kind)))
+
 -- | Decoded formals read back as the parser's formals they compile from.
 formalsBack :: EvalFormals -> IO Formals
 formalsBack formals = case formals of
@@ -26816,7 +26952,11 @@ formalsBack formals = case formals of
     back <- traverse formalBack entries
     pure (FormalNamedSet (symbolText name) back ellipsis)
   where
-    formalBack (EvalFormal name def) = Formal (symbolText name) <$> traverse childExpr def
+    formalBack (EvalFormal name def) = Formal (symbolText name) <$> traverse childExpr (defaultCode def)
+    defaultCode = \case
+      NoDefault -> Nothing
+      Default code -> Just code
+      SharedDefault code -> Just code
 
 -- | A binding read from the bytecode read back as the binding it compiles
 -- from.  An inherited name's select is the compiler's own and has no
@@ -26893,10 +27033,11 @@ testLambdaShape = do
         pure (assertEqual "refusals" (replicate 2 (Just "nn_lambda_new")) (map site outcomes))
     ]
 
--- | A closure's formals type and a string context element's tag each
--- hold one of the values the C side names (@NN_FORMALS_*@ and
--- @NN_SCE_*@).  Only memory written past the library holds another, so
--- each test writes one in place, at the field's offset in the struct
+-- | A closure's formals type, a formal's default kind and a string
+-- context element's tag each hold one of the values the C side names
+-- (@NN_FORMALS_*@, the kinds cbits/nn_lambda.h lists for a formal entry,
+-- and @NN_SCE_*@).  Only memory written past the library holds another,
+-- so each test writes one in place, at the field's offset in the struct
 -- cbits/nn_lambda.h or cbits/nn_ctxstr.h lays out, and restores the
 -- field once the read has refused it.
 testUnknownTags :: IO [Bool]
@@ -26909,6 +27050,13 @@ testUnknownTags = do
         lam <- cthunkPayload (unThunk cell)
         outcome <- withFieldAt lam lambdaShapeOffset (clambdaShape unnamedTag 0 0) (readComputed (unThunk cell))
         pure (assertEqual "site" (Just "nn_lambda_formals_type") (violatedAt outcome)),
+      runTestM "a closure whose formal holds no default kind raises CInvariantViolated" $ do
+        name <- symbolIntern "x"
+        cell <- evaluated (VLambda emptyEnv (EFSet AnonymousLambda [EvalFormal name NoDefault] False) 0)
+        lam <- cthunkPayload (unThunk cell)
+        entries <- peekByteOff lam pointerBytes
+        outcome <- withFieldAt entries entryKindOffset (unknownTag :: Word32) (readComputed (unThunk cell))
+        pure (assertEqual "site" (Just "nn_lambda_entry_kind") (violatedAt outcome)),
       runTestM "a string context element with no known tag raises CInvariantViolated" $ do
         cell <- evaluated (VStr "ztext" (StringContext (Set.singleton (SCPlain (StorePath censusStoreHash "zname")))))
         ctxstr <- cthunkPayload (unThunk cell)
@@ -26920,8 +27068,11 @@ testUnknownTags = do
     -- two bits of formals type the tags leave unnamed.
     unnamedTag = 3 :: Word8
     pointerBytes = sizeOf (nullPtr :: Ptr ())
-    -- An nn_lambda_t's shape follows its two pointers and three words.
+    -- An nn_lambda_t's shape follows its two pointers and three words,
+    -- and its entries are its second pointer.
     lambdaShapeOffset = 2 * pointerBytes + 3 * sizeOf (0 :: Word32)
+    -- A formal entry's kind follows its name's symbol.
+    entryKindOffset = sizeOf (0 :: Word32)
     -- An nn_ctxstr_t's elements follow its text pointer and its count,
     -- padded to their pointer alignment, and an element's tag is its
     -- first byte.
@@ -26949,7 +27100,7 @@ testBytecodeTags = do
           flags <- cbcFlags idx
           formalsOff <- cbcArg1 idx
           captureOff <- cbcArg3 idx
-          decodedFormals <- decodeBcFormals flags formalsOff >>= traverse formalsBack
+          decodedFormals <- decodeFormals flags formalsOff >>= traverse formalsBack
           decodedCaptures <- decodeBcCaptureInfo captureOff >>= traverse capturesBack
           pure ((decodedFormals, decodedCaptures) QC.=== (Just formals, Right captures)),
       runTestM "a lambda stored in a cell reads back with the symbols it was stored with" . quickCheckPasses $
@@ -26982,7 +27133,7 @@ testBytecodeTags = do
               _ -> Nothing
             formalsAt idx = do
               flags <- cbcFlags idx
-              decodeBcFormals flags =<< cbcArg1 idx
+              decodeFormals flags =<< cbcArg1 idx
             lambdaNameOf = \case
               EFSet name _ _ -> Just name
               EFNamedSet name _ _ _ -> Just name
@@ -26998,7 +27149,7 @@ testBytecodeTags = do
       runTestM "a compiled let's bindings, their counts and its capture info read back as compiled" . quickCheckPasses $
         QC.forAll ((,) <$> QC.listOf genBinding <*> genCaptureInfo) $ \(bindings, captures) -> QC.ioProperty $ do
           idx <- compileExpr (ELet bindings (ELit NixNull) captures)
-          compiled@(BcBindings (BcBindingCounts names dynamics) _ _) <- compiledBindings idx
+          compiled@(BcBindings (BcBindingCounts names dynamics) _ _ _) <- compiledBindings idx
           decodedBindings <- bindingList compiled >>= traverse (traverse bindingBack)
           decodedCaptures <- cbcArg3 idx >>= decodeBcCaptureInfo >>= traverse capturesBack
           pure ((decodedBindings, (names, dynamics), decodedCaptures) QC.=== (Right bindings, nameCounts bindings, Right captures))
@@ -27050,16 +27201,21 @@ unknownTag :: (Num a) => a
 unknownTag = 200
 
 -- | Whether hand-built code at a bytecode index fails to evaluate with the
--- corrupt-bytecode error for @what@.  The outcome, and a value it holds
--- (which the failure message shows), are forced inside the action, so an
--- exception a decoder raises instead, as the evaluator runs or once the
--- value is inspected, reaches 'runTestM' as a failure rather than
--- escaping after it.
+-- corrupt-bytecode error for @what@ holding 'unknownTag'.
 assertCorruptBytecode :: Text -> Word32 -> IO TestResult
-assertCorruptBytecode what idx = do
+assertCorruptBytecode what = assertCorruptBytecodeAt what unknownTag
+
+-- | Whether hand-built code at a bytecode index fails to evaluate with the
+-- corrupt-bytecode error for @what@ holding @value@.  The outcome, and a
+-- value it holds (which the failure message shows), are forced inside the
+-- action, so an exception a decoder raises instead, as the evaluator runs
+-- or once the value is inspected, reaches 'runTestM' as a failure rather
+-- than escaping after it.
+assertCorruptBytecodeAt :: Text -> Int -> Word32 -> IO TestResult
+assertCorruptBytecodeAt what value idx = do
   outcome <- evaluate (runPureEval (evalBytecode emptyEnv idx))
   evaluate $ case outcome of
-    Left err -> assertEqual "error" ("corrupt bytecode: unknown " <> what <> " " <> T.pack (show (unknownTag :: Int))) err
+    Left err -> assertEqual "error" ("corrupt bytecode: unknown " <> what <> " " <> T.pack (show value)) err
     Right val -> Fail ("expected the corrupt-bytecode error but got: " <> T.pack (show val))
 
 testBytecodeCorrupt :: IO [Bool]
@@ -27086,14 +27242,62 @@ testBytecodeCorrupt = do
       runTestM "an unknown binding tag in an attribute set is a corrupt-bytecode error" $ do
         bindingsOff <- bindingWords [unknownTag]
         cbcEmit OpAttrs 0 1 bindingsOff 0 0 >>= assertCorruptBytecode "binding tag",
+      runTestM "an unknown attribute set flag is a corrupt-bytecode error" $ do
+        bindingsOff <- bindingWords []
+        cbcEmit OpAttrs unknownTag 0 bindingsOff 0 0 >>= assertCorruptBytecode "attribute set flag",
       runTestM "an unknown binding tag in a let is a corrupt-bytecode error" $ do
         bindingsOff <- bindingWords [unknownTag]
         captureOff <- cbcEmitData captureNone
         body <- literalOne
-        cbcEmit OpLet 0 1 bindingsOff body captureOff >>= assertCorruptBytecode "binding tag"
+        cbcEmit OpLet 0 1 bindingsOff body captureOff >>= assertCorruptBytecode "binding tag",
+      -- A let of one slot, which no binding fills, with one share.
+      runTestM "a share naming a slot past its frame is a corrupt-bytecode error" $ do
+        let sharing slot target = do
+              bindingsOff <- dataWords 1 [0, 1, slot, target]
+              captureOff <- cbcEmitData captureNone
+              body <- literalOne
+              cbcEmit OpLet 0 0 bindingsOff body captureOff
+        sharer <- sharing unknownTag 0 >>= assertCorruptBytecode "share slot"
+        shared <- sharing 0 unknownTag >>= assertCorruptBytecode "share slot"
+        pure (sharer `andThen` shared),
+      -- A recursive set whose counts give it a dynamic name, so its names
+      -- are in a name table, and whose one binding is a static name.
+      runTestM "a share naming a symbol its frame does not bind is a corrupt-bytecode error" $ do
+        Symbol bound <- symbolIntern "zcorruptBound"
+        let sharing name target = do
+              value <- literalOne
+              bindingsOff <- dataWords 1 [1, 1, name, target, bindNamed, attrkeyStatic, bound, value, 0]
+              captureOff <- cbcEmitData captureNone
+              cbcEmit OpAttrs attrsRec 1 bindingsOff captureOff 0
+        sharer <- sharing unknownTag bound >>= assertCorruptBytecode "share symbol"
+        shared <- sharing bound unknownTag >>= assertCorruptBytecode "share symbol"
+        pure (sharer `andThen` shared),
+      runTestM "an unknown formal default kind is a corrupt-bytecode error" $ do
+        Symbol name <- symbolIntern "zcorruptFormal"
+        body <- literalOne
+        formalsOff <- dataWords invalidSymbolId [1, 0, name, unknownTag, body]
+        captureOff <- cbcEmitData captureNone
+        cbcEmit OpLambda formalSet 0 formalsOff body captureOff >>= assertCorruptBytecode "formal default kind",
+      -- Two formals whose defaults each share the other's slot, called
+      -- with an argument that holds neither.  The walk from slot 0 passes
+      -- through both formals' defaults and fails on slot 1, the next.
+      runTestM "a cycle of shared defaults is a corrupt-bytecode error" $ do
+        Symbol first <- symbolIntern "zcycleFirst"
+        Symbol second <- symbolIntern "zcycleSecond"
+        toSecond <- cbcEmit OpResolvedVar 0 0 0 1 0
+        toFirst <- cbcEmit OpResolvedVar 0 0 0 0 0
+        body <- literalOne
+        formalsOff <- dataWords invalidSymbolId [2, 0, first, formalSharedDefault, toSecond, second, formalSharedDefault, toFirst]
+        captureOff <- cbcEmitData captureNone
+        lambda <- cbcEmit OpLambda formalSet 0 formalsOff body captureOff
+        argument <- bindingWords [] >>= \bindingsOff -> cbcEmit OpAttrs 0 0 bindingsOff 0 0
+        cbcEmit OpApp 0 0 lambda argument 0 >>= assertCorruptBytecodeAt "shared default slot" 1
     ]
   where
     literalOne = cbcEmit OpLitInt 0 0 1 0 0
+    -- Data words built by hand, first to last; answers the offset of the
+    -- first.
+    dataWords firstWord rest = cbcEmitData firstWord <* mapM_ cbcEmitData rest
     -- @x: 1@, built by hand with the given formals type and capture tag.
     lambdaWith formalsType captureTag = do
       Symbol name <- symbolIntern "x"
@@ -27101,12 +27305,9 @@ testBytecodeCorrupt = do
       captureOff <- cbcEmitData captureTag
       body <- literalOne
       cbcEmit OpLambda formalsType 0 formalsOff body captureOff
-    -- A binding list's words, built by hand: both of its counts zero,
-    -- then the words given.  Answers the offset of the first.
-    bindingWords payload = do
-      off <- cbcEmitData 0
-      mapM_ cbcEmitData (0 : payload)
-      pure off
+    -- A binding list's words, built by hand: its three counts zero, then
+    -- the words given.  Answers the offset of the first.
+    bindingWords = dataWords 0 . (0 :) . (0 :)
 
 -- | An inherited name and whether its select reads that name, as the one
 -- path segment, from slot 0 of the env it runs in.
@@ -28860,6 +29061,7 @@ runSuite = do
           testSelectInterningIO,
           testDynamicAttrInterningIO,
           testDeepForceOrderIO,
+          testSharedVariableCellsIO,
           testStringSharing,
           testTraceVerboseOff,
           testStorePathLinksIO,

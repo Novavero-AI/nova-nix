@@ -19,7 +19,9 @@
 -- folds over the data buffer each time their code runs, so no list of
 -- them is built.  A binding list's words start with the names it binds
 -- counted, so the evaluator knows a frame's layout and a set's size
--- before it reads a binding.
+-- before it reads a binding, and then the frame's shares, which the
+-- compiler decides once ('siblingShares') for the evaluator to copy each
+-- time it fills the frame.
 --
 -- Compiling writes the bytecode store and interns names, so it runs in an
 -- evaluation session ('Nix.Eval.IO.withEvalSession').
@@ -38,7 +40,13 @@ module Nix.Eval.Compile
     foldBcCapturedSlots,
     BcBindings (..),
     BcBindingCounts (..),
+    BcShares (..),
     decodeBcBindings,
+    foldBcShares,
+    SiblingVar (..),
+    siblingShares,
+    formalDefaultWords,
+    formalDefaultFromWords,
     BcBinding (..),
     BcInheritedNames (..),
     BcInheritedName (..),
@@ -51,6 +59,9 @@ where
 
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.Int (Int64)
+import Data.List (sortOn)
+import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word16, Word32, Word64, Word8)
@@ -58,6 +69,9 @@ import GHC.Float (castDoubleToWord64, castWord64ToDouble)
 import Nix.Eval.CBytecode
   ( attrkeyDynamic,
     attrkeyStatic,
+    attrsPlain,
+    attrsRec,
+    attrsRecOverrides,
     binaryAdd,
     binaryAnd,
     binaryConcat,
@@ -84,9 +98,12 @@ import Nix.Eval.CBytecode
     cbcEmitData,
     cbcEmitString,
     cbcEmitText,
+    formalDefault,
     formalName,
     formalNamedSet,
+    formalNoDefault,
     formalSet,
+    formalSharedDefault,
     spilledCountSentinel,
     strpartEsc,
     strpartInterp,
@@ -120,7 +137,7 @@ import Nix.Eval.CBytecode
     pattern OpWithVar,
   )
 import Nix.Eval.CData (MonadCData)
-import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), LambdaName (..), lambdaNameFromSymbol, lambdaNameSymbol)
+import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), FormalDefault (..), LambdaName (..), lambdaNameFromSymbol, lambdaNameSymbol)
 import Nix.Eval.SourcePos (PosIdx (..), PosRecorder, newPosRecorder, recordPos)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern)
 import Nix.Expr.Types
@@ -168,8 +185,11 @@ compileWith recorder = go
     go (EWithVar name) = compileSymbolOp OpWithVar name
     go (EResolvedVar level idx) =
       cbcEmit OpResolvedVar 0 0 (fi level) (fi idx) 0
-    go (EAttrs isRec bindings captureInfo) =
-      compileAttrs isRec bindings captureInfo
+    go (EAttrs False bindings captureInfo) =
+      compileAttrs attrsPlain NothingShares bindings captureInfo
+    go (EAttrs True bindings captureInfo)
+      | bindsOverrides bindings = compileAttrs attrsRecOverrides NothingShares bindings captureInfo
+      | otherwise = compileAttrs attrsRec SiblingsShare bindings captureInfo
     go (EList exprs) = compileList exprs
     go (ESelect target path defExpr) =
       compileSelect target path defExpr
@@ -228,9 +248,9 @@ compileWith recorder = go
       cbcEmit op 0 0 sym 0 0
 
     -- \| Emit an instruction whose only operand is a string of the code's:
-    -- a URI, a path or a search path, each a value upstream's parser
-    -- makes (an @ExprString@ or an @ExprPath@, parser.y:294-308 and
-    -- :340-357 at 2.24.9), not a name it interns.
+    -- a URI or a path, each a value upstream's parser makes (an
+    -- @ExprString@ or an @ExprPath@, parser.y:301-309 and :340-357 at
+    -- 2.24.9), not a name it interns.
     compileTextOp :: Word8 -> Text -> IO Word32
     compileTextOp op text = do
       index <- cbcEmitText text
@@ -274,12 +294,15 @@ compileWith recorder = go
     -- Attribute sets (EAttrs)
     -- -----------------------------------------------------------------
 
-    compileAttrs :: Bool -> [Binding] -> CaptureInfo -> IO Word32
-    compileAttrs isRec bindings captureInfo = do
-      bindingWords <- compileBindingWords bindings
+    -- \| A set whose instruction holds the flag given ('attrsPlain',
+    -- 'attrsRec' or 'attrsRecOverrides'), its values sharing as
+    -- @sharing@ says.
+    compileAttrs :: Word8 -> FrameSharing -> [Binding] -> CaptureInfo -> IO Word32
+    compileAttrs kind sharing bindings captureInfo = do
+      bindingWords <- compileBindingWords sharing bindings
       capOff <- compileCaptureInfo captureInfo
       (bindingCount, dataOff) <- emitCounted "attribute set with bindings" (length bindings) bindingWords
-      cbcEmit OpAttrs (if isRec then 1 else 0) bindingCount dataOff capOff 0
+      cbcEmit OpAttrs kind bindingCount dataOff capOff 0
 
     -- -----------------------------------------------------------------
     -- Lists (EList)
@@ -352,28 +375,30 @@ compileWith recorder = go
       Symbol sym <- symbolIntern name
       emitWordList [sym]
     compileFormals name (FormalSet formals ellipsis) = do
-      formalWords <- compileFormalEntries formals
+      formalWords <- compileFormalEntries setFirstFormalSlot formals
       emitWordList $
         [lambdaNameSymbol name, fi (length formals), if ellipsis then 1 else 0]
           ++ formalWords
     compileFormals name (FormalNamedSet argName formals ellipsis) = do
       Symbol argSym <- symbolIntern argName
-      formalWords <- compileFormalEntries formals
+      formalWords <- compileFormalEntries namedSetFirstFormalSlot formals
       emitWordList $
         [lambdaNameSymbol name, argSym, fi (length formals), if ellipsis then 1 else 0]
           ++ formalWords
 
-    compileFormalEntries :: [Formal] -> IO [Word32]
-    compileFormalEntries = fmap concat . mapM compileFormalEntry
+    -- \| A set pattern's formal entries, the first formal in the slot
+    -- given, each three words: the name, the kind of its default and the
+    -- default's code ('formalDefaultWords').
+    compileFormalEntries :: Int -> [Formal] -> IO [Word32]
+    compileFormalEntries firstFormal formals = do
+      pending <- mapM compilePendingFormal formals
+      entries <- shareFormalDefaults firstFormal pending
+      pure (concat [[unSymbol name, kind, code] | EvalFormal name def <- entries, let (kind, code) = formalDefaultWords def])
 
-    compileFormalEntry :: Formal -> IO [Word32]
-    compileFormalEntry (Formal name defExpr) = do
-      Symbol nameSym <- symbolIntern name
-      case defExpr of
-        Nothing -> pure [nameSym, 0, 0]
-        Just d -> do
-          defIdx <- go d
-          pure [nameSym, 1, defIdx]
+    compilePendingFormal :: Formal -> IO PendingFormal
+    compilePendingFormal (Formal name defExpr) = do
+      sym <- symbolIntern name
+      PendingFormal sym <$> pendingDefault go defExpr
 
     -- -----------------------------------------------------------------
     -- Let (ELet)
@@ -382,7 +407,7 @@ compileWith recorder = go
     compileLet :: [Binding] -> Expr -> CaptureInfo -> IO Word32
     compileLet bindings body captureInfo = do
       bodyIdx <- go body
-      bindingWords <- compileBindingWords bindings
+      bindingWords <- compileBindingWords SiblingsShare bindings
       capOff <- compileCaptureInfo captureInfo
       (bindingCount, dataOff) <- emitCounted "let with bindings" (length bindings) bindingWords
       cbcEmit OpLet 0 bindingCount dataOff bodyIdx capOff
@@ -393,21 +418,30 @@ compileWith recorder = go
 
     -- \| The flat data words for a binding list: the names it binds
     -- statically and the bindings with a dynamic name, counted
-    -- ('bindingNameCounts'), then each binding's words.  The caller emits
-    -- them (with the count, via emitCounted) so a spilled count can
-    -- precede them contiguously.
-    compileBindingWords :: [Binding] -> IO [Word32]
-    compileBindingWords bindings = do
+    -- ('bindingNameCounts'), then its frame's shares, counted, then each
+    -- binding's words.  The caller emits them (with the count, via
+    -- emitCounted) so a spilled count can precede them contiguously.  The
+    -- shares are decided once the bindings are compiled, so every name
+    -- they read is interned where compiling interns it.
+    compileBindingWords :: FrameSharing -> [Binding] -> IO [Word32]
+    compileBindingWords sharing bindings = do
       let BcBindingCounts names dynamics = bindingNameCounts bindings
       namesWord <- countArg "binding set with static names" names
       dynamicsWord <- countArg "binding set with dynamic names" dynamics
-      (\bindingWords -> namesWord : dynamicsWord : concat bindingWords) <$> mapM compileOneBinding bindings
+      bindingWords <- mapM compileOneBinding bindings
+      shares <- case sharing of
+        NothingShares -> pure []
+        SiblingsShare
+          | dynamics == 0 -> slotShares bindings
+          | otherwise -> nameShares bindings
+      sharesWord <- countArg "binding set with shares" (length shares)
+      pure (namesWord : dynamicsWord : sharesWord : concat [[slot, target] | (slot, target) <- shares] ++ concat bindingWords)
 
     -- \| A function bound to a static name is named by it, as upstream's
     -- @addAttr@ names the value of an attribute path's last name
     -- (parser-state.hh:176-177 at 2.24.9).  Upstream names a function
     -- under a dynamic key too, with the name the key evaluates to, each
-    -- time it evaluates the set (@ExprAttrs::eval@, eval.cc:1270); a
+    -- time it evaluates the set (@ExprAttrs::eval@, eval.cc:1271); a
     -- name the compiler cannot know, so such a function is anonymous
     -- here.
     compileOneBinding :: Binding -> IO [Word32]
@@ -544,22 +578,95 @@ compileWith recorder = go
 -- ---------------------------------------------------------------------------
 
 -- | Compile parser 'Formals' (with 'Maybe Expr' defaults) to eval-time
--- 'EvalFormals' (with 'Maybe Word32' bc_idx defaults), for a function no
--- binding names, interning each name.
+-- 'EvalFormals', each default compiled and decided as a set pattern's
+-- entries hold it ('shareFormalDefaults'), for a function no binding
+-- names, interning each name.
 compileFormalsToEval :: Formals -> IO EvalFormals
 compileFormalsToEval (FormalName name) = EFName <$> symbolIntern name
 compileFormalsToEval (FormalSet formals ellipsis) =
-  EFSet AnonymousLambda <$> mapM compileOneFormal formals <*> pure ellipsis
+  EFSet AnonymousLambda <$> (mapM compileOneFormal formals >>= shareFormalDefaults setFirstFormalSlot) <*> pure ellipsis
 compileFormalsToEval (FormalNamedSet name formals ellipsis) =
-  EFNamedSet AnonymousLambda <$> symbolIntern name <*> mapM compileOneFormal formals <*> pure ellipsis
+  EFNamedSet AnonymousLambda <$> symbolIntern name <*> (mapM compileOneFormal formals >>= shareFormalDefaults namedSetFirstFormalSlot) <*> pure ellipsis
+
+-- | The slot of a set pattern's frame its first formal fills, the rest
+-- following it: the first, or for a pattern with an \@-pattern the one
+-- after the \@-pattern's name, which upstream's @callFunction@ fills
+-- first (eval.cc:1539-1540 at 2.24.9) and the resolver numbers first
+-- ('Nix.Expr.Resolve.lexicalScopeFromFormals').
+setFirstFormalSlot, namedSetFirstFormalSlot :: Int
+setFirstFormalSlot = 0
+namedSetFirstFormalSlot = 1
 
 -- | A formal with its default compiled, its name interned after the
 -- default's names, as upstream's parser interns them (parser.y:482-483
 -- at 2.24.9).
-compileOneFormal :: Formal -> IO EvalFormal
+compileOneFormal :: Formal -> IO PendingFormal
 compileOneFormal (Formal name defExpr) = do
-  defBcIdx <- traverse compileExpr defExpr
-  (`EvalFormal` defBcIdx) <$> symbolIntern name
+  pending <- pendingDefault compileExpr defExpr
+  (`PendingFormal` pending) <$> symbolIntern name
+
+-- | A formal whose default is compiled but for a variable of the call's
+-- own frame, which waits for the formals' shares to be decided.
+data PendingFormal = PendingFormal !Symbol !PendingDefault
+
+-- | A formal's default before the formals' shares are decided.
+data PendingDefault
+  = -- | None.
+    NoPendingDefault
+  | -- | Compiled, at a bytecode index.
+    CompiledDefault !Word32
+  | -- | A variable naming a slot of the call's own frame, not compiled
+    -- yet.  Compiling it interns no name.
+    FrameSlotDefault !Int
+
+-- | A default compiled as a pending one: a variable of level 0, which
+-- names a slot of the call's own frame, is left for
+-- 'shareFormalDefaults', and anything else is compiled by @compileDefault@.
+pendingDefault :: (Expr -> IO Word32) -> Maybe Expr -> IO PendingDefault
+pendingDefault _ Nothing = pure NoPendingDefault
+pendingDefault _ (Just (EResolvedVar 0 slot)) = pure (FrameSlotDefault slot)
+pendingDefault compileDefault (Just defExpr) = CompiledDefault <$> compileDefault defExpr
+
+-- | Formals with their defaults decided, the first formal in the slot
+-- given, as upstream's @callFunction@ fills a set pattern's frame through
+-- @maybeThunk@ (eval.cc:1539-1563 at 2.24.9): the @-pattern's slot first,
+-- then the formals' in symbol order (@validateFormals@,
+-- parser-state.hh:186-189).  A default that is a variable naming the
+-- @-pattern, or a formal 'siblingShares' says is filled before its own,
+-- shares that slot's cell ('SharedDefault'); one naming a formal filled
+-- after its own is a variable of its own ('Default').  Either stays a
+-- variable naming the slot it names: which cell a formal's slot holds
+-- depends on whether a call's argument holds the formal, so a chain of
+-- shared defaults ends where the call finds it.
+shareFormalDefaults :: Int -> [PendingFormal] -> IO [EvalFormal]
+shareFormalDefaults firstFormal pending = mapM decide (zip [firstFormal ..] pending)
+  where
+    names = Map.fromList (zip [firstFormal ..] [name | PendingFormal name _ <- pending])
+    shared = Set.fromList (map fst (siblingShares (`Map.lookup` names) [SiblingVar name slot target | (slot, PendingFormal name (FrameSlotDefault target)) <- zip [firstFormal ..] pending, target >= firstFormal]))
+    decide (slot, PendingFormal name pendingDef) =
+      EvalFormal name <$> case pendingDef of
+        NoPendingDefault -> pure NoDefault
+        CompiledDefault code -> pure (Default code)
+        FrameSlotDefault target
+          | target < firstFormal || Set.member slot shared -> SharedDefault <$> frameSlotVar target
+          | otherwise -> Default <$> frameSlotVar target
+    frameSlotVar slot = cbcEmit OpResolvedVar 0 0 0 (fromIntegral slot) 0
+
+-- | The kind and code words of a formal's default, as a set pattern's
+-- entries and a C lambda's hold them.
+formalDefaultWords :: FormalDefault -> (Word32, Word32)
+formalDefaultWords NoDefault = (formalNoDefault, 0)
+formalDefaultWords (Default code) = (formalDefault, code)
+formalDefaultWords (SharedDefault code) = (formalSharedDefault, code)
+
+-- | The default 'formalDefaultWords' writes as a kind and a code word,
+-- or 'Nothing' for a kind it never writes.
+formalDefaultFromWords :: Word32 -> Word32 -> Maybe FormalDefault
+formalDefaultFromWords kind code
+  | kind == formalNoDefault = Just NoDefault
+  | kind == formalDefault = Just (Default code)
+  | kind == formalSharedDefault = Just (SharedDefault code)
+  | otherwise = Nothing
 
 -- ---------------------------------------------------------------------------
 -- Operator tags (the flags byte of OpUnary and OpBinary)
@@ -623,38 +730,41 @@ decodeBinaryOp tag
 
 -- | Decode formals from the bytecode data buffer: @flags@ is the lambda's
 -- formal type ('formalName', 'formalSet' or 'formalNamedSet'), @dataOff@
--- the offset of its words.  'Nothing' for any other type.  The offset is
--- strict, though an unknown type never reads it, so a caller passes it
--- evaluated rather than as a thunk.
-decodeBcFormals :: (MonadCData m) => Word8 -> Word32 -> m (Maybe EvalFormals)
-decodeBcFormals flags !dataOff
+-- the offset of its words.  'Nothing' for any other type, and a formal's
+-- default kind the compiler never writes ('formalDefaultFromWords') is
+-- handed to @unknownKind@.  The offset is strict, though an unknown type
+-- never reads it, so a caller passes it evaluated rather than as a thunk.
+decodeBcFormals :: (MonadCData m) => (Word32 -> m FormalDefault) -> Word8 -> Word32 -> m (Maybe EvalFormals)
+decodeBcFormals unknownKind flags !dataOff
   | flags == formalName = Just . EFName . Symbol <$> cbcData dataOff
   | flags == formalSet = do
       lambdaSym <- cbcData dataOff
       count <- cbcData (dataOff + 1)
       ellipsis <- cbcData (dataOff + 2)
-      formals <- decodeFormalEntries (fromIntegral count) (dataOff + 3)
+      formals <- decodeFormalEntries unknownKind (fromIntegral count) (dataOff + 3)
       pure (Just (EFSet (lambdaNameFromSymbol lambdaSym) formals (ellipsis /= 0)))
   | flags == formalNamedSet = do
       lambdaSym <- cbcData dataOff
       nameSym <- cbcData (dataOff + 1)
       count <- cbcData (dataOff + 2)
       ellipsis <- cbcData (dataOff + 3)
-      formals <- decodeFormalEntries (fromIntegral count) (dataOff + 4)
+      formals <- decodeFormalEntries unknownKind (fromIntegral count) (dataOff + 4)
       pure (Just (EFNamedSet (lambdaNameFromSymbol lambdaSym) (Symbol nameSym) formals (ellipsis /= 0)))
   | otherwise = pure Nothing
 
 -- | Decode a list of formal entries from the data buffer.
--- Each entry is 3 words: [name_sym, has_default, default_bc_idx].
-decodeFormalEntries :: (MonadCData m) => Int -> Word32 -> m [EvalFormal]
-decodeFormalEntries 0 _ = pure []
-decodeFormalEntries n off = do
+-- Each entry is 3 words: the name's symbol, then the default's kind and
+-- code ('formalDefaultFromWords'), a kind the compiler never writes
+-- handed to @unknownKind@.
+decodeFormalEntries :: (MonadCData m) => (Word32 -> m FormalDefault) -> Int -> Word32 -> m [EvalFormal]
+decodeFormalEntries _ 0 _ = pure []
+decodeFormalEntries unknownKind n off = do
   nameSym <- cbcData off
-  hasDef <- cbcData (off + 1)
-  defBcIdx <- cbcData (off + 2)
-  let defMaybe = if hasDef /= 0 then Just defBcIdx else Nothing
-  rest <- decodeFormalEntries (n - 1) (off + 3)
-  pure (EvalFormal (Symbol nameSym) defMaybe : rest)
+  kind <- cbcData (off + 1)
+  code <- cbcData (off + 2)
+  def <- maybe (unknownKind kind) pure (formalDefaultFromWords kind code)
+  rest <- decodeFormalEntries unknownKind (n - 1) (off + 3)
+  pure (EvalFormal (Symbol nameSym) def : rest)
 
 -- ---------------------------------------------------------------------------
 -- Capture info reading (for evalBcLambda, evalBcAttrs and evalBcLet)
@@ -708,10 +818,10 @@ foldBcCapturedSlots step start (BcCapturedSlots count dataOff) = go start count 
 -- Binding reading (for evalBcAttrs and evalBcLet)
 -- ---------------------------------------------------------------------------
 
--- | The bindings of a set or a let: their names counted, then their
--- count, resolved through the short_arg spill, and the data offset of the
--- first.
-data BcBindings = BcBindings !BcBindingCounts !Int !Word32
+-- | The bindings of a set or a let: their names counted, the frame's
+-- shares, then their count, resolved through the short_arg spill, and the
+-- data offset of the first.
+data BcBindings = BcBindings !BcBindingCounts !BcShares !Int !Word32
 
 -- | How many names bindings bind statically, one for each static key and
 -- inherited variable and one for each name of an @inherit (from)@, and
@@ -732,14 +842,139 @@ bindingNameCounts = foldl' countOne (BcBindingCounts 0 0)
       Inherit {} -> BcBindingCounts (names + 1) dynamics
       InheritFrom _ inherited -> BcBindingCounts (names + length inherited) dynamics
 
+-- | Whether a recursive set's bindings bind 'overridesName' statically,
+-- as upstream looks for it among a recursive set's static attributes, an
+-- inherited one included (eval.cc:1205-1206 at 2.24.9).  Its instruction
+-- then holds 'attrsRecOverrides' rather than 'attrsRec'.
+bindsOverrides :: [Binding] -> Bool
+bindsOverrides = any bindsName
+  where
+    bindsName binding = case binding of
+      NamedBinding _ (StaticKey name) _ -> name == overridesName
+      NamedBinding _ (DynamicKey _) _ -> False
+      Inherit _ name _ -> name == overridesName
+      InheritFrom _ inherited -> overridesName `elem` [name | InheritedName _ name <- inherited]
+
+-- | The attribute a recursive set overrides its own attributes with
+-- upstream (@sOverrides@, eval.cc:233 at 2.24.9).
+overridesName :: Text
+overridesName = "__overrides"
+
+-- | Whether a binding list's values may share the cells of its own names:
+-- a recursive set's and a let's, but not a recursive set's that binds
+-- @__overrides@, whose values upstream makes thunks of their own
+-- (eval.cc:1214-1218 at 2.24.9), or a plain set's, which binds no name
+-- its values read.
+data FrameSharing = SiblingsShare | NothingShares
+
+-- | A binding of a frame being tied whose whole value is a variable naming
+-- another binding of the same frame: the name the binding binds, the key
+-- its cell is kept under, and the key of the binding the variable names.
+data SiblingVar k = SiblingVar !Symbol !k !k
+
+-- | Of a frame's sibling variables, each a t'SiblingVar', the ones that
+-- share a sibling's cell where upstream's do, each as its binding's key
+-- and the key of the binding whose cell it takes, in the order the frame
+-- fills them.  Upstream fills a frame's slots in symbol order, from an
+-- env whose slots start empty (eval-inline.hh:78 at 2.24.9), and
+-- @ExprVar::maybeThunk@ binds a variable to its slot's cell when the slot
+-- is filled and to a thunk of its own when it is not
+-- (eval.cc:1014-1021).  So a variable shares the cell of a sibling whose
+-- name has the lesser symbol, and keeps its own thunk otherwise, as a
+-- variable naming its own binding does.  A sibling that shares holds the
+-- cell it takes, so each pair names the binding at the end of the chain,
+-- whose cell is its own, and the pairs can be copied in any order.
+-- @nameOf@ gives the name the binding under a key binds.
+siblingShares :: (Ord k) => (k -> Maybe Symbol) -> [SiblingVar k] -> [(k, k)]
+siblingShares nameOf siblings = reverse shares
+  where
+    SharesMade _ shares = foldl' share (SharesMade Map.empty []) (sortOn bindingName siblings)
+    bindingName (SiblingVar name _ _) = name
+    share made@(SharesMade roots found) (SiblingVar name key target) = case nameOf target of
+      Just targetName
+        | targetName < name ->
+            let root = Map.findWithDefault target target roots
+             in SharesMade (Map.insert key root roots) ((key, root) : found)
+      _ -> made
+
+-- | The shares 'siblingShares' has made so far: the binding at the end of
+-- each sharing binding's chain, and the pairs, last first.
+data SharesMade k = SharesMade !(Map.Map k k) ![(k, k)]
+
+-- | Each slot a binding list's static names fill, in declaration order:
+-- the name, and the slot of the frame its value names when that value is
+-- a variable of the frame's own slots.
+staticSlots :: [Binding] -> [(Text, Maybe Int)]
+staticSlots = concatMap slotsOf
+  where
+    slotsOf (NamedBinding _ (StaticKey name) value) = [(name, frameSlot value)]
+    slotsOf (NamedBinding _ (DynamicKey _) _) = []
+    slotsOf (Inherit _ name _) = [(name, Nothing)]
+    slotsOf (InheritFrom _ inherited) = [(name, Nothing) | InheritedName _ name <- inherited]
+    frameSlot (EResolvedVar 0 slot) = Just slot
+    frameSlot _ = Nothing
+
+-- | The shares of a binding list whose names are in slots, as slot pairs
+-- ('siblingShares').  Its names are interned by then.
+slotShares :: [Binding] -> IO [(Word32, Word32)]
+slotShares bindings = do
+  let slots = staticSlots bindings
+  names <- traverse (symbolIntern . fst) slots
+  let siblings = [SiblingVar sym slot target | (slot, sym, Just target) <- zip3 [0 ..] names (map snd slots)]
+  pure [(fromIntegral slot, fromIntegral target) | (slot, target) <- siblingShares (`Map.lookup` Map.fromList (zip [0 ..] names)) siblings]
+
+-- | The shares of a binding list whose static names are in a name table,
+-- as symbol pairs ('siblingShares'): a static name's value that is a
+-- variable the resolver left to the table names another static name.
+-- Its names are interned by then.
+nameShares :: [Binding] -> IO [(Word32, Word32)]
+nameShares bindings = do
+  let staticNames = Set.fromList (map fst (staticSlots bindings))
+  siblings <-
+    sequence
+      [ (\sym target -> SiblingVar sym sym target) <$> symbolIntern own <*> symbolIntern name
+      | NamedBinding _ (StaticKey own) (EVar name) <- bindings,
+        Set.member name staticNames
+      ]
+  pure [(unSymbol key, unSymbol target) | (key, target) <- siblingShares Just siblings]
+
+-- | The shares of a frame's bindings, in the order the frame fills them:
+-- their count and the data offset of the first one's pair of words, each
+-- pair the slot or the symbol of a binding whose whole value is a
+-- variable naming another of the frame's names and the one whose cell it
+-- takes ('siblingShares').
+data BcShares = BcShares !Int !Word32
+
 -- | The bindings in an instruction's counted payload: @count@ bindings,
 -- resolved through the short_arg spill, whose words start at @dataOff@
--- with their names counted.
+-- with their names counted and their shares after the counts.
 decodeBcBindings :: (MonadCData m) => Int -> Word32 -> m BcBindings
 decodeBcBindings count dataOff = do
   names <- cbcData dataOff
   dynamics <- cbcData (dataOff + 1)
-  pure (BcBindings (BcBindingCounts (fromIntegral names) (fromIntegral dynamics)) count (dataOff + 2))
+  shares <- cbcData (dataOff + 2)
+  let firstShare = dataOff + 3
+  pure
+    ( BcBindings
+        (BcBindingCounts (fromIntegral names) (fromIntegral dynamics))
+        (BcShares (fromIntegral shares) firstShare)
+        count
+        (firstShare + 2 * shares)
+    )
+
+-- | Fold over a frame's shares, first to last, each given as the slot or
+-- symbol that takes a cell and the one whose cell it takes.  Each pair's
+-- words are read as the fold reaches them.
+{-# INLINE foldBcShares #-}
+foldBcShares :: (MonadCData m) => (acc -> Word32 -> Word32 -> m acc) -> acc -> BcShares -> m acc
+foldBcShares step start (BcShares count dataOff) = go start count dataOff
+  where
+    go !acc 0 !_ = pure acc
+    go !acc n !off = do
+      key <- cbcData off
+      target <- cbcData (off + 1)
+      next <- step acc key target
+      go next (n - 1) (off + 2)
 
 -- | A binding of a set or a let, each name at the position it was
 -- defined at.
@@ -780,7 +1015,7 @@ data BcInheritedName = BcInheritedName !PosIdx !Word32 !Word32
 foldBcBindings :: (MonadCData m) => (Word32 -> m acc) -> (acc -> BcBinding -> m acc) -> acc -> BcBindings -> m acc
 foldBcBindings unknownTag step = foldFrom
   where
-    foldFrom start (BcBindings _ count dataOff) = go start count dataOff
+    foldFrom start (BcBindings _ _ count dataOff) = go start count dataOff
     go !acc 0 !_ = pure acc
     go !acc n !off = cbcData off >>= stepTagged
       where

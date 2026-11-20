@@ -35,10 +35,14 @@ struct nn_env;
 
 /* --- Types --- */
 
-/* A single formal entry: name + optional default bytecode index. */
+/* A single formal entry: name + the kind of its default + the default's
+ * bytecode index.  The kinds are the Haskell side's
+ * (Nix.Eval.CBytecode.formalNoDefault and its siblings): 0 = required,
+ * 1 = has a default, 2 = has a default that is a variable naming a slot
+ * of the call's frame, whose cell the formal's slot takes. */
 typedef struct nn_formal_entry {
     uint32_t name_sym;       /* interned symbol ID */
-    uint32_t has_default;    /* 0 = required, 1 = has default */
+    uint32_t has_default;    /* the default's kind */
     uint32_t default_bc_idx; /* bytecode index of default (valid if has_default) */
 } nn_formal_entry_t;
 

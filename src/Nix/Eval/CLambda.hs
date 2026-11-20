@@ -122,9 +122,11 @@ clambdaNew :: (MonadCData m) => Ptr NnEnv -> Word32 -> Word8 -> Word32 -> Word32
 clambdaNew env body formalsType nameSym lambdaNameSym allowExtra formalCount =
   cdataIO (checkedCPtr "nn_lambda_new" =<< c_nn_lambda_new env body formalsType nameSym lambdaNameSym allowExtra formalCount)
 
--- | Set a formal entry at the given index.
+-- | Set a formal entry at the given index: its name's symbol, then its
+-- default's kind ('Nix.Eval.CBytecode.formalNoDefault' and its siblings)
+-- and bytecode index.
 clambdaSetEntry :: (MonadCData m) => CLambdaPtr -> Word32 -> Word32 -> Word32 -> Word32 -> m ()
-clambdaSetEntry lam idx nameSym hasDefault defaultIdx = cdataIO (c_nn_lambda_set_entry lam idx nameSym hasDefault defaultIdx)
+clambdaSetEntry lam idx nameSym defaultKind defaultIdx = cdataIO (c_nn_lambda_set_entry lam idx nameSym defaultKind defaultIdx)
 
 -- ---------------------------------------------------------------------------
 -- Accessors
@@ -164,7 +166,8 @@ clambdaFormalCount = cdataIO . c_nn_lambda_formal_count
 clambdaEntryName :: (MonadCData m) => CLambdaPtr -> Word32 -> m Word32
 clambdaEntryName lam idx = cdataIO (c_nn_lambda_entry_name lam idx)
 
--- | Read whether a formal entry has a default.
+-- | Read the kind of a formal entry's default
+-- ('Nix.Eval.CBytecode.formalNoDefault' and its siblings).
 clambdaEntryHasDefault :: (MonadCData m) => CLambdaPtr -> Word32 -> m Word32
 clambdaEntryHasDefault lam idx = cdataIO (c_nn_lambda_entry_has_default lam idx)
 
