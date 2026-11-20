@@ -52,6 +52,11 @@ typedef struct nn_str {
 /* The longest string an arena makes. */
 #define NN_STR_MAX_LEN ((uint64_t)UINT32_MAX)
 
+/* The bytes of a block strings share.  A string that takes more than a
+ * quarter of one gets a block of its own, sized to it. */
+#define NN_STR_BLOCK_BYTES ((uint64_t)1 << 20)
+#define NN_STR_LARGE_BYTES (NN_STR_BLOCK_BYTES / 4)
+
 typedef struct nn_str_block nn_str_block_t;
 
 /* An arena of strings.  An all-zero one is empty and ready to use. */
@@ -59,6 +64,7 @@ typedef struct {
     nn_str_block_t *blocks;   /* every block, newest first */
     nn_str_block_t *current;  /* the block strings that fit one are bumped from */
     uint64_t        count;    /* strings made, the empty string not counted */
+    uint64_t        bytes;    /* the bytes they take, padding included */
 } nn_str_arena_t;
 
 /* --- Arenas --- */
@@ -116,5 +122,8 @@ uint32_t nn_str_arena_blocks(const nn_str_arena_t *arena,
 /* Bytes an arena holds from the allocator: every block, header and
  * unused tail included. */
 uint64_t nn_str_arena_reserved_bytes(const nn_str_arena_t *arena);
+
+/* The bytes a block has handed out, given its first byte. */
+uint64_t nn_str_block_used(const char *data);
 
 #endif /* NN_STR_H */

@@ -42,6 +42,10 @@
 # the C side holds by kind, what the result, the root environment, the
 # import cache and the search path reach, and what the mark cost, and the
 # environments and attribute sets each construct or builtin allocated.
+# A third nova-nix run takes a census of regions under
+# NOVA_NIX_REGION_STATS: at the end of each force, what the force allocated
+# and what still reaches it, and what collectors freeing there would hold
+# at each threshold of bytes and each block size (cbits/nn_region.h).
 # Upstream's pass runs under NIX_SHOW_STATS.  The attrset-memory benchmark
 # then builds the attribute sets the census reached, as C sets and as sets
 # held in GHC's heap, under the copying and the non-moving collector.
@@ -74,12 +78,14 @@
 #                        printed
 #     memory/          - the memory suite (--memory): slice/, both walks of
 #                        the slice; settled.txt, the attributes every pass
-#                        passes over; nova-nix/, census/ and upstream/, the
-#                        three passes, each with its output, peak-rss.txt
-#                        and visited.txt, and census/census.txt, the C
-#                        census, census/heap.hp, the heap profile, and
-#                        upstream/nix-stats.json; attrset/, the benchmark's
-#                        runs; memory.md, every figure as printed
+#                        passes over; nova-nix/, census/, regions/ and
+#                        upstream/, the four passes, each with its output,
+#                        peak-rss.txt and visited.txt, and
+#                        census/census.txt, the C census, census/heap.hp,
+#                        the heap profile, regions/regions.txt, the census
+#                        of regions, and upstream/nix-stats.json; attrset/,
+#                        the benchmark's runs; memory.md, every figure as
+#                        printed
 #
 # Every nova-nix run gets the heap cap (-M4G default).
 
@@ -779,6 +785,70 @@ write_memory() {
   write_attrset_rows "$dir/attrset" "$census"
 }
 
+# The census of regions as Markdown: its totals, the closes by how much
+# their regions allocated, and the simulated collectors by threshold, each
+# with the most bytes held at once freeing single objects and freeing
+# whole blocks of each size the census tried.
+write_regions() {
+  local dir="$RESULTS_DIR/memory"
+  local regions="$dir/regions/regions.txt"
+  local allocated outside resurrected grains
+  echo "## Regions: $LABEL"
+  echo
+  if [[ ! -s "$regions" ]]; then
+    echo "No census of regions: $(exit_figure "$dir/regions" "$dir/regions/err")"
+    return 0
+  fi
+  allocated=$(named_value "$regions" regions.allocated.bytes)
+  outside=$(named_value "$regions" regions.outside.bytes)
+  resurrected=$(named_value "$regions" regions.resurrected.count)
+  echo "A region is the extent of one force.  At each close the census marks what of the force's" \
+    "allocations its writes into older cells and with-scopes, and the roots it registered, still reach" \
+    "(cbits/nn_region.h)."
+  echo
+  scoreboard_row "Figure" "nova-nix"
+  scoreboard_row ":--" "--:"
+  scoreboard_row "wall time, beside the measured pass" \
+    "$(figure_or "$(pass_seconds "$dir/regions/peak-rss.txt")" s "not measured"), $(figure_or "$(pass_seconds "$dir/nova-nix/peak-rss.txt")" s "not measured")"
+  scoreboard_row "OS peak RSS" "$(figure_or "$(peak_rss_mib "$dir/regions/peak-rss.txt")" MiB "not measured")"
+  scoreboard_row "regions closed" "$(named_value "$regions" regions.closes)"
+  scoreboard_row "most regions open at once" "$(named_value "$regions" regions.depth)"
+  scoreboard_row "most records held at once" "$(named_value "$regions" regions.records)"
+  scoreboard_row "C bytes allocated" "$(mib "$allocated")"
+  scoreboard_row "of them outside every region, which no close frees" \
+    "$(awk -v all="$allocated" -v out="$outside" 'BEGIN { printf "%.1f MiB, %.1f%%", out / 1048576, (all > 0 ? 100 * out / all : 0) }')"
+  scoreboard_row "pointers the census could not place" "$(named_value "$regions" regions.unplaced)"
+  scoreboard_row "**reached after a close found them unreached**" \
+    "**$resurrected, $(mib "$(named_value "$regions" regions.resurrected.bytes)")**"
+  echo
+  echo "### Closes by bytes their regions allocated"
+  echo
+  scoreboard_row "Allocated" "Closes" "Allocated" "Reached at close" "Objects entered" "Pointers examined"
+  scoreboard_row "--:" "--:" "--:" "--:" "--:" "--:"
+  awk '$1 == "regions.class" {
+      floor = $2
+      label = floor == 0 ? "nothing" : (floor < 1024 ? floor " B" : (floor < 1048576 ? floor / 1024 " KiB" : floor / 1048576 " MiB"))
+      printf "| from %s | %d | %.1f MiB | %.1f%% | %d | %d |\n", label, $3, $4 / 1048576, ($4 > 0 ? 100 * $5 / $4 : 0), $6, $7
+    }' "$regions"
+  echo
+  echo "### Collectors that mark at a close from a threshold of bytes allocated"
+  echo
+  grains=$(awk '$1 == "regions.grain" {
+      printf "%s%s KiB thunks, %s KiB envs, %s KiB strings", sep, $3 / 1024, $4 / 1024, $5 / 1024; sep = "; " }' "$regions")
+  echo "Peaks are the most C bytes held at once.  Blocks, largest first: $grains."
+  echo
+  scoreboard_row "Threshold" "Closes that mark" "Objects entered" "Pointers examined" "Peak, single objects" \
+    "Peak, blocks 1" "2" "3" "4" "5"
+  scoreboard_row "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:"
+  awk '$1 == "regions.threshold" {
+      t = $2
+      label = t == 0 ? "every close" : (t < 1048576 ? t / 1024 " KiB" : t / 1048576 " MiB")
+      printf "| %s | %d | %d | %d", label, $3, $4, $5
+      for (i = 6; i <= NF; i++) printf " | %.1f MiB", $i / 1048576
+      printf " |\n"
+    }' "$regions"
+}
+
 # The census's environments and attribute sets by the site that allocated
 # them, as rows of the memory table: the environments' slots beside
 # upstream's values in environments, their sizes, then each site that
@@ -1047,6 +1117,11 @@ run_memory() {
     --store "$SCOREBOARD_SCRATCH/census-store" \
     +RTS -hT -i"$HEAP_SAMPLE_SECONDS" -po"$dir/census/heap" "$HEAP_CAP" -RTS
   echo "memory: nova-nix's census pass exited $(cat "$dir/census/exit.txt")"
+  measured_pass "$dir/regions" "$dir/settled.json" "$(pass_budget "$dir/settled.txt" "$dir/slice/nova-nix/settled.txt")" \
+    "$MEMORY_WALK" env NOVA_NIX_REGION_STATS="$dir/regions/regions.txt" "${SCOREBOARD_NOVA[@]}" \
+    --store "$SCOREBOARD_SCRATCH/regions-store" \
+    +RTS "$HEAP_CAP" -RTS
+  echo "memory: nova-nix's region census pass exited $(cat "$dir/regions/exit.txt")"
   if [[ ${#SCOREBOARD_UPSTREAM[@]} -gt 0 ]]; then
     measured_pass "$dir/upstream" "$dir/settled.json" "$(pass_budget "$dir/settled.txt" "$dir/slice/upstream/settled.txt")" \
       "$MEMORY_WALK" env NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH="$dir/upstream/nix-stats.json" "${SCOREBOARD_UPSTREAM[@]}"
@@ -1055,7 +1130,7 @@ run_memory() {
   if [[ -s "$dir/census/census.txt" ]]; then
     attrset_benchmark "$bench_bin" "$dir/census/census.txt" "$dir/attrset"
   fi
-  write_memory > "$dir/memory.md"
+  { write_memory && echo && write_regions; } > "$dir/memory.md"
   echo
   cat "$dir/memory.md"
 }

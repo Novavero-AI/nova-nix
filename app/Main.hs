@@ -41,6 +41,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Eval (AttrSet, Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetLookup, compileSource, deepForce, evalBytecode, evalParsed, force, readThunkValue)
 import Nix.Eval.AttrPath (selectAttrPath)
+import Nix.Eval.CRegion (RegionCensus (..), regionFigures, renderRegionFigures)
 import Nix.Eval.CStats (CRoot (..), countSites, renderCensus, takeCensus, valueRoots)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
@@ -310,8 +311,8 @@ evalPolicyFor opts config =
 -- the resolved spelling; upstream allows only the given one and refuses
 -- the read, which is a mismatch between its own allow list and walk, not
 -- a rule worth keeping.
-withCliSession :: CliOpts -> NixConfig -> StoreDir -> FilePath -> FilePath -> (EvalState -> IO a) -> IO a
-withCliSession opts config storeDir dataDir baseDir action = do
+withCliSession :: CliOpts -> NixConfig -> StoreDir -> FilePath -> FilePath -> RegionCensus -> (EvalState -> IO a) -> IO a
+withCliSession opts config storeDir dataDir baseDir regions action = do
   let policy = evalPolicyFor opts config
   -- Read whatever the policy, so a NIX_PATH with no UTF-8 form is refused
   -- under pure-eval too, but parsed only where it is used.
@@ -319,7 +320,7 @@ withCliSession opts config storeDir dataDir baseDir action = do
   let searchPath
         | epPureEval policy = parseNixPath (TE.encodeUtf8 (T.pack dataDir))
         | otherwise = mergeSearchPaths (optNixPaths opts) dataDir nixPath
-  withEvalSession (SessionSettings policy searchPath storeDir baseDir) $ \st0 -> do
+  withEvalSession (SessionSettings policy searchPath storeDir baseDir regions) $ \st0 -> do
     let st = st0 {esCallDepth = topLevelCallDepth (ncMaxCallDepth config)}
     allowSearchPathRoots st
     action st
@@ -356,13 +357,15 @@ evalFile config opts storeDir dataDir rawFilePath = do
   (filePath, source) <- readSourceFile rawFilePath
   case parseForEval opts config (takeDirectory filePath) (SourceFile (T.pack filePath)) source of
     Left err -> failSource err
-    Right parsed -> withCliSession opts config storeDir dataDir (takeDirectory filePath) $ \st -> do
-      result <- runEvalIOTraced st (evalRooted (optStrict opts) (evalBaseEnv st) parsed)
-      case result of
-        Left failure -> do
-          TIO.hPutStrLn stderr (renderEvalFailure failure)
-          exitFailure
-        Right (env, forced) -> printResult forced >> writeCensus env forced
+    Right parsed -> do
+      regions <- regionCensusWanted
+      withCliSession opts config storeDir dataDir (takeDirectory filePath) regions $ \st -> do
+        result <- runEvalIOTraced st (evalRooted (optStrict opts) (evalBaseEnv st) parsed)
+        case result of
+          Left failure -> do
+            TIO.hPutStrLn stderr (renderEvalFailure failure)
+            exitFailure
+          Right (env, forced) -> printResult forced >> writeCensus env forced >> writeRegionCensus
 
 -- | Evaluate an inline expression and print the result.
 evalExpr :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
@@ -370,13 +373,15 @@ evalExpr config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
   case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
     Left err -> failSource err
-    Right parsed -> withCliSession opts config storeDir dataDir cwd $ \st -> do
-      result <- runEvalIOTraced st (evalRooted (optStrict opts) (evalBaseEnv st) parsed)
-      case result of
-        Left failure -> do
-          TIO.hPutStrLn stderr (renderEvalFailure failure)
-          exitFailure
-        Right (env, forced) -> printResult forced >> writeCensus env forced
+    Right parsed -> do
+      regions <- regionCensusWanted
+      withCliSession opts config storeDir dataDir cwd regions $ \st -> do
+        result <- runEvalIOTraced st (evalRooted (optStrict opts) (evalBaseEnv st) parsed)
+        case result of
+          Left failure -> do
+            TIO.hPutStrLn stderr (renderEvalFailure failure)
+            exitFailure
+          Right (env, forced) -> printResult forced >> writeCensus env forced >> writeRegionCensus
 
 -- | Evaluate the source in the root environment to the result 'finalize'
 -- gives, with that environment, which 'writeCensus' counts as held.
@@ -417,6 +422,37 @@ writeCensus env result = do
         Left failure -> failWith ("error: " <> T.pack (displayException failure))
         Right taken -> OsFile.writeFile' path (renderCensus taken)
 
+-- | The variable naming the file 'writeRegionCensus' writes.
+regionCensusVar :: BS.ByteString
+regionCensusVar = "NOVA_NIX_REGION_STATS"
+
+-- | The file 'regionCensusVar' names, when it names one: set and not
+-- empty.
+regionCensusTarget :: IO (Maybe BS.ByteString)
+regionCensusTarget = mfilter (not . BS.null) <$> configVariable regionCensusVar
+
+-- | Whether an evaluation runs a census of regions: when
+-- 'regionCensusVar' names a file.
+regionCensusWanted :: IO RegionCensus
+regionCensusWanted = maybe RegionCensusOff (const RegionCensusOn) <$> regionCensusTarget
+
+-- | With 'regionCensusVar' set to a path, write what the session's census
+-- of regions found ("Nix.Eval.CRegion") once an evaluation has
+-- succeeded: for each force, what it allocated and what still reached it
+-- as it returned, and what collectors freeing at those points would have
+-- held.
+writeRegionCensus :: IO ()
+writeRegionCensus = do
+  target <- regionCensusTarget
+  case target of
+    Nothing -> pure ()
+    Just bytes -> do
+      path <- variableHostPath regionCensusVar bytes
+      figures <- regionFigures
+      case figures of
+        Left failure -> failWith ("error: " <> T.pack (displayException failure))
+        Right found -> OsFile.writeFile' path (renderRegionFigures found)
+
 -- | Evaluate an inline expression to a derivation and print its ATerm (.drv
 -- contents), for diffing nova-nix's serialization against upstream Nix.
 evalExprAterm :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
@@ -424,7 +460,7 @@ evalExprAterm config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
   case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
     Left err -> failSource err
-    Right parsed -> withCliSession opts config storeDir dataDir cwd $ \st -> do
+    Right parsed -> withCliSession opts config storeDir dataDir cwd RegionCensusOff $ \st -> do
       result <- runEvalIOTraced st $ do
         val <- evalParsed (pure (evalBaseEnv st)) parsed
         forceDerivationAttrs val
@@ -481,7 +517,7 @@ evalTarget config opts storeDir dataDir target attrPath action = do
   (baseDir, origin, source) <- loadBuildSource target
   case parseForEval opts config baseDir origin source of
     Left err -> failSource err
-    Right parsed -> withCliSession opts config storeDir dataDir baseDir $ \st -> do
+    Right parsed -> withCliSession opts config storeDir dataDir baseDir RegionCensusOff $ \st -> do
       result <- runEvalIOTraced st $ do
         root <- evalParsed (pure (evalBaseEnv st)) parsed
         selected <- case attrPath of

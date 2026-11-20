@@ -23,7 +23,8 @@
  * that address, and a chain of suffixes costs its longest one.
  *
  * The mark sets an object's bit as it first reaches it and pushes it on a
- * work stack, so each object is pushed once and entered once.
+ * work stack, so each object is pushed once and entered once, and follows
+ * the pointers nn_graph.h says each object holds.
  */
 
 #include "nn_stats.h"
@@ -33,6 +34,7 @@
 #include "nn_bytecode.h"
 #include "nn_ctxstr.h"
 #include "nn_env.h"
+#include "nn_graph.h"
 #include "nn_lambda.h"
 #include "nn_list.h"
 #include "nn_primop.h"
@@ -630,19 +632,19 @@ static void count_reached(int kind, uint64_t bytes)
     g.visited_bytes += bytes;
 }
 
-/* The null, true, false and empty list cells, the builtins' cells and
- * the empty env are statics, not allocations: reached and neither counted nor entered,
- * as they hold no pointer. */
+/* The null, true, false and empty list cells, the builtins' cells, the
+ * empty env and the empty set are statics, not allocations: reached and
+ * neither counted nor entered, as they hold no pointer. */
 static int is_static(int kind, const void *object)
 {
-    if (kind == NN_STATS_THUNKS) return nn_thunk_is_static((const nn_thunk_t *)object);
-    if (kind == NN_STATS_ENVS) return object == nn_env_empty();
-    /* So is the empty set (nn_attrset_empty). */
-    if (kind == NN_STATS_ATTRSETS) return object == nn_attrset_empty();
+    if (kind == NN_GRAPH_THUNK) return nn_thunk_is_static((const nn_thunk_t *)object);
+    if (kind == NN_GRAPH_ENV) return object == nn_env_empty();
+    if (kind == NN_GRAPH_ATTRSET) return object == nn_attrset_empty();
     return 0;
 }
 
-/* Reach an object: mark it and push it when it is new. */
+/* Reach an object of an NN_GRAPH_* object kind: mark it and push it when
+ * it is new. */
 static void reach(int kind, const void *object)
 {
     uintptr_t p = (uintptr_t)object;
@@ -650,52 +652,52 @@ static void reach(int kind, const void *object)
     uint32_t pos;
     if (!object || is_static(kind, object)) return;
     switch (kind) {
-    case NN_STATS_THUNKS:
+    case NN_GRAPH_THUNK:
         if (!region_find(&g.thunks, p, &bit)) break;
         if (bit_set(g.thunks.bits, bit)) {
-            count_reached(kind, sizeof(nn_thunk_t));
+            count_reached(NN_STATS_THUNKS, sizeof(nn_thunk_t));
             work_push((uint8_t)kind, object);
         }
         return;
-    case NN_STATS_ENVS:
+    case NN_GRAPH_ENV:
         if (!region_find(&g.pages, p, &bit)) break;
         if (bit_set(g.pages.bits, bit)) {
-            count_reached(kind, nn_env_bytes((const nn_env_t *)object));
+            count_reached(NN_STATS_ENVS, nn_env_bytes((const nn_env_t *)object));
             work_push((uint8_t)kind, object);
         }
         return;
-    case NN_STATS_ATTRSETS:
+    case NN_GRAPH_ATTRSET:
         if (!object_find(&g.sets, p, &pos)) break;
         if (bit_set(g.sets.bits, pos)) {
-            count_reached(kind, nn_attrset_bytes((const nn_attrset_t *)object));
+            count_reached(NN_STATS_ATTRSETS, nn_attrset_bytes((const nn_attrset_t *)object));
             work_push((uint8_t)kind, object);
         }
         return;
-    case NN_STATS_LISTS:
+    case NN_GRAPH_LIST:
         if (!object_find(&g.lists, p, &pos)) break;
         if (bit_set(g.lists.bits, pos)) {
-            count_reached(kind, sizeof(nn_list_t));
+            count_reached(NN_STATS_LISTS, sizeof(nn_list_t));
             work_push((uint8_t)kind, object);
         }
         return;
-    case NN_STATS_LAMBDAS:
+    case NN_GRAPH_LAMBDA:
         if (!object_find(&g.lambdas, p, &pos)) break;
         if (bit_set(g.lambdas.bits, pos)) {
-            count_reached(kind, nn_lambda_bytes((const nn_lambda_t *)object));
+            count_reached(NN_STATS_LAMBDAS, nn_lambda_bytes((const nn_lambda_t *)object));
             work_push((uint8_t)kind, object);
         }
         return;
-    case NN_STATS_PRIMOP_APPS:
+    case NN_GRAPH_PRIMOP_APP:
         if (!object_find(&g.primop_apps, p, &pos)) break;
         if (bit_set(g.primop_apps.bits, pos)) {
-            count_reached(kind, nn_primop_app_bytes((const nn_primop_app_t *)object));
+            count_reached(NN_STATS_PRIMOP_APPS, nn_primop_app_bytes((const nn_primop_app_t *)object));
             work_push((uint8_t)kind, object);
         }
         return;
-    case NN_STATS_CTXSTRS:
+    case NN_GRAPH_CTXSTR:
         if (!object_find(&g.ctxstrs, p, &pos)) break;
         if (bit_set(g.ctxstrs.bits, pos)) {
-            count_reached(kind, nn_ctxstr_bytes((const nn_ctxstr_t *)object));
+            count_reached(NN_STATS_CTXSTRS, nn_ctxstr_bytes((const nn_ctxstr_t *)object));
             work_push((uint8_t)kind, object);
         }
         return;
@@ -719,14 +721,14 @@ static void reach_symbol(uint32_t sym)
     }
 }
 
-/* Reach a string.  NULL is no string (a context element without an
- * output).  The empty string is a static, reached and not counted, and a
- * string of the code's is placed and not counted, as code is not marked. */
+/* Reach a string.  The empty string is a static, reached and not
+ * counted, and a string of the code's is placed and not counted, as code
+ * is not marked. */
 static void reach_string(const nn_str_t *s)
 {
     uintptr_t p = (uintptr_t)s;
     uint64_t bit;
-    if (!s || s == nn_str_empty()) return;
+    if (s == nn_str_empty()) return;
     if (region_find(&g.strings, p, &bit)) {
         if (bit_set(g.strings.bits, bit)) {
             g.reached_count[NN_STATS_STRINGS]++;
@@ -744,7 +746,6 @@ static int reach_array(void *const *array, uint32_t n)
 {
     uint64_t bit;
     uint64_t bytes = (uint64_t)n * sizeof(void *);
-    if (!array || n == 0) return 0;
     if (!region_find(&g.pages, (uintptr_t)array, &bit)) {
         g.unplaced++;
         return 0;
@@ -757,115 +758,55 @@ static int reach_array(void *const *array, uint32_t n)
 }
 
 /* Reach a deferred application's `n` cells, an array of the env pages
- * that one thunk holds, and follow them when it is new. */
-static void reach_app(void *const *cells, uint32_t n)
+ * that one thunk holds; 1 when it is new and its cells are to be
+ * followed. */
+static int reach_app(void *const *cells, uint32_t n)
 {
     uint64_t bit;
-    uint32_t i;
     if (!region_find(&g.pages, (uintptr_t)cells, &bit)) {
         g.unplaced++;
-        return;
+        return 0;
     }
-    if (!bit_set(g.pages.bits, bit)) return;
+    if (!bit_set(g.pages.bits, bit)) return 0;
     count_reached(NN_STATS_APPS, (uint64_t)n * sizeof(void *));
-    for (i = 0; i < n; i++) reach(NN_STATS_THUNKS, cells[i]);
+    return 1;
 }
 
-/* --- Entering objects --- */
+/* --- The visitor (nn_graph.h) --- */
 
-static void enter_thunk(const nn_thunk_t *t)
+static void visit_object(void *ctx, int kind, const void *object)
 {
-    uint8_t state = nn_thunk_state(t);
-    if (state == NN_THUNK_PENDING || state == NN_THUNK_BLACKHOLE) {
-        /* A blackhole keeps its pending form and payload
-         * (nn_thunk_mark_pending puts it back to work), so it holds what a
-         * pending thunk does: an env, or an application's cells, one more
-         * than its form's arguments. */
-        uint8_t form = nn_thunk_pending_form(t);
-        switch (form) {
-        case NN_PENDING_CODE:
-            reach(NN_STATS_ENVS, nn_thunk_payload(t));
-            break;
-        case NN_PENDING_APPLY1:
-        case NN_PENDING_APPLY2:
-            reach_app((void *const *)nn_thunk_payload(t), (uint32_t)form + 1);
-            break;
-        default:
-            g.unplaced++;
-            break;
-        }
-        return;
-    }
-    if (state != NN_THUNK_COMPUTED) {
-        g.unplaced++;
-        return;
-    }
-    switch (nn_thunk_value_tag(t)) {
-    case NN_VALUE_INT:
-    case NN_VALUE_FLOAT:
-    case NN_VALUE_BOOL:
-    case NN_VALUE_NULL:
-        break;
-    case NN_VALUE_STR:
-    case NN_VALUE_PATH:
-        reach_string((const nn_str_t *)nn_thunk_payload(t));
-        break;
-    case NN_VALUE_LIST:
-        reach(NN_STATS_LISTS, nn_thunk_payload(t));
-        break;
-    case NN_VALUE_ATTRS:
-        reach(NN_STATS_ATTRSETS, nn_thunk_payload(t));
-        break;
-    case NN_VALUE_CTXSTR:
-        reach(NN_STATS_CTXSTRS, nn_thunk_payload(t));
-        break;
-    case NN_VALUE_LAMBDA:
-        reach(NN_STATS_LAMBDAS, nn_thunk_payload(t));
-        break;
-    case NN_VALUE_PRIMOP:
-        break;
-    case NN_VALUE_PRIMOP_APP:
-        reach(NN_STATS_PRIMOP_APPS, nn_thunk_payload(t));
-        break;
-    default:
-        g.unplaced++;
-        break;
-    }
+    (void)ctx;
+    reach(kind, object);
 }
 
-/* An env's slots are part of it, counted in its bytes when it is reached;
- * its with-scope array is an allocation of its own. */
-static void enter_env(const nn_env_t *env)
+static void visit_string(void *ctx, const nn_str_t *s)
 {
-    uint32_t i;
-    const nn_env_scopes_t *scopes = nn_env_scopes(env);
-    uint32_t slot_count = nn_env_slot_count(env);
-    for (i = 0; i < slot_count; i++) reach(NN_STATS_THUNKS, env->slots[i]);
-    reach(NN_STATS_ENVS, nn_env_parent(env));
-    if (!scopes) return;
-    reach(NN_STATS_ATTRSETS, scopes->name_table);
-    if (reach_array(scopes->with_scopes, scopes->with_count)) {
-        for (i = 0; i < scopes->with_count; i++) {
-            uintptr_t entry = (uintptr_t)scopes->with_scopes[i];
-            if (entry & NN_ENV_LAZY_WITH)
-                reach(NN_STATS_THUNKS, (const void *)(entry & ~NN_ENV_LAZY_WITH));
-            else
-                reach(NN_STATS_ATTRSETS, (const void *)entry);
-        }
-    }
+    (void)ctx;
+    reach_string(s);
 }
 
-static void enter_attrset(const nn_attrset_t *set)
+static void visit_symbol(void *ctx, uint32_t sym)
 {
-    uint32_t n = nn_attrset_size(set), i;
-    const nn_symbol_t *keys = nn_attrset_keys_ptr(set);
-    for (i = 0; i < n; i++) {
-        reach_symbol(keys[i]);
-        reach(NN_STATS_THUNKS, nn_attrset_get_value(set, i));
-    }
+    (void)ctx;
+    reach_symbol(sym);
 }
 
-static void enter_list(const nn_list_t *list)
+static void visit_unknown(void *ctx)
+{
+    (void)ctx;
+    g.unplaced++;
+}
+
+static void visit_array(void *ctx, int kind, const void *owner, void *const *base, uint32_t count);
+
+static const nn_graph_visitor_t visitor = {
+    visit_object, visit_array, visit_string, visit_symbol, visit_unknown
+};
+
+/* A list's items: the elements of its array below the lowest address the
+ * mark has scanned from, which every header over the array shares. */
+static void scan_items(const nn_list_t *list)
 {
     uint32_t pos, i, below;
     nn_items_t *items;
@@ -880,52 +821,49 @@ static void enter_list(const nn_list_t *list)
     }
     if (start >= items->scanned) return;
     below = (uint32_t)((items->scanned - start) / sizeof(void *));
-    for (i = 0; i < below; i++) reach(NN_STATS_THUNKS, list->items[i]);
+    for (i = 0; i < below; i++) reach(NN_GRAPH_THUNK, list->items[i]);
     items->scanned = start;
 }
 
-static void enter_lambda(const nn_lambda_t *lam)
+/* An env's with-scope array and an application's cells are counted the
+ * first time any owner reaches them, a list's items as far as it spans
+ * them. */
+static void visit_array(void *ctx, int kind, const void *owner, void *const *base, uint32_t count)
 {
     uint32_t i;
-    uint32_t formals = nn_lambda_formal_count(lam);
-    reach(NN_STATS_ENVS, lam->env);
-    reach_symbol(lam->name_sym);
-    reach_symbol(lam->lambda_name_sym);
-    for (i = 0; i < formals; i++) reach_symbol(lam->entries[i].name_sym);
-}
-
-static void enter_primop_app(const nn_primop_app_t *app)
-{
-    uint16_t i;
-    for (i = 0; i < app->taken; i++) reach(NN_STATS_THUNKS, app->args[i]);
-}
-
-static void enter_ctxstr(const nn_ctxstr_t *s)
-{
-    uint32_t i;
-    reach_string(s->text);
-    for (i = 0; i < s->ctx_count; i++) {
-        reach_string(s->ctx[i].sp_hash);
-        reach_string(s->ctx[i].sp_name);
-        reach_string(s->ctx[i].output);
+    switch (kind) {
+    case NN_GRAPH_WITH_SCOPES:
+        if (reach_array(base, count))
+            for (i = 0; i < count; i++) nn_graph_entry(kind, base[i], &visitor, ctx);
+        return;
+    case NN_GRAPH_APP_CELLS:
+        if (reach_app(base, count))
+            for (i = 0; i < count; i++) nn_graph_entry(kind, base[i], &visitor, ctx);
+        return;
+    case NN_GRAPH_ITEMS:
+        scan_items((const nn_list_t *)owner);
+        return;
+    default:
+        g.unplaced++;
+        return;
     }
 }
 
 /* --- The mark --- */
 
-void nn_stats_root_thunk(const void *thunk)   { if (g.open) reach(NN_STATS_THUNKS, thunk); }
-void nn_stats_root_env(const void *env)       { if (g.open) reach(NN_STATS_ENVS, env); }
-void nn_stats_root_attrset(const void *set)   { if (g.open) reach(NN_STATS_ATTRSETS, set); }
-void nn_stats_root_list(const void *list)     { if (g.open) reach(NN_STATS_LISTS, list); }
-void nn_stats_root_string(const void *str)    { if (g.open) reach_string((const nn_str_t *)str); }
-void nn_stats_root_ctxstr(const void *ctxstr) { if (g.open) reach(NN_STATS_CTXSTRS, ctxstr); }
+void nn_stats_root_thunk(const void *thunk)   { if (g.open) reach(NN_GRAPH_THUNK, thunk); }
+void nn_stats_root_env(const void *env)       { if (g.open) reach(NN_GRAPH_ENV, env); }
+void nn_stats_root_attrset(const void *set)   { if (g.open) reach(NN_GRAPH_ATTRSET, set); }
+void nn_stats_root_list(const void *list)     { if (g.open) reach(NN_GRAPH_LIST, list); }
+void nn_stats_root_string(const void *str)    { if (g.open && str) reach_string((const nn_str_t *)str); }
+void nn_stats_root_ctxstr(const void *ctxstr) { if (g.open) reach(NN_GRAPH_CTXSTR, ctxstr); }
 
 void nn_stats_root_registered(void)
 {
     uint32_t i, n;
     if (!g.open) return;
-    for (i = 0, n = nn_roots_thunk_count(); i < n; i++) reach(NN_STATS_THUNKS, nn_roots_thunk(i));
-    for (i = 0, n = nn_roots_env_count(); i < n; i++) reach(NN_STATS_ENVS, nn_roots_env(i));
+    for (i = 0, n = nn_roots_thunk_count(); i < n; i++) reach(NN_GRAPH_THUNK, nn_roots_thunk(i));
+    for (i = 0, n = nn_roots_env_count(); i < n; i++) reach(NN_GRAPH_ENV, nn_roots_env(i));
 }
 
 int nn_stats_mark(void)
@@ -933,16 +871,7 @@ int nn_stats_mark(void)
     if (!g.open) return -1;
     while (g.work_count > 0) {
         nn_work_t item = g.work[--g.work_count];
-        switch (item.kind) {
-        case NN_STATS_THUNKS:   enter_thunk((const nn_thunk_t *)item.object); break;
-        case NN_STATS_ENVS:     enter_env((const nn_env_t *)item.object); break;
-        case NN_STATS_ATTRSETS: enter_attrset((const nn_attrset_t *)item.object); break;
-        case NN_STATS_LISTS:    enter_list((const nn_list_t *)item.object); break;
-        case NN_STATS_LAMBDAS:  enter_lambda((const nn_lambda_t *)item.object); break;
-        case NN_STATS_PRIMOP_APPS: enter_primop_app((const nn_primop_app_t *)item.object); break;
-        case NN_STATS_CTXSTRS:  enter_ctxstr((const nn_ctxstr_t *)item.object); break;
-        default: g.unplaced++; break;
-        }
+        nn_graph_children(item.kind, item.object, &visitor, NULL);
     }
     return g.failed ? -1 : 0;
 }

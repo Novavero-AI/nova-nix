@@ -21,6 +21,7 @@ module Nix.Eval.CEnv
     cenvNew,
     cenvNewScoped,
     cenvPushWith,
+    cenvResolveWith,
 
     -- * Accessors
     cenvSlots,
@@ -80,6 +81,9 @@ foreign import ccall unsafe "nn_env_new_scoped"
 foreign import ccall unsafe "nn_env_push_with"
   c_nn_env_push_with :: Ptr NnEnv -> Ptr () -> Word32 -> IO (Ptr NnEnv)
 
+foreign import ccall unsafe "nn_env_resolve_with"
+  c_nn_env_resolve_with :: Ptr (Ptr ()) -> Word32 -> Ptr () -> IO ()
+
 foreign import ccall unsafe "nn_env_slots"
   c_nn_env_slots :: Ptr NnEnv -> IO (Ptr CThunkPtr)
 
@@ -137,6 +141,12 @@ cenvNewScoped site slotCount parent nameTable withs withCount =
 -- with a new with-scope prepended to those it sees.
 cenvPushWith :: (MonadCData m) => EnvSite -> Ptr NnEnv -> Ptr () -> m (Ptr NnEnv)
 cenvPushWith site base scope = cdataIO (checkedCPtr "nn_env_push_with" =<< c_nn_env_push_with base scope (envSiteIndex site))
+
+-- | Resolve the entry at an index of a with-scopes array to the set its
+-- thunk evaluated to: the one write into the array after its creation,
+-- which a census of regions records ("Nix.Eval.CRegion").
+cenvResolveWith :: (MonadCData m) => Ptr (Ptr ()) -> Word32 -> Ptr () -> m ()
+cenvResolveWith withScopes idx set = cdataIO (c_nn_env_resolve_with withScopes idx set)
 
 -- ---------------------------------------------------------------------------
 -- Accessors

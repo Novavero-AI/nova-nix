@@ -10,7 +10,7 @@
 -- by 'Nix.Parser.parseNix' evaluates in a session ('withEvalSession'):
 --
 -- @
--- withEvalSession (SessionSettings unrestrictedPolicy nixPathSearchPath storeDir "/path/to/project") $ \\st ->
+-- withEvalSession (SessionSettings unrestrictedPolicy nixPathSearchPath storeDir "/path/to/project" RegionCensusOff) $ \\st ->
 --   runEvalIO st (evalParsed (pure (evalBaseEnv st)) parsed)
 -- @
 module Nix.Eval.IO
@@ -77,6 +77,7 @@ import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.CData (MonadCData (..), runCData)
 import Nix.Eval.CList (CList (..))
+import Nix.Eval.CRegion (RegionCensus (..), inRegion, regionCensusRunning, withRegionCensus)
 import Nix.Eval.CRoots (crootsAddEnv, crootsAddThunk, crootsMark, crootsRelease)
 import Nix.Eval.CStatus (arenaLive, cInvariantViolated)
 import Nix.Eval.CThunk (CThunkPtr, cthunkMarkBlackhole, cthunkMarkPending, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedPrimop, cthunkSetComputedPrimopApp, cthunkSetComputedStr, cthunkState)
@@ -219,6 +220,10 @@ data EvalState = EvalState
     -- @trace-verbose@ setting.  Unrestricted unless the caller says
     -- otherwise, as upstream's defaults are.
     esPolicy :: !EvalPolicy,
+    -- | Whether the session runs a census of regions, which opens a
+    -- region around each force ("Nix.Eval.CRegion").  Every session in
+    -- the arena runs it once the outermost one has started it.
+    esRegionCensus :: !RegionCensus,
     -- | The allowed path prefixes under a restricting policy: the search
     -- path roots the caller seeded with 'allowEvalPath', plus every store
     -- object this evaluation copies, fetches or writes (upstream's
@@ -240,7 +245,11 @@ data SessionSettings = SessionSettings
     sessionStoreDir :: !SP.StoreDir,
     -- | The directory relative paths in the evaluated source resolve
     -- against.
-    sessionBaseDir :: !FilePath
+    sessionBaseDir :: !FilePath,
+    -- | Whether to run a census of regions ("Nix.Eval.CRegion").  Only a
+    -- session that sets up the arena starts one; a nested session runs
+    -- whatever the arena's runs.
+    sessionRegionCensus :: !RegionCensus
   }
 
 -- | Run an action in an evaluation session: the C data layer's arena is
@@ -259,7 +268,7 @@ withEvalSession settings action = withArena (bracket crootsMark crootsRelease (c
       newEvalStateWith (sessionPolicy settings) searchPaths (sessionStoreDir settings) (sessionBaseDir settings) >>= action
     withArena body = do
       live <- arenaLive
-      if live then body else bracket_ arenaInit arenaDestroy body
+      if live then body else withRegionCensus (sessionRegionCensus settings) (bracket_ arenaInit arenaDestroy body)
 
 -- | The search path @NIX_PATH@ gives ('nixPathValue').
 nixPathSearchPath :: IO [Thunk]
@@ -309,6 +318,7 @@ newEvalStateWith policy searchPaths storeDir baseDir = do
   now <- floor <$> getPOSIXTime :: IO Int64
   baseEnv@(Env baseEnvPtr) <- builtinEnv policy now searchPaths
   crootsAddEnv baseEnvPtr
+  regions <- regionCensusRunning
   pure
     EvalState
       { esImportCache = cache,
@@ -323,6 +333,7 @@ newEvalStateWith policy searchPaths storeDir baseDir = do
         esSearchPaths = searchPaths,
         esCallDepth = topLevelCallDepth defaultMaxCallDepth,
         esPolicy = policy,
+        esRegionCensus = regions,
         esAllowedPaths = allowedPaths
       }
 
@@ -931,15 +942,21 @@ instance MonadEval EvalIO where
         -- restore's own answer is not needed: it refuses only a thunk that is
         -- no longer BLACKHOLE, which a later force already handles, and the
         -- exception in flight is the one to report.
+        -- Under a census of regions the force is a region, closed once its
+        -- value is stored or it throws, so the store, which can allocate,
+        -- is inside it.
         EvalIO $ do
           st <- ask
           liftIO
-            ( ( do
-                  result <- runReaderT (unEvalIO (evalFn pending)) st
-                  storeComputed ptr result
-                  pure result
-              )
-                `onException` cthunkMarkPending ptr
+            ( inRegion
+                (esRegionCensus st)
+                ( ( do
+                      result <- runReaderT (unEvalIO (evalFn pending)) st
+                      storeComputed ptr result
+                      pure result
+                  )
+                    `onException` cthunkMarkPending ptr
+                )
             )
       other ->
         EvalIO (liftIO (cInvariantViolated "nn_thunk_state" ("no thunk has state " ++ show other)))

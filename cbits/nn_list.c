@@ -10,6 +10,7 @@
 #include "nn_list.h"
 #include "nn_env.h"
 #include "nn_assert.h"
+#include "nn_region.h"
 
 #include <stdlib.h>
 
@@ -36,6 +37,7 @@ nn_list_new(nn_list_t **out, uint32_t count)
         free(list);
         return -1;
     }
+    if (nn_region_census) nn_region_list(list, g_tracked.count - 1, NULL);
 
     *out = list;
     return 0;
@@ -56,6 +58,7 @@ nn_list_drop(nn_list_t **out, const nn_list_t *list, uint32_t n)
         free(rest);
         return -1;
     }
+    if (nn_region_census) nn_region_list(rest, g_tracked.count - 1, list);
 
     *out = rest;
     return 0;

@@ -104,6 +104,11 @@ typedef char nn_thunk_size_check_[(sizeof(nn_thunk_t) == 16) ? 1 : -1];
  * silently truncate large integers.  C99-compatible compile-time check: */
 typedef char nn_thunk_ptr_size_check_[(sizeof(void *) >= sizeof(int64_t)) ? 1 : -1];
 
+/* --- Blocks --- */
+
+/* The cells each block of the arena holds. */
+#define NN_THUNK_BLOCK_CELLS 65536u
+
 /* --- Lifecycle --- */
 
 /* Initialize the global thunk arena with its first block.  Called only
@@ -266,5 +271,11 @@ uint32_t nn_thunk_blocks(nn_thunk_t **slots, uint32_t *counts, uint32_t max);
 /* Bytes the arena holds from the allocator: every block, header and
  * unused slots included. */
 uint64_t nn_thunk_reserved_bytes(void);
+
+/* The cells the arena has handed out since nn_thunk_init. */
+uint64_t nn_thunk_cells_allocated(void);
+
+/* The bytes of cells a block has handed out, given its first slot. */
+uint64_t nn_thunk_block_used(const char *slots);
 
 #endif /* NN_THUNK_H */

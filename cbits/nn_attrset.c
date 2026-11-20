@@ -20,6 +20,7 @@
 
 #include "nn_attrset.h"
 #include "nn_assert.h"
+#include "nn_region.h"
 #include "nn_stats.h"
 
 #include <stdlib.h>
@@ -86,7 +87,9 @@ static int grow(nn_attrset_t *set)
     set->keys = new_keys;
     set->positions = new_keys + new_cap;
 
+    uint64_t before = nn_attrset_bytes(set);
     set->capacity = new_cap;
+    if (nn_region_census) nn_region_tracked_grew(nn_attrset_bytes(set) - before);
     return 0;
 }
 
@@ -133,6 +136,8 @@ static nn_attrset_t *attrset_alloc(uint32_t capacity)
         free(set);
         return NULL;
     }
+    if (nn_region_census)
+        nn_region_tracked(NN_REGION_SET, set, g_tracked.count - 1, nn_attrset_bytes(set));
     return set;
 }
 

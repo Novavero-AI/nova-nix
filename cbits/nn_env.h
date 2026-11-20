@@ -93,6 +93,9 @@ typedef char nn_env_count_width_check_[(UINTPTR_MAX >> NN_ENV_COUNT_SHIFT >= UIN
  * evaluator replaces by the set once it forces the thunk. */
 #define NN_ENV_LAZY_WITH ((uintptr_t)1)
 
+/* The bytes of each page, or of a request's own size when it is larger. */
+#define NN_ENV_PAGE_SIZE (256u * 1024u)
+
 /* --- Lifecycle --- */
 
 /* Initialize the global env allocator.  Must be called once before
@@ -164,6 +167,12 @@ nn_env_t *nn_env_new_scoped(uint32_t slot_count, nn_env_t *parent,
  * allocator makes is (NN_ASSERT). */
 nn_env_t *nn_env_push_with(nn_env_t *base, void *scope, uint32_t site);
 
+/* Resolve the with-scope entry at `idx` of a with-scopes array to the
+ * set its thunk evaluated to (NN_ENV_LAZY_WITH).  The one write into an
+ * array after its creation, which a census of regions records
+ * (nn_region.h). */
+void nn_env_resolve_with(void **with_scopes, uint32_t idx, void *set);
+
 /* --- Accessors --- */
 
 /* The env's slots, which the caller fills after construction. */
@@ -199,7 +208,7 @@ nn_env_t *nn_env_with_owner(nn_env_t *env);
 
 /* --- Diagnostics --- */
 
-/* The bytes the pages have handed out, summed over them. */
+/* The bytes the pages have handed out since nn_env_init. */
 uint64_t nn_env_bytes_allocated(void);
 
 /* --- Census (nn_stats.h) --- */
@@ -217,5 +226,8 @@ uint32_t nn_env_pages(char **data, uint32_t *used, uint32_t max);
 /* Bytes the pages hold from the allocator, headers and unused tails
  * included. */
 uint64_t nn_env_reserved_bytes(void);
+
+/* The bytes a page has handed out, given its first byte. */
+uint64_t nn_env_page_used(const char *data);
 
 #endif /* NN_ENV_H */

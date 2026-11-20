@@ -161,7 +161,7 @@ import Nix.Eval.CAttrSet (CAttrSet, cattrsetEmpty, cattrsetFreeze, cattrsetGetKe
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, strpartLit, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr, pattern OpVar)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText, pattern SceAllOutputs, pattern SceDrvOutput, pattern ScePlain)
 import Nix.Eval.CData (CData, MonadCData (..), cdataIO, runCDataPure)
-import Nix.Eval.CEnv (NnEnv, cenvEmpty, cenvLookupResolved, cenvNameTable, cenvNew, cenvNewScoped, cenvParent, cenvPushWith, cenvSlotCount, cenvSlots, cenvWithCount, cenvWithOwner, cenvWithScopes)
+import Nix.Eval.CEnv (NnEnv, cenvEmpty, cenvLookupResolved, cenvNameTable, cenvNew, cenvNewScoped, cenvParent, cenvPushWith, cenvResolveWith, cenvSlotCount, cenvSlots, cenvWithCount, cenvWithOwner, cenvWithScopes)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaLambdaNameSym, clambdaNameSym, clambdaNew, clambdaSetEntry, pattern FormalsName, pattern FormalsNamedSet, pattern FormalsSet)
 import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
 import Nix.Eval.CPrimop (CPrimopAppPtr, cprimopAppArg, cprimopAppForced, cprimopAppNew, cprimopAppPrimop, cprimopAppTaken)
@@ -804,7 +804,7 @@ withScopeAt withArr idx = classify . ptrToWordPtr <$> cdataIO (peekElemOff withA
 -- so later lookups read the set directly.  Every env sharing the array
 -- would evaluate the thunk to the same set.
 resolveWithScopeAt :: (MonadCData m) => Ptr (Ptr ()) -> Int -> AttrSet -> m ()
-resolveWithScopeAt withArr idx (AttrSet cset) = cdataIO (pokeElemOff withArr idx (castPtr cset))
+resolveWithScopeAt withArr idx (AttrSet cset) = cenvResolveWith withArr (fromIntegral idx) (castPtr cset)
 
 -- | The with-scopes an env sees, innermost first, and their count: those
 -- of the first env on its parent chain, itself included, that has
