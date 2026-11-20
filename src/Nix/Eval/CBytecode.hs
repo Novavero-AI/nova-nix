@@ -75,6 +75,11 @@ module Nix.Eval.CBytecode
     pattern OpPathStr,
     pattern OpPos,
 
+    -- * Attribute set flags
+    attrsPlain,
+    attrsRec,
+    attrsRecOverrides,
+
     -- * UnaryOp flags
     unaryNot,
     unaryNegate,
@@ -100,6 +105,11 @@ module Nix.Eval.CBytecode
     formalName,
     formalSet,
     formalNamedSet,
+
+    -- * Formal default kinds
+    formalNoDefault,
+    formalDefault,
+    formalSharedDefault,
 
     -- * String part tags
     strpartLit,
@@ -198,9 +208,8 @@ cbcEmitString bytes =
   cdataIO . BSU.unsafeUseAsCStringLen bytes $ \(ptr, len) ->
     checkedEmit "nn_bc_emit_string" =<< c_nn_bc_emit_string ptr (fromIntegral len)
 
--- | 'cbcEmitString' for text's UTF-8 bytes: a path, a URI, a search path
--- or a source file's path, which the evaluator reads back as text
--- ('cbcStringText').
+-- | 'cbcEmitString' for text's UTF-8 bytes: a path, a URI or a source
+-- file's path, which the evaluator reads back as text ('cbcStringText').
 cbcEmitText :: (MonadCData m) => Text -> m Word32
 cbcEmitText text =
   cdataIO . TF.withCStringLen text $ \(ptr, len) ->
@@ -395,6 +404,15 @@ pattern OpPos = 25
 -- Sub-type flags
 -- ---------------------------------------------------------------------------
 
+-- | @OpAttrs@ flag values: a set, a recursive set, or a recursive set
+-- that binds @__overrides@ statically, in which upstream makes every
+-- static value but an inherited name's a thunk of its own
+-- (eval.cc:1205-1218 at 2.24.9).
+attrsPlain, attrsRec, attrsRecOverrides :: Word8
+attrsPlain = 0
+attrsRec = 1
+attrsRecOverrides = 2
+
 -- | @OpUnary@ flag values: which unary operator to apply.
 unaryNot, unaryNegate :: Word8
 unaryNot = 0
@@ -437,6 +455,17 @@ formalName = 0
 formalSet = 1
 formalNamedSet = 2
 
+-- | Kinds of a set pattern formal's default, the second of the three
+-- words of its entry, the formal's name before it and its code after it:
+-- none, code made in the call's frame, or a variable naming a slot of the
+-- call's frame whose cell the formal's slot shares
+-- ('Nix.Eval.EvalFormals.SharedDefault').  A C lambda's formal entries
+-- hold the same words (@nn_formal_entry_t@, cbits/nn_lambda.h).
+formalNoDefault, formalDefault, formalSharedDefault :: Word32
+formalNoDefault = 0
+formalDefault = 1
+formalSharedDefault = 2
+
 -- | String-part kinds: a literal chunk, an interpolated @${...}@
 -- expression, or an indented-string escape (literal text the indentation
 -- scan must not measure).
@@ -447,6 +476,15 @@ strpartEsc = 2
 
 -- | Attribute-binding kinds: a @name = value@ binding, one name of an
 -- @inherit@, or an @inherit (from) ...@.
+--
+-- A binding list's words are the count of the names it binds statically,
+-- the count of its bindings with a dynamic name, the count of its shares
+-- and the shares, two words each, then the bindings, each led by its
+-- kind.  A share is a binding whose whole value is a variable naming
+-- another of the frame's names, which takes that name's cell
+-- ('Nix.Eval.Compile.siblingShares'): its slot and the slot whose cell it
+-- takes in a frame that holds its names in slots, and their symbols in
+-- one that holds them in a name table.
 bindNamed, bindInherit, bindInheritFrom :: Word32
 bindNamed = 0
 bindInherit = 1

@@ -24,6 +24,7 @@ module Nix.Eval.CEnv
 
     -- * Accessors
     cenvSlots,
+    cenvSlotCount,
     cenvNameTable,
     cenvParent,
     cenvWithScopes,
@@ -81,6 +82,9 @@ foreign import ccall unsafe "nn_env_push_with"
 
 foreign import ccall unsafe "nn_env_slots"
   c_nn_env_slots :: Ptr NnEnv -> IO (Ptr CThunkPtr)
+
+foreign import ccall unsafe "nn_env_slot_count"
+  c_nn_env_slot_count :: Ptr NnEnv -> IO Word32
 
 foreign import ccall unsafe "nn_env_name_table"
   c_nn_env_name_table :: Ptr NnEnv -> IO (Ptr ())
@@ -141,6 +145,10 @@ cenvPushWith site base scope = cdataIO (checkedCPtr "nn_env_push_with" =<< c_nn_
 -- | The slots of a C env, inline in it.
 cenvSlots :: (MonadCData m) => Ptr NnEnv -> m (Ptr CThunkPtr)
 cenvSlots = cdataIO . c_nn_env_slots
+
+-- | How many slots a C env has.
+cenvSlotCount :: (MonadCData m) => Ptr NnEnv -> m Word32
+cenvSlotCount = cdataIO . c_nn_env_slot_count
 
 -- | Read the name table pointer from a C env (NULL if none).
 cenvNameTable :: (MonadCData m) => Ptr NnEnv -> m (Ptr ())

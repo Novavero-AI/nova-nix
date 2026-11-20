@@ -14,6 +14,8 @@
 module Nix.Eval.EvalFormals
   ( EvalFormals (..),
     EvalFormal (..),
+    FormalDefault (..),
+    hasDefault,
     LambdaName (..),
     lambdaNameText,
     lambdaNameSymbol,
@@ -25,12 +27,32 @@ import Data.Text (Text)
 import Data.Word (Word32)
 import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolText)
 
--- | A single formal parameter with an optional default (bytecode index).
+-- | A single formal parameter and its default.
 data EvalFormal = EvalFormal
   { efName :: !Symbol,
-    efDefault :: !(Maybe Word32)
+    efDefault :: !FormalDefault
   }
   deriving (Eq, Show)
+
+-- | A formal's default, as the compiler decides it.
+data FormalDefault
+  = -- | None: a call's argument must hold the formal.
+    NoDefault
+  | -- | The code at a bytecode index, made in the call's frame.
+    Default !Word32
+  | -- | A variable naming a slot of the call's frame, the code at a
+    -- bytecode index, whose cell the formal's slot shares once the frame
+    -- is filled, as upstream's @maybeThunk@ shares the cell of a slot it
+    -- has filled before the formal's (eval.cc:1014-1021 and :1539-1563 at
+    -- 2.24.9).
+    SharedDefault !Word32
+  deriving (Eq, Show)
+
+-- | Whether a call can leave the formal out of its argument.
+hasDefault :: FormalDefault -> Bool
+hasDefault NoDefault = False
+hasDefault (Default _) = True
+hasDefault (SharedDefault _) = True
 
 -- | The name a function's call errors give it.  Upstream names a function
 -- after the attribute a set or @let@ binds it to, and names a function
@@ -63,7 +85,7 @@ lambdaNameFromSymbol sid
   | otherwise = NamedLambda (Symbol sid)
 
 -- | Formal parameter specification for a lambda.
--- Mirrors 'Nix.Expr.Types.Formals' but with bytecode indices for defaults.
+-- Mirrors 'Nix.Expr.Types.Formals' but with each default as compiled.
 data EvalFormals
   = -- | @x: body@ - single named parameter
     EFName !Symbol

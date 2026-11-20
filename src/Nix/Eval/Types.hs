@@ -34,6 +34,7 @@ module Nix.Eval.Types
     attrSetFromSymbolEntries,
     attrSetFromSymbolEntriesSizedFor,
     attrSetMember,
+    attrSetMemberSymbol,
     attrSetNull,
     attrSetSize,
     attrSetElems,
@@ -89,6 +90,9 @@ module Nix.Eval.Types
     readPending,
     evaluated,
     tieFrame,
+    frameThunkBc,
+    shareSlot,
+    envSlotCells,
 
     -- * Lambda marshalling
     marshalLambda,
@@ -138,6 +142,7 @@ import qualified Data.ByteString as BS
 import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -145,6 +150,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word32, Word64, Word8)
+import Foreign.Marshal.Array (peekArray)
 import Foreign.Ptr (Ptr, WordPtr, castPtr, nullPtr, ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import GHC.Float (castWord64ToDouble)
@@ -152,10 +158,10 @@ import Nix.Derivation (Derivation)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.Builtin (Builtin, builtinAtIndex, builtinIndex, builtinName)
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetEmpty, cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
-import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, strpartLit, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr)
+import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, strpartLit, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr, pattern OpVar)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText, pattern SceAllOutputs, pattern SceDrvOutput, pattern ScePlain)
 import Nix.Eval.CData (CData, MonadCData (..), cdataIO, runCDataPure)
-import Nix.Eval.CEnv (NnEnv, cenvEmpty, cenvLookupResolved, cenvNameTable, cenvNew, cenvNewScoped, cenvParent, cenvPushWith, cenvSlots, cenvWithCount, cenvWithOwner, cenvWithScopes)
+import Nix.Eval.CEnv (NnEnv, cenvEmpty, cenvLookupResolved, cenvNameTable, cenvNew, cenvNewScoped, cenvParent, cenvPushWith, cenvSlotCount, cenvSlots, cenvWithCount, cenvWithOwner, cenvWithScopes)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaBody, clambdaEntryDefault, clambdaEntryHasDefault, clambdaEntryName, clambdaEnv, clambdaFormalCount, clambdaFormalsType, clambdaLambdaNameSym, clambdaNameSym, clambdaNew, clambdaSetEntry, pattern FormalsName, pattern FormalsNamedSet, pattern FormalsSet)
 import Nix.Eval.CList (CList (..), clistFromThunks, clistLen, clistThunks, emptyCList)
 import Nix.Eval.CPrimop (CPrimopAppPtr, cprimopAppArg, cprimopAppForced, cprimopAppNew, cprimopAppPrimop, cprimopAppTaken)
@@ -164,7 +170,7 @@ import Nix.Eval.CStr (CStrPtr, cstrBytes, cstrFromText, cstrNew, cstrText)
 import Nix.Eval.CThunk (CThunkPtr, cthunkApplyCell, cthunkBool, cthunkEmptyList, cthunkGetBcIdx, cthunkGetBool, cthunkGetFloat, cthunkGetInt, cthunkGetPrimop, cthunkNewApply1, cthunkNewApply2, cthunkNewBc, cthunkNewComputedAttrs, cthunkNewComputedCtxStr, cthunkNewComputedFloat, cthunkNewComputedInt, cthunkNewComputedLambda, cthunkNewComputedList, cthunkNewComputedPath, cthunkNewComputedPrimop, cthunkNewComputedPrimopApp, cthunkNewComputedStr, cthunkNull, cthunkPayload, cthunkPendingForm, cthunkState, cthunkValueTag, noCode)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
-import Nix.Eval.Compile (BcCaptureInfo (..), BcCapturedSlots (..), compileExpr, compileFormalsToEval, compileParsed, foldBcCapturedSlots)
+import Nix.Eval.Compile (BcCaptureInfo (..), BcCapturedSlots (..), compileExpr, compileFormalsToEval, compileParsed, foldBcCapturedSlots, formalDefaultFromWords, formalDefaultWords)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), lambdaNameFromSymbol, lambdaNameSymbol)
 import Nix.Eval.Policy (EvalPolicy (..), unrestrictedPolicy)
 import Nix.Eval.SourcePos (PosIdx, noPos)
@@ -457,6 +463,11 @@ data AttrEntry = AttrEntry
 -- of the C array, which is sorted by symbol.
 attrSetLookupSymbol :: (MonadCData m) => Symbol -> AttrSet -> m (Maybe Thunk)
 attrSetLookupSymbol sym (AttrSet cset) = fmap Thunk <$> cattrsetLookup cset sym
+
+-- | Whether a set binds an interned name, a name table whose entry is not
+-- filled yet among them.
+attrSetMemberSymbol :: (MonadCData m) => Symbol -> AttrSet -> m Bool
+attrSetMemberSymbol sym (AttrSet cset) = isJust <$> cattrsetIndex cset sym
 
 -- | 'attrSetLookupSymbol' for a name given as text, which is interned
 -- first, so a name no symbol holds yet takes its place in symbol order.
@@ -956,16 +967,45 @@ readPending ptr =
   where
     cell i = Thunk <$> cthunkApplyCell ptr i
 
--- | Like 'cheapThunk' but for bytecode indices (used inside evalBytecode).
--- Short-circuits for resolved vars and literals without creating a
--- pending thunk.  Everything else falls back to 'mkThunkBc'.
+-- | The cell a binding, a list element, a call's argument or a with's
+-- scope holds for the code at a bytecode index in an env, as upstream's
+-- @maybeThunk@ makes it (eval.cc:1006-1046 at 2.24.9).  A variable is
+-- its own cell, found by its slot or, when the resolver left it to a
+-- name table, by its name ('envLookup'), so the binding and the variable
+-- are one value, as @==@ shows of a function.  A constant is a cell of
+-- its value.  Anything else is a pending thunk ('mkThunkBc'): a variable
+-- only a with supplies among them, since upstream looks in no with until
+-- the variable is forced (eval.cc:869-872), and a name no table binds,
+-- which fails when the thunk is forced.
+--
+-- Every slot and name table the variable is read from must be filled: a
+-- frame that is being tied makes its values with 'frameThunkBc'.
 cheapThunkBc :: (MonadCData m) => Env -> Word32 -> m Thunk
-cheapThunkBc env bcIdx =
+cheapThunkBc = maybeThunkBc OwnSlotsFilled
+
+-- | 'cheapThunkBc' for a value made in a frame that is being tied
+-- ('tieFrame'), whose own slots are not filled yet: a variable naming one
+-- of them is a thunk of its own, as upstream's @maybeThunk@ makes it for
+-- a slot it has not filled (eval.cc:1014-1021 at 2.24.9).  The frame's
+-- shares then give it the slot's cell where upstream's would have it
+-- ('Nix.Eval.Compile.siblingShares').
+frameThunkBc :: (MonadCData m) => Env -> Word32 -> m Thunk
+frameThunkBc = maybeThunkBc OwnSlotsEmpty
+
+-- | Whether the env a value is made in has filled its own slots: every
+-- env has once it is built, but a frame that is being tied has not.
+data OwnSlots = OwnSlotsFilled | OwnSlotsEmpty
+
+-- | 'cheapThunkBc' and 'frameThunkBc', by whether the env's own slots
+-- are filled.
+maybeThunkBc :: (MonadCData m) => OwnSlots -> Env -> Word32 -> m Thunk
+maybeThunkBc ownSlots env bcIdx =
   cbcOpcode bcIdx >>= \case
-    OpResolvedVar -> do
-      level <- cbcArg1 bcIdx
-      idx <- cbcArg2 bcIdx
-      envLookupResolved level idx env
+    OpResolvedVar ->
+      cbcArg1 bcIdx >>= \case
+        0 | OwnSlotsEmpty <- ownSlots -> mkThunkBc env bcIdx
+        level -> cbcArg2 bcIdx >>= \idx -> envLookupResolved level idx env
+    OpVar -> cbcArg1 bcIdx >>= \sym -> envLookup (Symbol sym) env >>= maybe (mkThunkBc env bcIdx) pure
     OpLitInt -> do
       w64 <- literalWord64 bcIdx
       Thunk <$> cthunkNewComputedInt (fromIntegral w64)
@@ -1055,19 +1095,26 @@ emptyBcList bcIdx = do
 literalStr :: (MonadCData m) => Word32 -> m (Maybe CStrPtr)
 literalStr bcIdx = do
   (count, dataOff) <- cbcCountedPayload bcIdx =<< cbcArg1 bcIdx
-  partIndices count dataOff >>= \case
-    Just [index] -> Just <$> cbcString index
-    Just indices -> Just <$> (mapM cbcStringBytes indices >>= cstrNew . BS.concat)
-    Nothing -> pure Nothing
+  partsLiteral count dataOff >>= \case
+    False -> pure Nothing
+    True
+      | count == 1 -> Just <$> (cbcData (dataOff + 1) >>= cbcString)
+      | otherwise -> Just <$> (partsBytes count dataOff >>= cstrNew . BS.concat)
   where
-    partIndices 0 _ = pure (Just [])
-    partIndices n off = do
-      tag <- cbcData off
-      if tag /= strpartLit
-        then pure Nothing
-        else do
-          index <- cbcData (off + 1)
-          fmap (index :) <$> partIndices (n - 1 :: Int) (off + 2)
+    -- Whether each of the parts, the count given from a data offset on,
+    -- is a literal, read before any part is collected.  Each helper takes
+    -- the offset as a strict argument rather than closing over it, so the
+    -- offset is never boxed for a string that is not all literal.
+    partsLiteral 0 !_ = pure True
+    partsLiteral n !off =
+      cbcData off >>= \case
+        tag
+          | tag == strpartLit -> partsLiteral (n - 1 :: Int) (off + 2)
+          | otherwise -> pure False
+    -- The bytes of each literal part, the count given from a data offset
+    -- on.
+    partsBytes 0 !_ = pure []
+    partsBytes n !off = (:) <$> (cbcData (off + 1) >>= cbcStringBytes) <*> partsBytes (n - 1 :: Int) (off + 2)
 
 -- | Wrap an already-computed value as a thunk.
 -- Ints, floats and a builtin with no argument taken are inline in a new
@@ -1165,11 +1212,9 @@ marshalLambda envPtr formals bodyBcIdx = case formals of
     pure (castPtr lam)
   where
     fillEntries _ _ [] = pure ()
-    fillEntries lam !idx (EvalFormal (Symbol nameSym) defBcIdx : rest) = do
-      let (hasDef, defIdx) = case defBcIdx of
-            Nothing -> (0, 0)
-            Just di -> (1, di)
-      clambdaSetEntry lam idx nameSym hasDef defIdx
+    fillEntries lam !idx (EvalFormal (Symbol nameSym) def : rest) = do
+      let (kind, code) = formalDefaultWords def
+      clambdaSetEntry lam idx nameSym kind code
       fillEntries lam (idx + 1) rest
 
 -- | Read a C nn_lambda_t back into VLambda.
@@ -1206,10 +1251,11 @@ unmarshalLambdaValue rawPtr = do
       | otherwise = mapM (readOneEntry lamPtr) [0 .. count - 1]
     readOneEntry lamPtr idx = do
       nameSym <- clambdaEntryName lamPtr idx
-      hasDef <- clambdaEntryHasDefault lamPtr idx
-      defIdx <- clambdaEntryDefault lamPtr idx
-      let defMaybe = if hasDef /= 0 then Just defIdx else Nothing
-      pure (EvalFormal (Symbol nameSym) defMaybe)
+      kind <- clambdaEntryHasDefault lamPtr idx
+      code <- clambdaEntryDefault lamPtr idx
+      case formalDefaultFromWords kind code of
+        Just def -> pure (EvalFormal (Symbol nameSym) def)
+        Nothing -> cdataIO (cInvariantViolated "nn_lambda_entry_kind" ("no formal has default kind " ++ show kind))
 
 -- | Marshal payload bytes + StringContext to a C nn_ctxstr_t, each a
 -- string's bytes: the payload as it is, and the StorePath and output-name
@@ -1287,6 +1333,27 @@ tieFrame site parent slotCount mkThunks = do
   thunks <- mkThunks env
   fillSlots env (take slotCount thunks)
   pure (env, thunks)
+
+-- | Give a slot of a frame 'tieFrame' has filled, and nothing has been
+-- evaluated in, the cell another slot holds: the first slot's binding is
+-- a variable naming the second, whose cell it shares.  Both slots are read
+-- from bytecode, so one past the frame's slots, which only corrupt
+-- bytecode holds, is handed to @pastFrame@ and nothing is written.
+shareSlot :: (MonadCData m) => (Word32 -> m ()) -> Env -> Word32 -> Word32 -> m ()
+shareSlot pastFrame (Env envPtr) slot target = cenvSlotCount envPtr >>= share
+  where
+    share slotCount
+      | slot >= slotCount = pastFrame slot
+      | target >= slotCount = pastFrame target
+      | otherwise = do
+          slots <- cenvSlots envPtr
+          cdataIO (peekElemOff slots (fromIntegral target) >>= pokeElemOff slots (fromIntegral slot))
+
+-- | The cells in an env's slots, the count given from slot 0.
+envSlotCells :: (MonadCData m) => Env -> Int -> m [Thunk]
+envSlotCells (Env envPtr) count = do
+  slots <- cenvSlots envPtr
+  cdataIO (map Thunk <$> peekArray count slots)
 
 -- | Write thunks into an env's slots, first to last from slot 0.  There
 -- are no more thunks than slots.

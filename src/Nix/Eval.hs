@@ -124,21 +124,21 @@ import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.Read as TR
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
-import Data.Word (Word32)
+import Data.Word (Word32, Word8)
 import Foreign.Ptr (Ptr)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAttrs, structuredAttrsKey)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.Builtin (Builtin, builtinName)
 import qualified Nix.Eval.Builtin as Builtin
-import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpPos, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CBytecode (attrsPlain, attrsRec, attrsRecOverrides, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcFlags, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, strpartEsc, strpartLit, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpPathStr, pattern OpPos, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (MonadCData)
 import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CStr (cstrText)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
-import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), BcCaptureInfo (..), BcInheritedName (..), decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, foldBcBindings, foldBcInheritedNames, reassembleDouble, reassembleInt64)
+import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), BcCaptureInfo (..), BcInheritedName (..), BcShares (..), decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, foldBcBindings, foldBcInheritedNames, foldBcShares, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, plainContext)
-import Nix.Eval.EvalFormals (LambdaName, lambdaNameText)
+import Nix.Eval.EvalFormals (FormalDefault (..), LambdaName, hasDefault, lambdaNameText)
 import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdate, expectInt, expectedFailure, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
 import Nix.Eval.Policy (fileUrlPrefix, isAbsolutePath)
 import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printSymbol, printValue)
@@ -177,6 +177,7 @@ import Nix.Eval.Types
     attrSetLookupSymbolEntry,
     attrSetMapWithKey,
     attrSetMember,
+    attrSetMemberSymbol,
     attrSetNull,
     attrSetRemoveKeys,
     attrSetSize,
@@ -195,9 +196,11 @@ import Nix.Eval.Types
     emptyEnv,
     envLookup,
     envLookupResolved,
+    envSlotCells,
     envWithScopesRaw,
     evaluated,
     fillCAttrSetValues,
+    frameThunkBc,
     heldString,
     mkApply2Thunk,
     mkApplyThunk,
@@ -210,6 +213,7 @@ import Nix.Eval.Types
     readThunkValue,
     resolveWithScopeAt,
     runPureEval,
+    shareSlot,
     storePathOrThrow,
     tieFrame,
     typeName,
@@ -694,7 +698,7 @@ evalBcLambda :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcLambda env bcIdx0 = do
   flags_ <- cbcFlags bcIdx0
   formalsOff <- cbcArg1 bcIdx0
-  decodeBcFormals flags_ formalsOff >>= \case
+  decodeBcFormals (corruptBytecode "formal default kind") flags_ formalsOff >>= \case
     Just formals -> do
       bodyBcIdx <- cbcArg2 bcIdx0
       captureOff <- cbcArg3 bcIdx0
@@ -793,11 +797,28 @@ hasBcAttrPath env n off val = case val of
 -- | Evaluate attribute set from bytecode.
 evalBcAttrs :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcAttrs env bcIdx0 = do
-  isRec <- (/= 0) <$> cbcFlags bcIdx0
+  kind <- cbcFlags bcIdx0
   bindings <- countedPayload1 bcIdx0 >>= uncurry decodeBcBindings
-  if isRec
-    then cbcArg2 bcIdx0 >>= \captureOff -> withBcCaptureInfo captureOff (evalBcRecAttrs env bindings)
-    else evalBcNonRecAttrs env bindings
+  case setKind kind of
+    Just PlainSet -> evalBcNonRecAttrs env bindings
+    Just (RecSet values) -> cbcArg2 bcIdx0 >>= \captureOff -> withBcCaptureInfo captureOff (evalBcRecAttrs values env bindings)
+    Nothing -> corruptBytecode "attribute set flag" kind
+
+-- | What an attribute set is.
+data SetKind
+  = -- | A set that is not recursive.
+    PlainSet
+  | -- | A recursive set, its static values made as the 'FrameValues' say.
+    RecSet !FrameValues
+
+-- | The kind of attribute set an instruction's flag says it is, or
+-- 'Nothing' for a flag the compiler never writes.
+setKind :: Word8 -> Maybe SetKind
+setKind kind
+  | kind == attrsPlain = Just PlainSet
+  | kind == attrsRec = Just (RecSet MaybeThunkValues)
+  | kind == attrsRecOverrides = Just (RecSet ThunkValues)
+  | otherwise = Nothing
 
 -- | Evaluate a non-recursive attr set from bytecode bindings: its static
 -- attributes ('bindStaticAttrs'), then its dynamic ones
@@ -805,12 +826,11 @@ evalBcAttrs env bcIdx0 = do
 -- as upstream's @ExprAttrs::eval@ binds them (eval.cc:1247-1275 at
 -- 2.24.9).
 --
--- Values go through 'cheapThunkBc', so a constant or a variable already in
--- scope becomes the value rather than a thunk over it, which is what
--- upstream's non-recursive @ExprAttrs::eval@ does through @maybeThunk@.  The
--- env here is the enclosing one and is fully built, so reading a variable
--- out of it now is safe; the recursive and @let@ paths knot-tie their own
--- frame and cannot make the same shortcut.
+-- Values go through 'cheapThunkBc', so a constant or a variable becomes
+-- the value rather than a thunk over it, which is what upstream's
+-- non-recursive @ExprAttrs::eval@ does through @maybeThunk@.  The env here
+-- is the enclosing one and is fully built, so every variable's cell can
+-- be read now.
 evalBcNonRecAttrs :: (MonadEval m) => Env -> BcBindings -> m NixValue
 evalBcNonRecAttrs env bindings =
   bindStaticAttrs cheapThunkBc env env bindings
@@ -823,7 +843,7 @@ evalBcNonRecAttrs env bindings =
 -- dynamicAttrs.size()@, eval.cc:1193 at 2.24.9), so a literal whose
 -- every name is a null @${...}@ makes an empty set of its own.
 literalSet :: (MonadEval m) => SetSite -> (Env -> Word32 -> m Thunk) -> Env -> BcBindings -> Map Symbol AttrEntry -> m AttrSet
-literalSet site mkValueThunk dynamicEnv bindings@(BcBindings (BcBindingCounts names dynamics) _ _) statics =
+literalSet site mkValueThunk dynamicEnv bindings@(BcBindings (BcBindingCounts names dynamics) _ _ _) statics =
   withDynamics >>= attrSetFromSymbolEntriesSizedFor site (names + dynamics)
   where
     withDynamics
@@ -855,54 +875,115 @@ data FrameLayout
 -- counted in their t'BcBindingCounts': by slot when no name is dynamic,
 -- as the resolver resolved the bindings' variables.
 frameLayout :: BcBindings -> FrameLayout
-frameLayout (BcBindings (BcBindingCounts names 0) _ _) = PositionalFrame names
+frameLayout (BcBindings (BcBindingCounts names 0) _ _ _) = PositionalFrame names
 frameLayout _ = ScopedFrame
+
+-- | How a frame makes the value a static name's binding gives it.
+data FrameValues
+  = -- | As upstream's @maybeThunk@ makes it ('frameThunkBc'), a variable
+    -- naming one of the frame's own names sharing its cell where the
+    -- frame's shares say ('Nix.Eval.Compile.siblingShares').
+    MaybeThunkValues
+  | -- | As a thunk of its own, but for an inherited name's, as upstream
+    -- makes the values of a recursive set that binds @__overrides@
+    -- (eval.cc:1214-1218 at 2.24.9).
+    ThunkValues
 
 -- | The frame of a recursive attr set or a @let@ in @env@ whose names are
 -- not all static: an env whose name table binds the static names
 -- ('bcBindingStaticKeys'), under @env@ as @captureInfo@ trims it
 -- ('buildBcCaptureEnv'), whose with-scopes the frame sees.  Answers the env
--- and the static attributes, bound in it ('bindStaticAttrs') and filled
--- into its table before any dynamic name is evaluated in it, as
+-- and the static attributes, their values made as @values@ says and
+-- filled into its table before any dynamic name is evaluated in it, as
 -- upstream's @ExprAttrs::eval@ fills @env2@ first (eval.cc:1197-1221 at
 -- 2.24.9).  Inlined, as 'tieBindingFrame' is, so that each caller's sites
 -- are constants.
 {-# INLINE scopeBindingFrame #-}
-scopeBindingFrame :: (MonadEval m) => FrameKind -> Env -> BcBindings -> BcCaptureInfo -> m (Env, Map Symbol AttrEntry)
-scopeBindingFrame kind env bindings captureInfo = do
-  scope <- bcBindingStaticKeys bindings >>= buildCAttrSetKeys
+scopeBindingFrame :: (MonadEval m) => FrameKind -> FrameValues -> Env -> BcBindings -> BcCaptureInfo -> m (Env, Map Symbol AttrEntry)
+scopeBindingFrame kind values env bindings captureInfo = do
+  names <- bcBindingStaticKeys bindings
+  scope <- buildCAttrSetKeys names
   parent <- buildBcCaptureEnv (frameCaptureSite kind) env captureInfo
   frame <- newScopeEnv (frameSite kind) (Just parent) (AttrSet scope)
-  statics <- bindStaticAttrs mkThunkBc frame env bindings
+  statics <- case values of
+    MaybeThunkValues -> bindScopedStatics (AttrSet scope) frame env bindings
+    ThunkValues -> bindStaticAttrs mkThunkBc frame env bindings
   fillCAttrSetValues scope (Map.map entryThunk statics)
   pure (frame, statics)
 
--- | The positional frame of a recursive attr set or a @let@ in @env@: the
--- frame's env and the thunks in its slots, in declaration order, tied by
--- 'tieFrame' as upstream's @ExprAttrs::eval@ and @ExprLet::eval@ tie
--- @env2@.  Its parent is @env@ as @captureInfo@ trims it
--- ('buildBcCaptureEnv'), whose with-scopes the frame sees, and it has
--- the slots its 'PositionalFrame' layout counts.
-{-# INLINE tieBindingFrame #-}
-tieBindingFrame :: (MonadEval m) => FrameKind -> Env -> BcBindings -> BcCaptureInfo -> Int -> m (Env, [Thunk])
-tieBindingFrame kind env bindings captureInfo slotCount = do
-  parent <- buildBcCaptureEnv (frameCaptureSite kind) env captureInfo
-  tieFrame (frameSite kind) (Just parent) slotCount (\frame -> buildBcSlotThunks frame env bindings)
+-- | The static attributes of a frame whose names are in @table@, bound in
+-- it ('bindStaticAttrs'), each value as upstream's @maybeThunk@ makes it.
+-- Upstream binds a recursive set's static names by slot whether it has a
+-- dynamic name or not, so a variable naming one of them, whose entry is
+-- not filled yet, gets a thunk of its own ('scopedValueThunk'), and then
+-- takes its sibling's cell where the frame's shares say, each share a
+-- pair of symbols ('Nix.Eval.Compile.siblingShares').  A share naming a
+-- symbol the frame does not bind statically, which only corrupt bytecode
+-- holds, fails.
+bindScopedStatics :: (MonadEval m) => AttrSet -> Env -> Env -> BcBindings -> m (Map Symbol AttrEntry)
+bindScopedStatics table frame env bindings@(BcBindings _ shares _ _) =
+  bindStaticAttrs (scopedValueThunk table) frame env bindings >>= \bound -> foldBcShares shareEntry bound shares
+  where
+    shareEntry entries name target = case (Map.lookup (Symbol name) entries, Map.lookup (Symbol target) entries) of
+      (Just (AttrEntry pos _), Just (AttrEntry _ cell)) -> pure (Map.insert (Symbol name) (AttrEntry pos cell) entries)
+      (Nothing, _) -> corruptBytecode "share symbol" name
+      (_, Nothing) -> corruptBytecode "share symbol" target
 
--- | Evaluate a recursive attr set from bytecode bindings.
-evalBcRecAttrs :: (MonadEval m) => Env -> BcBindings -> BcCaptureInfo -> m NixValue
-evalBcRecAttrs env bindings captureInfo = case frameLayout bindings of
+-- | 'cheapThunkBc' for a static name's value in a frame whose names are in
+-- @table@, but for a variable naming one of them: that name's entry is
+-- not filled yet, so the variable gets a thunk of its own, as a variable
+-- whose slot is empty does upstream.  'cheapThunkBc' would look the name
+-- up now, and a lookup passes over an entry not filled yet to an
+-- enclosing name table, which may bind the same name.
+scopedValueThunk :: (MonadEval m) => AttrSet -> Env -> Word32 -> m Thunk
+scopedValueThunk table frame valBcIdx =
+  cbcOpcode valBcIdx >>= \case
+    OpVar ->
+      cbcArg1 valBcIdx >>= \sym ->
+        attrSetMemberSymbol (Symbol sym) table >>= \case
+          True -> mkThunkBc frame valBcIdx
+          False -> cheapThunkBc frame valBcIdx
+    _ -> cheapThunkBc frame valBcIdx
+
+-- | The positional frame of a recursive attr set or a @let@ in @env@: the
+-- frame's env and the cells in its slots, in declaration order, tied by
+-- 'tieFrame' as upstream's @ExprAttrs::eval@ and @ExprLet::eval@ tie
+-- @env2@, their values made as @values@ says ('buildBcSlotThunks').  A
+-- variable naming one of the frame's own slots then takes that slot's
+-- cell where the frame's shares say, each a pair of slots
+-- ('Nix.Eval.Compile.siblingShares'), and the cells answered are read
+-- back from the slots; a frame with none reads no more than their count.
+-- Its parent is @env@ as @captureInfo@ trims it
+-- ('buildBcCaptureEnv'), whose with-scopes the frame sees, and it has the
+-- slots its 'PositionalFrame' layout counts.
+{-# INLINE tieBindingFrame #-}
+tieBindingFrame :: (MonadEval m) => FrameKind -> FrameValues -> Env -> BcBindings -> BcCaptureInfo -> Int -> m (Env, [Thunk])
+tieBindingFrame kind values env bindings@(BcBindings _ shares _ _) captureInfo slotCount = do
+  parent <- buildBcCaptureEnv (frameCaptureSite kind) env captureInfo
+  (frame, cells) <- tieFrame (frameSite kind) (Just parent) slotCount (\frame -> buildBcSlotThunks values frame env bindings)
+  case shares of
+    BcShares 0 _ -> pure (frame, cells)
+    _ -> do
+      foldBcShares (\() slot target -> shareSlot (corruptBytecode "share slot") frame slot target) () shares
+      (frame,) <$> envSlotCells frame slotCount
+
+-- | Evaluate a recursive attr set from bytecode bindings, its static
+-- values made as @values@ says.
+evalBcRecAttrs :: (MonadEval m) => FrameValues -> Env -> BcBindings -> BcCaptureInfo -> m NixValue
+evalBcRecAttrs values env bindings captureInfo = case frameLayout bindings of
   PositionalFrame slotCount -> do
     -- Positional path: slots for variable lookup, CAttrSet for return.
-    (_, thunkList) <- tieBindingFrame RecFrame env bindings captureInfo slotCount
+    (_, thunkList) <- tieBindingFrame RecFrame values env bindings captureInfo slotCount
     staticAttrsFromSlots bindings thunkList >>= fmap VAttrs . attrSetFromSymbolEntries SetRec
   ScopedFrame -> do
     -- Dynamic-key path: each dynamic name and value is evaluated in a
     -- frame whose name table holds the static names, as upstream's are
     -- in env2, so a dynamic name sees its static siblings and the
-    -- enclosing variables, and no other dynamic name.
-    (recEnv, statics) <- scopeBindingFrame RecFrame env bindings captureInfo
-    VAttrs <$> literalSet SetRec mkThunkBc recEnv bindings statics
+    -- enclosing variables, and no other dynamic name.  The table is
+    -- filled by then, so a dynamic value is made as upstream's
+    -- @maybeThunk@ makes it (eval.cc:1273 at 2.24.9).
+    (recEnv, statics) <- scopeBindingFrame RecFrame values env bindings captureInfo
+    VAttrs <$> literalSet SetRec cheapThunkBc recEnv bindings statics
 
 -- | Evaluate a let expression from bytecode.
 evalBcLet :: (MonadEval m) => Env -> Word32 -> m NixValue
@@ -913,7 +994,7 @@ evalBcLet env bcIdx0 = do
   withBcCaptureInfo captureOff $ \captureInfo -> case frameLayout bindings of
     PositionalFrame slotCount -> do
       -- Positional path: slots for O(1) lookup.
-      (letEnv, _) <- tieBindingFrame LetFrame env bindings captureInfo slotCount
+      (letEnv, _) <- tieBindingFrame LetFrame MaybeThunkValues env bindings captureInfo slotCount
       evalBytecode letEnv bodyIdx
     ScopedFrame -> do
       -- Dynamic path: a dynamic key, which the parser refuses in a
@@ -921,24 +1002,26 @@ evalBcLet env bcIdx0 = do
       -- outside the parser reaches here.  Its dynamic names are
       -- evaluated and checked in the let env as a recursive set's
       -- are, and bind nothing: the body sees the static names alone.
-      (letEnv, statics) <- scopeBindingFrame LetFrame env bindings captureInfo
+      (letEnv, statics) <- scopeBindingFrame LetFrame MaybeThunkValues env bindings captureInfo
       void (bindDynamicAttrs mkThunkBc letEnv bindings statics)
       evalBytecode letEnv bodyIdx
 
--- | Build thunks for positional bytecode bindings in declaration order.
--- An inherited variable is read from the enclosing env, as upstream's
--- @ExprAttrs::eval@ and @ExprLet::eval@ evaluate an Inherited attribute
--- there through @maybeThunk@ (eval.cc at 2.24.9); that env is fully
--- built, so the variable's own thunk can be shared now.
-buildBcSlotThunks :: (MonadEval m) => Env -> Env -> BcBindings -> m [Thunk]
-buildBcSlotThunks recEnv outerEnv bindings = reverse <$> foldBindings slotThunks [] bindings
+-- | The cells of positional bytecode bindings' slots, in declaration
+-- order, as upstream's @ExprAttrs::eval@ and @ExprLet::eval@ fill
+-- @env2@'s (eval.cc:1211-1221 and :1295-1300 at 2.24.9).  A name's value
+-- is made in the frame as @values@ says: under 'MaybeThunkValues' as
+-- 'frameThunkBc' makes it, a variable naming one of the frame's own
+-- slots, none of which is filled yet, a thunk of its own.  An inherited
+-- variable is read from the enclosing env, as upstream evaluates an
+-- Inherited attribute there through @maybeThunk@; that env is fully
+-- built, so the variable's own cell can be shared now.
+buildBcSlotThunks :: (MonadEval m) => FrameValues -> Env -> Env -> BcBindings -> m [Thunk]
+buildBcSlotThunks values recEnv outerEnv bindings = reverse <$> foldBindings slotCell [] bindings
   where
-    {-# INLINE slotThunks #-}
-    slotThunks made (BcNamed _ _ valBcIdx) =
-      (: made) <$> mkThunkBc recEnv valBcIdx
-    slotThunks made (BcInherit _ _ valBcIdx) =
-      (: made) <$> cheapThunkBc outerEnv valBcIdx
-    slotThunks made (BcInheritFrom fromBcIdx names) = do
+    {-# INLINE slotCell #-}
+    slotCell made (BcNamed _ _ valBcIdx) = (: made) <$> valueCell valBcIdx
+    slotCell made (BcInherit _ _ valBcIdx) = (: made) <$> cheapThunkBc outerEnv valBcIdx
+    slotCell made (BcInheritFrom fromBcIdx names) = do
       -- inherit (from) x y z; becomes one thunk per name that selects
       -- from the from-expr, each in the clause's env ('inheritFromEnv').
       fromEnv <- mkThunkBc recEnv fromBcIdx >>= inheritFromEnv
@@ -946,7 +1029,10 @@ buildBcSlotThunks recEnv outerEnv bindings = reverse <$> foldBindings slotThunks
     -- Unreachable for compiled code: the compiler counts every dynamic
     -- name, and frameLayout makes a positional frame only when it counts
     -- none.
-    slotThunks made (BcDynamic {}) = pure made
+    slotCell made (BcDynamic {}) = pure made
+    valueCell valBcIdx = case values of
+      MaybeThunkValues -> frameThunkBc recEnv valBcIdx
+      ThunkValues -> mkThunkBc recEnv valBcIdx
 
 -- | The env an @inherit (from)@ clause's selects run in: the from-value's
 -- thunk at slot 0, one env for every name of the clause, as upstream's
@@ -963,9 +1049,9 @@ inheritedSelect fromEnv (BcInheritedName _ _ selectBcIdx) = mkThunkBc fromEnv se
 -- | Positional attributes being matched with their slots' thunks.
 data SlotWalk = SlotWalk !(Map Symbol AttrEntry) ![Thunk]
 
--- | The attributes of positional bytecode bindings, from the thunks
--- 'buildBcSlotThunks' made for their slots: each under the symbol the
--- bytecode holds for it and at its binding's position.
+-- | The attributes of positional bytecode bindings, from the cells in
+-- their slots: each under the symbol the bytecode holds for it and at its
+-- binding's position.
 staticAttrsFromSlots :: (MonadEval m) => BcBindings -> [Thunk] -> m (Map Symbol AttrEntry)
 staticAttrsFromSlots bindings thunks = (\(SlotWalk attrs _) -> attrs) <$> foldBindings step (SlotWalk Map.empty thunks) bindings
   where
@@ -992,12 +1078,15 @@ staticAttrsFromSlots bindings thunks = (\(SlotWalk attrs _) -> attrs) <$> foldBi
 -- outside the parser holds, keeps its last definition, as the resolver
 -- keeps it.
 --
--- How a value becomes a thunk is the caller's decision: a non-recursive
--- attr set can resolve constants and in-scope variables immediately, while a
--- frame that is still being tied has to defer everything, since the slots
--- the variables point at are not filled yet.  An inherited variable is read
--- from @outerEnv@, the env around the binding set, which is always built
--- (for a non-recursive set it is @thunkEnv@ itself).
+-- How a named value becomes a thunk is the caller's decision: a
+-- non-recursive set makes a constant's value and shares an in-scope
+-- variable's cell at once ('cheapThunkBc'); a frame whose name table is
+-- being filled does the same but for a variable naming one of the frame's
+-- own names, whose entry is not filled yet ('scopedValueThunk'); and a
+-- recursive set that binds @__overrides@ makes each a thunk of its own
+-- ('mkThunkBc').  An inherited variable is read from @outerEnv@, the env
+-- around the binding set, which is always built (for a non-recursive set
+-- it is @thunkEnv@ itself).
 bindStaticAttrs :: (MonadEval m) => (Env -> Word32 -> m Thunk) -> Env -> Env -> BcBindings -> m (Map Symbol AttrEntry)
 bindStaticAttrs mkValueThunk thunkEnv outerEnv = foldBindings addBinding Map.empty
   where
@@ -1144,10 +1233,8 @@ matchFormals closureEnv (EFNamedSet lambdaName _ formals allowExtra) argThunk = 
 --
 -- The env is a knot: a default is evaluated in it, where it may name
 -- another formal or the @-pattern, and its slots hold the defaults'
--- thunks.  'tieFrame' builds it as upstream's @callFunction@ builds
--- @env2@.  A default is a 'mkThunkBc' and not a 'cheapThunkBc', which
--- would read a variable default out of a slot 'tieFrame' has not filled
--- yet.
+-- cells ('formalCell', 'shareFormalSlots').  'tieFrame' builds it as
+-- upstream's @callFunction@ builds @env2@.
 matchFormalSet :: (MonadEval m) => Env -> LambdaName -> [EvalFormal] -> Bool -> NixValue -> Maybe Thunk -> m Env
 matchFormalSet closureEnv lambdaName formals allowExtra argVal atThunk =
   case argVal of
@@ -1160,7 +1247,8 @@ matchFormalSet closureEnv lambdaName formals allowExtra argVal atThunk =
           EnvCallFormals
           (Just closureEnv)
           (length atSlot + length slots)
-          (\frame -> (atSlot ++) <$> mapM (slotThunk frame) slots)
+          (\frame -> (atSlot ++) <$> mapM (formalCell frame) slots)
+      when (any sharesSlot slots) (shareFormalSlots formalEnv (length atSlot) slots)
       pure formalEnv
     _ ->
       callSiteError
@@ -1205,11 +1293,60 @@ data FormalSlot
     Given !Thunk
   | -- | The formal's default, by its bytecode index.
     Defaulted !Word32
+  | -- | The formal's default, by its bytecode index: a variable naming a
+    -- slot of the call's frame whose cell the formal's slot shares
+    -- ('SharedDefault').
+    DefaultedShared !Word32
 
--- | The thunk a slot holds in the env a call's defaults are evaluated in.
-slotThunk :: (MonadCData m) => Env -> FormalSlot -> m Thunk
-slotThunk _ (Given thunk) = pure thunk
-slotThunk frame (Defaulted defBcIdx) = mkThunkBc frame defBcIdx
+-- | Whether a formal's slot shares another slot's cell.
+sharesSlot :: FormalSlot -> Bool
+sharesSlot (DefaultedShared _) = True
+sharesSlot _ = False
+
+-- | The cell a formal's slot holds before a default naming a slot takes
+-- that slot's cell ('shareFormalSlots'), as upstream's @callFunction@
+-- makes it (eval.cc:1546-1563 at 2.24.9): the argument's attribute, or a
+-- default as 'frameThunkBc' makes it in the call's frame, a variable
+-- naming a slot of the frame, which is not filled yet, a thunk of its own.
+formalCell :: (MonadEval m) => Env -> FormalSlot -> m Thunk
+formalCell _ (Given thunk) = pure thunk
+formalCell frame (Defaulted defBcIdx) = frameThunkBc frame defBcIdx
+formalCell frame (DefaultedShared defBcIdx) = frameThunkBc frame defBcIdx
+
+-- | Give each formal's slot whose default shares a slot's cell
+-- ('DefaultedShared') the cell that slot holds once filled, the first
+-- formal in the slot given.  The default is a variable naming the slot
+-- (its code's second argument).  That slot shares a cell in turn when its
+-- formal's default does and the argument leaves the formal out, so each
+-- default follows the chain to the first slot that holds a cell of its
+-- own, which upstream fills before every slot that shares it.  A chain
+-- the compiler writes only names slots filled before its own, so it
+-- follows each formal's default at most once and ends; one that goes on,
+-- a cycle, or names a slot past the frame's, is corrupt bytecode.
+shareFormalSlots :: (MonadEval m) => Env -> Int -> [FormalSlot] -> m ()
+shareFormalSlots frame firstFormal slots =
+  forM_ (zip [fromIntegral firstFormal ..] slots) $ \case
+    (slot, DefaultedShared defBcIdx) ->
+      cbcArg2 defBcIdx >>= ownCellSlot slots >>= \end -> case slotAt end of
+        DefaultedShared _ : _ -> corruptBytecode "shared default slot" end
+        _ -> shareSlot (corruptBytecode "share slot") frame slot end
+    _ -> pure ()
+  where
+    -- The formals' slots from a slot of the frame on: none for the
+    -- @-pattern's slot or for one past the frame's.
+    slotAt target
+      | fromIntegral target < firstFormal = []
+      | otherwise = drop (fromIntegral target - firstFormal) slots
+    -- The walk takes one of @unwalked@'s formals for each default it
+    -- follows and stops when none is left, having followed as many
+    -- defaults as there are formals, which only a cycle makes it do; it
+    -- then ends on a slot whose default still shares.  It answers a slot
+    -- on every path rather than failing on the cycle itself: a path that
+    -- fails would keep GHC from passing and answering the slot unboxed,
+    -- and box it on every call.
+    ownCellSlot unwalked target = case (slotAt target, unwalked) of
+      (DefaultedShared defBcIdx : _, _ : rest) -> cbcArg2 defBcIdx >>= ownCellSlot rest
+      _ -> pure target
 
 -- | What fills each formal's slot, found by the formal's symbol.  A
 -- formal with neither an attribute nor a default fails the call, the
@@ -1224,10 +1361,14 @@ formalSlots lambdaName attrs formals = do
     (name : names, _) ->
       callSiteError (throwEvalError ("function '" <> lambdaNameText lambdaName <> "' called without required argument '" <> printSymbol (symbolText (minimum (name :| names))) <> "'"))
   where
-    formalSlot (EvalFormal name defBcIdx) =
+    formalSlot (EvalFormal name def) =
       attrSetLookupSymbol name attrs >>= \case
         Just thunk -> pure (Right (Given thunk))
-        Nothing -> pure (maybe (Left name) (Right . Defaulted) defBcIdx)
+        Nothing -> pure $! defaultedSlot name def
+    defaultedSlot name = \case
+      NoDefault -> Left name
+      Default defBcIdx -> Right (Defaulted defBcIdx)
+      SharedDefault defBcIdx -> Right (DefaultedShared defBcIdx)
 
 -- ---------------------------------------------------------------------------
 -- Builtin definitions
@@ -2560,7 +2701,7 @@ formalsToAttrs (EFNamedSet _ _ formals _) = formalsListToAttrs formals
 
 formalsListToAttrs :: (MonadCData m) => [EvalFormal] -> m NixValue
 formalsListToAttrs formals =
-  traverse evaluated (Map.fromList [(efName f, VBool (isJust (efDefault f))) | f <- formals])
+  traverse evaluated (Map.fromList [(efName f, VBool (hasDefault (efDefault f))) | f <- formals])
     >>= fmap VAttrs . attrSetFromSymbols SetFunctionArgs
 
 -- | Upstream's @prim_zipAttrsWith@ (primops.cc:3123-3180 at 2.24.9): the

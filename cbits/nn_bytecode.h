@@ -11,11 +11,11 @@
  * and so are the source positions bindings refer to.
  *
  * The bytes of the code's literals (a string's literal parts, a URI, a
- * path, a search path, a source file's path) are strings of the code's
- * own (nn_str.h), named by their index in a string table: an instruction
- * or data word holds the index, and nn_bc_string answers the string.
- * A value a literal evaluates to can point at that string rather than
- * copy it, since the code's strings live as long as the code.
+ * path, a source file's path) are strings of the code's own (nn_str.h),
+ * named by their index in a string table: an instruction or data word
+ * holds the index, and nn_bc_string answers the string.  A value a
+ * literal evaluates to can point at that string rather than copy it,
+ * since the code's strings live as long as the code.
  *
  * A pending thunk holds an instruction's index and the nn_env_t * it
  * runs in, both C, so pending code takes nothing on GHC's heap.
