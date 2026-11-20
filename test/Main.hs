@@ -2189,6 +2189,13 @@ testRegionCensus = do
           (Right few, Right many) -> case (heldAtZero few, heldAtZero many, total allocatedName few, total allocatedName many) of
             ([fewHeld], [manyHeld], [fewAllocated], [manyAllocated]) ->
               assertEqual "held grows by under a hundredth of what is allocated" True ((manyHeld - fewHeld) * 100 < manyAllocated - fewAllocated)
+                -- Each step's region is past the threshold and inside the
+                -- loop's, so only the tenure collector's closes below the
+                -- outermost free it.
+                `andThen` case (tenuredHeld few, tenuredHeld many) of
+                  ([fewTenured], [manyTenured]) ->
+                    assertEqual "so does what the tenure collector with no budget holds" True ((manyTenured - fewTenured) * 100 < manyAllocated - fewAllocated)
+                  missing -> Fail ("tenure figures missing: " <> T.pack (show missing))
                 `andThen` orderings few
                 `andThen` orderings many
             missing -> Fail ("figures missing: " <> T.pack (show missing)),
@@ -2213,9 +2220,45 @@ testRegionCensus = do
             (`checked` orderings)
             [ ["--expr", withScopes],
               ["--strict", "--expr", setsAndStrings],
+              ["--expr", listAndTail],
               [root </> "main.nix"]
             ]
-        pure (foldr andThen Pass results)
+        pure (foldr andThen Pass results),
+      runTestM "a tenure collector enters a survivor at the close that tenures it and where a close marks its region whole, where its threshold's collector enters it at every close around" $ inRoot $ do
+        -- Each of 20 nested forces returns the list the innermost made,
+        -- so every close around that one finds the list still reached.
+        figures <- figuresOf ["--expr", "let f = n: if n == 0 then builtins.genList (x: x) 5000 else let xs = f (n - 1); in builtins.seq xs xs; in builtins.length (f 20)"]
+        pure $ case figures of
+          Left why -> Fail why
+          Right found ->
+            let fewer (bytes, entered) = case [rowEntered | ("regions.threshold", t : _ : rowEntered : _) <- found, t == bytes] of
+                  [rowEntered] -> assertEqual "fewer than a quarter of the objects entered" True (entered * 4 < rowEntered)
+                  _ -> Fail "no threshold of the tenure collector's bytes"
+             in case [(bytes, entered) | ("regions.tenure", _ : bytes : _ : _ : entered : _) <- found] of
+                  [] -> Fail "no tenure collector"
+                  tenured -> foldr (andThen . fewer) (orderings found) tenured,
+      runTestM "the tenure collector remembers what a survivor holds of a region around that the region has not tenured, and frees nothing reached" $ inRoot $ do
+        -- Each level's set holds thunks the level around made before it
+        -- forced the level, and each level's junk dies at its own close.
+        figures <- figuresOf ["--expr", "let f = n: acc: let mine = builtins.genList (x: x + n) 2000; junk = builtins.length (builtins.genList (x: x * n) 3000); next = acc ++ [ mine ]; c = if n == 0 then { inherit acc; } else f (n - 1) next; r = builtins.seq junk (builtins.seq c { inherit c next; }); in r; top = f 10 []; in builtins.length top.next"]
+        pure $ case figures of
+          Left why -> Fail why
+          Right found -> case [made | ("regions.tenure.remembered", [_, made, _]) <- found] of
+            [] -> Fail "no count of what was remembered"
+            made -> assertEqual "pointers remembered by each" True (all (> 0) made) `andThen` orderings found,
+      runTestM "a tenure collector with a budget marks a region whole once its closes have tenured that much, and frees what died since" $ inRoot $ do
+        -- Each level's list survives the close that makes it, stored in
+        -- the level's cell, and dies once the level has its length.
+        figures <- figuresOf ["--expr", "let f = n: if n == 0 then 0 else let xs = builtins.genList (x: x + n) 30000; ys = builtins.seq (f (n - 1)) xs; in builtins.length (builtins.seq ys ys); in f 12"]
+        pure $ case figures of
+          Left why -> Fail why
+          Right found -> case ([rest | ("regions.tenure", 0 : rest) <- found], [rest | ("regions.tenure", b : rest) <- found, b == 2 ^ (20 :: Int)]) of
+            ([_ : _ : _ : _ : _ : _ : unbudgeted : _], [_ : _ : full : _ : _ : freed : budgeted : _]) ->
+              assertEqual "it marks inner regions whole" True (full > 1)
+                `andThen` assertEqual "they free what died since" True (freed > 0)
+                `andThen` assertEqual "it holds less than the collector with no budget" True (budgeted < unbudgeted)
+                `andThen` orderings found
+            _ -> Fail "no tenure collectors with no budget and with 1 MiB"
     ]
   where
     regionVar = "NOVA_NIX_REGION_STATS"
@@ -2230,6 +2273,10 @@ testRegionCensus = do
     -- single objects first, then each block size, largest first.
     peaks figures = [drop 3 rest | ("regions.threshold", _ : rest) <- figures]
     heldAtZero figures = [held | ("regions.threshold", 0 : _ : _ : _ : held : _) <- figures]
+    -- The single objects the tenure collector with no budget holds at
+    -- most, past its budget, threshold, three counts and what its marks
+    -- of the whole freed.
+    tenuredHeld figures = [held | ("regions.tenure", 0 : _ : _ : _ : _ : _ : _ : held : _) <- figures]
     -- Each step's value is a binding of its own, so it is forced, and
     -- what the step allocates dies with its region.
     forcedLoop :: Int -> String
@@ -2240,6 +2287,13 @@ testRegionCensus = do
     withScopes =
       "let f = n: with rec { xs = builtins.genList (x: x) n; ys = builtins.map (x: x * 2) xs; }; builtins.length ys + builtins.length xs; "
         <> "in builtins.foldl' (acc: i: acc + (let v = f i; in v)) 0 (builtins.genList (x: x) 30)"
+    -- At c's close the records of l and t push their lists in that order,
+    -- so t's is entered first and keeps the head of l's items array, which
+    -- l's list must still follow: d's close, which reaches l alone, would
+    -- otherwise reach what c's found unreached.
+    listAndTail =
+      "let f = _: let l = builtins.genList (x: x) 1000; t = builtins.tail l; c = builtins.seq t (builtins.length t); in builtins.seq c l; "
+        <> "d = f null; in builtins.foldl' (a: x: a + x) 0 d"
     setsAndStrings =
       "let mk = i: { name = \"n${toString i}\"; value = builtins.genList (x: { inherit x; }) 10; }; "
         <> "s = builtins.listToAttrs (builtins.genList mk 100); "
@@ -2264,6 +2318,28 @@ testRegionCensus = do
             `andThen` assertEqual "a smaller block holds no more, and single objects least" True (all blocksShrink rows)
             `andThen` assertEqual "no class keeps more than it allocated" True (and [kept <= allocated | _ : _ : allocated : kept : _ <- classes])
             `andThen` assertEqual "every close is in a class" (total "regions.closes" figures) [sum [closes | _ : closes : _ <- classes]]
+            `andThen` tenureOrderings blocksShrink figures
+    -- What every census satisfies of each tenure collector: it marks at
+    -- the closes its threshold's collector does, frees nothing sooner,
+    -- and frees nothing anything reaches.
+    tenureOrderings blocksShrink figures =
+      let tenures = [values | ("regions.tenure", values) <- figures]
+          ofBudget name budget = [rest | (key, b : rest) <- figures, key == name, b == budget]
+          check values = case values of
+            budget : bytes : closes : full : _ : _ : _ : held ->
+              case [rest | ("regions.threshold", t : rest) <- figures, t == bytes] of
+                [rowCloses : _ : _ : rowHeld] ->
+                  assertEqual "it marks where its threshold's collector does" rowCloses closes
+                    `andThen` assertEqual "of them, no more marks of the whole than closes that mark" True (full <= closes)
+                    `andThen` assertEqual "six peaks" 6 (length held)
+                    `andThen` assertEqual "tenuring holds no less" True (and (zipWith (>=) held rowHeld))
+                    `andThen` assertEqual "a smaller block holds no more under tenure, and single objects least" True (blocksShrink held)
+                    `andThen` assertEqual "freed nothing the census's mark at the close reached" [[0]] (ofBudget "regions.tenure.reached" budget)
+                    `andThen` assertEqual "freed nothing a later close reached" [[0, 0]] (ofBudget "regions.tenure.resurrected" budget)
+                _ -> Fail "no threshold of the tenure collector's bytes"
+            _ -> Fail "a tenure collector's figures are missing"
+       in assertEqual "tenure collectors with no budget and with budgets of 1, 16 and 256 MiB" [0, 2 ^ (20 :: Int), 2 ^ (24 :: Int), 2 ^ (28 :: Int)] [budget | budget : _ <- tenures]
+            `andThen` foldr (andThen . check) Pass tenures
 
 testAllocSites :: IO [Bool]
 testAllocSites = do

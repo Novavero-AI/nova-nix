@@ -47,6 +47,32 @@
  * did not hold reached it, and a collector freeing at the first close
  * would have left that pointer dangling.
  *
+ * Tenure.  Every mark above enters again, at each close around a region,
+ * what the region's close found reached.  The census also simulates
+ * collectors that do not: at the closes of regions that allocated at
+ * least the tenure threshold, each marks only what no such close of its
+ * inside the region tenured, and then tenures the whole region.  A
+ * tenured object counts as reached until a close marks its region whole:
+ * the outermost close around it, past the threshold, which takes the
+ * census's own mark, or for a collector with a budget, any close whose
+ * region holds at least that many tenured bytes which no mark of the
+ * whole has reached since.  Besides the roots, two kinds of pointer reach an
+ * untenured object from outside what a close marks, and the census holds
+ * both: a store into a cell or with-scope entry that is tenured or older
+ * than the region, kept as a record that the first such close reads; and
+ * a pointer that an object a close's mark enters, or a cell a record
+ * names, holds into a region around that it is younger than and
+ * untenured in, which the close remembers for that region, since no later
+ * close but a mark of the whole looks inside the object or reads the
+ * record again.  A mark of the whole region reads every record of a cell
+ * or entry older than it, which the census keeps for as long as one is,
+ * and no remembered pointer: it looks inside everything in the region
+ * that holds one.  It counts these
+ * collectors' work and the most bytes they hold as for the others, and
+ * the bytes their marks of the whole free, and checks that they free
+ * nothing the census's own mark at the same close reached, and nothing a
+ * later close reaches.
+ *
  * A census runs from before the arena's init to after its teardown
  * (nn_region_census_begin and nn_region_census_end), so that it numbers
  * every block.  When one of its tables cannot grow it stops counting and
@@ -170,6 +196,25 @@ void nn_region_close(void);
 #define NN_REGION_THRESHOLD_PEAK     3
 #define NN_REGION_THRESHOLD_FIGURES  (NN_REGION_THRESHOLD_PEAK + NN_REGION_GRAINS)
 
+/* The tenure collectors, NN_REGION_TENURE_VARIANTS of them, mark at the
+ * closes of regions that allocated at least the bytes of this threshold,
+ * and NN_REGION_TENURE_FIGURES figures count what each did. */
+#define NN_REGION_TENURE_VARIANTS  4
+#define NN_REGION_TENURE_THRESHOLD 2
+#define NN_REGION_TENURE_CLOSES            0   /* closes that mark */
+#define NN_REGION_TENURE_FULL              1   /* of them, those that mark the whole region */
+#define NN_REGION_TENURE_ENTERED           2   /* objects the marks entered */
+#define NN_REGION_TENURE_EXAMINED          3   /* pointers they examined */
+#define NN_REGION_TENURE_RECORDS           4   /* the most records held at once */
+#define NN_REGION_TENURE_REMEMBERED        5   /* pointers closes remembered for regions around them */
+#define NN_REGION_TENURE_HELD              6   /* the most remembered at once */
+#define NN_REGION_TENURE_REACHED           7   /* units and places freed that the close's own mark reached */
+#define NN_REGION_TENURE_RESURRECTED       8   /* objects and array entries a later close reached once freed */
+#define NN_REGION_TENURE_RESURRECTED_BYTES 9
+#define NN_REGION_TENURE_FULL_FREED        10  /* bytes those freed, of objects freed one by one */
+#define NN_REGION_TENURE_PEAK              11  /* the most bytes held at once, at each grain */
+#define NN_REGION_TENURE_FIGURES           (NN_REGION_TENURE_PEAK + NN_REGION_GRAINS)
+
 /* What is allocated outside every region is what the evaluator does
  * between forces, at the top of an evaluation or in a function it calls
  * there, which no close can free; read with no region open, it counts
@@ -177,6 +222,11 @@ void nn_region_close(void);
 void nn_region_totals(uint64_t *totals);
 void nn_region_classes(uint64_t *figures);     /* NN_REGION_SIZE_CLASSES rows */
 void nn_region_thresholds(uint64_t *figures);  /* NN_REGION_THRESHOLDS rows */
+void nn_region_tenure(uint32_t variant, uint64_t *figures);  /* NN_REGION_TENURE_FIGURES */
+
+/* The bytes a tenure collector lets closes inside a region tenure before
+ * a close marks the region whole, or 0 for none but the outermost. */
+uint64_t nn_region_tenure_budget(uint32_t variant);
 
 /* The bytes of threshold k, and of a block of a bump kind at grain g from
  * 1. */
