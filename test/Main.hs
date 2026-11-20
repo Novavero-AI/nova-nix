@@ -2270,7 +2270,8 @@ testRegionCensus = do
       _ -> Nothing
     total name figures = [value | (key, [value]) <- figures, key == name]
     -- Each threshold's row past its bytes and three counts: its peaks,
-    -- single objects first, then each block size, largest first.
+    -- single objects first, then each block size, largest first, then
+    -- each line length, longest first.
     peaks figures = [drop 3 rest | ("regions.threshold", _ : rest) <- figures]
     heldAtZero figures = [held | ("regions.threshold", 0 : _ : _ : _ : held : _) <- figures]
     -- The single objects the tenure collector with no budget holds at
@@ -2300,29 +2301,30 @@ testRegionCensus = do
         <> "in builtins.attrNames s ++ [ (builtins.length (builtins.concatLists (builtins.attrValues s))) ]"
     -- What every census satisfies: a collector that marks only past a
     -- higher threshold frees later and holds no less; freeing whole
-    -- blocks frees less than freeing every object, and a smaller block
-    -- frees at least what a larger one does, as each smaller block nests
-    -- in a larger one.
+    -- blocks or lines frees less than freeing every object, and a smaller
+    -- block or line frees at least what a larger one does, as each nests
+    -- in the one before.
     orderings figures =
       let rows = peaks figures
           rising values = and (zipWith (<=) values (drop 1 values))
           falling values = and (zipWith (>=) values (drop 1 values))
-          blocksShrink row = case row of
-            objects : blocks -> falling blocks && all (objects <=) blocks
+          finerHoldsLess row = case row of
+            objects : grains -> falling grains && all (objects <=) grains
             [] -> False
           classes = [values | ("regions.class", values) <- figures]
        in assertEqual "unplaced" [0] (total "regions.unplaced" figures)
             `andThen` assertEqual "resurrected" [0] (total "regions.resurrected.count" figures)
-            `andThen` assertEqual "nine thresholds of six peaks" (replicate 9 6) (map length rows)
+            `andThen` assertEqual "nine thresholds of eight peaks" (replicate 9 8) (map length rows)
+            `andThen` assertEqual "lines of 256 and 128 bytes after the blocks" [[6, 256], [7, 128]] [values | ("regions.line", values) <- figures]
             `andThen` assertEqual "a higher threshold holds no less" True (all rising (transpose rows))
-            `andThen` assertEqual "a smaller block holds no more, and single objects least" True (all blocksShrink rows)
+            `andThen` assertEqual "a smaller block or line holds no more, and single objects least" True (all finerHoldsLess rows)
             `andThen` assertEqual "no class keeps more than it allocated" True (and [kept <= allocated | _ : _ : allocated : kept : _ <- classes])
             `andThen` assertEqual "every close is in a class" (total "regions.closes" figures) [sum [closes | _ : closes : _ <- classes]]
-            `andThen` tenureOrderings blocksShrink figures
+            `andThen` tenureOrderings finerHoldsLess figures
     -- What every census satisfies of each tenure collector: it marks at
     -- the closes its threshold's collector does, frees nothing sooner,
     -- and frees nothing anything reaches.
-    tenureOrderings blocksShrink figures =
+    tenureOrderings finerHoldsLess figures =
       let tenures = [values | ("regions.tenure", values) <- figures]
           ofBudget name budget = [rest | (key, b : rest) <- figures, key == name, b == budget]
           check values = case values of
@@ -2331,9 +2333,9 @@ testRegionCensus = do
                 [rowCloses : _ : _ : rowHeld] ->
                   assertEqual "it marks where its threshold's collector does" rowCloses closes
                     `andThen` assertEqual "of them, no more marks of the whole than closes that mark" True (full <= closes)
-                    `andThen` assertEqual "six peaks" 6 (length held)
+                    `andThen` assertEqual "eight peaks" 8 (length held)
                     `andThen` assertEqual "tenuring holds no less" True (and (zipWith (>=) held rowHeld))
-                    `andThen` assertEqual "a smaller block holds no more under tenure, and single objects least" True (blocksShrink held)
+                    `andThen` assertEqual "a smaller block or line holds no more under tenure, and single objects least" True (finerHoldsLess held)
                     `andThen` assertEqual "freed nothing the census's mark at the close reached" [[0]] (ofBudget "regions.tenure.reached" budget)
                     `andThen` assertEqual "freed nothing a later close reached" [[0, 0]] (ofBudget "regions.tenure.resurrected" budget)
                 _ -> Fail "no threshold of the tenure collector's bytes"
