@@ -1,0 +1,11 @@
+--- a/gcc/cppdefault.cc
++++ b/gcc/cppdefault.cc
+@@ -35,6 +35,8 @@
+ # undef CROSS_INCLUDE_DIR
+ #endif
+ 
++#undef LOCAL_INCLUDE_DIR
++
+ const struct default_include cpp_include_defaults[]
+ #ifdef INCLUDE_DEFAULTS
+ = INCLUDE_DEFAULTS;

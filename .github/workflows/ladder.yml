@@ -3,16 +3,17 @@ name: Ladder
 # One Windows leg of the seed ladder, the rungs pkgs/windows builds from its
 # 1,623-byte seed, as a chain of jobs: one for each stage
 # pkgs/windows/rungs.nix lists, Mes, TinyCC, GCC 4.6.4, GCC 4.6.4 C++,
-# GCC 10, GCC 16, x86_64 and GCC 16 x86_64.  A stage's job builds its
-# rungs, runs its checks, and starts from the store paths the job before it
-# built.  ci.yml calls this workflow once for each leg Ladder (mode) names,
-# so each leg's chain runs on its own: a stage that fails stops the stages
-# after it on its own leg alone.
+# GCC 10, GCC 16, x86_64, GCC 16 x86_64 and Native x86_64.  A stage's job
+# builds its rungs, runs its checks, and starts from the store paths the
+# job before it built.  ci.yml calls this workflow once for each leg
+# Ladder (mode) names, so each leg's chain runs on its own: a stage that
+# fails stops the stages after it on its own leg alone.
 #
-# The rungs are i686 programs.  The x64 leg runs them through WoW64 and the
-# ARM64 leg through ARM64 Windows' x86 emulator, where the x64 nova-nix
-# that Stage0 (nova-nix) builds runs through the x64 emulator, since the
-# ARM64 image has no GHC.
+# The rungs are i686 programs but Native x86_64's, which are x86_64 ones.
+# The x64 leg runs i686 programs through WoW64 and the ARM64 leg through
+# ARM64 Windows' x86 emulator; the x64 leg runs x86_64 programs natively
+# and the ARM64 leg through its x64 emulator, as it runs the x64 nova-nix
+# that Stage0 (nova-nix) builds, since the ARM64 image has no GHC.
 #
 # In seed mode every rung builds from the seed, and the stages name no
 # substituter but the handoff.  In substitute mode each stage takes the
@@ -2237,6 +2238,225 @@ jobs:
           for check in hello-c hello-cxx stamps; do
             expected=test/data/gcc-x86_64-$check-answer.txt
             if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc-x86_64.nix -A "$check" | tail -n 1); then
+              echo "::error::busybox sh did not run $check's script"
+              status=1
+              continue
+            fi
+            lines=$(cygpath -u "$out")
+            if cmp "$expected" "$lines"; then
+              echo "ok    $check wrote the lines of $expected"
+            else
+              echo "::error::$check's lines differ from $expected:"
+              diff "$expected" "$lines"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # --all is every valid path but the derivations: the sources, the rungs
+      # and the checks' outputs.  push skips what the handoff already holds.
+      - name: Hand the store to the Native x86_64 stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
+            --compression zstd --all
+
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # The handoff for the stage after this one.  Its NARs are compressed
+      # already, so the zip stores them as they are.  Kept a day: a re-run
+      # of a failed stage within it finds the handoff, and after it the run
+      # is re-run whole.
+      - name: Upload the handoff
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: handoff-gcc-x86_64-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
+        if: inputs.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+  # ---------------------------------------------------------------------------
+  # Native x86_64: gcc-x86_64 builds binutils and GCC 16.2.0 with C and C++
+  # that run on x86_64 Windows and write x86_64-w64-mingw32,
+  # binutils-native-x86_64 and gcc-native-x86_64, each a Canadian cross from
+  # the i686 stdenv.  test/data/binutils-native-x86_64.nix has the tools
+  # build an x86_64 program and an i386 one that run, and
+  # test/data/gcc-native-x86_64.nix has gcc and g++ link a C and a C++
+  # program that run and are PE32+ images; each finds the rung's own
+  # programs x86_64 PE32+ images that import no DLL of GCC's, and no program
+  # the rung installs carrying a time stamp.
+  #
+  # The timeout is twice an estimate of this stage on the ARM64 leg, about
+  # 105 minutes: there binutils-x86_64 and gcc-x86_64, which i686 compilers
+  # build from the same sources as these rungs, build in 14 and 89 minutes,
+  # and GCC 16 x86_64 spends 2 minutes around its build.
+  # ---------------------------------------------------------------------------
+  native-x86_64-windows:
+    name: Native x86_64
+    needs: [gcc-x86_64-windows]
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 210
+    environment:
+      name: ${{ inputs.publish && 'cache' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download nova-nix
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stage0-nova-nix
+          path: ${{ runner.temp }}
+
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
+
+      - name: Download the GCC 16 x86_64 stage's handoff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: handoff-gcc-x86_64-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      - name: Serve the handoff
+        shell: bash
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
+
+      # The handoff for every step below: what a stage before this one
+      # built, the sources among it, comes from there.
+      - name: Name the handoff as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY"
+
+      # The rungs of the stage before (pkgs/windows/rungs.nix), each from the
+      # handoff, which holds them all.  The script fails if one is built: a
+      # handoff that answers and cannot be used would have this job build
+      # the stages before it again and stay green.  It runs before the
+      # public cache is named, which would serve an unchanged rung in the
+      # handoff's place.  The builds below take what else they reach of
+      # the stages before from the handoff.
+      - name: Take the GCC 16 x86_64 stage's rungs from the handoff
+        shell: bash
+        run: CACHE_URL=$HANDOFF_URL bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc-x86_64 fail
+
+      # Substitute mode names the public cache after the handoff, so that
+      # only what no stage before this one built comes from it.
+      - name: Name the handoff and the public cache as substituters
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY" "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+
+      # This stage's rungs, each downloaded where the public cache holds it
+      # and built where the change alters it.  The script fails if a rung
+      # the cache holds is built, for the reason the handoff's check does.
+      # The build steps below then find each rung valid, and the time each
+      # prints is the time to find it so.
+      - name: Take the unchanged rungs from the public cache
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" native-x86_64 build
+
+      # GNU binutils 2.46 that run on x86_64 Windows and write
+      # x86_64-w64-mingw32, configured, compiled and installed in the seed
+      # stdenv by gcc-x86_64, timed.
+      - name: Build binutils-native-x86_64
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A binutils-native-x86_64
+          echo "== binutils-native-x86_64 built in $((SECONDS - start)) s"
+
+      # busybox's sh runs test/data/binutils-native-x86_64.nix's two
+      # scripts.  link has the tools by their own names do what
+      # binutils-x86_64's link check has its tools do, and writes what that
+      # check writes, then the machine and optional header magic od reads
+      # from as.exe's and ld.exe's own PE headers, the Windows DLLs every
+      # MinGW-w64 program imports among those the two import, and how many
+      # they import of GCC's or winpthreads'; stamps writes every program
+      # and DLL the rung installs with the time stamp its PE header
+      # carries.  The lines are compared with the file of test/data named
+      # for the check, which is what the formats and the configuration
+      # define them to be, each time stamp 0, for the reason gcc46-cxx's
+      # are.
+      - name: binutils-native-x86_64 links an x86_64 and an i386 program that run
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for check in link stamps; do
+            expected=test/data/binutils-native-x86_64-$check-answer.txt
+            if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/binutils-native-x86_64.nix -A "$check" | tail -n 1); then
+              echo "::error::busybox sh did not run $check's script"
+              status=1
+              continue
+            fi
+            lines=$(cygpath -u "$out")
+            if cmp "$expected" "$lines"; then
+              echo "ok    $check wrote the lines of $expected"
+            else
+              echo "::error::$check's lines differ from $expected:"
+              diff "$expected" "$lines"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # GCC 16.2.0 with C and C++ that runs on x86_64 Windows and writes
+      # x86_64-w64-mingw32, with GMP, MPFR and MPC built in its tree,
+      # configured, compiled and installed in the seed stdenv by gcc-x86_64
+      # against the x86_64 runtime, with libgcc and libstdc++ compiled by
+      # gcc-x86_64 too, timed.
+      - name: Build gcc-native-x86_64
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A gcc-native-x86_64
+          echo "== gcc-native-x86_64 built in $((SECONDS - start)) s"
+
+      # busybox's sh runs test/data/gcc-native-x86_64.nix's three scripts.
+      # The two hello scripts have gcc and g++ by their own names compile
+      # and link gcc-x86_64's checks' C and C++ programs, each with no flag
+      # naming a directory, and run them, and each writes what that check
+      # writes, then the machine and optional header magic od reads from the
+      # driver's and the compiler proper's own PE headers, the Windows DLLs
+      # every MinGW-w64 program imports among those the two import, and how
+      # many they import of GCC's or winpthreads'.  stamps writes every
+      # program and DLL the rung installs with the time stamp its PE header
+      # carries.  The lines are compared with the file of test/data named
+      # for the check, which is what the C and C++ standards, the formats
+      # and the configuration define them to be, each time stamp 0, for the
+      # reason gcc46-cxx's are.
+      - name: gcc-native-x86_64 links a C and a C++ program that run
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          for check in hello-c hello-cxx stamps; do
+            expected=test/data/gcc-native-x86_64-$check-answer.txt
+            if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/gcc-native-x86_64.nix -A "$check" | tail -n 1); then
               echo "::error::busybox sh did not run $check's script"
               status=1
               continue

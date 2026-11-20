@@ -17012,7 +17012,7 @@ testChecksForbidSubstitutes = do
     ]
   where
     checkFiles :: [Text]
-    checkFiles = ["binutils.nix", "binutils-x86_64.nix", "busybox.nix", "gcc-core.nix", "gcc-core-x86_64.nix", "gcc-latest.nix", "gcc-x86_64.nix", "gcc10.nix", "gcc46.nix", "gcc46-cxx.nix", "gnumake.nix", "mes.nix", "mingw-w64-latest.nix", "mingw-w64-x86_64.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
+    checkFiles = ["binutils.nix", "binutils-native-x86_64.nix", "binutils-x86_64.nix", "busybox.nix", "gcc-core.nix", "gcc-core-x86_64.nix", "gcc-latest.nix", "gcc-native-x86_64.nix", "gcc-x86_64.nix", "gcc10.nix", "gcc46.nix", "gcc46-cxx.nix", "gnumake.nix", "mes.nix", "mingw-w64-latest.nix", "mingw-w64-x86_64.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
 
 -- | @pkgs/windows@'s seed stdenv, read back as the build driver reads it:
 -- what the stdenv and GNU Hello built with it, @test\/data\/seed-stdenv.nix@'s
@@ -18893,6 +18893,397 @@ testGccX8664Windows = do
       [target <> "-gcc-" <> version, "hello-c.sh", "hello-cxx.sh", "stamps.sh"]
         ++ concat [[name, name <> "-builder"] | name <- ["gcc-x86_64-hello-c", "gcc-x86_64-hello-cxx", "gcc-x86_64-stamps"]]
 
+-- | @pkgs\/windows@'s native x86_64 binutils, read back as the build driver
+-- reads it: what binutils-native-x86_64 and
+-- @test\/data\/binutils-native-x86_64.nix@'s checks add to the closure of
+-- gcc-latest, gcc-x86_64 and binutils-x86_64, which build it.  It fetches
+-- nothing: its archive is binutils-x86_64's, so it adds no leaf, and it
+-- reads no input source but the stdenv's own files and what evaluation
+-- writes as text.  Its configure is told x86_64-w64-mingw32 as the host and
+-- the target, so the tools install under their own names; the build runs
+-- gcc-x86_64's compiler and binutils-x86_64's archiver and linker by the
+-- name of their target, since the stdenv's CC, AR and LD are tcc's, and
+-- gcc-latest's compiler for the build machine; and its other flags are
+-- binutils-x86_64's, so its CFLAGS leave out @-g@ and every link is told to
+-- write no time stamp.
+testBinutilsNativeX8664Windows :: IO [Bool]
+testBinutilsNativeX8664Windows = do
+  putStrLn "pkgs/binutils-native-x86_64"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "binutils-native-x86_64.nix")
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+          before <- sessionClosure (mapMaybe (`Map.lookup` rootOf) builtBefore)
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, before, full)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, before, full) -> do
+      let added = Map.elems (Map.difference full before)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          derivationAt root = Map.lookup root rootOf >>= (`Map.lookup` full)
+          binutilsNative = derivationAt binutilsNativeRoot
+          binutilsCross = derivationAt binutilsX8664Root
+          -- The output of a root's derivation, as a flag spells a store
+          -- path, or a word no flag holds where the root is missing.
+          outputOf root = maybe "<no output>" (storePathToText defaultStoreDir . doPath) (derivationAt root >>= listToMaybe . drvOutputs)
+          wordsOf name = maybe [] (T.words . variableOf name)
+          linesOf name = maybe [] (map T.strip . T.lines . variableOf name)
+          flagsWith prefixes drv = [flag | flag <- wordsOf "configureFlags" drv, any (`T.isPrefixOf` flag) prefixes]
+          sharedFlags drv = [flag | flag <- wordsOf "configureFlags" drv, not (any (`T.isPrefixOf` flag) hostAndToolPrefixes)]
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the fetches is i686-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "it adds no leaf, fetching nothing binutils-x86_64 does not" $
+            assertEqual "leaves added" [] (map nameOf addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text and the stdenv's files" $
+            assertEqual
+              "input sources not written as text"
+              ["config.site", "include", "setup.sh"]
+              (sort (map spName (nub [path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]))),
+          runTest "binutils-native-x86_64 builds binutils-x86_64's archive, with gcc-latest, gcc-x86_64 and binutils-x86_64 as its build inputs and no patch" $
+            assertEqual
+              "src, buildInputs and patches"
+              (wordsOf "src" binutilsCross, [outputOf gccLatestRoot, outputOf gccX8664Root, outputOf binutilsX8664Root], [], True)
+              (wordsOf "src" binutilsNative, wordsOf "buildInputs" binutilsNative, wordsOf "patches" binutilsNative, isJust binutilsCross),
+          runTest "binutils-native-x86_64 is configured for x86_64-w64-mingw32 as its host and target with no sysroot, and builds with gcc-x86_64's driver and binutils-x86_64's archiver and linker by their target's name, and gcc-latest's driver for the build machine" $
+            assertEqual
+              "host, target and tools"
+              [ "--host=" <> target,
+                "--target=" <> target,
+                "CC=" <> target <> "-gcc",
+                "AR=" <> target <> "-ar",
+                "LD=" <> target <> "-ld",
+                "CC_FOR_BUILD=" <> buildTarget <> "-gcc"
+              ]
+              (flagsWith ["--target=", "--host=", "--with-sysroot", "--with-build-sysroot", "CC=", "CXX=", "AR=", "LD=", "RANLIB=", "STRIP=", "CC_FOR_BUILD=", "CXX_FOR_BUILD=", "AR_FOR_BUILD=", "RANLIB_FOR_BUILD="] binutilsNative),
+          runTest "binutils-native-x86_64's other flags are binutils-x86_64's, so its CFLAGS carry no -g and LDFLAGS gives every link --no-insert-timestamp and nothing else" $
+            assertEqual
+              "the other flags, CFLAGS and LDFLAGS"
+              (sharedFlags binutilsCross, ["CFLAGS=-O2", "LDFLAGS=-Wl,--no-insert-timestamp"])
+              (sharedFlags binutilsNative, flagsWith ["CFLAGS=", "CXXFLAGS=", "LDFLAGS="] binutilsNative),
+          runTest "binutils-native-x86_64 unsets the stdenv's C_INCLUDE_PATH, configures from a build directory beside the source, and builds with NIX_BUILD_CORES jobs and nixpkgs' MAKEINFO" $
+            assertEqual
+              "preConfigure, makeFlags and parallelism"
+              ( [ "unset C_INCLUDE_PATH",
+                  "mkdir ../build",
+                  "cd ../build",
+                  "configureScript=../binutils-with-gold-" <> version <> "/configure"
+                ],
+                ["MAKEINFO=true"],
+                "1"
+              )
+              (linesOf "preConfigure" binutilsNative, wordsOf "makeFlags" binutilsNative, maybe "" (variableOf "enableParallelBuilding") binutilsNative)
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the native x86_64 binutils derivations instantiate, adding seven to the closure of gcc-latest, gcc-x86_64 and binutils-x86_64"
+    version :: Text
+    version = "2.46"
+    target :: Text
+    target = "x86_64-w64-mingw32"
+    -- The target of gcc-latest, the build machine's compiler.
+    buildTarget :: Text
+    buildTarget = "i686-w64-mingw32"
+    -- What starts the flags that name the host or a tool the build runs,
+    -- the flags in which the native and the cross binutils differ.
+    hostAndToolPrefixes :: [Text]
+    hostAndToolPrefixes = ["--host=", "CC=", "AR=", "LD=", "CC_FOR_BUILD="]
+    binutilsNativeRoot :: Text
+    binutilsNativeRoot = "pkgs.binutils-native-x86_64"
+    binutilsX8664Root :: Text
+    binutilsX8664Root = "pkgs.binutils-x86_64"
+    gccLatestRoot :: Text
+    gccLatestRoot = "pkgs.gcc-latest"
+    gccX8664Root :: Text
+    gccX8664Root = "pkgs.gcc-x86_64"
+    builtBefore :: [Text]
+    builtBefore = ["pkgs.busybox-w32", "pkgs.gnumake", "pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs", "pkgs.seedStdenv.applets", gccLatestRoot, binutilsX8664Root, gccX8664Root]
+    roots :: [Text]
+    roots = builtBefore ++ [binutilsNativeRoot, "checks.link", "checks.stamps"]
+    -- Each kaem.runCommand adds its script, written by writeText as
+    -- <name>-builder.
+    addedNames :: [Text]
+    addedNames =
+      ["binutils-" <> version, "link.sh", "stamps.sh"]
+        ++ concat [[name, name <> "-builder"] | name <- ["binutils-native-x86_64-link", "binutils-native-x86_64-stamps"]]
+
+-- | @pkgs\/windows@'s native x86_64 GCC, read back as the build driver
+-- reads it: what gcc-native-x86_64 and @test\/data\/gcc-native-x86_64.nix@'s
+-- checks add to the closure of gcc-x86_64 and binutils-native-x86_64, which
+-- build it and assemble and link for it.  It fetches nothing: its four
+-- archives are gcc-latest's, so it adds no leaf, and it reads no input
+-- source but the stdenv's own files, what evaluation writes as text, and
+-- its patch, which takes @\/usr\/local\/include@ out of its search.
+-- Its configure is told x86_64-w64-mingw32 as the host and the target,
+-- where its target's headers are at build time, since a compiler whose
+-- host is its target takes no @--with-headers@ or @--with-libs@, and which
+-- assembler and linker it runs, so each has to name the output of the
+-- derivation that builds it; the build runs gcc-x86_64's compilers and
+-- binutils-x86_64's tools for the host by the name of their target, and
+-- gcc-latest's and binutils' for the build machine by theirs.  It builds C
+-- and C++ with static libraries and the win32 thread model, its other
+-- flags are gcc-x86_64's, and its install copies the target's headers and
+-- runtime where the installed driver finds them.
+testGccNativeX8664Windows :: IO [Bool]
+testGccNativeX8664Windows = do
+  putStrLn "pkgs/gcc-native-x86_64"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-native-x86_64.nix")
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checks,
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+          before <- sessionClosure (mapMaybe (`Map.lookup` rootOf) builtBefore)
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, before, full)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  patchLines <- BS8.lines <$> BS.readFile (cwd </> "pkgs" </> "windows" </> "by-name" </> "gc" </> "gcc-native-x86_64" </> T.unpack patch)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, before, full) -> do
+      let added = Map.elems (Map.difference full before)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          -- A unified diff's new file names, and the lines it adds and
+          -- removes.
+          patchFiles = [rest | line <- patchLines, Just rest <- [BS.stripPrefix "+++ " line]]
+          patchAdded = [rest | line <- patchLines, Just rest <- [BS.stripPrefix "+" line], not ("++ " `BS.isPrefixOf` rest)]
+          patchRemoved = [rest | line <- patchLines, Just rest <- [BS.stripPrefix "-" line], not ("-- " `BS.isPrefixOf` rest)]
+          derivationAt root = Map.lookup root rootOf >>= (`Map.lookup` full)
+          gccNative = derivationAt gccNativeRoot
+          gccCross = derivationAt gccX8664Root
+          gccLatest = derivationAt gccLatestRoot
+          -- The output of a root's derivation, as a flag spells a store
+          -- path, or a word no flag holds where the root is missing.
+          outputOf root = maybe "<no output>" (storePathToText defaultStoreDir . doPath) (derivationAt root >>= listToMaybe . drvOutputs)
+          wordsOf name = maybe [] (T.words . variableOf name)
+          linesOf name = maybe [] (map T.strip . T.lines . variableOf name)
+          flagsWith prefixes drv = [flag | flag <- wordsOf "configureFlags" drv, any (`T.isPrefixOf` flag) prefixes]
+          sharedFlags drv = [flag | flag <- wordsOf "configureFlags" drv, not (any (`T.isPrefixOf` flag) hostAndToolPrefixes)]
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the fetches is i686-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= I686_Windows] of
+              [] -> Pass
+              named -> Fail ("not i686-windows: " <> T.intercalate ", " named),
+          runTest "it adds no leaf, fetching nothing gcc-latest does not" $
+            assertEqual "leaves added" [] (map nameOf addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text, the stdenv's files and its patch" $
+            assertEqual
+              "input sources not written as text"
+              (sort ["config.site", "include", "setup.sh", patch])
+              (sort (map spName (nub [path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]))),
+          runTest "gcc-native-x86_64 names gcc-latest's four archives where setup.sh and preConfigure read them, with gcc-latest, binutils, gcc-x86_64 and binutils-x86_64 as its build inputs and its patch" $
+            assertEqual
+              "the archives, buildInputs and patches"
+              ( [wordsOf variable gccLatest | variable <- archiveVariables],
+                [outputOf gccLatestRoot, outputOf binutilsRoot, outputOf gccX8664Root, outputOf binutilsX8664Root],
+                [storePathToText defaultStoreDir path | drv <- maybeToList gccNative, path <- drvInputSrcs drv, spName path == patch],
+                True
+              )
+              ( [wordsOf variable gccNative | variable <- archiveVariables],
+                wordsOf "buildInputs" gccNative,
+                wordsOf "patches" gccNative,
+                isJust gccLatest
+              ),
+          runTest "gcc-native-x86_64's preConfigure moves GMP, MPFR and MPC to the directories GCC's configure builds them from, and unsets the stdenv's C_INCLUDE_PATH" $
+            assertEqual
+              "preConfigure's mv and unset lines"
+              (["mv gmp-6.3.0 gmp", "mv mpfr-4.2.2 mpfr", "mv mpc-1.3.1 mpc"], ["unset C_INCLUDE_PATH"])
+              (filter ("mv " `T.isPrefixOf`) (linesOf "preConfigure" gccNative), filter ("unset " `T.isPrefixOf`) (linesOf "preConfigure" gccNative)),
+          runTest "gcc-native-x86_64's flags name x86_64-w64-mingw32 as its host and target, the current MinGW-w64's headers' output as the build sysroot with /include as their directory, binutils-native-x86_64's assembler and linker, and no sysroot and no headers or runtime to copy" $
+            assertEqual
+              "flags"
+              [ "--host=" <> target,
+                "--target=" <> target,
+                "--with-build-sysroot=" <> outputOf headersRoot,
+                "--with-native-system-header-dir=/include",
+                "--with-as=" <> outputOf binutilsNativeRoot <> "/bin/as.exe",
+                "--with-ld=" <> outputOf binutilsNativeRoot <> "/bin/ld.exe"
+              ]
+              (flagsWith ["--host=", "--target=", "--with-headers", "--with-libs", "--with-sysroot", "--with-build-sysroot", "--with-native-system-header-dir", "--with-gxx-include-dir", "--with-as=", "--with-ld="] gccNative),
+          runTest "gcc-native-x86_64 builds the host's programs with gcc-x86_64's drivers and binutils-x86_64's archiver, linker and resource compiler, and the build machine's with gcc-latest's drivers and binutils' archiver and ranlib, each by its target's name" $
+            assertEqual
+              "tools"
+              [ "CC=" <> target <> "-gcc",
+                "CXX=" <> target <> "-g++",
+                "AR=" <> target <> "-ar",
+                "LD=" <> target <> "-ld",
+                "WINDRES=" <> target <> "-windres",
+                "CC_FOR_BUILD=" <> buildTarget <> "-gcc",
+                "CXX_FOR_BUILD=" <> buildTarget <> "-g++",
+                "AR_FOR_BUILD=" <> buildTarget <> "-ar",
+                "RANLIB_FOR_BUILD=" <> buildTarget <> "-ranlib"
+              ]
+              (flagsWith ["CC=", "CXX=", "AR=", "LD=", "STRIP=", "RANLIB=", "WINDRES=", "CC_FOR_BUILD=", "CXX_FOR_BUILD=", "AR_FOR_BUILD=", "RANLIB_FOR_BUILD=", "LD_FOR_BUILD=", "NM_FOR_BUILD="] gccNative),
+          runTest "gcc-native-x86_64 gives every link it makes --no-insert-timestamp, and LDFLAGS nothing else" $
+            assertEqual
+              "LDFLAGS"
+              ["LDFLAGS=-Wl,--no-insert-timestamp"]
+              (flagsWith ["LDFLAGS=", "LDFLAGS_FOR_BUILD=", "LDFLAGS_FOR_TARGET="] gccNative),
+          runTest "gcc-native-x86_64's compiler options carry no -g, and it gives make no flags" $
+            assertEqual
+              "the options and makeFlags"
+              (["CFLAGS=-O2", "CXXFLAGS=-O2", "CFLAGS_FOR_TARGET=-O2", "CXXFLAGS_FOR_TARGET=-O2"], [])
+              (flagsWith ["CFLAGS=", "CXXFLAGS=", "CFLAGS_FOR_TARGET=", "CXXFLAGS_FOR_TARGET=", "CFLAGS_FOR_BUILD=", "CXXFLAGS_FOR_BUILD="] gccNative, wordsOf "makeFlags" gccNative),
+          runTest "gcc-native-x86_64 builds C and C++, static, with the win32 thread model, no LTO and no registry lookup" $
+            assertEqual
+              "languages, libraries, threads, LTO and registry"
+              ["--enable-languages=c,c++", "--enable-threads=win32", "--disable-lto", "--disable-shared", "--disable-win32-registry"]
+              (flagsWith ["--enable-languages=", "--enable-shared", "--disable-shared", "--enable-threads", "--disable-threads", "--enable-lto", "--disable-lto", "--enable-win32-registry", "--disable-win32-registry"] gccNative),
+          runTest "gcc-native-x86_64's other flags are gcc-x86_64's" $
+            assertEqual "the other flags" (sharedFlags gccCross, True) (sharedFlags gccNative, isJust gccCross),
+          runTest "gcc-native-x86_64 hands configure, through the environment, the host's strip with -p, which install-strip runs on each program and which keeps the zero time stamp ld writes" $
+            assertEqual "STRIP" (target <> "-strip -p") (maybe "" (variableOf "STRIP") gccNative),
+          runTest "gcc-native-x86_64 drops the configure arguments from the top-level Makefile, builds with NIX_BUILD_CORES jobs, installs with install-strip, strips libgcc's debugging information, removes what gcc-x86_64's install removes, and copies the current MinGW-w64's headers and the x86_64 runtime into its tool directory" $
+            assertEqual
+              "phases and parallelism"
+              ( [ "sed -e '/TOPLEVEL_CONFIGURE_ARGUMENTS=/d' -i Makefile",
+                  "make ${enableParallelBuilding:+-j$NIX_BUILD_CORES}"
+                ],
+                [ "make ${enableParallelInstalling:+-j$NIX_BUILD_CORES} install-strip",
+                  "libgccDir=$out/lib/gcc/" <> target <> "/" <> version,
+                  target <> "-strip -p --strip-debug \"$libgccDir\"/*.a \"$libgccDir\"/*.o",
+                  "rm -r \"$out/libexec/gcc/" <> target <> "/" <> version <> "/install-tools\" \"$libgccDir/install-tools\"",
+                  "rm -rf \"$out/share/gcc-" <> version <> "/python\" \"$out/share/man\" \"$out/share/info\"",
+                  "rm \"$out/lib/libstdc++.a-gdb.py\"",
+                  "rmdir \"$out/share/gcc-" <> version <> "\" \"$out/share\"",
+                  "mkdir -p \"$out/" <> target <> "/include\" \"$out/" <> target <> "/lib\"",
+                  "cp -r \"" <> outputOf headersRoot <> "/include/.\" \"$out/" <> target <> "/include\"",
+                  "cp -r \"" <> outputOf crtRoot <> "/lib/.\" \"$out/" <> target <> "/lib\""
+                ],
+                "1",
+                "1"
+              )
+              ( linesOf "buildPhase" gccNative,
+                linesOf "installPhase" gccNative,
+                maybe "" (variableOf "enableParallelBuilding") gccNative,
+                maybe "" (variableOf "enableParallelInstalling") gccNative
+              ),
+          runTest "no-local-include-dir.patch undefines LOCAL_INCLUDE_DIR in gcc/cppdefault.cc, and changes nothing else" $
+            assertEqual
+              "the files it changes, and the lines it adds and removes"
+              (["b/gcc/cppdefault.cc"], ["#undef LOCAL_INCLUDE_DIR", ""], [])
+              (patchFiles, patchAdded, patchRemoved)
+        ]
+  where
+    patch :: Text
+    patch = "no-local-include-dir.patch"
+    instantiates :: Text
+    instantiates = "the native x86_64 GCC's derivations instantiate, adding ten to the closure of gcc-x86_64 and binutils-native-x86_64"
+    target :: Text
+    target = "x86_64-w64-mingw32"
+    -- The target of gcc-latest and binutils, the build machine's compilers
+    -- and tools.
+    buildTarget :: Text
+    buildTarget = "i686-w64-mingw32"
+    version :: Text
+    version = "16.2.0"
+    -- The variables that name GCC's archive and the three it builds in its
+    -- tree.
+    archiveVariables :: [Text]
+    archiveVariables = ["src", "gmpSrc", "mpfrSrc", "mpcSrc"]
+    -- What starts the flags that name the host, where the target's headers
+    -- and runtime come from, the assembler and linker, or a tool the build
+    -- runs, the flags in which the native and the cross GCC differ.
+    hostAndToolPrefixes :: [Text]
+    hostAndToolPrefixes =
+      [ "--host=",
+        "--with-headers=",
+        "--with-libs=",
+        "--with-build-sysroot=",
+        "--with-native-system-header-dir=",
+        "--with-as=",
+        "--with-ld=",
+        "CC=",
+        "CXX=",
+        "AR=",
+        "LD=",
+        "WINDRES=",
+        "CC_FOR_BUILD=",
+        "CXX_FOR_BUILD=",
+        "AR_FOR_BUILD=",
+        "RANLIB_FOR_BUILD="
+      ]
+    gccNativeRoot :: Text
+    gccNativeRoot = "pkgs.gcc-native-x86_64"
+    gccX8664Root :: Text
+    gccX8664Root = "pkgs.gcc-x86_64"
+    gccLatestRoot :: Text
+    gccLatestRoot = "pkgs.gcc-latest"
+    headersRoot :: Text
+    headersRoot = "pkgs.mingw-w64-headers-latest"
+    crtRoot :: Text
+    crtRoot = "pkgs.mingw-w64-crt-x86_64"
+    binutilsRoot :: Text
+    binutilsRoot = "pkgs.binutils"
+    binutilsX8664Root :: Text
+    binutilsX8664Root = "pkgs.binutils-x86_64"
+    binutilsNativeRoot :: Text
+    binutilsNativeRoot = "pkgs.binutils-native-x86_64"
+    builtBefore :: [Text]
+    builtBefore = ["pkgs.busybox-w32", "pkgs.gnumake", "pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs", "pkgs.seedStdenv.applets", binutilsRoot, gccLatestRoot, headersRoot, binutilsX8664Root, crtRoot, gccX8664Root, binutilsNativeRoot]
+    roots :: [Text]
+    roots = builtBefore ++ [gccNativeRoot, "checks.hello-c", "checks.hello-cxx", "checks.stamps"]
+    -- Each kaem.runCommand adds its script, written by writeText as
+    -- <name>-builder.
+    addedNames :: [Text]
+    addedNames =
+      ["gcc-" <> version, "hello-c.sh", "hello-cxx.sh", "stamps.sh"]
+        ++ concat [[name, name <> "-builder"] | name <- ["gcc-native-x86_64-hello-c", "gcc-native-x86_64-hello-cxx", "gcc-native-x86_64-stamps"]]
+
 -- | @pkgs\/windows\/sources.nix@ against the package set whose sources it
 -- lists: the fetches in the closure of every derivation in the set are the
 -- list's, each fixed-output and listed once.  A package that fetches a
@@ -19095,12 +19486,13 @@ testWindowsRungs = do
         ("gcc10", "gcc10-windows"),
         ("gcc-latest", "gcc-latest-windows"),
         ("x86_64", "x86_64-windows"),
-        ("gcc-x86_64", "gcc-x86_64-windows")
+        ("gcc-x86_64", "gcc-x86_64-windows"),
+        ("native-x86_64", "native-x86_64-windows")
       ]
     -- The rung each stage ends on, so that a workflow read as building
     -- nothing does not pass against an empty list.
     knownRungs :: [(Text, Text)]
-    knownRungs = [("mes", "mes.libc"), ("tinycc", "seedStdenv.applets"), ("gcc46", "gcc46"), ("gcc46-cxx", "gcc46-cxx"), ("gcc10", "mingw-w64-crt-latest"), ("gcc-latest", "gcc-latest"), ("x86_64", "mingw-w64-crt-x86_64"), ("gcc-x86_64", "gcc-x86_64")]
+    knownRungs = [("mes", "mes.libc"), ("tinycc", "seedStdenv.applets"), ("gcc46", "gcc46"), ("gcc46-cxx", "gcc46-cxx"), ("gcc10", "mingw-w64-crt-latest"), ("gcc-latest", "gcc-latest"), ("x86_64", "mingw-w64-crt-x86_64"), ("gcc-x86_64", "gcc-x86_64"), ("native-x86_64", "gcc-native-x86_64")]
     -- What ends a stage's rungs in the string the expression returns: no
     -- attribute path is spelled so.
     stageEnd :: Text
@@ -29109,6 +29501,8 @@ runSuite = do
           testGccCoreX8664Windows,
           testMingwW64CrtX8664Windows,
           testGccX8664Windows,
+          testBinutilsNativeX8664Windows,
+          testGccNativeX8664Windows,
           testChecksForbidSubstitutes,
           testWindowsSources,
           testWindowsRungs,
