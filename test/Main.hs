@@ -3279,6 +3279,19 @@ testBuiltinArgumentOrder = do
            fails "builtins.length (map 1 [ 1 ])" "expected a function but found an integer: 1",
            fails "builtins.length (builtins.genList 1 1)" "expected a function but found an integer: 1",
            yields "map { __functor = self: x: x + 1; } [ 1 ] == [ 2 ]" (VBool True),
+           -- zipAttrsWith forces and checks its function before it forces
+           -- the list, so the function fails first whatever the list holds,
+           -- and a partial application checks nothing.
+           fails "builtins.zipAttrsWith 1 [ ]" "expected a function but found an integer: 1",
+           fails "builtins.attrNames (builtins.zipAttrsWith 1 [ { a = 1; } ])" "expected a function but found an integer: 1",
+           fails "builtins.zipAttrsWith 1 [ 1 ]" "expected a function but found an integer: 1",
+           fails "builtins.zipAttrsWith 1 (throw \"b\")" "expected a function but found an integer: 1",
+           fails "builtins.zipAttrsWith (throw \"a\") (throw \"b\")" "a",
+           fails "builtins.zipAttrsWith (throw \"a\") 1" "a",
+           fails "builtins.zipAttrsWith (throw \"a\") [ ]" "a",
+           yields "builtins.zipAttrsWith (n: vs: vs) [ ] == { }" (VBool True),
+           yields "builtins.zipAttrsWith { __functor = self: n: vs: n; } [ { a = 1; } ] == { a = \"a\"; }" (VBool True),
+           yields "builtins.typeOf (builtins.zipAttrsWith 1)" (mkStr "lambda"),
            -- foldl' hands its initial accumulator to the first step
            -- unforced, and forces it itself only for an empty list.
            yields "builtins.foldl' (acc: x: x) (throw \"a\") [ 1 ]" (VInt 1),
