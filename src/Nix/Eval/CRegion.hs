@@ -12,7 +12,9 @@
 -- the closes of regions past a threshold of bytes, freeing single objects
 -- or whole blocks of each of several sizes.  It also counts what a close
 -- reached after an earlier close found it unreached, which a collector
--- would have freed under a live pointer.
+-- would have freed under a live pointer.  And it simulates, each as a
+-- t'Tenure', collectors that tenure what their closes marked and mark it
+-- again only where a close marks its region whole.
 --
 -- Without the census a force pays for it one match on its session's
 -- setting, and the allocators one flag test per block, tracked object
@@ -27,6 +29,7 @@ module Nix.Eval.CRegion
     -- * Figures
     SizeClass (..),
     Threshold (..),
+    Tenure (..),
     RegionFigures (..),
     regionFigures,
     renderRegionFigures,
@@ -77,6 +80,12 @@ foreign import ccall unsafe "nn_region_classes"
 foreign import ccall unsafe "nn_region_thresholds"
   c_nn_region_thresholds :: Ptr Word64 -> IO ()
 
+foreign import ccall unsafe "nn_region_tenure"
+  c_nn_region_tenure :: Word32 -> Ptr Word64 -> IO ()
+
+foreign import ccall unsafe "nn_region_tenure_budget"
+  c_nn_region_tenure_budget :: Word32 -> Word64
+
 foreign import ccall unsafe "nn_region_threshold_bytes"
   c_nn_region_threshold_bytes :: Word32 -> Word64
 
@@ -111,6 +120,17 @@ thresholdCount, grainCount, thresholdFigures :: Int
 thresholdCount = 9
 grainCount = 6
 thresholdFigures = 3 + grainCount
+
+-- | @NN_REGION_TENURE_VARIANTS@, @NN_REGION_TENURE_THRESHOLD@, and
+-- @NN_REGION_TENURE_FIGURES@: eleven counts, then a peak per grain.
+tenureVariants :: Word32
+tenureVariants = 4
+
+tenureThreshold :: Word32
+tenureThreshold = 2
+
+tenureFigures :: Int
+tenureFigures = 11 + grainCount
 
 -- | The bump kinds in order: @NN_REGION_THUNK_BLOCK@,
 -- @NN_REGION_ENV_PAGE@ and @NN_REGION_STR_BLOCK@.
@@ -189,6 +209,42 @@ data Threshold = Threshold
   }
   deriving (Eq, Show)
 
+-- | A simulated collector that marks at the closes of regions that
+-- allocated at least 'tenureBytes' and then tenures the whole region:
+-- each such close marks only what no such close of its inside tenured,
+-- but one that marks its region whole, an outermost one or one whose
+-- region holds at least 'tenureBudget' tenured bytes no mark of the
+-- whole has reached since.
+data Tenure = Tenure
+  { -- | 0 for no budget, so that only outermost closes mark the whole.
+    tenureBudget :: !Word64,
+    tenureBytes :: !Word64,
+    -- | The closes that mark, and of them those that mark the whole.
+    tenureCloses :: !Word64,
+    tenureFull :: !Word64,
+    -- | Objects the marks entered, and pointers they examined.
+    tenureEntered :: !Word64,
+    tenureExamined :: !Word64,
+    -- | The most records held at once.
+    tenureRecords :: !Word64,
+    -- | Pointers closes remembered for regions around them, and the most
+    -- held at once.
+    tenureRemembered :: !Word64,
+    tenureHeld :: !Word64,
+    -- | Units and places it freed that the census's own mark at the same
+    -- close reached.
+    tenureReached :: !Word64,
+    -- | Objects and array entries a later close reached once it freed
+    -- them, and their bytes.
+    tenureResurrected :: !Word64,
+    tenureResurrectedBytes :: !Word64,
+    -- | Bytes of single objects the marks of the whole freed.
+    tenureFullFreed :: !Word64,
+    -- | The most bytes held at once, at each grain as 'thresholdPeaks'.
+    tenurePeaks :: ![Word64]
+  }
+  deriving (Eq, Show)
+
 -- | What a census of regions found.
 data RegionFigures = RegionFigures
   { regionCloses :: !Word64,
@@ -211,7 +267,10 @@ data RegionFigures = RegionFigures
     -- | Every size class with a close in it, smallest first.
     regionClasses :: ![SizeClass],
     -- | Each threshold, smallest first.
-    regionThresholds :: ![Threshold]
+    regionThresholds :: ![Threshold],
+    -- | Each tenure collector, by its budget, smallest first and no
+    -- budget first of all.
+    regionTenures :: ![Tenure]
   }
   deriving (Eq, Show)
 
@@ -232,6 +291,7 @@ regionFigures =
           else do
             sizeClasses <- traverse (sizeClass classes) [0 .. classCount - 1]
             simulated <- traverse (threshold thresholds) [0 .. thresholdCount - 1]
+            tenured <- traverse tenure [0 .. tenureVariants - 1]
             figures <-
               RegionFigures
                 <$> total totalCloses
@@ -244,6 +304,7 @@ regionFigures =
                 <*> total totalResurrectedBytes
                 <*> pure (filter ((> 0) . classCloses) sizeClasses)
                 <*> pure simulated
+                <*> pure tenured
             pure (Right figures)
   where
     sizeClass classes n = do
@@ -265,13 +326,33 @@ regionFigures =
         <*> figure 1
         <*> figure 2
         <*> traverse (figure . (3 +)) [0 .. grainCount - 1]
+    tenure variant = allocaArray tenureFigures $ \tenures -> do
+      c_nn_region_tenure variant tenures
+      let figure = peekElemOff tenures
+      Tenure (c_nn_region_tenure_budget variant) (c_nn_region_threshold_bytes tenureThreshold)
+        <$> figure 0
+        <*> figure 1
+        <*> figure 2
+        <*> figure 3
+        <*> figure 4
+        <*> figure 5
+        <*> figure 6
+        <*> figure 7
+        <*> figure 8
+        <*> figure 9
+        <*> figure 10
+        <*> traverse (figure . (11 +)) [0 .. grainCount - 1]
 
 -- | The figures as lines of a name and its values: totals as
 -- @regions.NAME VALUE@, a size class as @regions.class FLOOR CLOSES
 -- ALLOCATED SURVIVING ENTERED EXAMINED RECORDS@, a threshold as
 -- @regions.threshold BYTES CLOSES ENTERED EXAMINED@ and its peaks by
--- grain, and each grain from 1 as @regions.grain GRAIN@ and its block
--- bytes for thunk cells, env pages and strings.
+-- grain, each tenure collector as @regions.tenure BUDGET BYTES CLOSES FULL
+-- ENTERED EXAMINED FULLFREED@ and its peaks, with its records, what it
+-- remembered and held, what it freed that was reached and what was
+-- reached once freed on lines of their own after its budget, and each
+-- grain from 1 as @regions.grain GRAIN@ and its block bytes for thunk
+-- cells, env pages and strings.
 renderRegionFigures :: RegionFigures -> BS.ByteString
 renderRegionFigures figures =
   BL.toStrict . BB.toLazyByteString $
@@ -285,6 +366,7 @@ renderRegionFigures figures =
       <> field "regions.resurrected.bytes" [regionResurrectedBytes figures]
       <> foldMap sizeClass (regionClasses figures)
       <> foldMap threshold (regionThresholds figures)
+      <> foldMap tenure (regionTenures figures)
       <> foldMap grain [1 .. fromIntegral grainCount - 1]
   where
     field name values =
@@ -293,4 +375,10 @@ renderRegionFigures figures =
       field "regions.class" [lowest, closes, allocated, surviving, entered, examined, records]
     threshold (Threshold bytes closes entered examined peaks) =
       field "regions.threshold" ([bytes, closes, entered, examined] <> peaks)
+    tenure t =
+      field "regions.tenure" ([tenureBudget t, tenureBytes t, tenureCloses t, tenureFull t, tenureEntered t, tenureExamined t, tenureFullFreed t] <> tenurePeaks t)
+        <> field "regions.tenure.records" [tenureBudget t, tenureRecords t]
+        <> field "regions.tenure.remembered" [tenureBudget t, tenureRemembered t, tenureHeld t]
+        <> field "regions.tenure.reached" [tenureBudget t, tenureReached t]
+        <> field "regions.tenure.resurrected" [tenureBudget t, tenureResurrected t, tenureResurrectedBytes t]
     grain g = field "regions.grain" (fromIntegral g : [c_nn_region_grain_bytes kind g | kind <- bumpKinds])

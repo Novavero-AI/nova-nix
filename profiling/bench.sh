@@ -847,6 +847,50 @@ write_regions() {
       for (i = 6; i <= NF; i++) printf " | %.1f MiB", $i / 1048576
       printf " |\n"
     }' "$regions"
+  echo
+  echo "### Collectors that tenure what their closes mark"
+  echo
+  echo "Each marks at the closes of regions past its threshold, each only what no such close of its inside" \
+    "tenured, and then tenures the whole region.  A close marks its region whole when it is outermost, or" \
+    "when the closes inside have tenured at least the collector's budget since a mark of the whole.  The" \
+    "collector above at the same threshold is beside them."
+  echo
+  scoreboard_row "Collector" "Closes that mark" "of them marking the whole region" "Objects entered" "Pointers examined" \
+    "Freed by marks of the whole" "Peak, single objects" "Peak, blocks 1" "2" "3" "4" "5"
+  scoreboard_row ":--" "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:" "--:"
+  awk 'function budget(b) { return b == 0 ? "no budget" : "budget " b / 1048576 " MiB" }
+    $1 == "regions.threshold" { row[$2] = $0 }
+    $1 == "regions.tenure" { bytes = $3; tenure[++n] = $0 }
+    END {
+      if (n == 0 || !(bytes in row)) exit
+      label = bytes < 1048576 ? bytes / 1024 " KiB" : bytes / 1048576 " MiB"
+      m = split(row[bytes], r, " ")
+      printf "| marking again at each close, %s | %d | | %d | %d | ", label, r[3], r[4], r[5]
+      for (i = 6; i <= m; i++) printf " | %.1f MiB", r[i] / 1048576
+      printf " |\n"
+      for (k = 1; k <= n; k++) {
+        m = split(tenure[k], t, " ")
+        printf "| **tenuring, %s, %s** | %d | %d | %d | %d | %.1f MiB", budget(t[2]), label, t[4], t[5], t[6], t[7], t[8] / 1048576
+        for (i = 9; i <= m; i++) printf " | %.1f MiB", t[i] / 1048576
+        printf " |\n"
+      }
+    }' "$regions"
+  echo
+  scoreboard_row "Collector" "Most records held at once" "Pointers remembered for a region around" \
+    "Most remembered at once" "**Units freed that the census's mark at the close reached**" \
+    "**Reached after it freed them**"
+  scoreboard_row ":--" "--:" "--:" "--:" "--:" "--:"
+  awk 'function budget(b) { return b == 0 ? "no budget" : "budget " b / 1048576 " MiB" }
+    $1 == "regions.tenure.records" { records[$2] = $3; order[++n] = $2 }
+    $1 == "regions.tenure.remembered" { made[$2] = $3; held[$2] = $4 }
+    $1 == "regions.tenure.reached" { reached[$2] = $3 }
+    $1 == "regions.tenure.resurrected" { count[$2] = $3; bytes[$2] = $4 }
+    END {
+      for (k = 1; k <= n; k++) {
+        v = order[k]
+        printf "| tenuring, %s | %d | %d | %d | **%d** | **%d, %.1f MiB** |\n", budget(v), records[v], made[v], held[v], reached[v], count[v], bytes[v] / 1048576
+      }
+    }' "$regions"
 }
 
 # The census's environments and attribute sets by the site that allocated

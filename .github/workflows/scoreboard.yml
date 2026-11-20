@@ -176,8 +176,9 @@ jobs:
       # as well as after each failure tryEval cannot catch.  The memory
       # suite then runs on a slice of the fixture: both evaluators' passes
       # visit the same attributes, the census places every pointer it
-      # meets, and the census of regions does too and finds nothing reached
-      # after a close found it unreached.
+      # meets, and the census of regions does too, finds nothing reached
+      # after a close found it unreached, and finds that no tenure
+      # collector frees anything a mark reaches.
       - name: Check the walk on its fixture
         timeout-minutes: 10
         env:
@@ -195,6 +196,10 @@ jobs:
           grep -qx 'mark.unplaced 0' "$memory/census/census.txt"
           grep -qx 'regions.unplaced 0' "$memory/regions/regions.txt"
           grep -qx 'regions.resurrected.count 0' "$memory/regions/regions.txt"
+          for budget in 0 1048576 16777216 268435456; do
+            grep -qx "regions.tenure.reached $budget 0" "$memory/regions/regions.txt"
+            grep -qx "regions.tenure.resurrected $budget 0 0" "$memory/regions/regions.txt"
+          done
 
       # The two evaluators walk at once, in one bounded scope.  A process
       # the OOM killer ends there is retried at the attribute it was on, as
