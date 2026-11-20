@@ -90,4 +90,11 @@
   # GCC 16.2.0 with C and C++ for x86_64-w64-mingw32, the GCC 16
   # x86_64 stage.
   gcc-x86_64 = [ "gcc-x86_64" ];
+
+  # binutils and GCC 16.2.0 with C and C++ that run on x86_64 Windows and
+  # write x86_64-w64-mingw32, the native x86_64 stage.
+  native-x86_64 = [
+    "binutils-native-x86_64"
+    "gcc-native-x86_64"
+  ];
 }

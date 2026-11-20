@@ -1,0 +1,25 @@
+hello from gcc 16.2.0, C 202311
+MinGW-w64 14.0.0 for msvcrt.dll 0x600
+constexpr 42, typeof 42, twice 84, nullptr 1, bool 1, enum 200 of size 1
+pointer 8, long 4, long long 8, long double 16 bytes
+-9223372036854775807 remainder 65535
+0xffffffffffffffffffffffffffffffff0000
+hello.exe exits 0
+configured with: []
+Thread model: win32
+lines of -v naming /usr/local/include: 0
+	DLL Name: KERNEL32.dll
+	DLL Name: msvcrt.dll
+T __divmodti4
+T __mulbitint3
+CodeView entries: 0
+debugging sections: 0
+hello.exe: machine 0x8664, optional header magic 0x20b
+bin/gcc.exe: machine 0x8664, optional header magic 0x20b
+	DLL Name: KERNEL32.dll
+	DLL Name: msvcrt.dll
+bin/gcc.exe imports of GCC's runtime, winpthreads or mcfgthreads: 0
+libexec/gcc/x86_64-w64-mingw32/16.2.0/cc1.exe: machine 0x8664, optional header magic 0x20b
+	DLL Name: KERNEL32.dll
+	DLL Name: msvcrt.dll
+libexec/gcc/x86_64-w64-mingw32/16.2.0/cc1.exe imports of GCC's runtime, winpthreads or mcfgthreads: 0
