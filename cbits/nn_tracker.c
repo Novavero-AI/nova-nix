@@ -27,6 +27,20 @@ int nn_tracker_add(nn_tracker_t *tracker, void *object)
     return 0;
 }
 
+void nn_tracker_sweep(nn_tracker_t *tracker, uint32_t from, nn_tracker_keep_t keep, void *ctx,
+                      void (*free_object)(void *))
+{
+    uint32_t i, kept = from;
+    for (i = from; i < tracker->count; i++) {
+        void *object = tracker->objects[i];
+        if (keep(ctx, object, i, kept))
+            tracker->objects[kept++] = object;
+        else
+            free_object(object);
+    }
+    tracker->count = kept;
+}
+
 void nn_tracker_free_all(nn_tracker_t *tracker, void (*free_object)(void *))
 {
     uint32_t i;

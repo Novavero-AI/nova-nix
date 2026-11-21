@@ -70,6 +70,10 @@ struct nn_thunk *nn_primop_app_arg(const nn_primop_app_t *app, uint16_t i);
  * freed by nn_primop_app_free_all. */
 const nn_tracker_t *nn_primop_app_tracked(void);
 
+/* Free the applications from place `from` of the tracker on that `keep`
+ * refuses, and close up the rest (nn_tracker_sweep). */
+void nn_primop_app_sweep(uint32_t from, nn_tracker_keep_t keep, void *ctx);
+
 /* Bytes an application holds from the allocator. */
 uint64_t nn_primop_app_bytes(const nn_primop_app_t *app);
 

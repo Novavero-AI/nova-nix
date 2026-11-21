@@ -1,6 +1,8 @@
 /*
- * nn_region.h - A census of regions: what the C data layer could free at
- * the end of each force of a thunk, measured and never freed.
+ * nn_region.h - Regions: the C data layer's collector, which frees at the
+ * end of each force of a thunk what the force allocated that nothing
+ * reaches, and a census that measures what it and other collectors would
+ * free there, freeing nothing.
  *
  * A region is the extent of one force: everything the data layer
  * allocates from the force's start to the store of its value, inner
@@ -8,13 +10,13 @@
  * reachable only through an object older than the force that the force
  * wrote a pointer into (the forced cell, a cell an inner force memoized,
  * a with-scope entry resolved to a set) or through a root registered
- * during it (nn_roots.h).  The census records every such write: each
- * store into a cell (nn_thunk.h) and each resolved with-scope entry
- * (nn_env_resolve_with).  At a region's close it marks from the records
- * of objects older than the region and from the roots registered since
- * it opened, and stops at every object older than the region.  What the
- * mark does not reach is what a collector would free at that close.  The
- * census frees nothing and writes nothing in the data layer.
+ * during it (nn_roots.h).  Regions record every such write: each store
+ * into a cell (nn_thunk.h) and each resolved with-scope entry
+ * (nn_env_resolve_with).  At a region's close the census marks from the
+ * records of objects older than the region and from the roots registered
+ * since it opened, and stops at every object older than the region.  What
+ * the mark does not reach is what a collector would free at that close.
+ * The census frees nothing and writes nothing in the data layer.
  *
  * Age.  Each block objects are bumped from (a thunk block, an env page, a
  * block of the value string arena) is numbered as its allocator makes it,
@@ -75,10 +77,26 @@
  * nothing the census's own mark at the same close reached, and nothing a
  * later close reaches.
  *
- * A census runs from before the arena's init to after its teardown
- * (nn_region_census_begin and nn_region_census_end), so that it numbers
- * every block.  When one of its tables cannot grow it stops counting and
- * says so (NN_REGION_TOTAL_FAILED).  Not thread-safe.
+ * The collector.  Collecting, regions run one of the tenure collectors
+ * above and nothing else: the one with a budget of 1 MiB, whose close of
+ * an outermost region is a mark of the whole by its own mark.  At each
+ * close where it marks, it frees the tracked objects of the region its
+ * mark left unreached, and the region's part of each tracker closes up
+ * behind the places before it (nn_tracker_sweep), so that a tracker's
+ * order stays age order and every open region's count stays its start.
+ * Its marks are the census's premise at work, so one that reaches a unit
+ * it freed, or a tracked object it holds no place for, aborts
+ * (NN_ASSERT).  A freed tracked object whose address the allocator has
+ * given to another of its kind passes for that one: the sanitizers'
+ * quarantine, which holds a freed address back, is what catches a read of
+ * it.
+ *
+ * Regions run from before the arena's init to after its teardown
+ * (nn_region_begin and nn_region_end), so that they number every block
+ * and place every tracked object.  When one of their tables cannot grow
+ * they stop: a census stops counting and says so
+ * (NN_REGION_TOTAL_FAILED), and the collector stops freeing, leaving
+ * everything after to the arena's teardown.  Not thread-safe.
  */
 
 #ifndef NN_REGION_H
@@ -109,18 +127,24 @@ struct nn_thunk;
 #define NN_REGION_CTXSTR        4
 #define NN_REGION_TRACKED_KINDS 5
 
-/* Nonzero while a census runs.  The allocators' hooks below are called
- * only then. */
-extern int nn_region_census;
+/* What regions run for: nothing, a census, or the collector. */
+#define NN_REGION_OFF     0
+#define NN_REGION_CENSUS  1
+#define NN_REGION_COLLECT 2
+
+/* The mode regions run in, NN_REGION_OFF while none run.  The
+ * allocators' hooks below are called only while they run. */
+extern int nn_region_mode;
 
 /* --- Lifecycle --- */
 
-/* Start a census, while no arena is live (NN_ASSERT).  Returns 0, or -1
- * with no census running when its tables cannot be allocated. */
-int nn_region_census_begin(void);
+/* Start regions in NN_REGION_CENSUS or NN_REGION_COLLECT, while no arena
+ * is live (NN_ASSERT).  Returns 0, or -1 with none running when their
+ * tables cannot be allocated. */
+int nn_region_begin(int mode);
 
-/* End the census and release its tables, after the arena's teardown. */
-void nn_region_census_end(void);
+/* Stop them and release their tables, after the arena's teardown. */
+void nn_region_end(void);
 
 /* --- The allocators' half --- */
 
@@ -149,8 +173,8 @@ void nn_region_record_with(void *const *entry);
 /* --- The evaluator's half --- */
 
 /* Open a region as a force starts, and close the innermost as it ends,
- * after its value is stored or as it throws.  Nothing while no census
- * runs. */
+ * after its value is stored or as it throws.  Nothing while no regions
+ * run. */
 void nn_region_open(void);
 void nn_region_close(void);
 

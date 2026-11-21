@@ -163,6 +163,10 @@ nn_attrset_t *nn_attrset_remove_keys(
  * nn_attrset_free_all. */
 const nn_tracker_t *nn_attrset_tracked(void);
 
+/* Free the sets from place `from` of the tracker on that `keep` refuses,
+ * and close up the rest (nn_tracker_sweep). */
+void nn_attrset_sweep(uint32_t from, nn_tracker_keep_t keep, void *ctx);
+
 /* Bytes a set holds from the allocator: its header, and its keys,
  * positions and values at its capacity. */
 uint64_t nn_attrset_bytes(const nn_attrset_t *set);

@@ -116,7 +116,7 @@ nn_lambda_new(struct nn_env *env, uint32_t body_bc_idx,
         free(lam);
         return NULL;
     }
-    if (nn_region_census) nn_region_tracked(NN_REGION_LAMBDA, lam, g_tracked.count - 1, nn_lambda_bytes(lam));
+    if (nn_region_mode) nn_region_tracked(NN_REGION_LAMBDA, lam, g_tracked.count - 1, nn_lambda_bytes(lam));
     return lam;
 }
 
@@ -144,6 +144,12 @@ void
 nn_lambda_free_all(void)
 {
     nn_tracker_free_all(&g_tracked, lambda_free);
+}
+
+void
+nn_lambda_sweep(uint32_t from, nn_tracker_keep_t keep, void *ctx)
+{
+    nn_tracker_sweep(&g_tracked, from, keep, ctx, lambda_free);
 }
 
 /* --- Accessors --- */

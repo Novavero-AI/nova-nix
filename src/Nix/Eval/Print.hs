@@ -263,9 +263,10 @@ builderText = bytesToTextLossy . BL.toStrict . BB.toLazyByteString
 -- ---------------------------------------------------------------------------
 
 -- | A set or list a print has entered, by the identity upstream's printers
--- remember one by.  Each is a C pointer: the C layer frees nothing before
--- its arena is destroyed, and a print runs inside one evaluation, so a
--- pointer names one set, list or cell for the whole print.
+-- remember one by.  Each is a C pointer, reached from the value the print
+-- was handed, which is older than every force the print runs, so no close
+-- of one frees it ("Nix.Eval.CRegion"), and a pointer names one set, list
+-- or cell for the whole print.
 data Entered
   = -- | A set, by its C set, as upstream remembers a set by its
     -- @Bindings@: every empty set upstream shares is the one

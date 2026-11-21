@@ -84,7 +84,7 @@ alloc_page(uint32_t capacity)
     page->used = 0;
     page->capacity = capacity;
     /* Every page made becomes the one allocation bumps from. */
-    if (nn_region_census) nn_region_block(NN_REGION_ENV_PAGE, page->data, capacity, 1);
+    if (nn_region_mode) nn_region_block(NN_REGION_ENV_PAGE, page->data, capacity, 1);
     return page;
 }
 
@@ -387,7 +387,7 @@ void
 nn_env_resolve_with(void **with_scopes, uint32_t idx, void *set)
 {
     with_scopes[idx] = set;
-    if (nn_region_census) nn_region_record_with(&with_scopes[idx]);
+    if (nn_region_mode) nn_region_record_with(&with_scopes[idx]);
 }
 
 /* --- Accessors --- */

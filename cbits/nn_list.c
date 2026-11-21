@@ -37,7 +37,7 @@ nn_list_new(nn_list_t **out, uint32_t count)
         free(list);
         return -1;
     }
-    if (nn_region_census) nn_region_list(list, g_tracked.count - 1, NULL);
+    if (nn_region_mode) nn_region_list(list, g_tracked.count - 1, NULL);
 
     *out = list;
     return 0;
@@ -58,7 +58,7 @@ nn_list_drop(nn_list_t **out, const nn_list_t *list, uint32_t n)
         free(rest);
         return -1;
     }
-    if (nn_region_census) nn_region_list(rest, g_tracked.count - 1, list);
+    if (nn_region_mode) nn_region_list(rest, g_tracked.count - 1, list);
 
     *out = rest;
     return 0;
@@ -68,6 +68,12 @@ void
 nn_list_free_all(void)
 {
     nn_tracker_free_all(&g_tracked, free);
+}
+
+void
+nn_list_sweep(uint32_t from, nn_tracker_keep_t keep, void *ctx)
+{
+    nn_tracker_sweep(&g_tracked, from, keep, ctx, free);
 }
 
 /* --- Access --- */

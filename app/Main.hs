@@ -41,7 +41,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Eval (AttrSet, Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetLookup, compileSource, deepForce, evalBytecode, evalParsed, force, readThunkValue)
 import Nix.Eval.AttrPath (selectAttrPath)
-import Nix.Eval.CRegion (RegionCensus (..), regionFigures, renderRegionFigures)
+import Nix.Eval.CRegion (Regions (..), regionFigures, renderRegionFigures)
 import Nix.Eval.CStats (CRoot (..), countSites, renderCensus, takeCensus, valueRoots)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
@@ -311,7 +311,7 @@ evalPolicyFor opts config =
 -- the resolved spelling; upstream allows only the given one and refuses
 -- the read, which is a mismatch between its own allow list and walk, not
 -- a rule worth keeping.
-withCliSession :: CliOpts -> NixConfig -> StoreDir -> FilePath -> FilePath -> RegionCensus -> (EvalState -> IO a) -> IO a
+withCliSession :: CliOpts -> NixConfig -> StoreDir -> FilePath -> FilePath -> Regions -> (EvalState -> IO a) -> IO a
 withCliSession opts config storeDir dataDir baseDir regions action = do
   let policy = evalPolicyFor opts config
   -- Read whatever the policy, so a NIX_PATH with no UTF-8 form is refused
@@ -358,7 +358,7 @@ evalFile config opts storeDir dataDir rawFilePath = do
   case parseForEval opts config (takeDirectory filePath) (SourceFile (T.pack filePath)) source of
     Left err -> failSource err
     Right parsed -> do
-      regions <- regionCensusWanted
+      regions <- regionsWanted
       withCliSession opts config storeDir dataDir (takeDirectory filePath) regions $ \st -> do
         result <- runEvalIOTraced st (evalRooted (optStrict opts) (evalBaseEnv st) parsed)
         case result of
@@ -374,7 +374,7 @@ evalExpr config opts storeDir dataDir source = do
   case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
     Left err -> failSource err
     Right parsed -> do
-      regions <- regionCensusWanted
+      regions <- regionsWanted
       withCliSession opts config storeDir dataDir cwd regions $ \st -> do
         result <- runEvalIOTraced st (evalRooted (optStrict opts) (evalBaseEnv st) parsed)
         case result of
@@ -431,10 +431,17 @@ regionCensusVar = "NOVA_NIX_REGION_STATS"
 regionCensusTarget :: IO (Maybe BS.ByteString)
 regionCensusTarget = mfilter (not . BS.null) <$> configVariable regionCensusVar
 
--- | Whether an evaluation runs a census of regions: when
--- 'regionCensusVar' names a file.
-regionCensusWanted :: IO RegionCensus
-regionCensusWanted = maybe RegionCensusOff (const RegionCensusOn) <$> regionCensusTarget
+-- | What an evaluation runs regions for: a census of them when
+-- 'regionCensusVar' names a file; nothing when 'censusVar' does, since the
+-- census of the C data layer counts everything the evaluation allocated,
+-- which the collector would have freed some of; and the collector
+-- otherwise.
+regionsWanted :: IO Regions
+regionsWanted = wanted <$> regionCensusTarget <*> censusTarget
+  where
+    wanted (Just _) _ = RegionsCensus
+    wanted Nothing (Just _) = RegionsOff
+    wanted Nothing Nothing = RegionsCollect
 
 -- | With 'regionCensusVar' set to a path, write what the session's census
 -- of regions found ("Nix.Eval.CRegion") once an evaluation has
@@ -460,7 +467,7 @@ evalExprAterm config opts storeDir dataDir source = do
   cwd <- getCurrentDirectory
   case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
     Left err -> failSource err
-    Right parsed -> withCliSession opts config storeDir dataDir cwd RegionCensusOff $ \st -> do
+    Right parsed -> withCliSession opts config storeDir dataDir cwd RegionsCollect $ \st -> do
       result <- runEvalIOTraced st $ do
         val <- evalParsed (pure (evalBaseEnv st)) parsed
         forceDerivationAttrs val
@@ -517,7 +524,7 @@ evalTarget config opts storeDir dataDir target attrPath action = do
   (baseDir, origin, source) <- loadBuildSource target
   case parseForEval opts config baseDir origin source of
     Left err -> failSource err
-    Right parsed -> withCliSession opts config storeDir dataDir baseDir RegionCensusOff $ \st -> do
+    Right parsed -> withCliSession opts config storeDir dataDir baseDir RegionsCollect $ \st -> do
       result <- runEvalIOTraced st $ do
         root <- evalParsed (pure (evalBaseEnv st)) parsed
         selected <- case attrPath of

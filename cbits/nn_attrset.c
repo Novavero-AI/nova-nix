@@ -89,7 +89,7 @@ static int grow(nn_attrset_t *set)
 
     uint64_t before = nn_attrset_bytes(set);
     set->capacity = new_cap;
-    if (nn_region_census) nn_region_tracked_grew(nn_attrset_bytes(set) - before);
+    if (nn_region_mode) nn_region_tracked_grew(nn_attrset_bytes(set) - before);
     return 0;
 }
 
@@ -136,7 +136,7 @@ static nn_attrset_t *attrset_alloc(uint32_t capacity)
         free(set);
         return NULL;
     }
-    if (nn_region_census)
+    if (nn_region_mode)
         nn_region_tracked(NN_REGION_SET, set, g_tracked.count - 1, nn_attrset_bytes(set));
     return set;
 }
@@ -169,6 +169,11 @@ static void attrset_free(void *object)
 void nn_attrset_free_all(void)
 {
     nn_tracker_free_all(&g_tracked, attrset_free);
+}
+
+void nn_attrset_sweep(uint32_t from, nn_tracker_keep_t keep, void *ctx)
+{
+    nn_tracker_sweep(&g_tracked, from, keep, ctx, attrset_free);
 }
 
 static nn_attrset_t g_empty_set = { NULL, NULL, NULL, 0, 0, 1 };

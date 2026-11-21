@@ -68,7 +68,7 @@ static nn_str_arena_t g_values;
 
 static void block_made(const nn_str_arena_t *arena, const nn_str_block_t *b, int current)
 {
-    if (nn_region_census)
+    if (nn_region_mode)
         nn_region_block(arena == &g_values ? NN_REGION_STR_BLOCK : NN_REGION_CODE_BLOCK,
                         b->data, b->capacity, current);
 }

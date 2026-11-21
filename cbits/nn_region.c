@@ -1,5 +1,5 @@
 /*
- * nn_region.c - A census of regions (nn_region.h).
+ * nn_region.c - Regions: the collector and the census (nn_region.h).
  *
  * Marks are bits the census keeps beside the data layer: a bit per unit
  * of each block (a thunk cell, NN_ENV_ALIGNMENT bytes of an env page,
@@ -14,7 +14,8 @@
  * mark at a close has retired its region, and keeps three of its own: a
  * unit or place it has settled, tenuring or freeing it, one it has freed,
  * and one a close has remembered for a region around, so that it is
- * remembered once.
+ * remembered once.  Collecting, only the collector's are kept, and no
+ * census mark runs.
  *
  * The address index maps each NN_REGION_UNIT_BYTES of address space a
  * block covers to that block.  Every block is at least a unit, so no
@@ -215,7 +216,7 @@ typedef enum { AGE_YOUNGER, AGE_OLDER, AGE_OUTSIDE } age_t;
 
 /* --- State --- */
 
-int nn_region_census = 0;
+int nn_region_mode = NN_REGION_OFF;
 
 static struct {
     int failed;
@@ -279,11 +280,26 @@ static struct {
 } c;
 
 /* The bytes each tenure collector lets closes inside a region tenure
- * before a close marks the region whole, or 0 for none but the outermost. */
+ * before a close marks the region whole, or 0 for none but the outermost.
+ * The collector is the one with NN_REGION_COLLECTOR_BUDGET. */
 #define NN_REGION_MIB ((uint64_t)1 << 20)
+#define NN_REGION_COLLECTOR        1
+#define NN_REGION_COLLECTOR_BUDGET NN_REGION_MIB
 static const uint64_t tenure_budgets[NN_REGION_TENURE_VARIANTS] = {
-    0, NN_REGION_MIB, 16 * NN_REGION_MIB, 256 * NN_REGION_MIB
+    0, NN_REGION_COLLECTOR_BUDGET, 16 * NN_REGION_MIB, 256 * NN_REGION_MIB
 };
+
+/* Whether regions run for the collector, and whether tenure collector v
+ * runs: every one under a census, only the collector collecting. */
+static int collecting(void)
+{
+    return nn_region_mode == NN_REGION_COLLECT;
+}
+
+static int active(int v)
+{
+    return !collecting() || v == NN_REGION_COLLECTOR;
+}
 
 static void fail(void)
 {
@@ -335,6 +351,12 @@ static void bits_set(uint8_t *bits, uint64_t from, uint64_t to)
 {
     uint64_t i;
     for (i = from; i < to; i++) bit_set(bits, i);
+}
+
+static void bits_clear(uint8_t *bits, uint64_t from, uint64_t to)
+{
+    uint64_t i;
+    for (i = from; i < to; i++) bits[i / 8] &= (uint8_t)~(1u << (i % 8));
 }
 
 /* Whether any bit from `from` to below `to` is set. */
@@ -646,6 +668,28 @@ static int object_add(uintptr_t object, uint32_t position, int kind, uintptr_t f
     return 0;
 }
 
+/* Take a tracked object out of the table, moving back each slot after it
+ * that its probe passed through it to reach. */
+static void object_remove(uintptr_t object)
+{
+    uint32_t cap = c.object_cap;
+    uint32_t hole = (uint32_t)(object_slot(c.objects, cap, object) - c.objects), next = hole;
+    if (c.objects[hole].object == 0) return;
+    for (;;) {
+        uint32_t home;
+        next = (next + 1) & (cap - 1);
+        if (c.objects[next].object == 0) break;
+        home = hash((uint64_t)c.objects[next].object >> 4, cap);
+        /* A slot whose probe starts after the hole and at or before it
+         * never passed through the hole. */
+        if (hole <= next ? (hole < home && home <= next) : (hole < home || home <= next)) continue;
+        c.objects[hole] = c.objects[next];
+        hole = next;
+    }
+    c.objects[hole].object = 0;
+    c.object_used--;
+}
+
 /* Grow an array of bits from `old_bytes` to `bytes`, the new ones clear. */
 static int bits_grow(uint8_t **bits, size_t old_bytes, size_t bytes)
 {
@@ -673,6 +717,7 @@ static int places_reserve(places_t *places, uint32_t need)
         return -1;
     for (v = 0; v < NN_REGION_TENURE_VARIANTS; v++) {
         tenure_bits_t *t = &places->tenure[v];
+        if (!active(v)) continue;
         if (bits_grow(&t->tenured, old_bytes, bytes) != 0 || bits_grow(&t->freed, old_bytes, bytes) != 0
             || bits_grow(&t->remembered, old_bytes, bytes) != 0)
             return -1;
@@ -719,15 +764,18 @@ static void release(void)
     free(c.heads);
     free(c.live);
     memset(&c, 0, sizeof(c));
-    nn_region_census = 0;
+    nn_region_mode = NN_REGION_OFF;
 }
 
-int nn_region_census_begin(void)
+int nn_region_begin(int mode)
 {
     int k;
     NN_ASSERT(!nn_thunk_live() && !nn_env_live() && !nn_str_live(),
-              "nn_region_census_begin: the arena is live");
+              "nn_region_begin: the arena is live");
+    NN_ASSERT(mode == NN_REGION_CENSUS || mode == NN_REGION_COLLECT, "nn_region_begin: no such mode");
     release();
+    /* The bits a block or a tracked kind gets depend on the mode. */
+    nn_region_mode = mode;
     c.units = units_new(NN_REGION_INITIAL);
     c.objects = (object_slot_t *)calloc(NN_REGION_INITIAL, sizeof(object_slot_t));
     if (!c.units || !c.objects) {
@@ -739,11 +787,10 @@ int nn_region_census_begin(void)
     for (k = 0; k < NN_REGION_BUMP_KINDS; k++) c.current[k] = NN_REGION_NONE;
     c.last = NN_REGION_NONE;
     c.tv = -1;
-    nn_region_census = 1;
     return 0;
 }
 
-void nn_region_census_end(void)
+void nn_region_end(void)
 {
     release();
 }
@@ -783,6 +830,7 @@ void nn_region_block(int kind, const char *data, uint64_t capacity, int current)
         }
         for (v = 0; v < NN_REGION_TENURE_VARIANTS; v++) {
             tenure_bits_t *t = &b->tenure[v];
+            if (!active(v)) continue;
             t->tenured = bits_new(units);
             t->freed = bits_new(units);
             t->remembered = bits_new(units);
@@ -838,17 +886,20 @@ static void record(uintptr_t r)
     uintptr_t *records;
     int v;
     if (c.failed || c.frame_count == 0) return;
-    records = (uintptr_t *)reserve(c.records, &c.record_cap, sizeof(uintptr_t), c.record_count + 1);
-    if (!records) {
-        fail();
-        return;
+    if (!collecting()) {
+        records = (uintptr_t *)reserve(c.records, &c.record_cap, sizeof(uintptr_t), c.record_count + 1);
+        if (!records) {
+            fail();
+            return;
+        }
+        c.records = records;
+        c.records[c.record_count++] = r;
+        if (c.record_count > c.totals[NN_REGION_TOTAL_RECORDS])
+            c.totals[NN_REGION_TOTAL_RECORDS] = c.record_count;
     }
-    c.records = records;
-    c.records[c.record_count++] = r;
-    if (c.record_count > c.totals[NN_REGION_TOTAL_RECORDS])
-        c.totals[NN_REGION_TOTAL_RECORDS] = c.record_count;
     for (v = 0; v < NN_REGION_TENURE_VARIANTS; v++) {
         tenure_t *t = &c.t[v];
+        if (!active(v)) continue;
         records = (uintptr_t *)reserve(t->records, &t->record_cap, sizeof(uintptr_t), t->record_count + 1);
         if (!records) {
             fail();
@@ -1087,7 +1138,10 @@ static void survive(uint64_t bytes, int died, const tenure_bits_t *t, uint64_t i
             if (bit_get(t[v].freed, i)) resurrect(v, bytes);
         return;
     }
-    if (bit_get(t[c.tv].freed, i)) resurrect(c.tv, bytes);
+    if (bit_get(t[c.tv].freed, i)) {
+        NN_ASSERT(!collecting(), "nn_region_close: the collector's mark reached what it freed");
+        resurrect(c.tv, bytes);
+    }
 }
 
 /* Whether a tenure collector's mark under way passes over a unit or place
@@ -1161,6 +1215,7 @@ static void reach_tracked(int kind, const void *object)
     places_t *places = &c.places[tracked];
     uint64_t bytes;
     if (slot->object == 0 || slot->kind != tracked) {
+        NN_ASSERT(!collecting(), "nn_region_close: the collector's mark reached a tracked object it holds no place for");
         c.totals[NN_REGION_TOTAL_UNPLACED]++;
         return;
     }
@@ -1525,6 +1580,42 @@ static void retire(const frame_t *f, uint64_t *dead)
     }
 }
 
+/* The collector's sweep of a tracked kind's places from `from` to below
+ * `end`, the closing region's, once its close has settled them: it frees
+ * the objects whose places it freed, and the rest close up in order,
+ * tenured, behind the places before `from`.  No close remembers one of
+ * them: a pointer into the region a close inside found is remembered
+ * for the region itself, whose mark has forgotten it, reading it first
+ * unless the mark is of the whole. */
+static int sweep_keep(void *ctx, void *object, uint32_t place, uint32_t kept_at)
+{
+    const tenure_bits_t *bits = (const tenure_bits_t *)ctx;
+    if (bit_get(bits->freed, place)) {
+        object_remove((uintptr_t)object);
+        return 0;
+    }
+    object_slot(c.objects, c.object_cap, (uintptr_t)object)->position = kept_at;
+    return 1;
+}
+
+static void sweep(int kind, uint32_t from, uint32_t end)
+{
+    tenure_bits_t *bits = &c.places[kind].tenure[NN_REGION_COLLECTOR];
+    uint32_t kept;
+    NN_ASSERT(!bits_any(bits->remembered, from, end), "nn_region_close: a place the sweep moves is remembered");
+    switch (kind) {
+    case NN_REGION_SET:        nn_attrset_sweep(from, sweep_keep, bits); break;
+    case NN_REGION_LIST:       nn_list_sweep(from, sweep_keep, bits); break;
+    case NN_REGION_LAMBDA:     nn_lambda_sweep(from, sweep_keep, bits); break;
+    case NN_REGION_PRIMOP_APP: nn_primop_app_sweep(from, sweep_keep, bits); break;
+    default:                   nn_ctxstr_sweep(from, sweep_keep, bits); break;
+    }
+    kept = tracker_count(kind);
+    bits_set(bits->tenured, from, kept);
+    bits_clear(bits->tenured, kept, end);
+    bits_clear(bits->freed, from, end);
+}
+
 /* Tenure collector v's retirement of every block the closing region
  * allocated in, and every tracked object it made (tenure_retire_block). */
 static void tenure_retire(const frame_t *f, tenure_action_t action, int v, uint64_t *dead, uint64_t *reached)
@@ -1550,6 +1641,7 @@ static void tenure_retire(const frame_t *f, tenure_action_t action, int v, uint6
         else
             bits_tenure(places->marks, places->died, &places->tenure[v], action == TENURE_FULL, f->tracked[k], end,
                         reached);
+        if (collecting()) sweep(k, f->tracked[k], end);
     }
 }
 
@@ -1652,7 +1744,7 @@ static void pass_tenure_records(const frame_t *f, const frame_t *parent, int v)
 static tenure_action_t tenure_action(const frame_t *f, const frame_t *parent, int v, uint64_t allocated)
 {
     if (allocated < nn_region_threshold_bytes(NN_REGION_TENURE_THRESHOLD)) return TENURE_NONE;
-    if (!parent) return TENURE_OUTERMOST;
+    if (!parent) return collecting() ? TENURE_FULL : TENURE_OUTERMOST;
     if (tenure_budgets[v] != 0 && f->t[v].unchecked >= tenure_budgets[v]) return TENURE_FULL;
     return TENURE_YOUNG;
 }
@@ -1748,7 +1840,7 @@ void nn_region_open(void)
     frame_t *frames, *f;
     uint32_t cap = c.frame_cap;
     int k, v;
-    if (!nn_region_census || c.failed) return;
+    if (!nn_region_mode || c.failed) return;
     frames = (frame_t *)reserve(c.frames, &c.frame_cap, sizeof(frame_t), c.frame_count + 1);
     if (!frames) {
         fail();
@@ -1782,18 +1874,13 @@ void nn_region_open(void)
     if (c.frame_count > c.totals[NN_REGION_TOTAL_DEPTH]) c.totals[NN_REGION_TOTAL_DEPTH] = c.frame_count;
 }
 
-void nn_region_close(void)
+/* A census's close: its own mark, and then every tenure collector's. */
+static void census_close(frame_t *f, frame_t *parent)
 {
-    frame_t *f, *parent;
     uint64_t allocated, tracked, dead[NN_REGION_GRAINS];
     uint32_t g, records;
     tenure_action_t actions[NN_REGION_TENURE_VARIANTS];
     int v;
-    if (!nn_region_census || c.failed) return;
-    NN_ASSERT(c.frame_count > 0, "nn_region_close: no region is open");
-    f = &c.frames[c.frame_count - 1];
-    parent = c.frame_count > 1 ? &c.frames[c.frame_count - 2] : NULL;
-    c.closing = f;
     c.surviving = 0;
     c.surviving_tracked = 0;
     c.entered = 0;
@@ -1820,6 +1907,29 @@ void nn_region_close(void)
     pass_records(f, parent);
     for (v = 0; v < NN_REGION_TENURE_VARIANTS && !c.failed; v++)
         tenure_close(f, parent, actions[v], v, allocated, tracked, dead);
+}
+
+/* The collector's close: its tenure collector's alone, which frees. */
+static void collect_close(frame_t *f, frame_t *parent)
+{
+    uint64_t allocated = allocated_now() - f->allocated;
+    uint64_t tracked = c.tracked_bytes - f->tracked_bytes;
+    tenure_close(f, parent, tenure_action(f, parent, NN_REGION_COLLECTOR, allocated), NN_REGION_COLLECTOR,
+                 allocated, tracked, NULL);
+}
+
+void nn_region_close(void)
+{
+    frame_t *f, *parent;
+    if (!nn_region_mode || c.failed) return;
+    NN_ASSERT(c.frame_count > 0, "nn_region_close: no region is open");
+    f = &c.frames[c.frame_count - 1];
+    parent = c.frame_count > 1 ? &c.frames[c.frame_count - 2] : NULL;
+    c.closing = f;
+    if (collecting())
+        collect_close(f, parent);
+    else
+        census_close(f, parent);
     if (c.failed) return;
     c.closing = NULL;
     c.frame_count--;
@@ -1829,7 +1939,7 @@ void nn_region_close(void)
 
 void nn_region_totals(uint64_t *totals)
 {
-    uint64_t allocated = nn_region_census ? allocated_now() : 0;
+    uint64_t allocated = nn_region_mode ? allocated_now() : 0;
     memcpy(totals, c.totals, sizeof(c.totals));
     totals[NN_REGION_TOTAL_ALLOCATED] = allocated;
     totals[NN_REGION_TOTAL_OUTSIDE] = allocated > c.enclosed ? allocated - c.enclosed : 0;
@@ -1844,7 +1954,7 @@ void nn_region_classes(uint64_t *figures)
  * since the last close. */
 void nn_region_thresholds(uint64_t *figures)
 {
-    uint64_t now = nn_region_census ? allocated_now() : 0;
+    uint64_t now = nn_region_mode ? allocated_now() : 0;
     uint32_t k, g;
     memcpy(figures, c.thresholds, sizeof(c.thresholds));
     for (k = 0; k < NN_REGION_THRESHOLDS; k++) {
@@ -1862,7 +1972,7 @@ uint64_t nn_region_tenure_budget(uint32_t variant)
 
 void nn_region_tenure(uint32_t variant, uint64_t *figures)
 {
-    uint64_t now = nn_region_census ? allocated_now() : 0;
+    uint64_t now = nn_region_mode ? allocated_now() : 0;
     const tenure_t *t;
     uint32_t g;
     if (variant >= NN_REGION_TENURE_VARIANTS) return;

@@ -138,6 +138,10 @@ uint32_t nn_lambda_entry_default(const nn_lambda_t *lam, uint32_t idx);
  * nn_lambda_free_all. */
 const nn_tracker_t *nn_lambda_tracked(void);
 
+/* Free the lambdas from place `from` of the tracker on that `keep`
+ * refuses, and close up the rest (nn_tracker_sweep). */
+void nn_lambda_sweep(uint32_t from, nn_tracker_keep_t keep, void *ctx);
+
 /* Bytes a lambda holds from the allocator: its struct and its formal
  * entries. */
 uint64_t nn_lambda_bytes(const nn_lambda_t *lam);
