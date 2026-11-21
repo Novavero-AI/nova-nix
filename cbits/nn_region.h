@@ -283,6 +283,14 @@ void nn_region_tenure(uint32_t variant, uint64_t *figures);  /* NN_REGION_TENURE
  * a close marks the region whole, or 0 for none but the outermost. */
 uint64_t nn_region_tenure_budget(uint32_t variant);
 
+/* The spans begun since the regions began, and the most the span table
+ * held at once from the close of an outermost region before the last to
+ * the last, which trim it.  Collecting, the table drops the spans that
+ * hold no line, so under a long force whose lines are freed it holds
+ * fewer at once than the force begins. */
+uint32_t nn_region_spans_begun(void);
+uint32_t nn_region_spans_most(void);
+
 /* Collecting, the whole lines of the bump kinds' blocks whose every unit
  * a close freed but which are not free: none, as the collector frees a
  * line once the last unit in it is freed.  0 when not collecting. */

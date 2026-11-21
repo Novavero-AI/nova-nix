@@ -66,6 +66,14 @@
  * or less, so only a larger one looks in vain. */
 #define NN_REGION_REFILL_BLOCKS 4u
 
+/* Collecting, the span table drops the spans that hold no line once it
+ * holds NN_REGION_SPAN_GROWTH times what it kept the last time it did,
+ * and at least NN_REGION_SPAN_FLOOR, so that each drop's scan, at most a
+ * span's lines for each span kept, is paid for by the spans begun since
+ * the last. */
+#define NN_REGION_SPAN_FLOOR  4096u
+#define NN_REGION_SPAN_GROWTH 2u
+
 /* Under AddressSanitizer a freed line is poisoned until a refill hands
  * it out again, so that a read of it fails where a pointer the collector
  * missed reads it. */
@@ -279,12 +287,16 @@ static struct {
     uint32_t    last;               /* the block the last lookup found */
 
     /* The spans an open region's part takes in, oldest first, and each
-     * bump kind's current one: every span while a region is open, and
-     * the current ones alone between. */
+     * bump kind's current one: every span begun since the last close of
+     * an outermost region (spans_trim) that may still hold a line
+     * (spans_drop). */
     span_t     *spans;
     uint32_t    span_count;
     uint32_t    span_cap;
     uint32_t    span_next;          /* the number the next span takes */
+    uint32_t    span_drop_at;       /* the count at which spans_drop runs */
+    uint32_t    span_most;          /* the most it has held since the last trim */
+    uint32_t    span_most_ended;    /* the most it held before the last trim */
     uint32_t    current_span[NN_REGION_BUMP_KINDS];
 
     /* Each bump kind's blocks with free lines, and where its next refill
@@ -904,6 +916,34 @@ static void span_stop(int kind, uint64_t cursor)
         free_line(blk, line);
 }
 
+/* Whether a span holds a line: one that carries its number and is not
+ * free, or the part of a line past its block's last whole one, which is
+ * never freed.  A span that holds none gives a close nothing to retire,
+ * its lines being free or another span's. */
+static int span_holds(const span_t *s)
+{
+    const block_t *blk = &c.blocks[s->block];
+    uint64_t line, last = (s->limit + NN_REGION_LINE - 1) / NN_REGION_LINE;
+    for (line = s->start / NN_REGION_LINE; line < last; line++)
+        if (blk->spans[line] == s->number && (line >= blk->lines || !bit_get(blk->free, line))) return 1;
+    return 0;
+}
+
+/* Drop from the table every span but the current ones that holds no
+ * line, in order, and run again once it holds NN_REGION_SPAN_GROWTH
+ * times what it keeps.  It runs only as a span begins, where no pointer
+ * into the table is held. */
+static void spans_drop(void)
+{
+    uint32_t i, kept = 0;
+    uint64_t next;
+    for (i = 0; i < c.span_count; i++)
+        if (span_current(&c.spans[i]) || span_holds(&c.spans[i])) c.spans[kept++] = c.spans[i];
+    c.span_count = kept;
+    next = (uint64_t)kept * NN_REGION_SPAN_GROWTH;
+    c.span_drop_at = next < NN_REGION_SPAN_FLOOR ? NN_REGION_SPAN_FLOOR : next > UINT32_MAX ? UINT32_MAX : (uint32_t)next;
+}
+
 /* Start a span of block b from `start` to below `limit` bytes in, as its
  * kind's current one when `current`, the previous one ended first; one
  * that is not current is a block's single object, ended at its limit.
@@ -914,10 +954,12 @@ static int span_begin(uint32_t b, uint64_t start, uint64_t limit, int current)
     span_t *spans, *span;
     uint64_t line, last;
     if (current) span_stop(blk->kind, cursor_of(blk->kind));
+    if (collecting() && c.span_count >= c.span_drop_at) spans_drop();
     spans = (span_t *)reserve(c.spans, &c.span_cap, sizeof(span_t), c.span_count + 1);
     if (!spans || c.span_next == NN_REGION_NONE) return -1;
     c.spans = spans;
     span = &c.spans[c.span_count++];
+    if (c.span_count > c.span_most) c.span_most = c.span_count;
     span->number = c.span_next++;
     span->block = b;
     span->start = start;
@@ -1014,14 +1056,18 @@ int nn_region_refill(int kind, uint64_t cursor, uint64_t need, const char **data
     return -1;
 }
 
-/* Between regions no part takes a span in, so only the current ones are
- * kept. */
+/* As an outermost region closes no part takes a span in, so only the
+ * current ones are kept, spans_drop runs again from its floor, and the
+ * stretch since the last trim ends with the most spans it held. */
 static void spans_trim(void)
 {
     uint32_t i, kept = 0;
     for (i = 0; i < c.span_count; i++)
         if (span_current(&c.spans[i])) c.spans[kept++] = c.spans[i];
     c.span_count = kept;
+    c.span_drop_at = NN_REGION_SPAN_FLOOR;
+    c.span_most_ended = c.span_most;
+    c.span_most = kept;
 }
 
 /* --- Lifecycle --- */
@@ -1087,6 +1133,7 @@ int nn_region_begin(int mode)
     c.unit_cap = NN_REGION_INITIAL;
     c.object_cap = NN_REGION_INITIAL;
     for (k = 0; k < NN_REGION_BUMP_KINDS; k++) c.current_span[k] = NN_REGION_NONE;
+    c.span_drop_at = NN_REGION_SPAN_FLOOR;
     c.last = NN_REGION_NONE;
     c.tv = -1;
     return 0;
@@ -1935,7 +1982,8 @@ static void retire_span(const span_t *s, uint64_t from, uint64_t *dead)
 }
 
 /* The spans a region's part takes in: the one each bump kind bumped from
- * as it opened, from where the cursor was, and every one after. */
+ * as it opened, from where the cursor was, and every one after.  One the
+ * table no longer keeps holds no line, so its part is empty. */
 static const span_t *opening_span(const frame_t *f, int kind)
 {
     return f->current_span[kind] == NN_REGION_NONE ? NULL : span_numbered(f->current_span[kind]);
@@ -2366,6 +2414,16 @@ void nn_region_thresholds(uint64_t *figures)
 uint64_t nn_region_tenure_budget(uint32_t variant)
 {
     return variant < NN_REGION_TENURE_VARIANTS ? tenure_budgets[variant] : 0;
+}
+
+uint32_t nn_region_spans_begun(void)
+{
+    return c.span_next;
+}
+
+uint32_t nn_region_spans_most(void)
+{
+    return c.span_most_ended;
 }
 
 uint64_t nn_region_lines_lost(void)
