@@ -2152,7 +2152,8 @@ testRegionCollector = do
       takesNoMore "the collector hands out again the lines a force's cells, envs and strings took once nothing reaches them, so most of what forcing more of them allocates comes from lines it freed" id,
       takesNoMore "and so does a force whose region holds every one of them" nested,
       losesNoLine "a line that sibling forces share is freed once both have freed their part of it" id,
-      losesNoLine "and so is one inside a force whose region holds every one of them" nested
+      losesNoLine "and so is one inside a force whose region holds every one of them" nested,
+      holdsFewerSpans "under one force around them all, the span table drops the spans that hold no line, so it holds fewer at once than the forces begin"
     ]
   where
     leavesNoMore name wrap =
@@ -2195,6 +2196,25 @@ testRegionCollector = do
         pure $
           assertEqual "each force counted its cells" (Right (Just (200 * siblingCells))) (countOf answer)
             `andThen` assertEqual "lines whose every unit is freed but that are not free" 0 lost
+    -- Without the drop, the table holds every span begun since the last
+    -- close outside every region, so the peak the force's own close ends
+    -- (nn_region_spans_most) nears what the forces began.
+    holdsFewerSpans name =
+      runTestM name $ do
+        tmpBase <- getTemporaryDirectory
+        before <- c_nn_region_spans_begun
+        answer <- evalNixIO tmpBase (nested (siblings manySiblings))
+        begun <- subtract before <$> c_nn_region_spans_begun
+        most <- c_nn_region_spans_most
+        pure $
+          assertEqual "each force counted its cells" (Right (Just (fromIntegral manySiblings * siblingCells))) (countOf answer)
+            `andThen` if 2 * most < begun
+              then Pass
+              else Fail ("the table held " <> T.pack (show most) <> " spans at once, and the forces began " <> T.pack (show begun))
+    -- Enough forces to begin spans many times the table's floor
+    -- (NN_REGION_SPAN_FLOOR in cbits/nn_region.c).
+    manySiblings :: Int
+    manySiblings = 20000
     countOf = fmap (\case VInt n -> Just n; _ -> Nothing)
     nested source = "let total = " <> source <> "; in total"
     -- Forces one after another, each of a list of siblingCells cells it
@@ -2265,6 +2285,15 @@ foreign import ccall unsafe "nn_str_arena_bytes"
 -- | The collector's lines left all freed but not free (nn_region.h).
 foreign import ccall unsafe "nn_region_lines_lost"
   c_nn_region_lines_lost :: IO Word64
+
+-- | The spans begun since the regions began, and the most the span table
+-- held at once between the last two closes outside every region
+-- (nn_region.h).
+foreign import ccall unsafe "nn_region_spans_begun"
+  c_nn_region_spans_begun :: IO Word32
+
+foreign import ccall unsafe "nn_region_spans_most"
+  c_nn_region_spans_most :: IO Word32
 
 -- | What evaluating a source answered, the sets it made, by the sites'
 -- counts, and the sets it left allocated, by the census's before and
