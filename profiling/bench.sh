@@ -21,13 +21,21 @@
 # environment overrides how many attributes one evaluator process visits
 # during a walk before the next process resumes it.
 #
+# SCOREBOARD_MEMORY_MAX in the environment bounds the memory of what the
+# script measures, the evaluators and the memory suite's benchmark, as a
+# cgroup's memory.max takes it (12G, say), in every mode.  Run in a cgroup
+# v2 that systemd delegated to it (Delegate=yes), the script keeps itself
+# in a leaf of its own and runs each of them in a sibling whose
+# memory.max is the bound, so that the kernel's OOM killer, once they
+# reach it, ends one of them and never the script measuring them.
+# Without it, a pass run inside a cgroup v2 reports that cgroup's.
+#
 # --resources then takes a completed walk of the same label and forces
 # every attribute that evaluated in one nova-nix process, under +RTS -s,
 # for its max residency and GC productivity, with /usr/bin/time for its OS
 # peak RSS.  It runs apart from the walk so that a pass that exhausts the
-# machine costs only its own figures.  Run inside a cgroup v2 with a
-# memory.max, it reports that bound and the processes the kernel's OOM
-# killer ended during the pass.
+# machine costs only its own figures.  Under a memory bound it reports that
+# bound and the processes the kernel's OOM killer ended during the pass.
 #
 # --memory measures where one evaluation's memory goes, over a slice of the
 # walk: its first MEMORY_SLICE attributes (2000 unless the environment says
@@ -135,6 +143,10 @@ SCOREBOARD_UPSTREAM_PID=""
 SCOREBOARD_UPSTREAM_VERSION=""
 SCOREBOARD_NOVA=()
 SCOREBOARD_UPSTREAM=()
+# The cgroup bound_evaluators bounds the evaluators in, and the command
+# words that start an evaluator there.
+SCOREBOARD_BOUND_CGROUP=""
+SCOREBOARD_BOUNDED=()
 
 # ----------------------------------------------------------------
 # Build
@@ -188,18 +200,57 @@ own_cgroup() {
   awk -F: '$1 == "0" && $2 == "" { print "/sys/fs/cgroup" $3 }' /proc/self/cgroup
 }
 
-# The processes the kernel's OOM killer has ended in this process's cgroup,
-# from the oom_kill line of its memory.events; nothing without one.
+# The cgroup whose memory.max bounds the evaluators and whose memory.events
+# counts their OOM kills: the one bound_evaluators made, or else this
+# process's own.
+bound_cgroup() {
+  if [[ -n "$SCOREBOARD_BOUND_CGROUP" ]]; then
+    echo "$SCOREBOARD_BOUND_CGROUP"
+  else
+    own_cgroup
+  fi
+}
+
+# With SCOREBOARD_MEMORY_MAX set, bound the evaluators alone: move this
+# process into a leaf, harness, of the cgroup systemd delegated to it, and
+# give a sibling, bounded, that memory.max and no swap, which each
+# evaluator moves itself into as it starts (SCOREBOARD_BOUNDED).  A cgroup
+# v2 that enables a controller for its children holds no process of its
+# own, so this process moves first, while it has no child.  Writing 0 to
+# cgroup.procs moves the process that writes it.  Returns 2 when the bound
+# cannot be set.
+bound_evaluators() {
+  local cg
+  [[ -n "${SCOREBOARD_MEMORY_MAX:-}" ]] || return 0
+  cg=$(own_cgroup)
+  if [[ -z "$cg" ]] || ! mkdir -p "$cg/harness" "$cg/bounded" \
+    || ! echo 0 > "$cg/harness/cgroup.procs" \
+    || ! echo +memory > "$cg/cgroup.subtree_control" \
+    || ! echo "$SCOREBOARD_MEMORY_MAX" > "$cg/bounded/memory.max"; then
+    echo "SCOREBOARD_MEMORY_MAX needs a cgroup v2 delegated to this process (systemd's Delegate=yes)" >&2
+    return 2
+  fi
+  if [[ -e "$cg/bounded/memory.swap.max" ]] && ! echo 0 > "$cg/bounded/memory.swap.max"; then
+    echo "SCOREBOARD_MEMORY_MAX cannot keep the evaluators out of swap" >&2
+    return 2
+  fi
+  SCOREBOARD_BOUND_CGROUP="$cg/bounded"
+  # shellcheck disable=SC2016 # $0 and $@ are the inner shell's.
+  SCOREBOARD_BOUNDED=(sh -c 'echo 0 > "$0/cgroup.procs" && exec "$@"' "$SCOREBOARD_BOUND_CGROUP")
+}
+
+# The processes the kernel's OOM killer has ended under the bound, from
+# the oom_kill line of its cgroup's memory.events; nothing without one.
 cgroup_oom_kills() {
   local dir
-  dir=$(own_cgroup)
+  dir=$(bound_cgroup)
   [[ -n "$dir" && -r "$dir/memory.events" ]] || return 0
   awk '$1 == "oom_kill" { print $2 }' "$dir/memory.events"
 }
 
 # Why a process ran out of memory, or nothing when it did not: its heap
 # reached the -M cap, or the kernel's OOM killer ended it, which shows as
-# SIGKILL with an oom_kill counted in this cgroup since the process began.
+# SIGKILL with an oom_kill counted under the bound since the process began.
 #   memory_exhaustion <status> <oom-kills-before-it-began>
 memory_exhaustion() {
   local status="$1" before="$2" after
@@ -341,9 +392,8 @@ walk_both() {
 
 # One evaluator process over a walk, measured: the units it visited and
 # the drvPaths it evaluated, its exit status, wall time and OS peak RSS,
-# and inside a cgroup the cgroup's memory.max and the OOM kills during the
-# pass, which it can count only because a kill ends the evaluator and
-# leaves this script running (systemd's OOMPolicy=continue).
+# and under a bound (bound_cgroup) its memory.max and the OOM kills during
+# the pass.
 #   measured_pass <out-dir> <settled-json> <budget-or-empty> <walk-file> <evaluator command...>
 measured_pass() {
   local out_dir="$1" settled="$2" budget="$3" walk="$4"
@@ -355,7 +405,7 @@ measured_pass() {
     Linux) timer=(/usr/bin/time -f '%M %e' -o "$out_dir/peak-rss.txt") ;;
     Darwin) timer=(/usr/bin/time -l -o "$out_dir/peak-rss.txt") ;;
   esac
-  cgroup=$(own_cgroup)
+  cgroup=$(bound_cgroup)
   if [[ -n "$cgroup" && -r "$cgroup/memory.max" ]]; then
     cat "$cgroup/memory.max" > "$out_dir/memory-max.txt"
   fi
@@ -1041,6 +1091,7 @@ scoreboard_prepare() {
     echo "SCOREBOARD_BUDGET must be a positive number of attributes, not '${SCOREBOARD_BUDGET:-}'" >&2
     return 2
   fi
+  bound_evaluators || return
   nova_bin=$(cd "$REPO_ROOT" && cabal list-bin -v0 exe:nova-nix)
   if [[ ! -x "$nova_bin" ]]; then
     echo "no nova-nix build at $nova_bin; build it, or pass --build" >&2
@@ -1052,10 +1103,11 @@ scoreboard_prepare() {
   # A fresh cache for each evaluator, so that a fetch during evaluation is
   # a fetch and never a hit an earlier run left.
   export XDG_CACHE_HOME="$SCOREBOARD_SCRATCH/cache"
-  SCOREBOARD_NOVA=("$nova_bin" eval --nix-path "nixpkgs=$NIXPKGS_PATH" --nix-path "nix=$REPO_ROOT/data/nix")
+  SCOREBOARD_NOVA=(${SCOREBOARD_BOUNDED[@]+"${SCOREBOARD_BOUNDED[@]}"} "$nova_bin" eval
+    --nix-path "nixpkgs=$NIXPKGS_PATH" --nix-path "nix=$REPO_ROOT/data/nix")
   if command -v nix-instantiate > /dev/null 2>&1; then
     SCOREBOARD_UPSTREAM_VERSION=$(nix-instantiate --version)
-    SCOREBOARD_UPSTREAM=(nix-instantiate --eval --read-write-mode
+    SCOREBOARD_UPSTREAM=(${SCOREBOARD_BOUNDED[@]+"${SCOREBOARD_BOUNDED[@]}"} nix-instantiate --eval --read-write-mode
       --option allow-import-from-derivation false -I "nixpkgs=$NIXPKGS_PATH")
   fi
 }
@@ -1107,7 +1159,8 @@ run_resources() {
 }
 
 # The attrset benchmark over the census's reached sets, under each
-# collector, into <attrset-dir>/<representation>-<collector>.txt.
+# collector, into <attrset-dir>/<representation>-<collector>.txt, under the
+# bound as the evaluators are.
 #   attrset_benchmark <bench-binary> <census-file> <attrset-dir>
 attrset_benchmark() {
   local bench="$1" census="$2" dir="$3" representation collector
@@ -1119,7 +1172,7 @@ attrset_benchmark() {
       rts=()
       [[ "$collector" == nonmoving ]] && rts=(+RTS -xn -RTS)
       echo "attrset-memory: $representation sets under the $collector collector"
-      "$bench" "$representation" "$dir/sizes.txt" ${rts[@]+"${rts[@]}"} \
+      ${SCOREBOARD_BOUNDED[@]+"${SCOREBOARD_BOUNDED[@]}"} "$bench" "$representation" "$dir/sizes.txt" ${rts[@]+"${rts[@]}"} \
         > "$dir/$representation-$collector.txt" 2> "$dir/$representation-$collector.err" \
         || echo "attrset-memory: $representation under $collector exited $?" >&2
     done

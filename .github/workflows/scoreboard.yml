@@ -93,19 +93,22 @@ jobs:
       NIX_VERSION: ${{ matrix.nix }}
       NIXPKGS_REV: ${{ matrix.rev }}
       LABEL: nixpkgs-${{ matrix.channel }}
-      # The walk and the resource pass each run in a transient systemd
-      # scope whose MemoryMax keeps them below the 16 GB of RAM a hosted
-      # runner has for a public repository, with 4 GB left for the system,
-      # the runner itself and the Nix daemon: at the bound the kernel's OOM
-      # killer ends an evaluator, and the runner stays up.
-      # OOMPolicy=continue keeps bench.sh, in the same scope, running to
-      # handle the kill, where systemd would otherwise stop the whole scope,
-      # and MemorySwapMax=0 makes the bound one of memory rather than of
-      # memory and swap.  The runner's passwordless sudo creates the scope
-      # and --uid runs bench.sh in it as the runner user.  The runner's
-      # sudoers refuses -E and sudo resets the environment, so --setenv
-      # passes on what the scope's processes read from the step: PATH, for
-      # the toolchain, and NIXPKGS_PATH.
+      # bench.sh bounds the evaluators' memory at MEMORY_MAX, its
+      # SCOREBOARD_MEMORY_MAX, below the 16 GB of RAM a hosted runner has
+      # for a public repository, with 4 GB left for the system, the runner
+      # itself and the Nix daemon: at the bound the kernel's OOM killer ends
+      # an evaluator, and the runner stays up.  Each bounded step runs
+      # bench.sh in a transient systemd scope whose cgroup systemd hands to
+      # the runner user (Delegate=yes with User= and Group=), so that
+      # bench.sh keeps itself outside the bound and every evaluator inside
+      # it.  OOMPolicy=continue keeps systemd from stopping the scope when
+      # the kernel ends an evaluator in it.  The runner's passwordless sudo
+      # creates the scope and --uid runs bench.sh in it as the runner user.
+      # The runner's sudoers refuses -E and sudo resets the environment, so
+      # --setenv passes on what bench.sh reads from the step: PATH, for the
+      # toolchain, NIXPKGS_PATH and the bound.  systemd-run expands $ in the
+      # command it runs, as ExecStart= does, so that command names no
+      # variable of its own.
       MEMORY_MAX: 12G
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -201,7 +204,7 @@ jobs:
             grep -qx "regions.tenure.resurrected $budget 0 0" "$memory/regions/regions.txt"
           done
 
-      # The two evaluators walk at once, in one bounded scope.  A process
+      # The two evaluators walk at once, under the one bound.  A process
       # the OOM killer ends there is retried at the attribute it was on, as
       # bench.sh retries a heap overflow.  The Nix installer's
       # NIX_SSL_CERT_FILE is passed on too, for a fetch upstream makes.
@@ -212,9 +215,10 @@ jobs:
         run: |
           sudo systemd-run --scope --quiet \
             --uid="$(id -un)" --gid="$(id -gn)" \
+            -p User="$(id -un)" -p Group="$(id -gn)" -p Delegate=yes -p OOMPolicy=continue \
             --setenv=PATH="$PATH" --setenv=NIXPKGS_PATH="$NIXPKGS" \
             --setenv=NIX_SSL_CERT_FILE="$NIX_SSL_CERT_FILE" \
-            -p MemoryMax="$MEMORY_MAX" -p MemorySwapMax=0 -p OOMPolicy=continue \
+            --setenv=SCOREBOARD_MEMORY_MAX="$MEMORY_MAX" \
             profiling/bench.sh "$LABEL" --scoreboard
 
       - name: Job summary
@@ -245,9 +249,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # One nova-nix process over every attribute that evaluated, in a
-      # bounded scope of its own; bench.sh reports a kill there as the
-      # pass's result.
+      # One nova-nix process over every attribute that evaluated, under the
+      # bound; bench.sh reports a kill there as the pass's result.
       - name: Force what evaluated in one bounded process
         id: resources
         if: inputs.measure != 'memory'
@@ -255,8 +258,9 @@ jobs:
         run: |
           sudo systemd-run --scope --quiet \
             --uid="$(id -un)" --gid="$(id -gn)" \
+            -p User="$(id -un)" -p Group="$(id -gn)" -p Delegate=yes -p OOMPolicy=continue \
             --setenv=PATH="$PATH" --setenv=NIXPKGS_PATH="$NIXPKGS" \
-            -p MemoryMax="$MEMORY_MAX" -p MemorySwapMax=0 -p OOMPolicy=continue \
+            --setenv=SCOREBOARD_MEMORY_MAX="$MEMORY_MAX" \
             profiling/bench.sh "$LABEL" --resources
 
       - name: Resource summary
@@ -281,8 +285,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # The memory suite's walks and passes run in a bounded scope as the
-      # walk does, MEMORY_SLICE passed on with the rest.
+      # The memory suite's walks and passes run under the bound as the walk
+      # does, MEMORY_SLICE passed on with the rest.
       - name: Measure memory over a slice of the walk
         id: memory
         if: inputs.measure == 'memory'
@@ -292,9 +296,10 @@ jobs:
         run: |
           sudo systemd-run --scope --quiet \
             --uid="$(id -un)" --gid="$(id -gn)" \
+            -p User="$(id -un)" -p Group="$(id -gn)" -p Delegate=yes -p OOMPolicy=continue \
             --setenv=PATH="$PATH" --setenv=NIXPKGS_PATH="$NIXPKGS" \
             --setenv=NIX_SSL_CERT_FILE="$NIX_SSL_CERT_FILE" --setenv=MEMORY_SLICE="$MEMORY_SLICE" \
-            -p MemoryMax="$MEMORY_MAX" -p MemorySwapMax=0 -p OOMPolicy=continue \
+            --setenv=SCOREBOARD_MEMORY_MAX="$MEMORY_MAX" \
             profiling/bench.sh "$LABEL" --memory
 
       - name: Memory summary
