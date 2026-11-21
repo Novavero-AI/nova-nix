@@ -249,8 +249,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # One nova-nix process over every attribute that evaluated, under the
-      # bound; bench.sh reports a kill there as the pass's result.
+      # One process of each evaluator over every attribute its walk
+      # evaluated, one after the other under the bound; bench.sh reports a
+      # kill there as that pass's result.
       - name: Force what evaluated in one bounded process
         id: resources
         if: inputs.measure != 'memory'
@@ -270,7 +271,7 @@ jobs:
             if [ -s "profiling/results/$LABEL/resources/resources.md" ]; then
               cat "profiling/results/$LABEL/resources/resources.md"
             else
-              echo "## nova-nix resource pass: $LABEL"
+              echo "## Resource pass: $LABEL"
               echo
               echo "The resource pass did not finish; the uploaded resources hold its output so far."
             fi

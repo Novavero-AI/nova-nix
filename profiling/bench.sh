@@ -32,8 +32,10 @@
 #
 # --resources then takes a completed walk of the same label and forces
 # every attribute that evaluated in one nova-nix process, under +RTS -s,
-# for its max residency and GC productivity, with /usr/bin/time for its OS
-# peak RSS.  It runs apart from the walk so that a pass that exhausts the
+# for its max residency and GC productivity, and, where upstream walked
+# too, every attribute upstream's walk evaluated in one nix-instantiate
+# process, under NIX_SHOW_STATS for its Boehm heap, each with
+# /usr/bin/time for its OS peak RSS.  It runs apart from the walk so that a pass that exhausts the
 # machine costs only its own figures.  Under a memory bound it reports that
 # bound and the processes the kernel's OOM killer ended during the pass.
 #
@@ -422,17 +424,16 @@ measured_pass() {
   echo $((SECONDS - started)) > "$out_dir/seconds.txt"
 }
 
-# Force every attribute the nova-nix walk evaluated, in one process under
-# +RTS -s and the heap cap: the walk again, with every other unit settled.
-#   resource_pass <walk-dir> <out-dir> <nova-nix command...>
+# Force every attribute a walk evaluated, in one process of the evaluator
+# that walked: the walk again, with every other unit settled.
+#   resource_pass <name> <walk-dir> <out-dir> <evaluator command...>
 resource_pass() {
-  local walk_dir="$1" out_dir="$2"
-  shift 2
+  local name="$1" walk_dir="$2" out_dir="$3"
+  shift 3
   mkdir -p "$out_dir"
   awk '$1 != "drv"' "$walk_dir/results.txt" | settled_json > "$out_dir/settled.json"
-  measured_pass "$out_dir" "$out_dir/settled.json" "" "$SCOREBOARD_WALK" \
-    "$@" +RTS -s"$out_dir/rts-stats.txt" "$HEAP_CAP" -RTS
-  echo "resources: one process forced $(($(wc -l < "$out_dir/evaluated.txt"))) attributes," \
+  measured_pass "$out_dir" "$out_dir/settled.json" "" "$SCOREBOARD_WALK" "$@"
+  echo "resources: one $name process forced $(($(wc -l < "$out_dir/evaluated.txt"))) attributes," \
     "exit $(cat "$out_dir/exit.txt"), $(cat "$out_dir/seconds.txt") s"
 }
 
@@ -549,30 +550,43 @@ exit_figure() {
   fi
 }
 
-# The resource pass's figures as Markdown.  A pass the OOM killer ended
-# has no +RTS -s report, which the RTS writes only on its way out.
-#   write_resources <resources-dir> <attributes-the-walk-evaluated>
+# The resource pass's figures as Markdown, nova-nix's and, where upstream
+# walked too, upstream's beside them.  A pass the OOM killer ended has no
+# +RTS -s report or NIX_SHOW_STATS file, which each writes only on its way
+# out.
+#   write_resources <resources-dir> <attributes-nova-nix-evaluated> <attributes-upstream-evaluated-or-empty>
 write_resources() {
-  local resources="$1" evaluated="$2" figure bound=""
+  local resources="$1" evaluated="$2" theirs_evaluated="$3" figure bound=""
+  local upstream="$1/upstream" upstream_column="upstream"
   [[ -s "$resources/memory-max.txt" ]] && bound=$(cat "$resources/memory-max.txt")
-  echo "## nova-nix resource pass: $LABEL"
+  [[ -s "$upstream/exit.txt" ]] && upstream_column="upstream: $SCOREBOARD_UPSTREAM_VERSION"
+  echo "## Resource pass: $LABEL"
   echo
-  echo "One nova-nix process forcing the $evaluated attributes that evaluate, under +RTS $HEAP_CAP:"
+  echo "One process of each evaluator forcing every attribute its walk evaluated, nova-nix under +RTS $HEAP_CAP:"
   echo
-  scoreboard_row "Resources" ""
-  scoreboard_row ":--" "--:"
-  scoreboard_row "attributes forced" "$(($(wc -l < "$resources/evaluated.txt"))) of $evaluated"
-  if [[ "$bound" =~ ^[0-9]+$ ]]; then
-    scoreboard_row "memory bound" "$(awk -v bytes="$bound" 'BEGIN { printf "%.1f", bytes / 1048576 }') MiB, the memory.max of its cgroup"
+  if [[ ! -s "$upstream/exit.txt" ]]; then
+    echo "No upstream pass ran, so its column is empty."
+    echo
   fi
-  scoreboard_row "exit status" "$(exit_figure "$resources" "$resources/err")"
+  scoreboard_row "Resources" "nova-nix" "$upstream_column"
+  scoreboard_row ":--" "--:" "--:"
+  scoreboard_row "attributes forced" "$(($(wc -l < "$resources/evaluated.txt"))) of $evaluated" \
+    "$( [[ -s "$upstream/exit.txt" ]] && echo "$(($(wc -l < "$upstream/evaluated.txt"))) of $theirs_evaluated" )"
+  if [[ "$bound" =~ ^[0-9]+$ ]]; then
+    scoreboard_row "memory bound" "$(awk -v bytes="$bound" 'BEGIN { printf "%.1f", bytes / 1048576 }') MiB, the memory.max of the evaluators' cgroup" ""
+  fi
+  scoreboard_row "exit status" "$(exit_figure "$resources" "$resources/err")" \
+    "$( [[ -s "$upstream/exit.txt" ]] && exit_figure "$upstream" "$upstream/err" )"
   figure=$(rts_figure "$resources/rts-stats.txt" residency)
-  scoreboard_row "max residency" "$(figure_or "$figure" MiB "not reported")"
+  scoreboard_row "max residency" "$(figure_or "$figure" MiB "not reported")" ""
   figure=$(rts_figure "$resources/rts-stats.txt" productivity)
-  scoreboard_row "GC productivity" "${figure:-not reported}"
-  figure=$(peak_rss_mib "$resources/peak-rss.txt")
-  scoreboard_row "OS peak RSS" "$(figure_or "$figure" MiB "not measured on this platform")"
-  scoreboard_row "wall time" "$(cat "$resources/seconds.txt") s"
+  scoreboard_row "GC productivity" "${figure:-not reported}" ""
+  figure=$(mib "$(upstream_stat "$upstream/nix-stats.json" .gc.heapSize)")
+  scoreboard_row "Boehm heap" "" "$( [[ -s "$upstream/exit.txt" ]] && echo "${figure:-not reported}" )"
+  scoreboard_row "OS peak RSS" "$(figure_or "$(peak_rss_mib "$resources/peak-rss.txt")" MiB "not measured on this platform")" \
+    "$(figure_or "$(peak_rss_mib "$upstream/peak-rss.txt")" MiB "")"
+  scoreboard_row "wall time" "$(cat "$resources/seconds.txt") s" \
+    "$( [[ -s "$upstream/seconds.txt" ]] && echo "$(cat "$upstream/seconds.txt") s" )"
 }
 
 # The scoreboard as Markdown, which a job summary renders as it stands.
@@ -1134,12 +1148,15 @@ run_scoreboard() {
   [[ "$walks_complete" == true ]]
 }
 
-# The resource pass over the label's nova-nix walk, its figures written to
-# resources/resources.md.  The pass settles every unit the walk did not
-# evaluate, so it needs a walk that settled them all: one that stopped
-# would leave the units it never reached for the pass to begin.
+# The resource pass over the label's nova-nix walk and, with
+# nix-instantiate on PATH and an upstream walk that settled every unit,
+# over upstream's, one after the other under the same bound, its figures
+# written to resources/resources.md.  A pass settles every unit its walk
+# did not evaluate, so it needs a walk that settled them all: one that
+# stopped would leave the units it never reached for the pass to begin.
 run_resources() {
-  local walk="$RESULTS_DIR/nova-nix" resources="$RESULTS_DIR/resources"
+  local walk="$RESULTS_DIR/nova-nix" theirs="$RESULTS_DIR/upstream" resources="$RESULTS_DIR/resources"
+  local theirs_evaluated=""
   scoreboard_prepare || return
   if [[ ! -s "$walk/processes.txt" ]]; then
     echo "no nova-nix walk under $RESULTS_DIR; run --scoreboard with this label first" >&2
@@ -1152,8 +1169,18 @@ run_resources() {
   rm -rf "${resources:?}"
   # A store of its own, so that the pass writes what a fresh evaluation
   # writes (builtins.toFile's files, say) rather than finding the walk's.
-  resource_pass "$walk" "$resources" "${SCOREBOARD_NOVA[@]}" --store "$SCOREBOARD_SCRATCH/pass-store"
-  write_resources "$resources" "$(count_kind "$walk/results.txt" drv)" > "$resources/resources.md"
+  resource_pass nova-nix "$walk" "$resources" "${SCOREBOARD_NOVA[@]}" --store "$SCOREBOARD_SCRATCH/pass-store" \
+    +RTS -s"$resources/rts-stats.txt" "$HEAP_CAP" -RTS
+  if [[ ${#SCOREBOARD_UPSTREAM[@]} -gt 0 ]]; then
+    if [[ -s "$theirs/processes.txt" && ! -e "$theirs/stopped.txt" ]]; then
+      theirs_evaluated=$(count_kind "$theirs/results.txt" drv)
+      resource_pass upstream "$theirs" "$resources/upstream" env NIX_SHOW_STATS=1 \
+        NIX_SHOW_STATS_PATH="$resources/upstream/nix-stats.json" "${SCOREBOARD_UPSTREAM[@]}"
+    else
+      echo "resources: no upstream walk under $RESULTS_DIR settled every unit, so upstream's pass does not run" >&2
+    fi
+  fi
+  write_resources "$resources" "$(count_kind "$walk/results.txt" drv)" "$theirs_evaluated" > "$resources/resources.md"
   echo
   cat "$resources/resources.md"
 }
@@ -1249,7 +1276,7 @@ usage() {
   echo ""
   echo "  label:         name for this run (e.g. 'nixpkgs-24.11')"
   echo "  --scoreboard:  walk the package set and count what evaluates and matches upstream"
-  echo "  --resources:   force what the label's walk evaluated in one process, for its figures"
+  echo "  --resources:   force what the label's walks evaluated in one process of each evaluator, for its figures"
   echo "  --memory:      measure where one process's memory goes over a slice of the walk"
   echo "  -M<cap>:       nova-nix's heap cap (default $DEFAULT_HEAP_CAP)"
   echo "  --build:       build what the mode runs first"
