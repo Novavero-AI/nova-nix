@@ -85,7 +85,7 @@ import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
 import Nix.Eval.CEnv (cenvNameTable, cenvParent)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsType, clambdaNew, clambdaShape, clambdaShapeAllowExtra, clambdaShapeFormalCount, clambdaShapeFormalsType)
 import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistThunks, thunkListToCList)
-import Nix.Eval.CRegion (RegionCensus (..))
+import Nix.Eval.CRegion (Regions (..))
 import Nix.Eval.CRoots (crootsAddThunk)
 import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
 import Nix.Eval.CStatus (CStatusError (..), arenaLive)
@@ -2137,6 +2137,55 @@ appsOfEval baseDir source = do
   after <- censusOf []
   let count census = fromMaybe 0 (figuresCount (kindApps (censusAllocated census)))
   pure (outcome >> ((-) <$> fmap count after <*> fmap count before))
+
+-- | The region collector ("Nix.Eval.CRegion"), which the suite's own
+-- session runs.
+testRegionCollector :: IO [Bool]
+testRegionCollector = do
+  putStrLn "eval/region-collector"
+  sequence
+    [ leavesNoMore "the collector frees the sets a force made once nothing reaches them, so forcing more of them leaves no more behind" id,
+      -- One force around them all: the forces inside it close inside a
+      -- region, tenuring what they mark, and it marks its region whole as
+      -- they pass the budget.
+      leavesNoMore "and so does a force whose region holds every one of them" (\source -> "let total = " <> source <> "; in total")
+    ]
+  where
+    leavesNoMore name wrap =
+      runTestM name $ do
+        tmpBase <- getTemporaryDirectory
+        few <- setsOfEval tmpBase (wrap (dropped 20))
+        many <- setsOfEval tmpBase (wrap (dropped 200))
+        pure $ case (few, many) of
+          (Right (VInt answerFew, madeFew, leftFew), Right (VInt answerMany, madeMany, leftMany)) ->
+            assertEqual "each force counted its thousand names" (20000, 200000) (answerFew, answerMany)
+              `andThen` assertEqual "the forces made a thousand sets each" True (madeMany - madeFew >= 180 * 1000)
+              `andThen` assertEqual "as many left after 200 forces as after 20" leftFew leftMany
+          _ -> Fail ("no census or no count: " <> T.pack (show (fmap third few, fmap third many)))
+    third (_, _, left) = left
+    -- Each element of the map is a force that makes a set of a thousand
+    -- names, each from a set of its own, and returns only a count.
+    dropped :: Int -> Text
+    dropped n =
+      "let mk = i: builtins.length (builtins.attrNames (builtins.listToAttrs "
+        <> "(builtins.genList (j: { name = \"a${toString j}\"; value = i; }) 1000))); "
+        <> "in builtins.foldl' (a: b: a + b) 0 (map mk (builtins.genList (i: i) "
+        <> T.pack (show n)
+        <> "))"
+
+-- | What evaluating a source answered, the sets it made, by the sites'
+-- counts, and the sets it left allocated, by the census's before and
+-- after.
+setsOfEval :: FilePath -> Text -> IO (Either Text (NixValue, Integer, Integer))
+setsOfEval baseDir source = do
+  before <- censusOf []
+  outcome <- newIORef (Left "the evaluation did not run")
+  added <- sitesAdded (evalNixIO baseDir source >>= writeIORef outcome)
+  after <- censusOf []
+  answer <- readIORef outcome
+  let count census = toInteger (fromMaybe 0 (figuresCount (kindAttrSets (censusAllocated census))))
+      made counts = sum (map (toInteger . setSiteSets) (Map.elems (sitesSets counts)))
+  pure ((,,) <$> answer <*> fmap made added <*> ((-) <$> fmap count after <*> fmap count before))
 
 -- | The census of regions ("Nix.Eval.CRegion"), run by @nova-nix eval@ in
 -- a process of its own: the census starts before its arena does.
@@ -25172,7 +25221,7 @@ namesOnlyChildFlag = "--names-only-child"
 inTestSession :: IO a -> IO a
 inTestSession action = do
   storeDir <- evalNixIOStoreDir
-  withEvalSession (SessionSettings unrestrictedPolicy (pure []) storeDir testBaseDir RegionCensusOff) (const action)
+  withEvalSession (SessionSettings unrestrictedPolicy (pure []) storeDir testBaseDir RegionsCollect) (const action)
 
 -- | The flag that runs 'arenaCycleChild'.
 arenaCycleChildFlag :: String
@@ -29614,6 +29663,7 @@ runSuite = do
           testCensus,
           testRegionCensus,
           testAllocSites,
+          testRegionCollector,
           testEnvLayout,
           testEvalLists,
           testEvalLambda,

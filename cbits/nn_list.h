@@ -83,4 +83,9 @@ void nn_list_set(nn_list_t *list, uint32_t index, struct nn_thunk *thunk);
  * address share one array, which the longest of them spans. */
 const nn_tracker_t *nn_list_tracked(void);
 
+/* Free the headers from place `from` of the tracker on that `keep`
+ * refuses, and close up the rest (nn_tracker_sweep).  An items array is
+ * in an env page, which a header's free leaves alone. */
+void nn_list_sweep(uint32_t from, nn_tracker_keep_t keep, void *ctx);
+
 #endif /* NN_LIST_H */

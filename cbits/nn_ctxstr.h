@@ -108,6 +108,10 @@ nn_str_t *nn_ctxstr_elem_output(const nn_ctxstr_t *s, uint32_t idx);
  * nn_ctxstr_free_all. */
 const nn_tracker_t *nn_ctxstr_tracked(void);
 
+/* Free the strings from place `from` of the tracker on that `keep`
+ * refuses, and close up the rest (nn_tracker_sweep). */
+void nn_ctxstr_sweep(uint32_t from, nn_tracker_keep_t keep, void *ctx);
+
 /* Bytes a string holds from the allocator: its header and its context
  * elements. */
 uint64_t nn_ctxstr_bytes(const nn_ctxstr_t *s);

@@ -3206,8 +3206,10 @@ builtinDeepSeq first second = deepForce first >> argValue second
 -- Upstream enters each @Value@ once, so a value reached twice is forced
 -- once and one that holds itself, as a derivation does through its @all@
 -- and output attributes, is not entered without end.  The cell holding
--- a value is its identity here: the C layer frees no cell before its
--- arena is destroyed, so a cell is one value for the whole force.  The
+-- a value is its identity here: every cell the walk enters is reached
+-- from the value handed over, which is older than every force the walk
+-- runs, so no close of one frees a cell the walk has entered
+-- ("Nix.Eval.CRegion"), and a cell is one value for the whole force.  The
 -- value handed over has no cell, so it is not entered by one; what it
 -- holds is.
 deepForce :: (MonadEval m) => NixValue -> m ()

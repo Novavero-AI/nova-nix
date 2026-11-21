@@ -50,7 +50,7 @@ alloc_block(void)
     if (!block) return NULL;
     block->next = NULL;
     block->count = 0;
-    if (nn_region_census)
+    if (nn_region_mode)
         nn_region_block(NN_REGION_THUNK_BLOCK, (const char *)block->slots,
                         (uint64_t)NN_THUNK_BLOCK_CELLS * sizeof(nn_thunk_t), 1);
     return block;
@@ -427,7 +427,7 @@ set_computed(nn_thunk_t *thunk, uint8_t tag, void *payload)
     thunk->state = NN_THUNK_COMPUTED;
     thunk->val_tag = tag;
     thunk->payload = payload;
-    if (nn_region_census && holds_object(tag)) nn_region_record_cell(thunk);
+    if (nn_region_mode && holds_object(tag)) nn_region_record_cell(thunk);
     return 1;
 }
 

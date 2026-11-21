@@ -1,13 +1,17 @@
--- | A census of regions (@cbits\/nn_region.h@): what the C data layer
--- could free at the end of each force of a thunk, measured and never
--- freed.
+-- | Regions (@cbits\/nn_region.h@): the C data layer's collector, which
+-- frees at the end of each force of a thunk what the force allocated
+-- that nothing reaches, and a census of what collectors would free there,
+-- which frees nothing.
 --
--- A session started with 'RegionCensusOn' runs the census for its
--- arena's whole life ('withRegionCensus'), and each force in it opens a
--- region as it starts and closes it once its value is stored or it
--- throws ('inRegion').  At each close the census marks, among what the
--- force allocated, what its writes into older cells and with-scopes and
--- the roots it registered still reach.  'regionFigures' reads the counts
+-- A session runs its regions for its arena's whole life ('withRegions'),
+-- and each force in it opens a region as it starts and closes it once its
+-- value is stored or it throws ('inRegion').  Under 'RegionsCollect' each
+-- close the collector marks at frees the attribute sets, list headers,
+-- lambdas, builtins' partial applications and strings with context that
+-- the force allocated and nothing reaches.  Under 'RegionsCensus' each
+-- close marks, among what the force allocated, what its writes into older
+-- cells and with-scopes and the roots it registered still reach, and
+-- frees nothing.  'regionFigures' reads the census's counts
 -- by size of region, and a simulation of collectors that mark only at
 -- the closes of regions past a threshold of bytes, freeing single objects,
 -- whole blocks of each of several sizes, or whole lines of a block of each
@@ -17,14 +21,14 @@
 -- tenure what their closes marked and mark it again only where a close
 -- marks its region whole.
 --
--- Without the census a force pays for it one match on its session's
+-- Under 'RegionsOff' a force pays for regions one match on its session's
 -- setting, and the allocators one flag test per block, tracked object
 -- and stored object.
 module Nix.Eval.CRegion
-  ( -- * Running the census
-    RegionCensus (..),
-    withRegionCensus,
-    regionCensusRunning,
+  ( -- * Running regions
+    Regions (..),
+    withRegions,
+    regionsRunning,
     inRegion,
 
     -- * Figures
@@ -53,14 +57,14 @@ import Nix.Eval.CStatus (CStatusError (..))
 -- FFI imports
 -- ---------------------------------------------------------------------------
 
-foreign import ccall unsafe "nn_region_census_begin"
-  c_nn_region_census_begin :: IO CInt
+foreign import ccall unsafe "nn_region_begin"
+  c_nn_region_begin :: CInt -> IO CInt
 
-foreign import ccall unsafe "nn_region_census_end"
-  c_nn_region_census_end :: IO ()
+foreign import ccall unsafe "nn_region_end"
+  c_nn_region_end :: IO ()
 
-foreign import ccall unsafe "&nn_region_census"
-  c_nn_region_census :: Ptr CInt
+foreign import ccall unsafe "&nn_region_mode"
+  c_nn_region_mode :: Ptr CInt
 
 -- A close marks and retires one region, work bounded by what the force
 -- allocated, between two steps of the single-threaded evaluator: an
@@ -145,40 +149,55 @@ lineKind :: CInt
 lineKind = 0
 
 -- ---------------------------------------------------------------------------
--- Running the census
+-- Running regions
 -- ---------------------------------------------------------------------------
 
--- | Whether a session runs a census of regions.
-data RegionCensus
-  = RegionCensusOff
-  | RegionCensusOn
+-- | What a session's regions run for.
+data Regions
+  = -- | Nothing: no force opens a region, and the arena frees everything
+    -- at its teardown.
+    RegionsOff
+  | -- | A census, which measures what collectors would free and frees
+    -- nothing.
+    RegionsCensus
+  | -- | The collector.
+    RegionsCollect
   deriving (Eq, Show)
 
--- | Run an action that sets up and tears down an arena with the census
--- running, when it is asked for, from before the arena's first block to
--- after its teardown.  Raises 'CAllocationFailed' when the census's
--- tables cannot be allocated.
-withRegionCensus :: RegionCensus -> IO a -> IO a
-withRegionCensus RegionCensusOff action = action
-withRegionCensus RegionCensusOn action = bracket_ begin c_nn_region_census_end action
-  where
-    begin = do
-      status <- c_nn_region_census_begin
-      unless (status == 0) (throwIO (CAllocationFailed "nn_region_census_begin" "the census's tables could not be allocated"))
+-- | @NN_REGION_CENSUS@ and @NN_REGION_COLLECT@.
+regionCensusMode, regionCollectMode :: CInt
+regionCensusMode = 1
+regionCollectMode = 2
 
--- | Whether a census runs now, which a session sharing a running arena
--- takes on.
-regionCensusRunning :: IO RegionCensus
-regionCensusRunning = running <$> peek c_nn_region_census
+-- | Run an action that sets up and tears down an arena with its regions
+-- running, from before the arena's first block to after its teardown.
+-- Raises 'CAllocationFailed' when the regions' tables cannot be
+-- allocated.
+withRegions :: Regions -> IO a -> IO a
+withRegions regions action = case regions of
+  RegionsOff -> action
+  RegionsCensus -> running regionCensusMode
+  RegionsCollect -> running regionCollectMode
   where
-    running flag
-      | flag /= 0 = RegionCensusOn
-      | otherwise = RegionCensusOff
+    running mode = bracket_ (begin mode) c_nn_region_end action
+    begin mode = do
+      status <- c_nn_region_begin mode
+      unless (status == 0) (throwIO (CAllocationFailed "nn_region_begin" "the regions' tables could not be allocated"))
 
--- | Run a force's work in a region of its own under a census.
-inRegion :: RegionCensus -> IO a -> IO a
-inRegion RegionCensusOff action = action
-inRegion RegionCensusOn action = bracket_ c_nn_region_open c_nn_region_close action
+-- | What the regions running now run for, which a session sharing a
+-- running arena takes on.
+regionsRunning :: IO Regions
+regionsRunning = running <$> peek c_nn_region_mode
+  where
+    running mode
+      | mode == regionCensusMode = RegionsCensus
+      | mode == regionCollectMode = RegionsCollect
+      | otherwise = RegionsOff
+
+-- | Run a force's work in a region of its own, while regions run.
+inRegion :: Regions -> IO a -> IO a
+inRegion RegionsOff action = action
+inRegion _ action = bracket_ c_nn_region_open c_nn_region_close action
 
 -- ---------------------------------------------------------------------------
 -- Figures

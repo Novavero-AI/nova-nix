@@ -38,7 +38,7 @@ nn_primop_app_new(uint32_t primop, uint16_t forced,
         free(app);
         return NULL;
     }
-    if (nn_region_census)
+    if (nn_region_mode)
         nn_region_tracked(NN_REGION_PRIMOP_APP, app, g_tracked.count - 1, nn_primop_app_bytes(app));
     return app;
 }
@@ -47,6 +47,12 @@ void
 nn_primop_app_free_all(void)
 {
     nn_tracker_free_all(&g_tracked, free);
+}
+
+void
+nn_primop_app_sweep(uint32_t from, nn_tracker_keep_t keep, void *ctx)
+{
+    nn_tracker_sweep(&g_tracked, from, keep, ctx, free);
 }
 
 /* --- Accessors --- */

@@ -7,7 +7,9 @@
  * lambda in more than one block.  Each kind keeps a tracker, adds every
  * object to it as the object is made, and frees them all at once at
  * arena teardown through its own free function.  A census (nn_stats.h)
- * reads the objects back from it.
+ * reads the objects back from it, and the region collector (nn_region.h)
+ * frees the objects a close finds unreached through a sweep, which keeps
+ * the rest in the order they were added.
  *
  * Not thread-safe - single-threaded evaluation only.
  */
@@ -33,5 +35,15 @@ int nn_tracker_add(nn_tracker_t *tracker, void *object);
 /* Free every object with `free_object`, and then the array: the tracker
  * is empty after. */
 void nn_tracker_free_all(nn_tracker_t *tracker, void (*free_object)(void *));
+
+/* Whether to keep an object a sweep meets at `place`, told the place it
+ * takes if kept. */
+typedef int (*nn_tracker_keep_t)(void *ctx, void *object, uint32_t place, uint32_t kept_at);
+
+/* Sweep the objects from `from` on, in order: each `keep` refuses is
+ * freed with `free_object`, and the kept ones close up behind the ones
+ * before `from`, which stay where they are. */
+void nn_tracker_sweep(nn_tracker_t *tracker, uint32_t from, nn_tracker_keep_t keep, void *ctx,
+                      void (*free_object)(void *));
 
 #endif /* NN_TRACKER_H */
