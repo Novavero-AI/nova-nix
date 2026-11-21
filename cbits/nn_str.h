@@ -59,10 +59,16 @@ typedef struct nn_str {
 
 typedef struct nn_str_block nn_str_block_t;
 
-/* An arena of strings.  An all-zero one is empty and ready to use. */
+/* An arena of strings.  An all-zero one is empty and ready to use.
+ * Strings that fit a shared block are bumped from a room of the current
+ * block, from the cursor to below the limit: a new block, or, in the
+ * value arena while the region collector runs, lines of a block it freed
+ * (nn_region_refill). */
 typedef struct {
     nn_str_block_t *blocks;   /* every block, newest first */
     nn_str_block_t *current;  /* the block strings that fit one are bumped from */
+    uint64_t        cursor;   /* bytes into it */
+    uint64_t        limit;
     uint64_t        count;    /* strings made, the empty string not counted */
     uint64_t        bytes;    /* the bytes they take, padding included */
 } nn_str_arena_t;
@@ -114,8 +120,8 @@ const nn_str_arena_t *nn_str_values(void);
 uint64_t nn_str_object_bytes(const nn_str_t *s);
 
 /* An arena's blocks: for each of the first `max`, where its strings start
- * and the bytes they take go to `starts` and `used`.  Returns the number
- * of blocks, which may exceed `max`. */
+ * and one past the last byte it has ever handed out go to `starts` and
+ * `used`.  Returns the number of blocks, which may exceed `max`. */
 uint32_t nn_str_arena_blocks(const nn_str_arena_t *arena,
                              const char **starts, uint64_t *used, uint32_t max);
 
@@ -123,7 +129,12 @@ uint32_t nn_str_arena_blocks(const nn_str_arena_t *arena,
  * unused tail included. */
 uint64_t nn_str_arena_reserved_bytes(const nn_str_arena_t *arena);
 
-/* The bytes a block has handed out, given its first byte. */
-uint64_t nn_str_block_used(const char *data);
+/* Bytes an arena's strings took as they were made, padding included,
+ * which a collector reusing lines can put where others were. */
+uint64_t nn_str_arena_bytes(const nn_str_arena_t *arena);
+
+/* Where the next string that fits a shared block comes from in the value
+ * arena's current block, in bytes from its first byte (nn_region.h). */
+uint64_t nn_str_cursor(void);
 
 #endif /* NN_STR_H */

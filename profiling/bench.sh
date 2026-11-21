@@ -104,12 +104,11 @@ SCOREBOARD_MARKER="trace: nova-nix-scoreboard "
 # Upstream's walk chunk: the attributes nixpkgs' own CI gives one evaluator
 # process, to bound its memory (chunkSize in nixpkgs' ci/eval/default.nix).
 DEFAULT_UPSTREAM_BUDGET=5000
-# nova-nix's walk chunk.  Its C data layer keeps thunk cells, envs and
-# strings until the process exits, and the resource pass reached a 12 GiB
-# bound, with nothing freed, after 5,973
-# attributes of nixpkgs 24.11 and 8,867 of 26.05, about 2.1 and 1.4 MiB
-# each, so a chunk of 2000 stays near 4 GiB beside upstream's.  It can rise
-# to upstream's once the C layer frees what evaluation no longer reaches.
+# nova-nix's walk chunk.  With the region collector off, so that the C
+# data layer frees nothing until the process exits, the resource pass
+# reached a 12 GiB bound after 5,973 attributes of nixpkgs 24.11 and 8,867
+# of 26.05, about 2.1 and 1.4 MiB each, so a chunk of 2000 stays near
+# 4 GiB beside upstream's whether the collector runs or not.
 DEFAULT_NOVA_BUDGET=2000
 UPSTREAM_BUDGET="${SCOREBOARD_BUDGET:-$DEFAULT_UPSTREAM_BUDGET}"
 NOVA_BUDGET="${SCOREBOARD_BUDGET:-$DEFAULT_NOVA_BUDGET}"

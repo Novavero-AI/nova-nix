@@ -214,7 +214,8 @@ uint64_t nn_env_bytes_allocated(void);
 /* --- Census (nn_stats.h) --- */
 
 /* The pages, oldest first: for each of the first `max`, its first byte
- * and the bytes it has handed out go to `data` and `used`.  Every
+ * and one past the last byte it has ever handed out go to `data` and
+ * `used`.  Every
  * allocation starts at an NN_ENV_ALIGNMENT boundary from its page's first
  * byte.  Returns the number of pages, which may exceed `max`; 0 outside
  * the init .. destroy window. */
@@ -227,7 +228,8 @@ uint32_t nn_env_pages(char **data, uint32_t *used, uint32_t max);
  * included. */
 uint64_t nn_env_reserved_bytes(void);
 
-/* The bytes a page has handed out, given its first byte. */
-uint64_t nn_env_page_used(const char *data);
+/* Where the next env comes from in the page envs are bumped from, in
+ * bytes from its first byte (nn_region.h). */
+uint64_t nn_env_cursor(void);
 
 #endif /* NN_ENV_H */

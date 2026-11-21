@@ -17,6 +17,12 @@
  * remembered once.  Collecting, only the collector's are kept, and no
  * census mark runs.
  *
+ * A block also keeps, per line, the number of the span that last handed
+ * it out and whether the collector has freed it, and the collector keeps
+ * each bump kind's blocks with free lines for refills.  A region's part
+ * of a span is the runs of the span's lines that no later span has
+ * taken: a line a refill hands out again is retired with its new span.
+ *
  * The address index maps each NN_REGION_UNIT_BYTES of address space a
  * block covers to that block.  Every block is at least a unit, so no
  * block lies inside a unit without reaching its edge, and at most two
@@ -49,6 +55,35 @@
 
 /* No block, and no slot of the address index. */
 #define NN_REGION_NONE UINT32_MAX
+
+/* The collector's line, the census's finest: what a close frees and a
+ * refill hands out at a time, and what a span number is kept for. */
+#define NN_REGION_LINE ((uint64_t)NN_REGION_LINE_FIRST >> (NN_REGION_LINE_GRAINS - 1))
+
+/* The blocks with free lines a refill looks at in vain before the
+ * allocator makes a block, so that a refill costs a bounded scan however
+ * fragmented the free lines are.  Any free line holds a request of a line
+ * or less, so only a larger one looks in vain. */
+#define NN_REGION_REFILL_BLOCKS 4u
+
+/* Under AddressSanitizer a freed line is poisoned until a refill hands
+ * it out again, so that a read of it fails where a pointer the collector
+ * missed reads it. */
+#if defined(__SANITIZE_ADDRESS__)
+#define NN_REGION_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define NN_REGION_ASAN 1
+#endif
+#endif
+#ifdef NN_REGION_ASAN
+#include <sanitizer/asan_interface.h>
+#define NN_REGION_POISON(p, n)   ASAN_POISON_MEMORY_REGION((p), (n))
+#define NN_REGION_UNPOISON(p, n) ASAN_UNPOISON_MEMORY_REGION((p), (n))
+#else
+#define NN_REGION_POISON(p, n)   ((void)(p), (void)(n))
+#define NN_REGION_UNPOISON(p, n) ((void)(p), (void)(n))
+#endif
 
 /* The low bits of a record: one set for a with-scope entry, clear for a
  * cell; and in a tenure collector's records, one set once a close of its
@@ -95,8 +130,25 @@ typedef struct {
     uint8_t      *marks;   /* a bit per unit: reached by the close under way */
     uint8_t      *died;    /* a bit per unit: found unreached by a close */
     tenure_bits_t tenure[NN_REGION_TENURE_VARIANTS];
+    uint32_t     *spans;   /* a span number per line: the room that last handed it out */
+    uint8_t      *free;    /* a bit per line: freed by the collector and not handed out since */
+    uint32_t      lines;   /* whole lines its capacity holds */
+    uint32_t      free_count;
+    uint32_t      hint;    /* no line below it is free */
+    int           recycling; /* whether it is on its kind's list of blocks with free lines */
     int           kind;
 } block_t;
+
+/* A room an allocator bumped from, a new block or lines a refill handed
+ * out, numbered in the order the rooms started: from `start` to below
+ * `limit` bytes into its block, and bumped up to `end` once it ended. */
+typedef struct {
+    uint32_t number;
+    uint32_t block;
+    uint64_t start;
+    uint64_t limit;
+    uint64_t end;
+} span_t;
 
 /* A unit of address space and the blocks that touch it. */
 typedef struct {
@@ -177,9 +229,9 @@ typedef struct {
 
 /* An open region: what each allocator had handed out as it opened. */
 typedef struct {
-    uint32_t blocks;                                 /* blocks numbered before it */
-    uint32_t current[NN_REGION_BUMP_KINDS];          /* the block each bumped from */
-    uint64_t current_used[NN_REGION_BUMP_KINDS];     /* and the bytes it had handed out */
+    uint32_t spans;                                  /* the number the first span after it opened takes */
+    uint32_t current_span[NN_REGION_BUMP_KINDS];     /* the span each bump kind bumped from */
+    uint64_t current_used[NN_REGION_BUMP_KINDS];     /* and how far into its block it had bumped */
     uint32_t tracked[NN_REGION_TRACKED_KINDS];       /* each tracker's count */
     uint64_t tracked_bytes;
     uint64_t allocated;
@@ -224,8 +276,23 @@ static struct {
     block_t    *blocks;
     uint32_t    block_count;
     uint32_t    block_cap;
-    uint32_t    current[NN_REGION_BUMP_KINDS];
     uint32_t    last;               /* the block the last lookup found */
+
+    /* The spans an open region's part takes in, oldest first, and each
+     * bump kind's current one: every span while a region is open, and
+     * the current ones alone between. */
+    span_t     *spans;
+    uint32_t    span_count;
+    uint32_t    span_cap;
+    uint32_t    span_next;          /* the number the next span takes */
+    uint32_t    current_span[NN_REGION_BUMP_KINDS];
+
+    /* Each bump kind's blocks with free lines, and where its next refill
+     * looks first. */
+    uint32_t   *recycle[NN_REGION_BUMP_KINDS];
+    uint32_t    recycle_count[NN_REGION_BUMP_KINDS];
+    uint32_t    recycle_cap[NN_REGION_BUMP_KINDS];
+    uint32_t    recycle_at[NN_REGION_BUMP_KINDS];
 
     unit_slot_t *units;
     uint32_t     unit_cap;
@@ -493,30 +560,18 @@ static uint64_t block_bytes(int kind)
     }
 }
 
-/* The bytes a block has handed out. */
-static uint64_t block_used(const block_t *b)
-{
-    const char *data = (const char *)b->start;
-    switch (b->kind) {
-    case NN_REGION_THUNK_BLOCK: return nn_thunk_block_used(data);
-    case NN_REGION_ENV_PAGE:    return nn_env_page_used(data);
-    default:                    return nn_str_block_used(data);
-    }
-}
-
 /* A grain's liveness is read from the finest line's (dead_grains), so
  * every grain is a whole number of the next: each kind's unit divides the
  * finest line, each line is twice the next, and each kind's block is a
  * whole number of the longest line times the block grains' quarterings,
  * which makes every block grain exact and its smallest a whole number of
  * the longest line. */
-#define NN_REGION_FINEST_LINE (NN_REGION_LINE_FIRST >> (NN_REGION_LINE_GRAINS - 1))
 #define NN_REGION_BLOCK_MULTIPLE \
     ((uint64_t)NN_REGION_LINE_FIRST << (NN_REGION_GRAIN_SHIFT * (NN_REGION_BLOCK_GRAINS - 1)))
 typedef char nn_region_line_halves_check_[(NN_REGION_LINE_FIRST % (1u << (NN_REGION_LINE_GRAINS - 1)) == 0) ? 1 : -1];
-typedef char nn_region_thunk_line_check_[(NN_REGION_FINEST_LINE % sizeof(nn_thunk_t) == 0) ? 1 : -1];
-typedef char nn_region_env_line_check_[(NN_REGION_FINEST_LINE % NN_ENV_ALIGNMENT == 0) ? 1 : -1];
-typedef char nn_region_str_line_check_[(NN_REGION_FINEST_LINE % NN_STR_ALIGNMENT == 0) ? 1 : -1];
+typedef char nn_region_thunk_line_check_[(NN_REGION_LINE % sizeof(nn_thunk_t) == 0) ? 1 : -1];
+typedef char nn_region_env_line_check_[(NN_REGION_LINE % NN_ENV_ALIGNMENT == 0) ? 1 : -1];
+typedef char nn_region_str_line_check_[(NN_REGION_LINE % NN_STR_ALIGNMENT == 0) ? 1 : -1];
 typedef char nn_region_thunk_grain_check_[
     (((uint64_t)NN_THUNK_BLOCK_CELLS * sizeof(nn_thunk_t)) % NN_REGION_BLOCK_MULTIPLE == 0) ? 1 : -1];
 typedef char nn_region_env_grain_check_[(NN_ENV_PAGE_SIZE % NN_REGION_BLOCK_MULTIPLE == 0) ? 1 : -1];
@@ -726,6 +781,249 @@ static int places_reserve(places_t *places, uint32_t need)
     return 0;
 }
 
+/* --- Spans and lines --- */
+
+/* Where the allocator of a bump kind bumps from next, in bytes into its
+ * current block. */
+static uint64_t cursor_of(int kind)
+{
+    switch (kind) {
+    case NN_REGION_THUNK_BLOCK: return nn_thunk_cursor();
+    case NN_REGION_ENV_PAGE:    return nn_env_cursor();
+    default:                    return nn_str_cursor();
+    }
+}
+
+/* The span numbered n, or NULL when it is no longer kept. */
+static span_t *span_numbered(uint32_t n)
+{
+    uint32_t lo = 0, hi = c.span_count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (c.spans[mid].number < n)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo < c.span_count && c.spans[lo].number == n ? &c.spans[lo] : NULL;
+}
+
+/* The first kept span numbered n or after. */
+static uint32_t span_index_from(uint32_t n)
+{
+    uint32_t lo = 0, hi = c.span_count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (c.spans[mid].number < n)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+/* Whether a span is the room its kind bumps from now. */
+static int span_current(const span_t *s)
+{
+    return s->number == c.current_span[c.blocks[s->block].kind];
+}
+
+/* How far a span has bumped: to the allocator's cursor while it is
+ * current, to where it ended otherwise. */
+static uint64_t span_end(const span_t *s)
+{
+    return span_current(s) ? cursor_of(c.blocks[s->block].kind) : s->end;
+}
+
+/* Below which offset a span's lines take no more objects: the line the
+ * cursor is in still does while the span is current; an ended span's
+ * last line is settled, the rest of it unallocated, unless it runs past
+ * the block's last whole line. */
+static uint64_t span_settled(const span_t *s)
+{
+    const block_t *blk = &c.blocks[s->block];
+    uint64_t whole = (uint64_t)blk->lines * NN_REGION_LINE;
+    uint64_t settled;
+    if (span_current(s)) return cursor_of(blk->kind) / NN_REGION_LINE * NN_REGION_LINE;
+    settled = (s->end + NN_REGION_LINE - 1) / NN_REGION_LINE * NN_REGION_LINE;
+    return settled < whole ? settled : whole;
+}
+
+/* Put a block on its kind's list of blocks with free lines. */
+static void recycle(block_t *blk)
+{
+    int kind = blk->kind;
+    uint32_t *list;
+    if (blk->recycling) return;
+    list = (uint32_t *)reserve_from(c.recycle[kind], &c.recycle_cap[kind], sizeof(uint32_t),
+                                    c.recycle_count[kind] + 1, NN_REGION_ENTRIES_INITIAL);
+    if (!list) {
+        fail();
+        return;
+    }
+    c.recycle[kind] = list;
+    c.recycle[kind][c.recycle_count[kind]++] = (uint32_t)(blk - c.blocks);
+    blk->recycling = 1;
+}
+
+/* Free a line of a block for a refill to hand out. */
+static void free_line(block_t *blk, uint64_t line)
+{
+    if (bit_get(blk->free, line)) return;
+    bit_set(blk->free, line);
+    blk->free_count++;
+    if (line < blk->hint) blk->hint = (uint32_t)line;
+    NN_REGION_POISON((void *)(blk->start + line * NN_REGION_LINE), NN_REGION_LINE);
+    recycle(blk);
+}
+
+/* End a bump kind's current span where its allocator stopped.
+ * Collecting, the whole lines past that it never bumped into are free
+ * again. */
+static void span_stop(int kind, uint64_t cursor)
+{
+    span_t *s;
+    block_t *blk;
+    uint64_t line;
+    if (c.current_span[kind] == NN_REGION_NONE) return;
+    s = span_numbered(c.current_span[kind]);
+    c.current_span[kind] = NN_REGION_NONE;
+    if (!s) return;
+    s->end = cursor;
+    if (!collecting()) return;
+    blk = &c.blocks[s->block];
+    for (line = (cursor + NN_REGION_LINE - 1) / NN_REGION_LINE; line < s->limit / NN_REGION_LINE; line++)
+        free_line(blk, line);
+    /* The line the cursor stopped in takes no more objects now, and a
+     * close may have freed every one it holds while it still could. */
+    line = cursor / NN_REGION_LINE;
+    if (cursor % NN_REGION_LINE != 0 && line * NN_REGION_LINE >= s->start && line < blk->lines
+        && blk->spans[line] == s->number
+        && bits_all(blk->tenure[NN_REGION_COLLECTOR].freed, line * NN_REGION_LINE / unit_bytes(blk->kind),
+                    cursor / unit_bytes(blk->kind)))
+        free_line(blk, line);
+}
+
+/* Start a span of block b from `start` to below `limit` bytes in, as its
+ * kind's current one when `current`, the previous one ended first; one
+ * that is not current is a block's single object, ended at its limit.
+ * Returns 0 or -1. */
+static int span_begin(uint32_t b, uint64_t start, uint64_t limit, int current)
+{
+    block_t *blk = &c.blocks[b];
+    span_t *spans, *span;
+    uint64_t line, last;
+    if (current) span_stop(blk->kind, cursor_of(blk->kind));
+    spans = (span_t *)reserve(c.spans, &c.span_cap, sizeof(span_t), c.span_count + 1);
+    if (!spans || c.span_next == NN_REGION_NONE) return -1;
+    c.spans = spans;
+    span = &c.spans[c.span_count++];
+    span->number = c.span_next++;
+    span->block = b;
+    span->start = start;
+    span->limit = limit;
+    span->end = current ? start : limit;
+    last = (limit + NN_REGION_LINE - 1) / NN_REGION_LINE;
+    for (line = start / NN_REGION_LINE; line < last; line++) blk->spans[line] = span->number;
+    if (current) c.current_span[blk->kind] = span->number;
+    return 0;
+}
+
+/* The first run of a block's free lines at least `lines` long: its first
+ * line and length, or 0 for none.  The scan starts at the block's hint
+ * and moves it up to the first free line it meets. */
+static int free_run(block_t *blk, uint64_t lines, uint64_t *first, uint64_t *count)
+{
+    uint64_t line = blk->hint;
+    int met = 0;
+    while (line < blk->lines) {
+        uint64_t end;
+        if (line % 8 == 0 && blk->free[line / 8] == 0) {
+            line += 8;
+            continue;
+        }
+        if (!bit_get(blk->free, line)) {
+            line++;
+            continue;
+        }
+        if (!met) {
+            blk->hint = (uint32_t)line;
+            met = 1;
+        }
+        for (end = line; end < blk->lines && bit_get(blk->free, end); end++) {}
+        if (end - line >= lines) {
+            *first = line;
+            *count = end - line;
+            return 1;
+        }
+        line = end;
+    }
+    if (!met) blk->hint = blk->lines;
+    return 0;
+}
+
+/* Hand out a block's free lines from `first` for `count` lines: cleared
+ * of every bit a close left on their units, for objects younger than
+ * every open region. */
+static void hand_out(block_t *blk, uint64_t first, uint64_t count)
+{
+    uint64_t unit = unit_bytes(blk->kind);
+    uint64_t from = first * NN_REGION_LINE / unit, to = (first + count) * NN_REGION_LINE / unit;
+    tenure_bits_t *t = &blk->tenure[NN_REGION_COLLECTOR];
+    NN_ASSERT(!bits_any(t->remembered, from, to), "nn_region_refill: a free line holds a remembered unit");
+    NN_ASSERT(!bits_any(blk->marks, from, to), "nn_region_refill: a free line holds a marked unit");
+    bits_clear(t->tenured, from, to);
+    bits_clear(t->freed, from, to);
+    bits_clear(blk->died, from, to);
+    bits_clear(blk->free, first, first + count);
+    blk->free_count -= (uint32_t)count;
+    if (first == blk->hint) blk->hint = (uint32_t)(first + count);
+    NN_REGION_UNPOISON((void *)(blk->start + first * NN_REGION_LINE), count * NN_REGION_LINE);
+}
+
+int nn_region_refill(int kind, uint64_t cursor, uint64_t need, const char **data, uint64_t *start,
+                     uint64_t *limit)
+{
+    uint64_t lines = (need + NN_REGION_LINE - 1) / NN_REGION_LINE, first, count;
+    uint32_t looked = 0;
+    if (!collecting() || c.failed) return -1;
+    span_stop(kind, cursor);
+    while (c.recycle_count[kind] > 0 && looked < NN_REGION_REFILL_BLOCKS && !c.failed) {
+        uint32_t at = c.recycle_at[kind] % c.recycle_count[kind];
+        uint32_t b = c.recycle[kind][at];
+        block_t *blk = &c.blocks[b];
+        if (blk->free_count == 0) {
+            c.recycle[kind][at] = c.recycle[kind][--c.recycle_count[kind]];
+            blk->recycling = 0;
+            continue;
+        }
+        if (free_run(blk, lines, &first, &count)) {
+            hand_out(blk, first, count);
+            if (span_begin(b, first * NN_REGION_LINE, (first + count) * NN_REGION_LINE, 1) != 0) {
+                fail();
+                return -1;
+            }
+            *data = (const char *)blk->start;
+            *start = first * NN_REGION_LINE;
+            *limit = (first + count) * NN_REGION_LINE;
+            return 0;
+        }
+        c.recycle_at[kind] = at + 1;
+        looked++;
+    }
+    return -1;
+}
+
+/* Between regions no part takes a span in, so only the current ones are
+ * kept. */
+static void spans_trim(void)
+{
+    uint32_t i, kept = 0;
+    for (i = 0; i < c.span_count; i++)
+        if (span_current(&c.spans[i])) c.spans[kept++] = c.spans[i];
+    c.span_count = kept;
+}
+
 /* --- Lifecycle --- */
 
 static void tenure_bits_free(tenure_bits_t *t)
@@ -745,8 +1043,12 @@ static void release(void)
     for (i = 0; i < c.block_count; i++) {
         free(c.blocks[i].marks);
         free(c.blocks[i].died);
+        free(c.blocks[i].spans);
+        free(c.blocks[i].free);
         tenure_bits_free(c.blocks[i].tenure);
     }
+    for (i = 0; i < NN_REGION_BUMP_KINDS; i++) free(c.recycle[i]);
+    free(c.spans);
     for (i = 0; i < NN_REGION_TRACKED_KINDS; i++) {
         free(c.places[i].marks);
         free(c.places[i].died);
@@ -784,7 +1086,7 @@ int nn_region_begin(int mode)
     }
     c.unit_cap = NN_REGION_INITIAL;
     c.object_cap = NN_REGION_INITIAL;
-    for (k = 0; k < NN_REGION_BUMP_KINDS; k++) c.current[k] = NN_REGION_NONE;
+    for (k = 0; k < NN_REGION_BUMP_KINDS; k++) c.current_span[k] = NN_REGION_NONE;
     c.last = NN_REGION_NONE;
     c.tv = -1;
     return 0;
@@ -817,6 +1119,12 @@ void nn_region_block(int kind, const char *data, uint64_t capacity, int current)
     b->marks = NULL;
     b->died = NULL;
     memset(b->tenure, 0, sizeof(b->tenure));
+    b->spans = NULL;
+    b->free = NULL;
+    b->lines = (uint32_t)(capacity / NN_REGION_LINE);
+    b->free_count = 0;
+    b->hint = b->lines;
+    b->recycling = 0;
     c.block_count++;
     /* Nothing in a block of code is ever marked. */
     if (kind != NN_REGION_CODE_BLOCK) {
@@ -824,7 +1132,9 @@ void nn_region_block(int kind, const char *data, uint64_t capacity, int current)
         int v;
         b->marks = bits_new(units);
         b->died = bits_new(units);
-        if (!b->marks || !b->died) {
+        b->spans = (uint32_t *)malloc((size_t)((capacity + NN_REGION_LINE - 1) / NN_REGION_LINE) * sizeof(uint32_t));
+        b->free = bits_new(b->lines);
+        if (!b->marks || !b->died || !b->spans || !b->free) {
             fail();
             return;
         }
@@ -847,7 +1157,7 @@ void nn_region_block(int kind, const char *data, uint64_t capacity, int current)
             return;
         }
     }
-    if (current && kind < NN_REGION_BUMP_KINDS) c.current[kind] = index;
+    if (kind < NN_REGION_BUMP_KINDS && span_begin(index, 0, capacity, current) != 0) fail();
 }
 
 static void track(int kind, const void *object, uint32_t position, uint64_t bytes, uintptr_t first)
@@ -923,12 +1233,19 @@ void nn_region_record_with(void *const *entry)
 
 /* --- Age --- */
 
+/* An object is younger than a region when the span its line was last
+ * handed out in started after the region opened, or is the one its kind
+ * bumped from as the region opened and the object lies at or past where
+ * the cursor was then.  A refill hands out lines in a span of their own,
+ * so what it puts in a line an older object left is younger than every
+ * region open. */
 static age_t bump_age(const frame_t *f, uint32_t b, uintptr_t p)
 {
-    int kind = c.blocks[b].kind;
-    if (b >= f->blocks) return AGE_YOUNGER;
-    if (b == f->current[kind] && (uint64_t)(p - c.blocks[b].start) >= f->current_used[kind])
-        return AGE_YOUNGER;
+    const block_t *blk = &c.blocks[b];
+    uint64_t offset = (uint64_t)(p - blk->start);
+    uint32_t n = blk->spans[offset / NN_REGION_LINE];
+    if (n >= f->spans) return AGE_YOUNGER;
+    if (n == f->current_span[blk->kind] && offset >= f->current_used[blk->kind]) return AGE_YOUNGER;
     return AGE_OLDER;
 }
 
@@ -1509,13 +1826,47 @@ static void dead_grains(const block_t *blk, uint64_t from, uint64_t used, uint64
     }
 }
 
+/* byte_tenure over the units from `from` to below `to`: whether it freed
+ * any. */
+static int tenure_range(uint8_t *marks, const tenure_bits_t *t, int full, uint64_t from, uint64_t to)
+{
+    uint64_t i = from;
+    uint8_t lost = 0;
+    for (; i < to && i % 8 != 0; i++) lost |= byte_tenure(marks, t, full, i / 8, (uint8_t)(1u << (i % 8)));
+    for (; i + 8 <= to; i += 8) lost |= byte_tenure(marks, t, full, i / 8, 0xFFu);
+    for (; i < to; i++) lost |= byte_tenure(marks, t, full, i / 8, (uint8_t)(1u << (i % 8)));
+    return lost != 0;
+}
+
+/* The collector's retirement of a block's units from `from` bytes in to
+ * `used`, a line at a time: a line below `settled`, where no more objects
+ * go, is free once this close frees the last of its units, the ones past
+ * `used` never handed out.  The units of a line below `from` are older
+ * objects of the same span, as a span starts on a line, so a line this
+ * region shares with closes before it is free once theirs and its own are
+ * all freed.  A line whose last unit a close freed while the cursor was
+ * in it is freed by a later close that frees a unit in it, or by
+ * span_stop when its span ends with the cursor still in it. */
+static void collect_retire_block(block_t *blk, uint64_t from, uint64_t used, uint64_t settled, int full)
+{
+    uint64_t unit = unit_bytes(blk->kind), at = from;
+    tenure_bits_t *t = &blk->tenure[NN_REGION_COLLECTOR];
+    while (at < used) {
+        uint64_t line = at / NN_REGION_LINE;
+        uint64_t stop = (line + 1) * NN_REGION_LINE < used ? (line + 1) * NN_REGION_LINE : used;
+        if (tenure_range(blk->marks, t, full, at / unit, stop / unit) && (line + 1) * NN_REGION_LINE <= settled
+            && line < blk->lines && bits_all(t->freed, line * NN_REGION_LINE / unit, stop / unit))
+            free_line(blk, line);
+        at = stop;
+    }
+}
+
 /* Retire a block's units from `from` bytes in, the closing region's part
  * of it, and add to dead[g] the bytes of each block or line of grain g
  * wholly in that part that holds no survivor. */
-static int retire_block(block_t *blk, uint64_t from, uint64_t *dead)
+static int retire_block(block_t *blk, uint64_t from, uint64_t used, uint64_t *dead)
 {
     uint64_t unit = unit_bytes(blk->kind);
-    uint64_t used = block_used(blk);
     uint64_t finest = nn_region_grain_bytes(blk->kind, NN_REGION_GRAINS - 1);
     uint64_t first, count, j;
     if (used <= from) return 0;
@@ -1535,16 +1886,19 @@ static int retire_block(block_t *blk, uint64_t from, uint64_t *dead)
  * has freed every unit; or, at an outermost close, where it takes the
  * census's own mark of the whole region, before the census retires it,
  * freeing what that mark left unmarked. */
-static int tenure_retire_block(block_t *blk, uint64_t from, tenure_action_t action, int v, uint64_t *dead,
-                               uint64_t *reached)
+static int tenure_retire_block(block_t *blk, uint64_t from, uint64_t used, uint64_t settled, tenure_action_t action,
+                               int v, uint64_t *dead, uint64_t *reached)
 {
     uint64_t unit = unit_bytes(blk->kind);
-    uint64_t used = block_used(blk);
     uint64_t finest = nn_region_grain_bytes(blk->kind, NN_REGION_GRAINS - 1);
     uint64_t first, count, j;
     if (used <= from) return 0;
     if (action == TENURE_OUTERMOST) {
         bits_tenure_full(blk->marks, &blk->tenure[v], from / unit, used / unit);
+        return 0;
+    }
+    if (collecting()) {
+        collect_retire_block(blk, from, used, settled, action == TENURE_FULL);
         return 0;
     }
     bits_tenure(blk->marks, blk->died, &blk->tenure[v], action == TENURE_FULL, from / unit, used / unit, reached);
@@ -1557,19 +1911,47 @@ static int tenure_retire_block(block_t *blk, uint64_t from, tenure_action_t acti
     return 0;
 }
 
-/* Retire every block the closing region allocated in, and every tracked
+/* The next run of a span's own lines from `at` bytes in, to below `end`:
+ * its start, with *to past its last byte, or `end` for none.  A line a
+ * refill handed out again is a newer span's. */
+static uint64_t span_run(const span_t *s, uint64_t at, uint64_t end, uint64_t *to)
+{
+    const block_t *blk = &c.blocks[s->block];
+    while (at < end && blk->spans[at / NN_REGION_LINE] != s->number) at = (at / NN_REGION_LINE + 1) * NN_REGION_LINE;
+    *to = at;
+    while (*to < end && blk->spans[*to / NN_REGION_LINE] == s->number) *to = (*to / NN_REGION_LINE + 1) * NN_REGION_LINE;
+    if (*to > end) *to = end;
+    return at < end ? at : end;
+}
+
+/* The closing region's part of a span, from `from` bytes in. */
+static void retire_span(const span_t *s, uint64_t from, uint64_t *dead)
+{
+    uint64_t end = span_end(s), to, at = from > s->start ? from : s->start;
+    while (!c.failed && (at = span_run(s, at, end, &to)) < end) {
+        if (retire_block(&c.blocks[s->block], at, to, dead) != 0) fail();
+        at = to;
+    }
+}
+
+/* The spans a region's part takes in: the one each bump kind bumped from
+ * as it opened, from where the cursor was, and every one after. */
+static const span_t *opening_span(const frame_t *f, int kind)
+{
+    return f->current_span[kind] == NN_REGION_NONE ? NULL : span_numbered(f->current_span[kind]);
+}
+
+/* Retire every span the closing region allocated in, and every tracked
  * object it made. */
 static void retire(const frame_t *f, uint64_t *dead)
 {
-    uint32_t b;
+    uint32_t i;
     int k;
     for (k = 0; k < NN_REGION_BUMP_KINDS && !c.failed; k++) {
-        if (f->current[k] != NN_REGION_NONE
-            && retire_block(&c.blocks[f->current[k]], f->current_used[k], dead) != 0)
-            fail();
+        const span_t *opening = opening_span(f, k);
+        if (opening) retire_span(opening, f->current_used[k], dead);
     }
-    for (b = f->blocks; b < c.block_count && !c.failed; b++)
-        if (c.blocks[b].kind < NN_REGION_BUMP_KINDS && retire_block(&c.blocks[b], 0, dead) != 0) fail();
+    for (i = span_index_from(f->spans); i < c.span_count && !c.failed; i++) retire_span(&c.spans[i], c.spans[i].start, dead);
     /* Every object a tracker gained while the census ran has a place in
      * the bits; one it held before has none and is in no region. */
     for (k = 0; k < NN_REGION_TRACKED_KINDS; k++) {
@@ -1594,7 +1976,7 @@ static int sweep_keep(void *ctx, void *object, uint32_t place, uint32_t kept_at)
         object_remove((uintptr_t)object);
         return 0;
     }
-    object_slot(c.objects, c.object_cap, (uintptr_t)object)->position = kept_at;
+    if (kept_at != place) object_slot(c.objects, c.object_cap, (uintptr_t)object)->position = kept_at;
     return 1;
 }
 
@@ -1616,22 +1998,31 @@ static void sweep(int kind, uint32_t from, uint32_t end)
     bits_clear(bits->freed, from, end);
 }
 
-/* Tenure collector v's retirement of every block the closing region
- * allocated in, and every tracked object it made (tenure_retire_block). */
+/* Tenure collector v's retirement of the closing region's part of a
+ * span, from `from` bytes in (tenure_retire_block). */
+static void tenure_retire_span(const span_t *s, uint64_t from, tenure_action_t action, int v, uint64_t *dead,
+                               uint64_t *reached)
+{
+    uint64_t end = span_end(s), settled = span_settled(s), to, at = from > s->start ? from : s->start;
+    while (!c.failed && (at = span_run(s, at, end, &to)) < end) {
+        if (tenure_retire_block(&c.blocks[s->block], at, to, settled, action, v, dead, reached) != 0) fail();
+        at = to;
+    }
+}
+
+/* Tenure collector v's retirement of every span the closing region
+ * allocated in, and every tracked object it made. */
 static void tenure_retire(const frame_t *f, tenure_action_t action, int v, uint64_t *dead, uint64_t *reached)
 {
-    uint32_t b;
+    uint32_t i;
     int k;
     for (k = 0; k < NN_REGION_BUMP_KINDS && !c.failed; k++) {
-        if (f->current[k] != NN_REGION_NONE
-            && tenure_retire_block(&c.blocks[f->current[k]], f->current_used[k], action, v, dead, reached) != 0)
-            fail();
+        const span_t *opening = opening_span(f, k);
+        if (opening) tenure_retire_span(opening, f->current_used[k], action, v, dead, reached);
     }
-    for (b = f->blocks; b < c.block_count && !c.failed; b++)
-        if (c.blocks[b].kind < NN_REGION_BUMP_KINDS
-            && tenure_retire_block(&c.blocks[b], 0, action, v, dead, reached) != 0)
-            fail();
-    for (k = 0; k < NN_REGION_TRACKED_KINDS; k++) {
+    for (i = span_index_from(f->spans); i < c.span_count && !c.failed; i++)
+        tenure_retire_span(&c.spans[i], c.spans[i].start, action, v, dead, reached);
+    for (k = 0; k < NN_REGION_TRACKED_KINDS && !c.failed; k++) {
         places_t *places = &c.places[k];
         uint32_t end = tracker_count(k);
         if (end > places->capacity) end = places->capacity;
@@ -1761,12 +2152,16 @@ static void tenure_close(frame_t *f, frame_t *parent, tenure_action_t action, in
 {
     frame_tenure_t *ft = &f->t[v];
     tenure_t *t = &c.t[v];
-    uint64_t now = allocated_now(), lost[NN_REGION_GRAINS], lost_tracked = 0, reached = 0, unchecked = 0;
+    uint64_t lost[NN_REGION_GRAINS], lost_tracked = 0, reached = 0, unchecked = 0;
     uint32_t g;
     memset(lost, 0, sizeof(lost));
-    for (g = 0; g < NN_REGION_GRAINS; g++) {
-        uint64_t held = now - t->freed[g];
-        if (held > t->figures[NN_REGION_TENURE_PEAK + g]) t->figures[NN_REGION_TENURE_PEAK + g] = held;
+    /* The peaks are the census's figures, which collecting keeps none of. */
+    if (!collecting()) {
+        uint64_t now = allocated_now();
+        for (g = 0; g < NN_REGION_GRAINS; g++) {
+            uint64_t held = now - t->freed[g];
+            if (held > t->figures[NN_REGION_TENURE_PEAK + g]) t->figures[NN_REGION_TENURE_PEAK + g] = held;
+        }
     }
     if (action == TENURE_YOUNG || action == TENURE_FULL) {
         int full = action == TENURE_FULL;
@@ -1850,19 +2245,21 @@ void nn_region_open(void)
     if (c.frame_cap > cap) memset(frames + cap, 0, (size_t)(c.frame_cap - cap) * sizeof(frame_t));
     c.frames = frames;
     f = &c.frames[c.frame_count++];
-    f->blocks = c.block_count;
+    f->spans = c.span_next;
     for (k = 0; k < NN_REGION_BUMP_KINDS; k++) {
-        f->current[k] = c.current[k];
-        f->current_used[k] = c.current[k] == NN_REGION_NONE ? 0 : block_used(&c.blocks[c.current[k]]);
+        f->current_span[k] = c.current_span[k];
+        f->current_used[k] = c.current_span[k] == NN_REGION_NONE ? 0 : cursor_of(k);
     }
     for (k = 0; k < NN_REGION_TRACKED_KINDS; k++) f->tracked[k] = tracker_count(k);
     f->tracked_bytes = c.tracked_bytes;
     f->allocated = allocated_now();
     f->records = c.record_count;
     nn_roots_mark(&f->root_thunks, &f->root_envs);
-    memset(f->freed, 0, sizeof(f->freed));
+    /* What the census simulates is the census's alone. */
+    if (!collecting()) memset(f->freed, 0, sizeof(f->freed));
     for (v = 0; v < NN_REGION_TENURE_VARIANTS; v++) {
         frame_tenure_t *ft = &f->t[v];
+        if (!active(v)) continue;
         ft->records = c.t[v].record_count;
         ft->unchecked = 0;
         ft->tenured = 0;
@@ -1933,6 +2330,7 @@ void nn_region_close(void)
     if (c.failed) return;
     c.closing = NULL;
     c.frame_count--;
+    if (c.frame_count == 0) spans_trim();
 }
 
 /* --- Reading the figures --- */
@@ -1968,6 +2366,24 @@ void nn_region_thresholds(uint64_t *figures)
 uint64_t nn_region_tenure_budget(uint32_t variant)
 {
     return variant < NN_REGION_TENURE_VARIANTS ? tenure_budgets[variant] : 0;
+}
+
+uint64_t nn_region_lines_lost(void)
+{
+    uint64_t lost = 0, line;
+    uint32_t b;
+    if (!collecting()) return 0;
+    for (b = 0; b < c.block_count; b++) {
+        const block_t *blk = &c.blocks[b];
+        uint64_t per;
+        if (blk->kind >= NN_REGION_BUMP_KINDS || !blk->free) continue;
+        per = NN_REGION_LINE / unit_bytes(blk->kind);
+        for (line = 0; line < blk->lines; line++)
+            if (!bit_get(blk->free, line)
+                && bits_all(blk->tenure[NN_REGION_COLLECTOR].freed, line * per, (line + 1) * per))
+                lost++;
+    }
+    return lost;
 }
 
 void nn_region_tenure(uint32_t variant, uint64_t *figures)

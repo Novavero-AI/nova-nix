@@ -20,7 +20,7 @@
 
 struct nn_str_block {
     nn_str_block_t *next;
-    uint64_t        used;      /* bytes handed out from data */
+    uint64_t        used;      /* one past the last byte ever handed out */
     uint64_t        capacity;  /* bytes data holds */
     char            data[];
 };
@@ -66,11 +66,41 @@ nn_str_t *nn_str_empty(void)
  * whose strings a census of regions places outside every region. */
 static nn_str_arena_t g_values;
 
+/* Tell regions of a block, while the arena's current room is still the
+ * one it had. */
 static void block_made(const nn_str_arena_t *arena, const nn_str_block_t *b, int current)
 {
     if (nn_region_mode)
         nn_region_block(arena == &g_values ? NN_REGION_STR_BLOCK : NN_REGION_CODE_BLOCK,
                         b->data, b->capacity, current);
+}
+
+/* Bump from the room the collector names next, with space for `need`
+ * bytes, or from a new block. */
+static int refill(nn_str_arena_t *arena, uint64_t need)
+{
+    const char *data;
+    uint64_t start, limit;
+    nn_str_block_t *b;
+    if (arena == &g_values && nn_region_mode == NN_REGION_COLLECT) {
+        /* The room ends here even if no block follows (nn_region_refill). */
+        arena->limit = arena->cursor;
+        if (nn_region_refill(NN_REGION_STR_BLOCK, arena->cursor, need, &data, &start, &limit) == 0) {
+            arena->current = (nn_str_block_t *)(void *)(data - offsetof(nn_str_block_t, data));
+            arena->cursor = start;
+            arena->limit = limit;
+            return 0;
+        }
+    }
+    b = block_new(NN_STR_BLOCK_BYTES);
+    if (!b) return -1;
+    b->next = arena->blocks;
+    arena->blocks = b;
+    block_made(arena, b, 1);
+    arena->current = b;
+    arena->cursor = 0;
+    arena->limit = b->capacity;
+    return 0;
 }
 
 nn_str_t *nn_str_arena_new(nn_str_arena_t *arena, const char *bytes, size_t len)
@@ -89,20 +119,16 @@ nn_str_t *nn_str_arena_new(nn_str_arena_t *arena, const char *bytes, size_t len)
         b->next = arena->blocks;
         arena->blocks = b;
         block_made(arena, b, 0);
+        b->used = need;
+        s = (nn_str_t *)b->data;
     } else {
+        if ((!arena->current || arena->limit - arena->cursor < need) && refill(arena, need) != 0) return NULL;
         b = arena->current;
-        if (!b || b->capacity - b->used < need) {
-            b = block_new(NN_STR_BLOCK_BYTES);
-            if (!b) return NULL;
-            b->next = arena->blocks;
-            arena->blocks = b;
-            arena->current = b;
-            block_made(arena, b, 1);
-        }
+        s = (nn_str_t *)(b->data + arena->cursor);
+        arena->cursor += need;
+        if (arena->cursor > b->used) b->used = arena->cursor;
     }
 
-    s = (nn_str_t *)(b->data + b->used);
-    b->used += need;
     s->len = (uint32_t)len;
     memcpy(s->bytes, bytes, len);
     arena->count++;
@@ -186,10 +212,14 @@ uint32_t nn_str_arena_blocks(const nn_str_arena_t *arena,
     return n;
 }
 
-uint64_t nn_str_block_used(const char *data)
+uint64_t nn_str_cursor(void)
 {
-    const nn_str_block_t *b = (const nn_str_block_t *)(const void *)(data - offsetof(nn_str_block_t, data));
-    return b->used;
+    return g_values.cursor;
+}
+
+uint64_t nn_str_arena_bytes(const nn_str_arena_t *arena)
+{
+    return arena->bytes;
 }
 
 uint64_t nn_str_arena_reserved_bytes(const nn_str_arena_t *arena)

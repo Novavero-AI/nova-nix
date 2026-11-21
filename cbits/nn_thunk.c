@@ -2,9 +2,12 @@
  * nn_thunk.c - Arena-allocated thunk memoization cells.
  *
  * Chunked bump allocator: linked list of blocks, each containing a
- * contiguous array of nn_thunk_t slots.  When the current block is
- * full, a new block is allocated (same capacity).  Pointers into any
- * block remain valid until the arena is destroyed.
+ * contiguous array of nn_thunk_t slots.  Slots are bumped from a room:
+ * a new block, or, while the region collector runs, lines of a block it
+ * freed (nn_region_refill).  When the room is full, the collector names
+ * the next one, or a new block is allocated (same capacity).  A pointer
+ * into a block stays valid until the collector frees its line or the
+ * arena is destroyed.
  *
  * Memory layout per block:
  *   [nn_thunk_block header] [slot 0] [slot 1] ... [slot N-1]
@@ -27,16 +30,20 @@
 
 struct nn_thunk_block {
     struct nn_thunk_block *next;      /* NULL for newest block */
-    uint32_t               count;     /* slots used in this block */
+    uint32_t               count;     /* one past the last slot ever handed out */
     nn_thunk_t             slots[];   /* C99 flexible array member */
 };
 
 /* --- Global state --- */
 
-/* The first block, for iteration, and the newest, for allocation: NULL
- * outside the init .. destroy window. */
+/* The first block and the newest, for iteration and for linking a new
+ * one, and the block slots are bumped from, with its room: from the
+ * cursor to below the limit.  NULL outside the init .. destroy window. */
 static struct nn_thunk_block *g_first_block = NULL;
+static struct nn_thunk_block *g_last_block = NULL;
 static struct nn_thunk_block *g_current_block = NULL;
+static uint32_t g_cursor = 0;
+static uint32_t g_limit = 0;
 static uint64_t g_cells_allocated = 0;
 
 /* --- Internal helpers --- */
@@ -56,23 +63,46 @@ alloc_block(void)
     return block;
 }
 
+/* Bump from the room the collector names next, or from a new block. */
+static int
+refill(void)
+{
+    const char *data;
+    uint64_t start, limit;
+    struct nn_thunk_block *block;
+    if (nn_region_mode == NN_REGION_COLLECT
+        && nn_region_refill(NN_REGION_THUNK_BLOCK, (uint64_t)g_cursor * sizeof(nn_thunk_t), sizeof(nn_thunk_t),
+                            &data, &start, &limit) == 0) {
+        g_current_block = (struct nn_thunk_block *)(void *)(data - offsetof(struct nn_thunk_block, slots));
+        g_cursor = (uint32_t)(start / sizeof(nn_thunk_t));
+        g_limit = (uint32_t)(limit / sizeof(nn_thunk_t));
+        return 0;
+    }
+    block = alloc_block();
+    if (!block) return -1;
+    g_last_block->next = block;
+    g_last_block = block;
+    g_current_block = block;
+    g_cursor = 0;
+    g_limit = NN_THUNK_BLOCK_CELLS;
+    return 0;
+}
+
 static nn_thunk_t *
 arena_alloc(void)
 {
+    nn_thunk_t *t;
     /* No blocks before nn_thunk_init or after nn_thunk_destroy.  Report
      * it through the NULL the callers already check for rather than
      * dereferencing it; nn_arena_live is how the Haskell boundary tells
      * this apart from exhaustion. */
     if (!g_current_block) return NULL;
 
-    if (g_current_block->count >= NN_THUNK_BLOCK_CELLS) {
-        struct nn_thunk_block *block = alloc_block();
-        if (!block) return NULL;
-        g_current_block->next = block;
-        g_current_block = block;
-    }
+    if (g_cursor >= g_limit && refill() != 0) return NULL;
+    t = &g_current_block->slots[g_cursor++];
+    if (g_cursor > g_current_block->count) g_current_block->count = g_cursor;
     g_cells_allocated++;
-    return &g_current_block->slots[g_current_block->count++];
+    return t;
 }
 
 /* --- Lifecycle --- */
@@ -87,7 +117,10 @@ nn_thunk_init(void)
         fprintf(stderr, "nn_thunk_init: block alloc failed\n");
         abort();
     }
+    g_last_block = g_first_block;
     g_current_block = g_first_block;
+    g_cursor = 0;
+    g_limit = NN_THUNK_BLOCK_CELLS;
     g_cells_allocated = 0;
 }
 
@@ -107,7 +140,10 @@ nn_thunk_destroy(void)
         block = next;
     }
     g_first_block = NULL;
+    g_last_block = NULL;
     g_current_block = NULL;
+    g_cursor = 0;
+    g_limit = 0;
     g_cells_allocated = 0;
 }
 
@@ -543,9 +579,7 @@ nn_thunk_cells_allocated(void)
 }
 
 uint64_t
-nn_thunk_block_used(const char *slots)
+nn_thunk_cursor(void)
 {
-    const struct nn_thunk_block *block = (const struct nn_thunk_block *)(const void *)(
-        slots - offsetof(struct nn_thunk_block, slots));
-    return (uint64_t)block->count * sizeof(nn_thunk_t);
+    return (uint64_t)g_cursor * sizeof(nn_thunk_t);
 }
