@@ -18,15 +18,17 @@
  * the mark does not reach is what a collector would free at that close.
  * The census frees nothing and writes nothing in the data layer.
  *
- * Age.  Each block objects are bumped from (a thunk block, an env page, a
- * block of the value string arena) is numbered as its allocator makes it,
- * and an address index finds the block of any pointer into one.  An
- * object is younger than a region when its block was made after the
- * region opened, or when it lies in the block its allocator bumped from
- * as the region opened, at or past what that block had handed out then.
- * An object malloc'd on its own and tracked (nn_tracker.h) is younger
- * when its place in its tracker is at or past the tracker's count as the
- * region opened.
+ * Age.  Objects are bumped from rooms of blocks (thunk blocks, env pages,
+ * blocks of the value string arena): a new block, or, collecting, a run
+ * of a block's free lines.  Each room is a span, numbered as it starts,
+ * each line of a block keeps the number of the span that last handed it
+ * out, and an address index finds the block of any pointer into one.  An
+ * object is younger than a region when its line's span started after the
+ * region opened, or is the one its allocator bumped from as the region
+ * opened and the object lies at or past where the allocator had bumped
+ * to then.  An object malloc'd on its own and tracked (nn_tracker.h) is
+ * younger when its place in its tracker is at or past the tracker's
+ * count as the region opened.
  *
  * A close passes to the region around it the records of objects older
  * than that region as well, and drops the rest: a write into an object
@@ -84,12 +86,20 @@
  * mark left unreached, and the region's part of each tracker closes up
  * behind the places before it (nn_tracker_sweep), so that a tracker's
  * order stays age order and every open region's count stays its start.
- * Its marks are the census's premise at work, so one that reaches a unit
- * it freed, or a tracked object it holds no place for, aborts
- * (NN_ASSERT).  A freed tracked object whose address the allocator has
- * given to another of its kind passes for that one: the sanitizers'
- * quarantine, which holds a freed address back, is what catches a read of
- * it.
+ * It frees too each line of the region's spans once every unit in it is
+ * freed, those its mark left unreached with those closes before it
+ * freed, a line being NN_REGION_LINE_FIRST >>
+ * (NN_REGION_LINE_GRAINS - 1) bytes from a multiple of that into its
+ * block, and an allocator whose room is full bumps next from a run of a
+ * block's free lines (nn_region_refill), in a span of its own, so that
+ * what it puts there is younger than every region open.  Its marks are
+ * the census's premise at work, so one that reaches a unit it freed, or
+ * a tracked object it holds no place for, aborts (NN_ASSERT).  What it
+ * freed and then gave to another object, a line a refill handed out
+ * again or a tracked object's address the allocator reused, passes for
+ * that one: under AddressSanitizer a free line is poisoned until a
+ * refill hands it out and a freed address is held back from reuse, which
+ * is what catches a read of either.
  *
  * Regions run from before the arena's init to after its teardown
  * (nn_region_begin and nn_region_end), so that they number every block
@@ -150,9 +160,21 @@ void nn_region_end(void);
 
 /* A block of `capacity` bytes from `data`, made for objects of a bump
  * kind or for the code's strings, and whether its allocator now bumps
- * from it.  Every block is at least the address index's unit
- * (NN_ASSERT). */
+ * from it, called while the allocator's cursor is still where it stopped
+ * in the room it leaves (nn_thunk_cursor, nn_env_cursor, nn_str_cursor).
+ * Every block is at least the address index's unit (NN_ASSERT). */
 void nn_region_block(int kind, const char *data, uint64_t capacity, int current);
+
+/* Collecting, the room the allocator of a bump kind bumps from next, once
+ * the one it bumps from, which it stopped in at `cursor` bytes into its
+ * block, has no room for `need` bytes: a run of at least that many bytes
+ * of lines a close freed.  Returns 0 with the block's data in *data and
+ * the room from *start to below *limit bytes into it, or -1 when there
+ * is none, and the allocator makes a block.  Either way the allocator
+ * bumps no more from the room it stopped in, whose lines past `cursor`
+ * this may have freed. */
+int nn_region_refill(int kind, uint64_t cursor, uint64_t need, const char **data, uint64_t *start,
+                     uint64_t *limit);
 
 /* A tracked object of a tracked kind, at `position` in its tracker,
  * holding `bytes`; and bytes a tracked object took on as it grew. */
@@ -260,6 +282,11 @@ void nn_region_tenure(uint32_t variant, uint64_t *figures);  /* NN_REGION_TENURE
 /* The bytes a tenure collector lets closes inside a region tenure before
  * a close marks the region whole, or 0 for none but the outermost. */
 uint64_t nn_region_tenure_budget(uint32_t variant);
+
+/* Collecting, the whole lines of the bump kinds' blocks whose every unit
+ * a close freed but which are not free: none, as the collector frees a
+ * line once the last unit in it is freed.  0 when not collecting. */
+uint64_t nn_region_lines_lost(void);
 
 /* The bytes of threshold k, and of a block or line of a bump kind at
  * grain g from 1. */

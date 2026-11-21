@@ -3,9 +3,11 @@
 --
 -- A cell holding a string or a path, and a string with context, points at
 -- an @nn_str_t@: a length and the bytes after it, made once and never
--- moved or written again until the arena is destroyed.  A cell takes a
--- copy of a new value's bytes ('cstrNew'), and shares the object of a
--- value read from another cell or of a literal in the compiled code
+-- moved or written again while anything reaches it.  The region
+-- collector hands its line out again once nothing does
+-- ("Nix.Eval.CRegion"), and the arena's teardown frees the rest.  A cell
+-- takes a copy of a new value's bytes ('cstrNew'), and shares the object
+-- of a value read from another cell or of a literal in the compiled code
 -- ("Nix.Eval.CBytecode"), which the value carries
 -- ('Nix.Eval.Types.HeldBytes').  A read gives back a copy ('cstrBytes'),
 -- so a t'ByteString' in a 'Nix.Eval.Types.NixValue' never points into C

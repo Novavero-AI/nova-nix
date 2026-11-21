@@ -8,7 +8,9 @@
 -- value is stored or it throws ('inRegion').  Under 'RegionsCollect' each
 -- close the collector marks at frees the attribute sets, list headers,
 -- lambdas, builtins' partial applications and strings with context that
--- the force allocated and nothing reaches.  Under 'RegionsCensus' each
+-- the force allocated and nothing reaches, and the lines of thunk blocks,
+-- env pages and string blocks that hold nothing it reached, which the
+-- allocators then bump from again.  Under 'RegionsCensus' each
 -- close marks, among what the force allocated, what its writes into older
 -- cells and with-scopes and the roots it registered still reach, and
 -- frees nothing.  'regionFigures' reads the census's counts

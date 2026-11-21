@@ -22,7 +22,7 @@
 
 struct nn_env_page {
     struct nn_env_page *next;     /* NULL for newest page */
-    uint32_t            used;     /* bytes used in this page */
+    uint32_t            used;     /* one past the last byte ever handed out */
     uint32_t            capacity; /* usable bytes in this page */
     /* Flexible array member: page data follows */
     char                data[];
@@ -62,8 +62,16 @@ typedef char nn_env_short_max_check_[(NN_ENV_SHORT_MAX == NN_ENV_SHORT_MASK) ? 1
 
 /* --- Global state --- */
 
+/* The first page and the newest, for iteration and for linking a new
+ * one, and the page envs are bumped from, with its room: from the cursor
+ * to below the limit, in bytes.  A page is a room of its own when it is
+ * new; while the region collector runs, a room can also be lines of a
+ * page it freed (nn_region_refill). */
 static struct nn_env_page *g_first_page = NULL;
+static struct nn_env_page *g_last_page = NULL;
 static struct nn_env_page *g_current_page = NULL;
+static uint32_t g_cursor = 0;
+static uint32_t g_limit = 0;
 static uint64_t g_app_count = 0;
 static uint64_t g_app_bytes = 0;
 static uint64_t g_bytes_allocated = 0;
@@ -94,6 +102,35 @@ align_up(uint32_t n, uint32_t alignment)
     return (n + alignment - 1) & ~(alignment - 1);
 }
 
+/* Bump from the room the collector names next, with space for `bytes`,
+ * or from a new page.  A request larger than a page gets a page of its
+ * own. */
+static int
+refill(uint32_t bytes)
+{
+    const char *data;
+    uint64_t start, limit;
+    struct nn_env_page *page;
+    if (nn_region_mode == NN_REGION_COLLECT && bytes <= NN_ENV_PAGE_SIZE) {
+        /* The room ends here even if no page follows (nn_region_refill). */
+        g_limit = g_cursor;
+        if (nn_region_refill(NN_REGION_ENV_PAGE, g_cursor, bytes, &data, &start, &limit) == 0) {
+            g_current_page = (struct nn_env_page *)(void *)(data - offsetof(struct nn_env_page, data));
+            g_cursor = (uint32_t)start;
+            g_limit = (uint32_t)limit;
+            return 0;
+        }
+    }
+    page = alloc_page(bytes > NN_ENV_PAGE_SIZE ? bytes : NN_ENV_PAGE_SIZE);
+    if (!page) return -1;
+    g_last_page->next = page;
+    g_last_page = page;
+    g_current_page = page;
+    g_cursor = 0;
+    g_limit = page->capacity;
+    return 0;
+}
+
 /* Allocate raw bytes from the page-based bump allocator.
  * Returns aligned, zero-initialized memory, or NULL on overflow/OOM. */
 static void *
@@ -109,21 +146,16 @@ nn_env_alloc_raw(uint32_t bytes)
      * nn_env_init frees, under every pointer built from it. */
     if (!g_current_page) return NULL;
 
-    /* used <= capacity always holds, so capacity - used cannot underflow;
-     * the additive form (used + bytes > capacity) overflows uint32_t for
+    /* cursor <= limit always holds, so limit - cursor cannot underflow;
+     * the additive form (cursor + bytes > limit) overflows uint32_t for
      * near-4GB requests and would pass the check, then memset past the
      * end of a 256 KB page. */
-    if (bytes > g_current_page->capacity - g_current_page->used) {
-        uint32_t page_cap = bytes > NN_ENV_PAGE_SIZE ? bytes : NN_ENV_PAGE_SIZE;
-        struct nn_env_page *page = alloc_page(page_cap);
-        if (!page) return NULL;
-        g_current_page->next = page;
-        g_current_page = page;
-    }
+    if (bytes > g_limit - g_cursor && refill(bytes) != 0) return NULL;
 
-    void *result = g_current_page->data + g_current_page->used;
+    void *result = g_current_page->data + g_cursor;
     memset(result, 0, bytes);
-    g_current_page->used += bytes;
+    g_cursor += bytes;
+    if (g_cursor > g_current_page->used) g_current_page->used = g_cursor;
     g_bytes_allocated += bytes;
     return result;
 }
@@ -242,7 +274,10 @@ nn_env_init(void)
 {
     g_first_page = alloc_page(NN_ENV_PAGE_SIZE);
     if (!g_first_page) { fprintf(stderr, "nn_env_init: page alloc failed\n"); abort(); }
+    g_last_page = g_first_page;
     g_current_page = g_first_page;
+    g_cursor = 0;
+    g_limit = g_first_page->capacity;
     g_app_count = 0;
     g_app_bytes = 0;
     g_bytes_allocated = 0;
@@ -264,7 +299,10 @@ nn_env_destroy(void)
         page = next;
     }
     g_first_page = NULL;
+    g_last_page = NULL;
     g_current_page = NULL;
+    g_cursor = 0;
+    g_limit = 0;
     g_app_count = 0;
     g_app_bytes = 0;
     g_bytes_allocated = 0;
@@ -504,11 +542,9 @@ nn_env_pages(char **data, uint32_t *used, uint32_t max)
 }
 
 uint64_t
-nn_env_page_used(const char *data)
+nn_env_cursor(void)
 {
-    const struct nn_env_page *page = (const struct nn_env_page *)(const void *)(
-        data - offsetof(struct nn_env_page, data));
-    return page->used;
+    return g_cursor;
 }
 
 uint64_t

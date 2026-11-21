@@ -366,6 +366,7 @@ static void object_free(nn_object_index_t *o)
 static int index_thunks(void)
 {
     uint32_t n = nn_thunk_blocks(NULL, NULL, 0), i;
+    uint64_t extent = 0;
     nn_thunk_t **slots = (nn_thunk_t **)malloc((size_t)n * sizeof(nn_thunk_t *) + 1);
     uint32_t *counts = (uint32_t *)malloc((size_t)n * sizeof(uint32_t) + 1);
     nn_span_t *spans = (nn_span_t *)malloc((size_t)n * sizeof(nn_span_t) + 1);
@@ -375,7 +376,7 @@ static int index_thunks(void)
         for (i = 0; i < n; i++) {
             spans[i].start = (uintptr_t)slots[i];
             spans[i].end = spans[i].start + (uintptr_t)counts[i] * sizeof(nn_thunk_t);
-            g.allocated_count[NN_STATS_THUNKS] += counts[i];
+            extent += (uint64_t)counts[i] * sizeof(nn_thunk_t);
         }
         status = region_build(&g.thunks, spans, n, sizeof(nn_thunk_t));
         spans = NULL;
@@ -383,13 +384,18 @@ static int index_thunks(void)
     free(slots);
     free(counts);
     free(spans);
+    /* Cells the evaluation allocated, which a collector reusing lines puts
+     * where others were, so they can exceed what the blocks hold. */
+    g.allocated_count[NN_STATS_THUNKS] = nn_thunk_cells_allocated();
     g.allocated_bytes[NN_STATS_THUNKS] = g.allocated_count[NN_STATS_THUNKS] * sizeof(nn_thunk_t);
+    g.overhead_bytes += nn_thunk_reserved_bytes() - extent;
     return status;
 }
 
 static int index_pages(void)
 {
     uint32_t n = nn_env_pages(NULL, NULL, 0), i;
+    uint64_t extent = 0;
     char **data = (char **)malloc((size_t)n * sizeof(char *) + 1);
     uint32_t *used = (uint32_t *)malloc((size_t)n * sizeof(uint32_t) + 1);
     nn_span_t *spans = (nn_span_t *)malloc((size_t)n * sizeof(nn_span_t) + 1);
@@ -399,6 +405,7 @@ static int index_pages(void)
         for (i = 0; i < n; i++) {
             spans[i].start = (uintptr_t)data[i];
             spans[i].end = spans[i].start + used[i];
+            extent += used[i];
         }
         status = region_build(&g.pages, spans, n, NN_ENV_ALIGNMENT);
         spans = NULL;
@@ -406,6 +413,7 @@ static int index_pages(void)
     free(data);
     free(used);
     free(spans);
+    g.overhead_bytes += nn_env_reserved_bytes() - extent;
     return status;
 }
 
@@ -525,7 +533,7 @@ static int index_strings(void)
     if (index_str_arena(&g.strings, values, &used) != 0) return -1;
     if (index_str_arena(&g.code_strings, nn_bc_strings(), NULL) != 0) return -1;
     g.allocated_count[NN_STATS_STRINGS] = values->count;
-    g.allocated_bytes[NN_STATS_STRINGS] = used;
+    g.allocated_bytes[NN_STATS_STRINGS] = values->bytes;
     g.overhead_bytes += nn_str_arena_reserved_bytes(values) - used;
     return 0;
 }
@@ -567,9 +575,7 @@ int nn_stats_begin(void)
     g.allocated_count[NN_STATS_SYMBOLS] = g.symbol_count;
     g.allocated_bytes[NN_STATS_SYMBOLS] = text;
 
-    g.overhead_bytes += nn_thunk_reserved_bytes() - g.allocated_bytes[NN_STATS_THUNKS]
-                      + nn_env_reserved_bytes() - nn_env_bytes_allocated()
-                      + reserved - text;
+    g.overhead_bytes += reserved - text;
     g.code_bytes = nn_bc_reserved_bytes();
     return 0;
 }

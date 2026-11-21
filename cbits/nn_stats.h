@@ -117,13 +117,16 @@ void nn_stats_end(void);
 /* --- What is allocated --- */
 
 /* Objects and the bytes they hold, by kind (NN_STATS_KIND_COUNT entries
- * each).  The env count is NN_STATS_UNCOUNTED unless counting by site
- * has covered every env (nn_stats_count_sites). */
+ * each): for thunk cells, envs and strings every one the evaluation
+ * allocated, which a collector reusing lines may have put where others
+ * were, and for the tracked kinds those still allocated.  The env count
+ * is NN_STATS_UNCOUNTED unless counting by site has covered every env
+ * (nn_stats_count_sites). */
 void nn_stats_allocated(uint64_t *counts, uint64_t *bytes);
 
-/* Bytes the allocators hold that no object does: block and page headers
- * and unused tails, the tracking arrays, and the symbol table beyond its
- * text. */
+/* Bytes the allocators hold that no object ever has: block and page
+ * headers and the tails past where each block's allocations reached, the
+ * tracking arrays, and the symbol table beyond its text. */
 uint64_t nn_stats_overhead_bytes(void);
 
 /* Bytes the bytecode store holds, its strings included.  Code is freed

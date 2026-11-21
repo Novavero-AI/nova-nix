@@ -9,9 +9,11 @@
  *
  * Each thunk is a 16-byte C struct in an arena, invisible to GHC's GC.
  *
- * Arena: chunked bump allocator.  Thunks are never individually freed -
- * the entire arena is destroyed at evaluation end.  Pointers into the
- * arena remain valid until nn_thunk_destroy().
+ * Arena: chunked bump allocator.  The region collector frees a line of
+ * thunks once nothing reaches any of them, and hands it out again
+ * (nn_region.h); the rest are freed at once when the arena is destroyed.
+ * A pointer to a thunk stays valid while the thunk is reachable, and
+ * until nn_thunk_destroy() while no collector runs.
  *
  * A PENDING payload is the nn_env_t * the code runs in, or the cells of
  * a deferred application, a builtin's per-element application of a
@@ -134,8 +136,8 @@ void nn_thunk_destroy(void);
 #define NN_THUNK_NO_CODE UINT32_MAX
 
 /* Allocate a new PENDING thunk with a bytecode index + env payload.
- * Returns a pointer into arena memory, valid until nn_thunk_destroy(),
- * or NULL when the thunk cannot be allocated.
+ * Returns a pointer into arena memory, valid as the arena's are, or NULL
+ * when the thunk cannot be allocated.
  * bc_idx is the root instruction index in the bytecode store, never
  * NN_THUNK_NO_CODE (asserted).
  * env is the nn_env_t * the code runs in.  It must already exist, but
@@ -263,7 +265,8 @@ int nn_thunk_set_computed_primop_app(nn_thunk_t *thunk, void *app);
 /* --- Census (nn_stats.h) --- */
 
 /* The arena's blocks, oldest first: for each of the first `max`, its
- * first slot and the slots it has handed out go to `slots` and `counts`.
+ * first slot and one past the last slot it has ever handed out go to
+ * `slots` and `counts`.
  * Returns the number of blocks, which may exceed `max`; 0 outside the
  * init .. destroy window. */
 uint32_t nn_thunk_blocks(nn_thunk_t **slots, uint32_t *counts, uint32_t max);
@@ -275,7 +278,8 @@ uint64_t nn_thunk_reserved_bytes(void);
 /* The cells the arena has handed out since nn_thunk_init. */
 uint64_t nn_thunk_cells_allocated(void);
 
-/* The bytes of cells a block has handed out, given its first slot. */
-uint64_t nn_thunk_block_used(const char *slots);
+/* Where the next cell comes from in the block cells are bumped from, in
+ * bytes from its first slot (nn_region.h). */
+uint64_t nn_thunk_cursor(void);
 
 #endif /* NN_THUNK_H */

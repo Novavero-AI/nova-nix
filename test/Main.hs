@@ -2148,7 +2148,11 @@ testRegionCollector = do
       -- One force around them all: the forces inside it close inside a
       -- region, tenuring what they mark, and it marks its region whole as
       -- they pass the budget.
-      leavesNoMore "and so does a force whose region holds every one of them" (\source -> "let total = " <> source <> "; in total")
+      leavesNoMore "and so does a force whose region holds every one of them" nested,
+      takesNoMore "the collector hands out again the lines a force's cells, envs and strings took once nothing reaches them, so most of what forcing more of them allocates comes from lines it freed" id,
+      takesNoMore "and so does a force whose region holds every one of them" nested,
+      losesNoLine "a line that sibling forces share is freed once both have freed their part of it" id,
+      losesNoLine "and so is one inside a force whose region holds every one of them" nested
     ]
   where
     leavesNoMore name wrap =
@@ -2163,6 +2167,49 @@ testRegionCollector = do
               `andThen` assertEqual "as many left after 200 forces as after 20" leftFew leftMany
           _ -> Fail ("no census or no count: " <> T.pack (show (fmap third few, fmap third many)))
     third (_, _, left) = left
+    -- The blocks grow by less than half of what 200 forces allocate, where
+    -- without reuse they grow by nearly all of it.  They need not stay
+    -- exactly as they were: a refill that finds no run long enough among
+    -- the blocks it looks at makes a new one, and which runs are free
+    -- depends on what the suite's earlier evaluations left.  The first 20
+    -- forces take their lines before the measure starts.
+    takesNoMore name wrap =
+      runTestM name $ do
+        tmpBase <- getTemporaryDirectory
+        warmed <- evalNixIO tmpBase (wrap (dropped 20))
+        (reservedBefore, allocatedBefore) <- bumpBytes
+        answer <- evalNixIO tmpBase (wrap (dropped 200))
+        (reservedAfter, allocatedAfter) <- bumpBytes
+        let grown = reservedAfter - reservedBefore
+            allocated = allocatedAfter - allocatedBefore
+        pure $
+          assertEqual "each force counted its thousand names" (Right (Just 20000), Right (Just 200000)) (countOf warmed, countOf answer)
+            `andThen` if 2 * grown < allocated
+              then Pass
+              else Fail ("the blocks grew by " <> T.pack (show grown) <> " bytes while the forces allocated " <> T.pack (show allocated))
+    losesNoLine name wrap =
+      runTestM name $ do
+        tmpBase <- getTemporaryDirectory
+        answer <- evalNixIO tmpBase (wrap (siblings 200))
+        lost <- c_nn_region_lines_lost
+        pure $
+          assertEqual "each force counted its cells" (Right (Just (200 * siblingCells))) (countOf answer)
+            `andThen` assertEqual "lines whose every unit is freed but that are not free" 0 lost
+    countOf = fmap (\case VInt n -> Just n; _ -> Nothing)
+    nested source = "let total = " <> source <> "; in total"
+    -- Forces one after another, each of a list of siblingCells cells it
+    -- drops but for their count: past the collector's threshold, and an
+    -- odd count of cells, so that most forces start partway into a line
+    -- the one before them freed its part of.
+    siblings :: Int -> Text
+    siblings n =
+      "builtins.foldl' (a: b: a + b) 0 (builtins.genList (i: builtins.length (builtins.genList (j: j + i) "
+        <> T.pack (show siblingCells)
+        <> ")) "
+        <> T.pack (show n)
+        <> ")"
+    siblingCells :: Int64
+    siblingCells = 1025
     -- Each element of the map is a force that makes a set of a thousand
     -- names, each from a set of its own, and returns only a count.
     dropped :: Int -> Text
@@ -2172,6 +2219,52 @@ testRegionCollector = do
         <> "in builtins.foldl' (a: b: a + b) 0 (map mk (builtins.genList (i: i) "
         <> T.pack (show n)
         <> "))"
+
+-- | The bytes the thunk arena's blocks, the env pages and the value
+-- strings' blocks hold from the allocator, and the bytes their objects
+-- took as they were made, which reused lines put where others were.
+bumpBytes :: IO (Word64, Word64)
+bumpBytes = do
+  values <- c_nn_str_values
+  reserved <-
+    (\thunks envs strings -> thunks + envs + strings)
+      <$> c_nn_thunk_reserved_bytes
+      <*> c_nn_env_reserved_bytes
+      <*> c_nn_str_arena_reserved_bytes values
+  allocated <-
+    (\cells envs strings -> cells * censusCellBytes + envs + strings)
+      <$> c_nn_thunk_cells_allocated
+      <*> c_nn_env_bytes_allocated
+      <*> c_nn_str_arena_bytes values
+  pure (reserved, allocated)
+
+-- | What the bump allocators hold and have handed out, for the collector's
+-- test of reuse: no census reads it, as a census counts objects, which
+-- reuse puts where others were.
+foreign import ccall unsafe "nn_thunk_reserved_bytes"
+  c_nn_thunk_reserved_bytes :: IO Word64
+
+foreign import ccall unsafe "nn_thunk_cells_allocated"
+  c_nn_thunk_cells_allocated :: IO Word64
+
+foreign import ccall unsafe "nn_env_reserved_bytes"
+  c_nn_env_reserved_bytes :: IO Word64
+
+foreign import ccall unsafe "nn_env_bytes_allocated"
+  c_nn_env_bytes_allocated :: IO Word64
+
+foreign import ccall unsafe "nn_str_values"
+  c_nn_str_values :: IO (Ptr ())
+
+foreign import ccall unsafe "nn_str_arena_reserved_bytes"
+  c_nn_str_arena_reserved_bytes :: Ptr () -> IO Word64
+
+foreign import ccall unsafe "nn_str_arena_bytes"
+  c_nn_str_arena_bytes :: Ptr () -> IO Word64
+
+-- | The collector's lines left all freed but not free (nn_region.h).
+foreign import ccall unsafe "nn_region_lines_lost"
+  c_nn_region_lines_lost :: IO Word64
 
 -- | What evaluating a source answered, the sets it made, by the sites'
 -- counts, and the sets it left allocated, by the census's before and

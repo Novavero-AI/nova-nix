@@ -29,7 +29,8 @@ nn_list_new(nn_list_t **out, uint32_t count)
     if (!list) return -1;
 
     /* The items array is zeroed in an env page.  When tracking fails it
-     * stays there, since only nn_env_destroy releases a page. */
+     * stays there, unreached, until the region collector frees its lines
+     * or nn_env_destroy releases the page. */
     list->items = (struct nn_thunk **)nn_env_alloc_items(count);
     list->count = count;
 
