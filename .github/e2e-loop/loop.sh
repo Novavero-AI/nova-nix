@@ -144,11 +144,15 @@ echo "trusted key: $PUB_KEY"
 # Loop plumbing
 # --------------------------------------------------------------------------
 
+# Every build here reads the path it prints and links nothing: the
+# stores are scratch, and a build refuses to replace a ./result that
+# points into another store.
+
 # Build FIXTURE into STORE and echo the resulting output path.
 build_into() {
   store=$1
   fixture=$2
-  "$NOVA_NIX_BIN" build "$SCRIPT_DIR/$fixture" --store "$store" | tail -n 1
+  "$NOVA_NIX_BIN" build "$SCRIPT_DIR/$fixture" --store "$store" --no-out-link | tail -n 1
 }
 
 push_from() {
@@ -173,7 +177,7 @@ substitute_into() {
   shift 2
   stderr_log="$LOG_DIR/substitute-$fixture.log"
   # shellcheck disable=SC2086
-  $MEASURE_PREFIX "$NOVA_NIX_BIN" build "$SCRIPT_DIR/$fixture" --store "$store" \
+  $MEASURE_PREFIX "$NOVA_NIX_BIN" build "$SCRIPT_DIR/$fixture" --store "$store" --no-out-link \
     --substituter "$LOOP_URL" --trusted-key "$PUB_KEY" "$@" \
     2> "$stderr_log" | tail -n 1
   grep -Fq '[subst]' "$stderr_log" || {
@@ -244,7 +248,7 @@ push_from "$STORE_A" "$LOOP_URL" zstd "$OUT_LOCAL_A"
 # The cache holds the output and is named as a substituter, and the
 # derivation forbids substitutes, so store B builds it.
 LOCAL_LOG="$LOG_DIR/build-local.nix.log"
-OUT_LOCAL_B=$("$NOVA_NIX_BIN" build "$SCRIPT_DIR/local.nix" --store "$STORE_B" \
+OUT_LOCAL_B=$("$NOVA_NIX_BIN" build "$SCRIPT_DIR/local.nix" --store "$STORE_B" --no-out-link \
   --substituter "$LOOP_URL" --trusted-key "$PUB_KEY" 2> "$LOCAL_LOG" | tail -n 1) || {
   cat "$LOCAL_LOG" >&2
   fail "local.nix failed in store B"
@@ -287,7 +291,7 @@ push_from "$STORE_A" "$LOOP_URL" zstd "$OUT_STABLE_A"
 # then builds it again beside the substituted one: both tags are in the
 # log, and the ordinary build's is not.
 STABLE_LOG="$LOG_DIR/check-stable.nix.log"
-OUT_STABLE_D=$("$NOVA_NIX_BIN" build "$SCRIPT_DIR/stable.nix" --check --store "$STORE_D" \
+OUT_STABLE_D=$("$NOVA_NIX_BIN" build "$SCRIPT_DIR/stable.nix" --check --store "$STORE_D" --no-out-link \
   --substituter "$LOOP_URL" --trusted-key "$PUB_KEY" 2> "$STABLE_LOG" | tail -n 1) || {
   cat "$STABLE_LOG" >&2
   fail "the check of stable.nix failed in store D"
@@ -318,7 +322,7 @@ echo "== small fixture: a check of the substituted output finds the rebuild diff
 # status, name the output, and leave store B holding what it substituted.
 SMALL_CHECK_LOG="$LOG_DIR/check-small.nix.log"
 small_check_status=0
-"$NOVA_NIX_BIN" build "$SCRIPT_DIR/small.nix" --check --store "$STORE_B" \
+"$NOVA_NIX_BIN" build "$SCRIPT_DIR/small.nix" --check --store "$STORE_B" --no-out-link \
   > /dev/null 2> "$SMALL_CHECK_LOG" || small_check_status=$?
 [ "$small_check_status" -eq "$CHECK_MISMATCH_STATUS" ] || {
   cat "$SMALL_CHECK_LOG" >&2

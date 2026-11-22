@@ -11,6 +11,8 @@ module Nix.Cli.Args
   ( CliOpts (..),
     Command (..),
     BuildTarget (..),
+    OutLink (..),
+    outLinkFor,
     PushArgs (..),
     parseArgs,
   )
@@ -52,7 +54,7 @@ data CliOpts = CliOpts
 data Command
   = CmdEvalFile !FilePath
   | CmdEvalExpr !T.Text
-  | CmdBuild !BuildTarget !(Maybe T.Text) !(Maybe FilePath)
+  | CmdBuild !BuildTarget !(Maybe T.Text) !OutLink
   | -- | @trust@: report what the closure of the target's derivation, at
     -- the attribute path when one is given, relies on.
     CmdTrust !BuildTarget !(Maybe T.Text)
@@ -78,6 +80,40 @@ data BuildTarget
     TargetExpr !T.Text
   deriving (Eq, Show)
 
+-- | Where a build links its output.
+data OutLink
+  = -- | Link it from a name made from this path ('outLinkFor'), and
+    -- register the link as a GC root.
+    OutLinkAt !FilePath
+  | -- | @--no-out-link@: link nothing.  nix-build links into a temporary
+    -- directory it deletes on exit (nix-build.cc:143 and 203-204 at
+    -- 2.24.9), which leaves a dangling record that its next collection
+    -- removes (gc.cc:246-249); linking nothing leaves the same, less the
+    -- record.
+    NoOutLink
+  deriving (Eq, Show)
+
+-- | What a build links its output from until a flag says otherwise:
+-- nix-build's @.\/result@ (nix-build.cc:145 at 2.24.9).
+defaultOutLink :: OutLink
+defaultOutLink = OutLinkAt "result"
+
+-- | The output whose link is the out-link's path itself.
+unsuffixedOutput :: T.Text
+unsuffixedOutput = "out"
+
+-- | The link a build of the named output creates, if any: the out-link's
+-- path for the output @out@, and the path with @-NAME@ appended for any
+-- other, as nix-build names its links (nix-build.cc:701-720 at 2.24.9).
+-- nix-build also appends @-2@, @-3@ and so on for the second and later
+-- derivations it builds; a build here builds one.
+outLinkFor :: OutLink -> T.Text -> Maybe FilePath
+outLinkFor outLink outputName = case outLink of
+  NoOutLink -> Nothing
+  OutLinkAt path
+    | outputName == unsuffixedOutput -> Just path
+    | otherwise -> Just (path <> "-" <> T.unpack outputName)
+
 -- | A command that evaluates one target to a derivation.
 data TargetCommand
   = -- | @build@, which builds it.
@@ -95,14 +131,14 @@ targetWord kind = case kind of
 data BuildArgs = BuildArgs
   { baTarget :: !(Maybe BuildTarget),
     baAttrPath :: !(Maybe T.Text),
-    -- | Where to create the result symlink, registered as a GC root.
-    -- Only @build@ takes one.
-    baOutLink :: !(Maybe FilePath)
+    -- | Where @build@ links its output.  Only @build@ takes a flag that
+    -- sets it.
+    baOutLink :: !OutLink
   }
 
 -- | Target command arguments before any flag is parsed.
 emptyBuildArgs :: BuildArgs
-emptyBuildArgs = BuildArgs Nothing Nothing Nothing
+emptyBuildArgs = BuildArgs Nothing Nothing defaultOutLink
 
 -- | Arguments to the push command.
 data PushArgs = PushArgs
@@ -216,10 +252,13 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
       | flag `elem` attrFlags = case baAttrPath targetArgs of
           Just _ -> Left (targetWord kind ++ " accepts one attribute path")
           Nothing -> goTarget kind opts (targetArgs {baAttrPath = Just (T.pack path)}) rest
+    -- Each link flag replaces what the flags before it said, so the
+    -- later one wins, as nix-build assigns its outLink as it reads each
+    -- (nix-build.cc:203-204 and 212-213 at 2.24.9).
     goTarget BuildsTarget opts targetArgs (flag : path : rest)
-      | flag `elem` outLinkFlags = case baOutLink targetArgs of
-          Just _ -> Left "build accepts one --out-link"
-          Nothing -> goTarget BuildsTarget opts (targetArgs {baOutLink = Just path}) rest
+      | flag `elem` outLinkFlags = goTarget BuildsTarget opts (targetArgs {baOutLink = OutLinkAt path}) rest
+    goTarget BuildsTarget opts targetArgs (flag : rest)
+      | flag `elem` noOutLinkFlags = goTarget BuildsTarget opts (targetArgs {baOutLink = NoOutLink}) rest
     goTarget _ _ _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     goTarget kind _ _ (arg@('-' : _) : _) = Left ("unknown " ++ targetWord kind ++ " flag: " ++ arg)
@@ -294,3 +333,5 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
     attrFlags = ["-A", "--attr"]
     -- The result link, under both of nix-build's spellings.
     outLinkFlags = ["-o", "--out-link"]
+    -- No result link, under both of nix-build's spellings.
+    noOutLinkFlags = ["--no-out-link", "--no-link"]

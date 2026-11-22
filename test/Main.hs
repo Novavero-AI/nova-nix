@@ -23714,7 +23714,7 @@ testExecWrapperCLI = do
         builds <-
           mapM
             ( \(label, args) -> runTestM ("CLI wrapper " <> label) $ do
-                (code, out, err) <- runCLI (args ++ ["--store", root </> T.unpack label])
+                (code, out, err) <- runCLI (args ++ ["--store", root </> T.unpack label, "--no-out-link"])
                 case (code, reverse (filter (not . null) (lines out))) of
                   (ExitSuccess, path : _) -> assertEqual "wrapped output" "wrapped" <$> BS.readFile path
                   _ -> pure (Fail ("CLI failed: " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err))
@@ -23858,7 +23858,7 @@ testCheckCLI = do
         expression
           "check-differs"
           "stem=${out%-check-differs}; front=${stem%????????????????}; printf '%s\\n%s\\n' \"$front\" \"${stem#\"$front\"}\" > \"$out\""
-      build source store flags = runCLI (["build", "--expr", source, "--store", root </> store] ++ flags)
+      build source store flags = runCLI (["build", "--expr", source, "--store", root </> store, "--no-out-link"] ++ flags)
       printed out = listToMaybe (reverse (filter (not . null) (lines (filter (/= '\r') out))))
       outcome (code, out, err) = "exit " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err
   bracket_
@@ -23905,7 +23905,7 @@ testBuildCoresCLI = do
       -- no user file, so NIX_CONFIG alone sets cores.
       buildWith nixConfig store =
         Proc.readCreateProcessWithExitCode
-          ( (Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "build", "--expr", expression, "--store", root </> store])
+          ( (Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "build", "--expr", expression, "--store", root </> store, "--no-out-link"])
               { Proc.env =
                   Just
                     ( ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n" <> nixConfig)
@@ -23945,6 +23945,112 @@ testBuildCoresCLI = do
                 other -> Fail ("unset: " <> T.pack (show other) <> "; hardware count " <> T.pack (show hardware))
           ]
     )
+
+-- | The link a build makes to its output, through the real CLI run in a
+-- directory of the test's own: @./result@ when no flag names another,
+-- with @-NAME@ appended for an output other than @out@, each a root that
+-- @store gc@ keeps, as nix-build links and roots them; with
+-- @--no-out-link@ no link and no root.  The parse and the names are
+-- checked on their own first.
+testOutLinkCLI :: IO [Bool]
+testOutLinkCLI = do
+  putStrLn "cli/out-link"
+  shell <- findTestShell
+  canLink <- symlinksAvailable
+  projectDir <- Dir.getCurrentDirectory
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-out-link"
+      linkedDir = root </> "linked"
+      unlinkedDir = root </> "unlinked"
+      isolatedEnv =
+        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
+          : ("XDG_CONFIG_HOME", root </> "config")
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
+      -- cabal finds the project from the directory it runs in, which is
+      -- the directory the link is made in, so the project is named.
+      runIn dir args =
+        Proc.readCreateProcessWithExitCode
+          ((Proc.proc "cabal" (["run", "-v0", "--project-dir", projectDir, "nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv, Proc.cwd = Just dir})
+          ""
+      expression =
+        T.unpack
+          ( "derivation { name = \"out-link\"; system = builtins.currentSystem; builder = "
+              <> nixQuotedPath (T.unpack shell)
+              <> "; outputs = [ \"out\" \"dev\" ]; args = [ \"-c\" \"echo out > $out; echo dev > $dev\" ]; }"
+          )
+      buildIn dir store flags = runIn dir (["build", "--expr", expression, "--store", root </> store] ++ flags)
+      collectIn dir store = runIn dir ["store", "gc", "--store", root </> store]
+      printed (code, out, _) = case code of
+        ExitSuccess -> listToMaybe (reverse (filter (not . null) (lines (filter (/= '\r') out))))
+        ExitFailure _ -> Nothing
+      outcome (code, out, err) = "exit " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err
+      linkTarget path = either (\(_ :: IOException) -> Nothing) Just <$> try (Dir.getSymbolicLinkTarget path)
+      parsed = fmap Cli.optCommand . Cli.parseArgs
+      buildOf = Cli.CmdBuild (Cli.TargetExpr "1") Nothing
+  parses <-
+    sequence
+      [ runTest "build links ./result unless --out-link names another path, or --no-out-link or --no-link none" $
+          assertEqual "no flag" (Right (buildOf (Cli.OutLinkAt "result"))) (parsed ["build", "--expr", "1"])
+            `andThen` assertEqual "--out-link" (Right (buildOf (Cli.OutLinkAt "out"))) (parsed ["build", "-o", "out", "--expr", "1"])
+            `andThen` assertEqual "--no-out-link" (Right (buildOf Cli.NoOutLink)) (parsed ["build", "--expr", "1", "--no-out-link"])
+            `andThen` assertEqual "--no-link" (Right (buildOf Cli.NoOutLink)) (parsed ["build", "--no-link", "--expr", "1"])
+            `andThen` assertEqual "--no-out-link twice" (Right (buildOf Cli.NoOutLink)) (parsed ["build", "--no-out-link", "--expr", "1", "--no-out-link"]),
+        runTest "a --no-out-link after an --out-link links nothing, as nix-build's later flag wins" $
+          assertEqual "--no-out-link" (Right (buildOf Cli.NoOutLink)) (parsed ["build", "-o", "out", "--no-out-link", "--expr", "1"])
+            `andThen` assertEqual "--no-link" (Right (buildOf Cli.NoOutLink)) (parsed ["build", "-o", "out", "--expr", "1", "--no-link"]),
+        runTest "an --out-link after a --no-out-link links its path, as nix-build's later flag wins" $
+          assertEqual "--no-out-link" (Right (buildOf (Cli.OutLinkAt "out"))) (parsed ["build", "--no-out-link", "--expr", "1", "--out-link", "out"])
+            `andThen` assertEqual "--no-link" (Right (buildOf (Cli.OutLinkAt "out"))) (parsed ["build", "--no-link", "-o", "out", "--expr", "1"]),
+        runTest "a second --out-link replaces the first, as nix-build's later flag wins" $
+          assertEqual "two links" (Right (buildOf (Cli.OutLinkAt "b"))) (parsed ["build", "-o", "a", "--expr", "1", "--out-link", "b"]),
+        runTest "an output other than out is linked with -NAME appended to the out-link, as nix-build names it" $
+          assertEqual "out" (Just "result") (Cli.outLinkFor (Cli.OutLinkAt "result") "out")
+            `andThen` assertEqual "dev" (Just "result-dev") (Cli.outLinkFor (Cli.OutLinkAt "result") "dev")
+            `andThen` assertEqual "a path" (Just ("links" </> "hello-bin")) (Cli.outLinkFor (Cli.OutLinkAt ("links" </> "hello")) "bin")
+            `andThen` assertEqual "no link" Nothing (Cli.outLinkFor Cli.NoOutLink "dev")
+      ]
+  runs <-
+    bracket_
+      (forceRemoveIfExists root >> mapM_ (createDirectoryIfMissing True) [linkedDir, unlinkedDir])
+      (forceRemoveIfExists root)
+      ( do
+          linked <-
+            if not canLink
+              then [] <$ putStrLn "  SKIP  a build's link needs symlink privilege"
+              else do
+                outBuilt <- buildIn linkedDir "linked-store" []
+                devBuilt <- buildIn linkedDir "linked-store" ["-A", "dev"]
+                outLink <- linkTarget (linkedDir </> "result")
+                devLink <- linkTarget (linkedDir </> "result-dev")
+                collected@(collectedCode, _, _) <- collectIn linkedDir "linked-store"
+                kept <- traverse Dir.doesPathExist (catMaybes [printed outBuilt, printed devBuilt])
+                sequence
+                  [ runTest "build links its output from ./result" $
+                      case printed outBuilt of
+                        Just path | outLink == Just path -> Pass
+                        _ -> Fail (outcome outBuilt <> "; link: " <> T.pack (show outLink)),
+                    runTest "build links an output other than out from ./result-NAME" $
+                      case printed devBuilt of
+                        Just path | devLink == Just path -> Pass
+                        _ -> Fail (outcome devBuilt <> "; link: " <> T.pack (show devLink)),
+                    runTest "store gc keeps the outputs a build's links root" $
+                      if collectedCode == ExitSuccess && kept == [True, True]
+                        then Pass
+                        else Fail (outcome collected <> "; kept: " <> T.pack (show kept))
+                  ]
+          unlinkedBuilt <- buildIn unlinkedDir "unlinked-store" ["--no-out-link"]
+          left <- Dir.listDirectory unlinkedDir
+          unlinkedCollected@(unlinkedCode, _, _) <- collectIn unlinkedDir "unlinked-store"
+          survived <- traverse Dir.doesPathExist (printed unlinkedBuilt)
+          unlinked <-
+            runTest "build --no-out-link links nothing, and store gc then deletes the output" $
+              if null left && unlinkedCode == ExitSuccess && survived == Just False
+                then Pass
+                else Fail (outcome unlinkedBuilt <> "; left: " <> T.pack (show left) <> "; gc: " <> outcome unlinkedCollected)
+          pure (linked ++ [unlinked])
+      )
+  pure (parses ++ runs)
 
 -- ---------------------------------------------------------------------------
 -- Tests: trust
@@ -24210,6 +24316,7 @@ testTrust = do
         assertEqual "target" (Right (Cli.CmdTrust (Cli.TargetExpr "1") (Just "a.b"))) (Cli.optCommand <$> Cli.parseArgs ["trust", "--expr", "1", "-A", "a.b"])
           `andThen` assertEqual "check" (Left "unknown trust flag: --check") (Cli.optCommand <$> Cli.parseArgs ["trust", "--check", "--expr", "1"])
           `andThen` assertEqual "out-link" (Left "unknown trust flag: -o") (Cli.optCommand <$> Cli.parseArgs ["trust", "-o", "result", "--expr", "1"])
+          `andThen` assertEqual "no-out-link" (Left "unknown trust flag: --no-out-link") (Cli.optCommand <$> Cli.parseArgs ["trust", "--no-out-link", "--expr", "1"])
           `andThen` assertEqual "exec-wrapper" (Left "unknown trust flag: --exec-wrapper") (Cli.optCommand <$> Cli.parseArgs ["trust", "--exec-wrapper", "x86_64-windows=wine", "--expr", "1"]),
       runTest "every fixed-output derivation of the closure is an input, one with inputs of its own included" $
         assertEqual
@@ -24789,8 +24896,9 @@ testCliReference = do
             ),
         runTest "spellings are well formed and name one flag each" $
           let spellings = concatMap (toList . Ref.flagSpellings . snd) referenceFlags
+              longFormed = all (\part -> not (T.null part) && T.all isAsciiLower part) . T.splitOn "-"
               wellFormed entry =
-                all (\part -> not (T.null part) && T.all isAsciiLower part) (T.splitOn "-" (Ref.flagLong entry))
+                all longFormed (Ref.flagLong entry : toList (Ref.flagAlias entry))
                   && maybe True isAsciiLetter (Ref.flagShort entry)
            in assertEqual "malformed" [] [Ref.flagLong entry | (_, entry) <- referenceFlags, not (wellFormed entry)]
                 `andThen` assertEqual "repeated" [] [spelling | (spelling, count) <- Map.toList (Map.fromListWith (+) [(spelling, 1 :: Int) | spelling <- spellings]), count > 1],
@@ -29960,6 +30068,7 @@ runSuite = do
           testExecWrapperCLI,
           testCheckCLI,
           testBuildCoresCLI,
+          testOutLinkCLI,
           testUncaughtIOFailureCLI,
           testClosedStdoutCLI,
           testCliReference,

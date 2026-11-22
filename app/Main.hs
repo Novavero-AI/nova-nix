@@ -32,7 +32,7 @@ import GHC.Profiling (requestHeapCensus)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, execWrapperConfig, substituteFromCaches)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builtins (isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
-import Nix.Cli.Args (BuildTarget (..), CliOpts (..), Command (..), PushArgs (..), parseArgs)
+import Nix.Cli.Args (BuildTarget (..), CliOpts (..), Command (..), OutLink, PushArgs (..), outLinkFor, parseArgs)
 import Nix.Cli.Reference (Host (..), SystemConfDirSource (..), currentHost, helpLines, systemConfDirSource)
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
@@ -547,7 +547,7 @@ evalTarget config opts storeDir dataDir target attrPath action = do
 -- output path.  A store directory upstream Nix's database also manages
 -- is refused before evaluation, which can write to the store too
 -- ("Nix.Store.Upstream").
-buildCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> Maybe FilePath -> IO ()
+buildCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> OutLink -> IO ()
 buildCommand config opts storeDir dataDir target attrPath outLink = do
   upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("build: " <>))
   let caches = resolveCaches config (optSubstituter opts) (optTrustedKey opts)
@@ -587,7 +587,7 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
   -- prints after the link exists, as nix-build prints it, so a
   -- failed link prints nothing a script would take for success.
   rooted <- case buildResult of
-    BuildSuccess _ -> traverse (\link -> addOutLinkRoot store link outputPath) outLink
+    BuildSuccess _ -> traverse (\link -> addOutLinkRoot store link outputPath) (outLinkFor outLink outputName)
     BuildFailure _ _ -> pure Nothing
   closeStore store
   case (buildResult, rooted) of

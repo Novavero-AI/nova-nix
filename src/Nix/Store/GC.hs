@@ -22,9 +22,10 @@
 --   since a symlink on Windows needs Developer Mode.  Nothing in
 --   nova-nix creates a permanent root; they are for the operator.
 --
--- * __Indirect roots__ are what @build --out-link PATH@ registers
---   ('addOutLinkRoot', upstream's @addPermRoot@): the out-link
---   @PATH -> \<store path\>@ where the user asked for it, plus a record
+-- * __Indirect roots__ are what @build@ registers for the link it makes
+--   to its output ('addOutLinkRoot', upstream's @addPermRoot@): the
+--   out-link @PATH -> \<store path\>@, @.\/result@ unless @--out-link@
+--   names another path, plus a record
 --   @gcroots\/auto\/\<sha256 of PATH\>@ holding PATH's absolute
 --   spelling.  Upstream's record is a symlink to the out-link; here it
 --   is a regular file with the same content, because the record must be

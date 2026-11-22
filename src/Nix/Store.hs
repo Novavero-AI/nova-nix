@@ -27,8 +27,8 @@
 --
 -- == Garbage collection
 --
--- A GC root is an explicit "keep this" marker: the out-link
--- @build --out-link@ creates, or a file the operator drops under the
+-- A GC root is an explicit "keep this" marker: the out-link @build@
+-- makes to its output, or a file the operator drops under the
 -- store's @gcroots@ directory.  The collector walks every root, follows
 -- references transitively, and deletes everything not reachable; a
 -- delete of named paths refuses a path that walk reaches.
