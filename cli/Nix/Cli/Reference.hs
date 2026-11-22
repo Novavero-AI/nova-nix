@@ -232,15 +232,19 @@ command name = case name of
           Form "FILE.nix" "Build a derivation from a .nix file"
             :| [Form "--expr 'EXPR'" "Build a derivation from an inline expression"],
         commandDescription =
-          "Evaluates `FILE.nix`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. The outputs of a derivation whose `allowSubstitutes` attribute is false are built instead, unless `always-allow-substitutes` is on. A substituter that fails stops the build unless `fallback` is on. With `--check` the derivation is checked as `nix-build --check` checks one: an output of its that is not valid is first downloaded from a substituter that holds it, the derivations it depends on are built or downloaded as ever, and then it is built again beside its outputs, never downloaded, and each output is compared with the one in the store. The rebuild changes nothing in the store and what it wrote is discarded; the downloads and builds before it add to the store as in any build. An output that comes out different fails the command with status 104, so a path a substituter supplied can be held to a build. With `--out-link` the output is linked from `PATH` and kept from garbage collection; without it nothing is linked, where `nix-build` links `./result`. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is evaluated.",
+          "Evaluates `FILE.nix`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. The outputs of a derivation whose `allowSubstitutes` attribute is false are built instead, unless `always-allow-substitutes` is on. A substituter that fails stops the build unless `fallback` is on. With `--check` the derivation is checked as `nix-build --check` checks one: an output of its that is not valid is first downloaded from a substituter that holds it, the derivations it depends on are built or downloaded as ever, and then it is built again beside its outputs, never downloaded, and each output is compared with the one in the store. The rebuild changes nothing in the store and what it wrote is discarded; the downloads and builds before it add to the store as in any build. An output that comes out different fails the command with status 104, so a path a substituter supplied can be held to a build. The output is linked from `./result`, or from the path `--out-link` gives, with `-NAME` appended for an output `NAME` other than `out`, as `nix-build` links it, and the link is a root the garbage collector keeps; it replaces a link already there that points into the store, and anything else there fails the command. With `--no-out-link` nothing is linked. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is evaluated.",
         commandExamples =
           Example
             "Build GNU Hello for Windows from the directory a release unpacks to, with the public cache as a substituter."
             ("build" :| ["pkgs/windows/hello.nix", "--substituter", "https://cache.novavero.ai", "--trusted-key", "cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ="])
             []
             :| [ Example
-                   "Build an attribute of a file and link the output from `./result`, a root the garbage collector keeps."
-                   ("build" :| ["pkgs/windows/default.nix", "-A", "hello", "-o", "result"])
+                   "Build an attribute of a file, linking the output from `./result`, a root the garbage collector keeps."
+                   ("build" :| ["pkgs/windows/default.nix", "-A", "hello"])
+                   [],
+                 Example
+                   "Build GNU Hello for Windows and print its path with no link, as a script that reads the path does."
+                   ("build" :| ["pkgs/windows/hello.nix", "--no-out-link"])
                    [],
                  Example
                    "Build a derivation written inline, on Linux or macOS."
@@ -310,7 +314,7 @@ command name = case name of
     CommandEntry
       { commandForms = Form "" "Remove every store path not reachable from a root" :| [],
         commandDescription =
-          "Deletes every store path no root keeps, directly or through the paths that reference it, and prints how many it deleted and the space it freed, as `nix-store --gc` does. The roots are the out-links `build --out-link` registered and the links and files under the store's `.nova-nix/gcroots` directory; a path a running program has open is not a root, and a rooted output does not keep the `.drv` that built it. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused. With `--print-roots` it lists the roots and deletes nothing.",
+          "Deletes every store path no root keeps, directly or through the paths that reference it, and prints how many it deleted and the space it freed, as `nix-store --gc` does. The roots are the links `build` made to its outputs, while they stay, and the links and files under the store's `.nova-nix/gcroots` directory; a path a running program has open is not a root, and a rooted output does not keep the `.drv` that built it. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused. With `--print-roots` it lists the roots and deletes nothing.",
         commandExamples =
           Example "Delete everything no root keeps." ("store" :| ["gc"]) []
             :| [Example "List the roots, each as the link that names it and the path it keeps." ("store" :| ["gc", "--print-roots"]) []]
@@ -326,6 +330,7 @@ data FlagName
   = ExprFlag
   | AttrFlag
   | OutLinkFlag
+  | NoOutLinkFlag
   | StrictFlag
   | AtermFlag
   | NixPathFlag
@@ -354,6 +359,9 @@ data FlagEntry = FlagEntry
     -- | The one-letter spelling, without its leading @-@, where there is
     -- one.
     flagShort :: !(Maybe Char),
+    -- | A second long spelling, without its leading @--@, where upstream
+    -- accepts one.
+    flagAlias :: !(Maybe Text),
     -- | The name of the value it takes, where it takes one.
     flagArgument :: !(Maybe Text),
     -- | What it does, in a line.
@@ -375,11 +383,14 @@ data FlagScope
 flagNames :: [FlagName]
 flagNames = [minBound .. maxBound]
 
--- | A flag's spellings: the one-letter one first, where there is one.
+-- | A flag's spellings: the one-letter one first, where there is one,
+-- then the long one and its alias.
 flagSpellings :: FlagEntry -> NonEmpty Text
 flagSpellings entry = case flagShort entry of
-  Just letter -> T.pack ['-', letter] :| [longSpelling entry]
-  Nothing -> longSpelling entry :| []
+  Just letter -> T.pack ['-', letter] :| (longSpelling entry : alias)
+  Nothing -> longSpelling entry :| alias
+  where
+    alias = map ("--" <>) (toList (flagAlias entry))
 
 -- | A flag's long spelling, which names it.
 longSpelling :: FlagEntry -> Text
@@ -397,7 +408,9 @@ flag name = case name of
   AttrFlag ->
     short 'A' "attr" (Just "ATTRPATH") "Select a dotted attribute path (`a.b.c`)" buildAndTrust
   OutLinkFlag ->
-    short 'o' "out-link" (Just "PATH") "Create `PATH` as a symlink to the result and register it as a GC root" buildOnly
+    short 'o' "out-link" (Just "PATH") "Link the output from `PATH` in place of `./result`" buildOnly
+  NoOutLinkFlag ->
+    aliased "no-out-link" "no-link" Nothing "Create no link to the output, and no GC root" buildOnly
   StrictFlag ->
     long "strict" Nothing "Deep-force all thunks before printing (warning: OOM on large results)" evalOnly
   AtermFlag ->
@@ -437,8 +450,9 @@ flag name = case name of
   VersionFlag ->
     long "version" Nothing "Print the version and exit" GlobalFlag
   where
-    long longName = FlagEntry longName Nothing
-    short letter longName = FlagEntry longName (Just letter)
+    long longName = FlagEntry longName Nothing Nothing
+    short letter longName = FlagEntry longName (Just letter) Nothing
+    aliased longName aliasName = FlagEntry longName Nothing (Just aliasName)
     evalOnly = CommandFlag (EvalCommand :| [])
     buildOnly = CommandFlag (BuildCommand :| [])
     pushOnly = CommandFlag (PushCommand :| [])

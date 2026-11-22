@@ -154,9 +154,10 @@ the examples below do.
 **Windows.** The store is `C:\nix\store`, which nova-nix creates, and it
 inherits the drive root's permissions, so every signed-in user can modify it.
 Turn on Developer Mode (Settings, For developers): nova-nix makes native
-symlinks, inside store paths and for `--out-link`, and Windows allows them only
-in Developer Mode or an elevated shell. Without either, building or downloading
-a path that holds a symlink fails.
+symlinks, inside store paths and for the `result` link a build makes, and
+Windows allows them only in Developer Mode or an elevated shell. Without
+either, building or downloading a path that holds a symlink fails, and so does
+a build's `result` link, unless `--no-out-link` is given.
 
 Expressions see store paths as `/nix/store/...` on Windows too, so a
 derivation has the same store path whichever platform evaluates it; a build
@@ -235,17 +236,17 @@ $ nova-nix eval greet.nix
 ### Build a derivation on macOS or Linux
 
 ```console
-$ nova-nix build --store ~/nix/store -o result --expr 'derivation { name = "greeting"; system = builtins.currentSystem; builder = "/bin/sh"; args = [ "-c" "echo hello > $out" ]; }'
+$ nova-nix build --store ~/nix/store --expr 'derivation { name = "greeting"; system = builtins.currentSystem; builder = "/bin/sh"; args = [ "-c" "echo hello > $out" ]; }'
   [build]  greeting
 /Users/me/nix/store/gs1rwhzwrg6p0vf3pk8lxv35d7z2dfiz-greeting
 $ cat result
 hello
 ```
 
-`build` prints the output's path on stdout and its progress on stderr.
-`-o result` links the output from `./result` and makes it a root that
-`nova-nix store gc` keeps; without it nothing is linked. The collector does not
-keep the `.drv` behind a rooted output, or a path a running program has open.
+`build` prints the output's path on stdout and its progress on stderr, and
+links the output from `./result`, a root that `nova-nix store gc` keeps, unless
+`--no-out-link` is given. The collector does not keep the `.drv` behind a
+rooted output, or a path a running program has open.
 On Linux with `/nix` set up, leave out `--store`.
 
 ### Build GNU Hello on Windows
@@ -258,7 +259,7 @@ Set-Location "$env:LOCALAPPDATA\Programs\nova-nix-windows-x64"
 ```
 
 ```console
-> nova-nix build pkgs\windows\hello.nix -o result --substituter https://cache.novavero.ai --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
+> nova-nix build pkgs\windows\hello.nix --substituter https://cache.novavero.ai --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
   [subst]  hello
 C:\nix\store\78n2mrxhg3xgjganf7nfkaznh2j03z68-hello
 > .\result\bin\hello.exe
@@ -288,7 +289,7 @@ mv nixpkgs-6f06d204d8f2d8761d9da78778745974a3216381 nixpkgs
 ```console
 $ nova-nix eval --expr '(import ./nixpkgs { }).hello.version'
 "2.12.3"
-$ nova-nix build --store ~/nix/store -o result --expr '(import ./nixpkgs { }).hello' --substituter https://cache.nixos.org --trusted-key cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+$ nova-nix build --store ~/nix/store --expr '(import ./nixpkgs { }).hello' --substituter https://cache.nixos.org --trusted-key cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
   [subst]  hello-2.12.3
 /Users/me/nix/store/0blwcqcg0swwz9x748rhyzbfyaybmql8-hello-2.12.3
 ```
@@ -298,7 +299,7 @@ runs only from a store at `/nix/store`. From `~/nix/store`, macOS stops it with
 `Library not loaded: /nix/store/...`. On Linux with `/nix` set up:
 
 ```console
-$ nova-nix build -o result --expr '(import ./nixpkgs { }).hello' --substituter https://cache.nixos.org --trusted-key cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+$ nova-nix build --expr '(import ./nixpkgs { }).hello' --substituter https://cache.nixos.org --trusted-key cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
   [subst]  hello-2.12.3
 /nix/store/fkv51s1m2gsy6pz71nnyqyprbvfg7sd7-hello-2.12.3
 $ ./result/bin/hello
@@ -309,9 +310,9 @@ Hello, world!
 
 Not implemented yet, and on the [roadmap]: flakes, `nix-shell` and
 `nix develop`, profiles (`nix-env`, `nix profile`; run a program from its store
-path or an `--out-link` instead), and a daemon for a multi-user store. Builds
-are not sandboxed on any platform: a builder can read and write outside its
-build directory and reach the network.
+path or the `result` link a build makes instead), and a daemon for a
+multi-user store. Builds are not sandboxed on any platform: a builder can read
+and write outside its build directory and reach the network.
 
 `eval` and `build` take a file or `--expr`, not a directory or a search-path
 argument such as `<nixpkgs>` (an expression can use one). They take no `--arg`
