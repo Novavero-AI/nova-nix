@@ -28,6 +28,10 @@
 -- @nix-build --check@ selects, and it covers that derivation alone: its
 -- inputs are realised as under 'BuildNormal'.
 --
+-- Several derivations can be realised in one call, each for the outputs a
+-- request asks of it, as upstream's @Store::buildPaths@ realises several
+-- requests with one worker ('realiseRequests').
+--
 -- Every effect is a record field, so the decisions run in tests over a fake
 -- cache and store.  "Nix.Builder" supplies the real ones.
 module Nix.Realise
@@ -58,6 +62,12 @@ module Nix.Realise
     realiseFailureMessage,
     realiseFailureStatus,
     realise,
+
+    -- * Realising several requests
+    RequestsFailure (..),
+    requestsFailureMessage,
+    requestsFailureStatus,
+    realiseRequests,
   )
 where
 
@@ -462,8 +472,9 @@ data BuildMode
 data RealiseSettings = RealiseSettings
   { rsFallback :: !Fallback,
     rsSubstitutes :: !SubstitutesSetting,
-    -- | What is done with the root.  Every other derivation in the graph
-    -- is realised as under 'BuildNormal', whatever this says.
+    -- | What 'realise' does with its root.  Every other derivation in the
+    -- graph, and every request 'realiseRequests' is given, is realised as
+    -- under 'BuildNormal', whatever this says.
     rsMode :: !BuildMode
   }
   deriving (Eq, Show)
@@ -699,6 +710,51 @@ outputsFromCaches :: (Monad m) => RealiseEffects s m -> Substitutes -> [StorePat
 outputsFromCaches _ MustBuild _ = pure ClosureUnavailable
 outputsFromCaches effects MaySubstitute outputs = substituteClosure (reSubst effects) outputs
 
+-- | Where a request for some of a derivation's outputs stands before
+-- anything is substituted or built for it.
+data Assessment
+  = -- | Nothing is left to realise: the graph does not hold the
+    -- derivation, or the outputs asked of it are realised already.
+    NothingToRealise
+  | -- | Every output asked of the derivation is valid.
+    OutputsValid !DepNode
+  | -- | Some output asked of the derivation is not valid.  The paths are
+    -- those of every output asked, and the derivation may or may not be
+    -- substituted.
+    OutputsWanted !DepNode ![StorePath] !Substitutes
+
+-- | Assess a request against what has been realised so far, reading what
+-- upstream's goal for it reads before it asks any cache
+-- (@DerivationGoal::haveDerivation@ at 2.24.9): the derivation's
+-- attributes, whether it has every output asked, whether those are valid,
+-- and, when one is not, whether the derivation may be substituted.  A node
+-- outside the graph has nothing to realise.
+assess ::
+  (Monad m) =>
+  RealiseSettings ->
+  RealiseEffects s m ->
+  DepGraph ->
+  RealisedOutputs ->
+  (StorePath, Set Text) ->
+  m (Either RealiseFailure Assessment)
+assess settings effects graph realised (node, wanted) = case Map.lookup node (unDepGraph graph) of
+  Nothing -> pure (Right NothingToRealise)
+  Just depNode
+    | wanted `Set.isSubsetOf` Map.findWithDefault Set.empty node realised -> pure (Right NothingToRealise)
+    | otherwise -> either (pure . Left . InvalidDerivation) (parsed depNode) (derivationAttrs node (dnDerivation depNode))
+  where
+    parsed depNode attrs = case NE.nonEmpty (Set.toAscList (wanted `Set.difference` outputNames drv)) of
+      Just absent -> pure (Left (MissingOutputs node absent))
+      Nothing -> do
+        valid <- allValid effects outputs
+        pure $
+          if valid
+            then Right (OutputsValid depNode)
+            else first InvalidDerivation (OutputsWanted depNode outputs <$> substitutesAllowed (rsSubstitutes settings) node attrs)
+      where
+        drv = dnDerivation depNode
+        outputs = namedOutputPaths wanted drv
+
 -- | Realise one node for the outputs asked of it, threading what has been
 -- realised so far.  A request for outputs already realised does nothing,
 -- so a derivation several others ask the same of is realised once.  One
@@ -716,36 +772,23 @@ realiseNode ::
   RealisedOutputs ->
   (StorePath, Set Text) ->
   m (Either RealiseFailure RealisedOutputs)
-realiseNode settings effects graph realised (node, wanted) = case Map.lookup node (unDepGraph graph) of
-  -- A node outside the graph has nothing to realise.
-  Nothing -> pure (Right realised)
-  Just depNode
-    | wanted `Set.isSubsetOf` Map.findWithDefault Set.empty node realised -> pure (Right realised)
-    | otherwise ->
-        either invalid (realiseParsed depNode (Map.insertWith Set.union node wanted realised)) (derivationAttrs node (dnDerivation depNode))
+realiseNode settings effects graph realised request@(node, wanted) =
+  assess settings effects graph realised request >>= either (pure . Left) realiseAssessed
   where
+    seen = Map.insertWith Set.union node wanted realised
     stopFor = substitutionStop (rsFallback settings) node
     reported status drv done = Right done <$ reReport effects status drv
-    invalid = pure . Left . InvalidDerivation
-    realiseParsed depNode seen attrs = case NE.nonEmpty (Set.toAscList absent) of
-      Just names -> pure (Left (MissingOutputs node names))
-      Nothing -> do
-        valid <- allValid effects outputs
-        if valid
-          then reported AlreadyValid drv seen
-          else either invalid (substituteOrBuild depNode outputs seen) (substitutesAllowed (rsSubstitutes settings) node attrs)
-      where
-        drv = dnDerivation depNode
-        absent = wanted `Set.difference` outputNames drv
-        outputs = namedOutputPaths wanted drv
-    substituteOrBuild depNode outputs seen allowed = do
+    realiseAssessed NothingToRealise = pure (Right realised)
+    realiseAssessed (OutputsValid depNode) = reported AlreadyValid (dnDerivation depNode) seen
+    realiseAssessed (OutputsWanted depNode outputs allowed) = substituteOrBuild depNode outputs allowed
+    substituteOrBuild depNode outputs allowed = do
       let substituteOutputs = outputsFromCaches effects allowed outputs
       firstTry <- substituteOutputs
       case (firstTry, stopFor firstTry) of
         (ClosureComplete, _) -> reported Substituted (dnDerivation depNode) seen
         (_, Just failure) -> pure (Left failure)
-        (_, Nothing) -> buildFromInputs substituteOutputs firstTry depNode seen
-    buildFromInputs substituteOutputs firstTry depNode seen = do
+        (_, Nothing) -> buildFromInputs substituteOutputs firstTry depNode
+    buildFromInputs substituteOutputs firstTry depNode = do
       let drv = dnDerivation depNode
       inputs <- realiseAll settings effects graph seen (Map.toList (dnDeps depNode))
       case inputs of
@@ -796,3 +839,142 @@ realiseAll settings effects graph realised (request : rest) = do
   case outcome of
     Left err -> pure (Left err)
     Right deeper -> realiseAll settings effects graph deeper rest
+
+-- ---------------------------------------------------------------------------
+-- Realising several requests
+-- ---------------------------------------------------------------------------
+
+-- | Why realising several requests stopped, as upstream's
+-- @Store::buildPaths@ reports it (entry-points.cc:21-47 at 2.24.9).
+data RequestsFailure
+  = -- | The call failed with this, reported as it is: a failure that ends
+    -- the whole call, as one upstream's goals throw does, or one that ended
+    -- a request when every other request was realised.
+    FailedWith !RealiseFailure
+  | -- | The request for this derivation failed with this, and left the
+    -- requests for these others unrealised.  Upstream logs the failure,
+    -- then fails the call naming every request its worker did not finish.
+    FailedLeaving !RealiseFailure !StorePath !(NonEmpty StorePath)
+  deriving (Eq, Show)
+
+-- | A failure as the call reports it, given the directory the store's
+-- files are in: the failure's own message ('realiseFailureMessage'), or
+-- upstream's @build of %s failed@, which names the request that failed
+-- and the others it left unrealised in the order of their paths, as
+-- upstream's sorted set of them lists them, each under the logical store
+-- directory.  The failure that left them is what upstream logs before it.
+requestsFailureMessage :: StoreDir -> RequestsFailure -> Text
+requestsFailureMessage realDir (FailedWith failure) = realiseFailureMessage realDir failure
+requestsFailureMessage _ (FailedLeaving _ failed others) =
+  "build of " <> T.intercalate ", " (map quoted (Set.toAscList (Set.fromList (failed : NE.toList others)))) <> " failed"
+  where
+    quoted drvPath = "'" <> storePathToText defaultStoreDir drvPath <> "'"
+
+-- | The exit status of a call that stopped with this failure: the
+-- failure's own ('realiseFailureStatus'), however it is reported.
+-- Upstream gives a failed request's report the status its worker composes
+-- from what failed in the call (@Worker::failingExitStatus@,
+-- worker.cc:495-513 at 2.24.9), and a call here stops at its first
+-- failure, so that is the one failure's.  An error upstream's goals throw
+-- keeps its own status, 1 (error.hh:94), which 'realiseFailureStatus'
+-- gives each of them.
+requestsFailureStatus :: RequestsFailure -> Int
+requestsFailureStatus (FailedWith failure) = realiseFailureStatus failure
+requestsFailureStatus (FailedLeaving failure _ _) = realiseFailureStatus failure
+
+-- | How far a failure reaches in upstream's worker.
+data FailureReach
+  = -- | It ends the request it arose in, and with it the call, as a failed
+    -- goal does, and @Store::buildPaths@ reports it among the requests
+    -- its worker left unrealised.
+    EndsRequest
+  | -- | It ends the call where it arises, as an error upstream's goals
+    -- throw does: its worker does not catch one (@Worker::run@,
+    -- worker.cc:328-331 at 2.24.9), so it leaves @buildPaths@ as it is.
+    EndsCall
+
+-- | How far a failure reaches.  A cache that cannot be asked is rethrown
+-- (@PathSubstitutionGoal::init@, substitution-goal.cc:90-94 at 2.24.9),
+-- and attributes that cannot be read, an output a derivation does not
+-- have and a check of outputs that are not valid are thrown
+-- (derivation-goal.cc:197, 249, 1500-1503 and 329-331).  A failed build
+-- or check, a failed substitute and a derivation that cannot be loaded end
+-- their goal (@buildDone@, :1030-1053; @outputsSubstitutionTried@,
+-- :281-285; @loadDerivation@, :166-167).
+failureReach :: RealiseFailure -> FailureReach
+failureReach failure = case failure of
+  BuildFailed _ -> EndsRequest
+  SubstitutesFailed _ -> EndsRequest
+  NotDeterministic _ _ -> EndsRequest
+  MissingDerivation _ -> EndsRequest
+  CacheQueryFailed _ -> EndsCall
+  InvalidDerivation _ -> EndsCall
+  MissingOutputs _ _ -> EndsCall
+  OutputsNotValid _ -> EndsCall
+
+-- | Realise several derivations, each for the outputs a request asks of
+-- it, with one record of what is realised, so that a derivation is not
+-- realised again for outputs one request, or an input of one, has
+-- already realised.  Upstream's @Store::buildPaths@ makes a goal for each
+-- request and runs them with one worker (entry-points.cc:11-19 at
+-- 2.24.9), which keeps one goal for a derivation: requests that name the
+-- same derivation share it, and it wants every output any of them asks
+-- for (@Worker::makeDerivationGoalCommon@, worker.cc:46-61).  Such
+-- requests are realised here as one request for all those outputs.
+--
+-- Every request is assessed before any is realised, as the worker's first
+-- pass works every goal until it waits for a substitute, an input or a
+-- build (worker.cc:319-333): one whose outputs are valid is realised
+-- there, and one whose derivation's attributes cannot be read, that asks
+-- for an output the derivation does not have, or that has an output that
+-- is not valid and an @allowSubstitutes@ that cannot be read stops the
+-- call before any substitute or build has finished
+-- (@DerivationGoal::haveDerivation@, derivation-goal.cc:193-272).
+-- The rest are realised one after another in the order of their
+-- derivations' paths, the order a derivation's inputs are realised in,
+-- where upstream's worker takes its goals in the order of their
+-- derivations' names (@DerivationGoal::key@, derivation-goal.cc:97-104).
+--
+-- The first failure stops the call, as a failed goal ends every other
+-- unless @keep-going@ is set (@Worker::removeGoal@, worker.cc:162-168),
+-- which nova-nix does not offer.  One that upstream's goals throw, such
+-- as a cache that cannot be asked, is reported as it is.  Any other is
+-- reported as it is when every other request was realised, and otherwise
+-- with the request that failed and each after it whose outputs are not
+-- valid, which upstream's worker had not finished (entry-points.cc:21-47).
+-- That worker runs the goals that wait for substitutes and builds
+-- together, so which of them it has finished when one fails depends on
+-- how their work interleaves; realising them in turn answers as upstream
+-- does when each request's work ends before the next one's begins.
+--
+-- Every request is realised as under 'BuildNormal', whatever 'rsMode'
+-- says, as import from derivation builds its requests under @bmNormal@
+-- (@EvalState::realiseContext@, primops.cc:88).  A derivation the graph
+-- does not hold has nothing to realise, as for 'realise', and the graph
+-- has to be acyclic.
+realiseRequests ::
+  (Monad m) =>
+  RealiseSettings ->
+  RealiseEffects s m ->
+  DepGraph ->
+  [(StorePath, Set Text)] ->
+  m (Either RequestsFailure ())
+realiseRequests settings effects graph requests = do
+  firstPass <- runExceptT (traverse assessRequest (Map.toList (Map.fromListWith Set.union requests)))
+  case firstPass of
+    Left failure -> pure (Left (FailedWith failure))
+    Right assessments -> do
+      mapM_ (reReport effects AlreadyValid . dnDerivation) [depNode | (_, OutputsValid depNode) <- assessments]
+      inTurn
+        (Map.fromList [request | (request, OutputsValid _) <- assessments])
+        [(request, outputs) | (request, OutputsWanted _ outputs _) <- assessments]
+  where
+    assessRequest request = (,) request <$> ExceptT (assess settings effects graph Map.empty request)
+    inTurn _ [] = pure (Right ())
+    inTurn realised ((request, _) : rest) =
+      realiseNode settings effects graph realised request >>= either (fmap Left . stoppedAt request rest) (`inTurn` rest)
+    stoppedAt (node, _) rest failure = case failureReach failure of
+      EndsCall -> pure (FailedWith failure)
+      EndsRequest -> do
+        unrealised <- filterM (fmap not . allValid effects . snd) rest
+        pure (maybe (FailedWith failure) (FailedLeaving failure node) (NE.nonEmpty (map (fst . fst) unrealised)))
