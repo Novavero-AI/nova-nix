@@ -23431,6 +23431,37 @@ testBuilder = do
         pure $ case result of
           BuildSuccess _ -> Pass
           BuildFailure msg code -> Fail ("ambient leaked into a non-fixed-output build (" <> T.pack (show code) <> "): " <> msg),
+      -- The carve-out is for upstream's fixed-output type alone: one
+      -- output, out, with a hash that fixes it.  Each builder only logs
+      -- what it saw, so every build fails for want of its outputs, which
+      -- is not what is tested.
+      runTestM "impureEnvVars reach a fixed-output build and no other that names a hash algorithm" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-impure3"
+            logPath = tmpBase </> "nova-nix-test-impure3.log"
+            pin = T.replicate 64 "0"
+            pathOf index = StorePath ("ffffffffffffffffffffffffffffff1" <> T.pack (show (index :: Int))) "impure-gate"
+            output name = DerivationOutput name . pathOf
+            kinds =
+              [ ("a fixed-output build", [output "out" 0 "sha256" pin], "seen: passed\n"),
+                ("a floating content-addressed build", [output "out" 1 "r:sha256" ""], "seen: unset\n"),
+                ("an impure build", [output "out" 2 "r:sha256" "impure"], "seen: unset\n"),
+                ("a fixed output beside another", [output "out" 3 "sha256" pin, output "dev" 4 "" ""], "seen: unset\n"),
+                ("a fixed output not named out", [output "data" 5 "sha256" pin], "seen: unset\n")
+              ]
+            seenBy store outputs = do
+              let baseDrv = mkTestBuildDrv shell (pathOf 0) "echo \"seen: ${NOVA_TEST_IMPURE-unset}\""
+                  drv = baseDrv {drvOutputs = outputs, drvEnv = Map.insert "impureEnvVars" "NOVA_TEST_IMPURE" (drvEnv baseDrv)}
+              _ <-
+                withBinaryFile logPath WriteMode $ \logHandle ->
+                  buildDerivation (defaultBuildConfig (stDir store)) {bcBuildLog = logHandle} store drv testDrvPath
+              BS.readFile logPath
+        forceRemoveIfExists tmpStore
+        results <-
+          bracket_ (setEnv "NOVA_TEST_IMPURE" "passed") (unsetEnv "NOVA_TEST_IMPURE" *> forceRemoveIfExists tmpStore *> Dir.removePathForcibly logPath) $
+            bracket (openStore (StoreDir tmpStore)) closeStore $ \store ->
+              traverse (\(label, outputs, expected) -> assertEqual ("what " <> label <> " saw") expected <$> seenBy store outputs) kinds
+        pure (foldr andThen Pass results),
       runTestM "fixed-output flat mismatch fails and removes the output" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-fo2"

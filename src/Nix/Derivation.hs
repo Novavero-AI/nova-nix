@@ -52,6 +52,7 @@ module Nix.Derivation
   ( -- * Derivation type
     Derivation (..),
     DerivationOutput (..),
+    fixedOutput,
 
     -- * ATerm serialization
     toATerm,
@@ -167,9 +168,12 @@ data DerivationOutput = DerivationOutput
     doName :: !Text,
     -- | The store path this output will be placed at.
     doPath :: !StorePath,
-    -- | Hash algorithm (empty for input-addressed, "sha256" for fixed).
+    -- | The content-addressing method and hash algorithm, such as
+    -- @sha256@ or @r:sha256@: empty for an input-addressed output.
     doHashAlgo :: !Text,
-    -- | Expected hash (empty for input-addressed, actual hash for fixed).
+    -- | The hash that fixes the output: empty for an input-addressed or
+    -- a floating content-addressed output, and upstream's @impure@
+    -- marker for an impure one.
     doHash :: !Text
   }
   deriving (Eq, Show)
@@ -199,6 +203,32 @@ data Derivation = Derivation
     drvEnv :: !(Map Text ByteString)
   }
   deriving (Eq, Show)
+
+-- | The output of a fixed-output derivation: its one output, @out@, with
+-- the hash that fixes it, as upstream's derivation type has it
+-- (@BasicDerivation::type@, derivations.cc:734-748 at 2.24.9).  A
+-- floating content-addressed output names an algorithm and no hash, and
+-- an impure one upstream's @impure@ marker; neither is fixed.  Nor is a
+-- fixed output beside others or named otherwise, whose derivation
+-- upstream refuses (derivations.cc:740-744 and 777).
+fixedOutput :: Derivation -> Maybe DerivationOutput
+fixedOutput drv = case drvOutputs drv of
+  [out]
+    | doName out == fixedOutputName,
+      not (T.null (doHashAlgo out)),
+      not (T.null (doHash out)),
+      doHash out /= impureOutputHash ->
+        Just out
+  _ -> Nothing
+
+-- | The name of the one output a fixed-output derivation has.
+fixedOutputName :: Text
+fixedOutputName = "out"
+
+-- | What an impure derivation's output records as its hash, upstream's
+-- @DerivationOutput::Impure@ in a @.drv@ (derivations.cc:282).
+impureOutputHash :: Text
+impureOutputHash = "impure"
 
 -- | Serialize a derivation to ATerm format (the .drv file format).
 -- This serialization is what gets hashed to compute the store path,

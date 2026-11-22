@@ -74,7 +74,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word32, Word8)
 import Nix.DependencyGraph (DepGraph (..), DepNode (..), transitiveDeps)
-import Nix.Derivation (Derivation (..), DerivationOutput (..))
+import Nix.Derivation (Derivation (..), DerivationOutput (..), fixedOutput)
 import Nix.Store.Path (StorePath (spName), defaultStoreDir, defaultStoreDirText, parseStorePathBaseName, storePathToText)
 
 -- ---------------------------------------------------------------------------
@@ -369,29 +369,6 @@ data ContentFacts = ContentFacts
 -- ---------------------------------------------------------------------------
 -- The closure
 -- ---------------------------------------------------------------------------
-
--- | The name of the one output a fixed-output derivation has.
-fixedOutputName :: Text
-fixedOutputName = "out"
-
--- | What an impure derivation's output records as its hash, upstream's
--- @DerivationOutput::Impure@ in a @.drv@.
-impureOutputHash :: Text
-impureOutputHash = "impure"
-
--- | The output of a fixed-output derivation: its one output, @out@, with
--- the hash that fixes it.  A floating content-addressed output names an
--- algorithm and no hash, and an impure one upstream's @impure@ marker;
--- neither is fixed.
-fixedOutput :: Derivation -> Maybe DerivationOutput
-fixedOutput drv = case drvOutputs drv of
-  [out]
-    | doName out == fixedOutputName,
-      not (T.null (doHashAlgo out)),
-      not (T.null (doHash out)),
-      doHash out /= impureOutputHash ->
-        Just out
-  _ -> Nothing
 
 -- | The store path of a fixed-output derivation's output ('fixedOutput').
 fixedOutputPath :: Derivation -> Maybe StorePath

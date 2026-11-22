@@ -108,7 +108,7 @@ import Nix.Builder.BuildDir (withBuildDir)
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
 import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimits, runBuiltinUnpack)
 import Nix.DependencyGraph (TopoResult (..), buildDepGraph, topoSort)
-import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fromATerm, platformToText)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fixedOutput, fromATerm, platformToText)
 import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, renderAttrsShell, stringsAttr, structuredAttrsKey, withOutputPlaceholders)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
@@ -739,13 +739,15 @@ runPlannedBuild config sensitivity drv buildDir plans finish = do
                   SpawnThrough launcher -> (launcher, builderPath : builderArgs)
                   _ -> (builderPath, builderArgs)
                 -- Only a fixed-output derivation's impureEnvVars reach
-                -- the spawn: upstream gates the carve-out on the
-                -- derivation type being non-sandboxed, which for us is
-                -- exactly the fixed-output case.
-                carriesHash out = not (T.null (doHashAlgo out))
-                impureVars delivery
-                  | any carriesHash (drvOutputs drv) = adImpureEnvVars delivery
-                  | otherwise = Right []
+                -- the spawn.  Upstream passes them to a derivation whose
+                -- type is not sandboxed (local-derivation-goal.cc:1176 at
+                -- 2.24.9): a fixed-output one, or an impure one
+                -- (derivations.cc:99-112 and 746), which takes the
+                -- impure-derivations experimental feature nova-nix does
+                -- not implement.
+                impureVars delivery = case fixedOutput drv of
+                  Just _ -> adImpureEnvVars delivery
+                  Nothing -> Right []
              in case attrsDelivery config drv buildDir outputDirs of
                   Left err -> pure (Left (BuilderRefused 1 err))
                   Right delivery -> case impureVars delivery of
@@ -1324,7 +1326,7 @@ isWindows = System.Info.os == "mingw32"
 -- are written and read back.
 runBuiltinFetchurl :: FetchRetryPolicy -> CaseSensitivity -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
 runBuiltinFetchurl policy sensitivity drv outputDirs =
-  case (fetchUrlsFromEnv env, lookup envOut outputDirs, fixedOutput) of
+  case (fetchUrlsFromEnv env, lookup envOut outputDirs, hashedOutput) of
     (Left err, _, _) -> pure (Left (1, "builtin:fetchurl: " <> err))
     (_, Nothing, _) -> pure (Left (1, "builtin:fetchurl: derivation defines no 'out' output"))
     (_, _, Nothing) -> pure (Left (1, "builtin:fetchurl: 'out' output has no fixed-output hash"))
@@ -1352,7 +1354,7 @@ runBuiltinFetchurl policy sensitivity drv outputDirs =
       | otherwise = LeaveMode
     -- builtin:fetchurl derivations are always fixed-output; the expected hash
     -- lives in the canonical output spec (doHashAlgo + doHash), not the env.
-    fixedOutput = case drvOutputs drv of
+    hashedOutput = case drvOutputs drv of
       (out : _) | not (T.null (doHashAlgo out)) -> Just out
       _ -> Nothing
     fetchWithRetry outPath out ctx url =
