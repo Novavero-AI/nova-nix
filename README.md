@@ -31,6 +31,35 @@ nova-nix is experimental; [Status](#status) says what it does not do.
 
 ## Install
 
+Linux and macOS:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Novavero-AI/install-nova-nix/v1/install.sh | sh
+```
+
+Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Novavero-AI/install-nova-nix/v1/install.ps1 | iex
+```
+
+The [installer](https://github.com/Novavero-AI/install-nova-nix) checks the
+latest release against its published checksums, puts `nova-nix` on `PATH` and
+sets up [the store](#the-store), so no command needs `--store`. Its README says
+what it changes on each platform and how to uninstall. Then, in a new shell:
+
+```console
+$ nova-nix eval --expr '1 + 2'
+3
+```
+
+The macOS executable needs macOS 26 or newer on Apple silicon. The Linux
+executable needs glibc 2.38 or newer, and the GMP and zlib libraries
+(`libgmp.so.10` and `libz.so.1`). On Windows 11 on Arm, the x64 executable
+runs under emulation.
+
+### By hand
+
 Each [release](https://github.com/Novavero-AI/nova-nix/releases/latest) has an
 archive per platform:
 
@@ -47,11 +76,7 @@ location, so keep the directory together and put its `bin/` on `PATH`. `pkgs/`
 holds the Windows package recipes. `SHA256SUMS`, attached to the same release,
 lists each archive's checksum.
 
-### macOS and Linux
-
-The macOS executable needs macOS 26 or newer on Apple silicon. The Linux
-executable needs glibc 2.38 or newer, and the GMP and zlib libraries
-(`libgmp.so.10` and `libz.so.1`).
+#### macOS and Linux
 
 ```sh
 curl -fsSLO https://github.com/Novavero-AI/nova-nix/releases/latest/download/nova-nix-macos-arm64.tar.gz
@@ -71,7 +96,7 @@ $ nova-nix eval --expr '1 + 2'
 3
 ```
 
-### Windows
+#### Windows
 
 In PowerShell:
 
@@ -87,8 +112,7 @@ $env:Path += ";$env:LOCALAPPDATA\Programs\nova-nix-windows-x64\bin"
 The two hashes printed should match, apart from case. The last line puts
 `nova-nix` on `Path` in this shell; for new shells, add
 `%LOCALAPPDATA%\Programs\nova-nix-windows-x64\bin` to your user `Path` in
-Settings (search for "environment variables"). On Windows 11 on Arm, the x64
-archive runs under emulation.
+Settings (search for "environment variables").
 
 ```console
 > nova-nix eval --expr '1 + 2'
@@ -131,7 +155,7 @@ Each `nova-nix` process opens the store itself, with no daemon, so whoever
 builds needs write access to the store directory.
 
 **Linux.** The store is `/nix/store`, which nova-nix creates when `/nix` is
-yours:
+yours. The installer gives you `/nix`; by hand:
 
 ```sh
 sudo mkdir -p /nix
@@ -139,21 +163,23 @@ sudo chown "$USER" /nix
 ```
 
 **macOS.** The store is `/nix/store` too. The root volume is read-only, so
-`/nix` exists only if `/etc/synthetic.conf` creates it, which
+`/nix` exists only if `/etc/synthetic.conf` creates it. The installer does, on
+an APFS volume of its own, and
 [upstream Nix's installer](https://nix.dev/manual/nix/latest/installation/installing-binary.html#macos-installation)
-sets up and nova-nix does not. Without it, a command that writes to the store,
-such as a build or an evaluation that computes a nixpkgs package's store path,
-fails:
+sets one up too. Without either, a command that writes to the store, such as a
+build or an evaluation that computes a nixpkgs package's store path, fails:
 
 ```text
 error: /nix: createDirectory: permission denied (Read-only file system)
 ```
 
-Give those commands a store in your home directory, `--store ~/nix/store`, as
-the examples below do.
+In that case, give those commands a store in your home directory,
+`--store ~/nix/store`, as the examples below do.
 
-**Windows.** The store is `C:\nix\store`, which nova-nix creates, and it
-inherits the drive root's permissions, so every signed-in user can modify it.
+**Windows.** The store is `C:\nix\store`. The installer creates `C:\nix` so
+that only you, SYSTEM and Administrators can change it. A `C:\nix` that
+nova-nix creates itself inherits the drive root's permissions, so every
+signed-in user can modify it.
 Turn on Developer Mode (Settings, For developers): nova-nix makes native
 symlinks, inside store paths and for the `result` link a build makes, and
 Windows allows them only in Developer Mode or an elevated shell. Without
