@@ -17,9 +17,14 @@
 -- surrogate has no UTF-8 form, so a value holding one is refused rather
 -- than approximated, the rule the NAR serialiser applies to such a file
 -- name.
+--
+-- A command-line argument is read the same way: its bytes as the file
+-- system takes them when it names a file, which on POSIX are the bytes
+-- the program was given, and on Windows the UTF-8 form of its UTF-16.
 module Nix.Environment
   ( EnvLookup (..),
     lookupEnvBytes,
+    argumentBytes,
   )
 where
 
@@ -30,6 +35,8 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import System.Environment (lookupEnv)
 #else
+import qualified Data.ByteString.Char8 as BS8
+import qualified System.OsPath as OP
 import qualified System.Posix.Env.ByteString as PosixEnv
 #endif
 
@@ -57,11 +64,31 @@ lookupEnvBytes name = case TE.decodeUtf8' name of
   Right decoded -> maybe EnvUnset utf8Value <$> lookupEnv (T.unpack decoded)
   where
     -- base decodes a surrogate pair into one character and keeps an
-    -- unpaired surrogate as its own code point, which 'T.pack' would
-    -- replace with U+FFFD.
+    -- unpaired surrogate as its own code point ('hasNoUtf8Form').
     utf8Value value
-      | any ((== Surrogate) . generalCategory) value = EnvUnpairedSurrogate
+      | any hasNoUtf8Form value = EnvUnpairedSurrogate
       | otherwise = EnvValue (TE.encodeUtf8 (T.pack value))
 #else
 lookupEnvBytes name = maybe EnvUnset EnvValue <$> PosixEnv.getEnv name
+#endif
+
+-- | The bytes of a command-line argument as 'System.Environment.getArgs'
+-- gave it, or 'Nothing' for a Windows argument holding an unpaired
+-- surrogate.  On POSIX they are the argument encoded back with the file
+-- system encoding it was decoded with, which keeps a byte with no UTF-8
+-- reading as it was.
+argumentBytes :: String -> IO (Maybe ByteString)
+#if defined(mingw32_HOST_OS)
+argumentBytes arg
+  | any hasNoUtf8Form arg = pure Nothing
+  | otherwise = pure (Just (TE.encodeUtf8 (T.pack arg)))
+#else
+argumentBytes arg = Just . BS8.pack . map OP.toChar . OP.unpack <$> OP.encodeFS arg
+#endif
+
+#if defined(mingw32_HOST_OS)
+-- | Whether a character is an unpaired surrogate's own code point, which
+-- has no UTF-8 form and which 'T.pack' would replace with U+FFFD.
+hasNoUtf8Form :: Char -> Bool
+hasNoUtf8Form = (== Surrogate) . generalCategory
 #endif

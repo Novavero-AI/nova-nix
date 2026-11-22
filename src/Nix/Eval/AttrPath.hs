@@ -84,17 +84,22 @@ parseAttrPath path = go path T.empty []
 -- ---------------------------------------------------------------------------
 
 -- | Follow an attribute path into an evaluated value, forcing each step.
+-- Before each component, the value it indexes is passed through @call@,
+-- as upstream's @findAlongAttrPath@ calls it with the command line's
+-- arguments (attr-path.cc:56-60 at 2.24.9, "Nix.Eval.AutoCall"); a
+-- caller with nothing to call passes 'pure'.
 --
 -- Only the components named are forced: selecting one attribute leaves its
 -- siblings as thunks, so naming one package does not evaluate the rest of
 -- a package set.
-selectAttrPath :: (MonadEval m) => Text -> NixValue -> m (Either Text NixValue)
-selectAttrPath path root = case parseAttrPath path of
+selectAttrPath :: (MonadEval m) => (NixValue -> m NixValue) -> Text -> NixValue -> m (Either Text NixValue)
+selectAttrPath call path root = case parseAttrPath path of
   Left err -> pure (Left err)
   Right names -> walk names root
   where
     walk [] val = pure (Right val)
-    walk (name : rest) val = case val of
+    walk (name : rest) val = call val >>= select name rest
+    select name rest val = case val of
       VAttrs attrs
         | T.null name -> pure (Left (emptyNameMessage path))
         | otherwise ->

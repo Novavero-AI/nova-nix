@@ -33,7 +33,7 @@ import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
-import Data.List (find, genericLength, inits, intercalate, isPrefixOf, mapAccumL, nub, sort, sortOn, transpose, unfoldr)
+import Data.List (find, genericLength, inits, intercalate, isInfixOf, isPrefixOf, isSuffixOf, mapAccumL, nub, sort, sortOn, transpose, unfoldr)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as Map
@@ -77,6 +77,7 @@ import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAtt
 import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, checkGitRef, checkGitRev, checkGitUrl, currentSystemStr, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evalParsed, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, listedBuiltins, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
+import Nix.Eval.AutoCall (autoCallFunction)
 import Nix.Eval.Builtin (Builtin, builtinIndex, builtinName, builtinNamed)
 import qualified Nix.Eval.Builtin as Builtin
 import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion, cattrsetUpdate)
@@ -1434,7 +1435,7 @@ testCoercionErrors = do
                   Left "the expression selected by the selection path 'c.x' should be a set but is a function"
                 ]
             )
-            (runPureEval (mapM (`selectAttrPath` root) ["a.x", "b.x", "c.x"]))
+            (runPureEval (mapM (\path -> selectAttrPath pure path root) ["a.x", "b.x", "c.x"]))
     ]
 
 -- ---------------------------------------------------------------------------
@@ -24293,6 +24294,232 @@ testBuildCoresCLI = do
           ]
     )
 
+-- | Upstream's @autoCallFunction@ (eval.cc:1767-1814 at 2.24.9) over the
+-- pure evaluator, each case a set of @fun@, the value called, and @args@,
+-- whose attributes are the arguments, unforced; and the targets and
+-- arguments the command line names, as the parser reads them.
+testTargetArgs :: IO [Bool]
+testTargetArgs = do
+  putStrLn "eval/auto-call"
+  let autoCalled source = case evalNix source of
+        Left err -> Left err
+        Right (VAttrs attrs) -> runPureEval $ do
+          fun <- attrSetLookup "fun" attrs >>= maybe (throwEvalError "no fun") force
+          args <-
+            attrSetLookup "args" attrs >>= maybe (throwEvalError "no args") force >>= \case
+              VAttrs argSet -> attrSetToMap argSet
+              _ -> throwEvalError "args is not a set"
+          autoCallFunction args fun
+        Right other -> Left ("not a set: " <> T.pack (show other))
+      missingMessage name =
+        T.intercalate
+          "\n"
+          [ "cannot evaluate a function that has an argument without a value ('" <> name <> "')",
+            "Nix attempted to evaluate a function as a top level expression; in",
+            "this case it must have its arguments supplied either by default",
+            "values, or passed explicitly with '--arg' or '--argstr'. See",
+            "https://nixos.org/manual/nix/stable/language/constructs.html#functions."
+          ]
+      parsed = fmap Cli.optCommand . Cli.parseArgs
+      autoArgsOf = fmap Cli.optAutoArgs . Cli.parseArgs
+  sequence
+    [ runTest "a function is called with the arguments its formals name, its defaults filling the rest" $
+        assertEqual "defaults" (Right (VInt 3)) (autoCalled "{ fun = { x, y ? 2 }: x + y; args = { x = 1; }; }"),
+      runTest "an argument a function without an ellipsis does not take is not passed" $
+        assertEqual "extra" (Right (VInt 1)) (autoCalled "{ fun = { x }: x; args = { x = 1; z = throw \"never\"; }; }"),
+      runTest "a function with an ellipsis is passed every argument" $
+        assertEqual "ellipsis" (Right (VInt 5)) (autoCalled "{ fun = { x, ... }@given: given.z; args = { x = 1; z = 5; }; }"),
+      runTest "an argument the function does not use is not evaluated" $
+        assertEqual "lazy" (Right (VInt 1)) (autoCalled "{ fun = { x, y }: x; args = { x = 1; y = throw \"never\"; }; }"),
+      runTest "a formal with neither an argument nor a default fails with upstream's message" $
+        assertEqual "missing" (Left (missingMessage "y")) (autoCalled "{ fun = { x, y }: x; args = { x = 1; }; }"),
+      runTest "a set with __functor is called as the function its functor gives" $
+        assertEqual "functor" (Right (VInt 11)) (autoCalled "{ fun = { k = 10; __functor = self: { x }: x + self.k; }; args = { x = 1; }; }"),
+      runTest "a function without a set pattern, and a value that is no function, are left as they are" $
+        case (autoCalled "{ fun = x: x; args = { x = 1; }; }", autoCalled "{ fun = 7; args = { x = 1; }; }") of
+          (Right (VLambda {}), Right (VInt 7)) -> Pass
+          other -> Fail (T.pack (show other)),
+      runTest "an argument in angle brackets is a search path lookup, as upstream's lookupFileArg reads one" $
+        assertEqual "build" (Right (Cli.CmdBuild (Cli.TargetSearchPath "nixpkgs") (Just "hello") (Cli.OutLinkAt "result"))) (parsed ["build", "<nixpkgs>", "-A", "hello"])
+          `andThen` assertEqual "eval" (Right (Cli.CmdEval (Cli.TargetSearchPath "nixpkgs/lib"))) (parsed ["eval", "<nixpkgs/lib>"])
+          `andThen` assertEqual "trust" (Right (Cli.CmdTrust (Cli.TargetSearchPath "x") Nothing)) (parsed ["trust", "<x>"])
+          `andThen` assertEqual "two characters" (Right (Cli.CmdEval (Cli.TargetFile "<>"))) (parsed ["eval", "<>"])
+          `andThen` assertEqual "unclosed" (Right (Cli.CmdEval (Cli.TargetFile "<x"))) (parsed ["eval", "<x"])
+          `andThen` assertEqual "a path" (Right (Cli.CmdEval (Cli.TargetFile "./dir"))) (parsed ["eval", "./dir"]),
+      runTest "--arg and --argstr name a function's arguments before or after the target, a later one for a name replacing an earlier" $
+        assertEqual "build" (Right (Map.fromList [("s", Cli.AutoArgString "hi"), ("x", Cli.AutoArgExpr "1")])) (autoArgsOf ["build", "--arg", "x", "1", "f.nix", "--argstr", "s", "hi"])
+          `andThen` assertEqual "eval, after the file" (Right (Map.fromList [("x", Cli.AutoArgExpr "2")])) (autoArgsOf ["eval", "f.nix", "--arg", "x", "2"])
+          `andThen` assertEqual "eval, before it" (Right (Map.fromList [("x", Cli.AutoArgString "a")])) (autoArgsOf ["eval", "--argstr", "x", "a", "--expr", "1"])
+          `andThen` assertEqual "trust" (Right (Map.fromList [("x", Cli.AutoArgExpr "1")])) (autoArgsOf ["trust", "--expr", "1", "--arg", "x", "1"])
+          `andThen` assertEqual "replaced" (Right (Map.fromList [("x", Cli.AutoArgString "two")])) (autoArgsOf ["build", "--arg", "x", "1", "--argstr", "x", "two", "--expr", "1"]),
+      runTest "--arg and --argstr without both a name and a value are refused" $
+        assertEqual "none" (Left "--arg requires a name and a value") (parsed ["build", "--expr", "1", "--arg"])
+          `andThen` assertEqual "one" (Left "--argstr requires a name and a value") (parsed ["eval", "--argstr", "x"])
+          `andThen` assertEqual "after eval's target" (Left "--arg requires a name and a value") (parsed ["eval", "f.nix", "--arg", "x"])
+    ]
+
+-- | A target and its arguments through the real CLI: a directory's
+-- @default.nix@, a @\<NAME\>@ the search path finds, read as
+-- @import \<NAME\>@ reads it, and a function called with @--arg@ and
+-- @--argstr@, its defaults filling the rest, as @nix-instantiate --eval@
+-- and @nix-build@ call one.  @eval@ calls a function only when an
+-- argument is given, and under @--aterm@ always; @build@ calls the value
+-- before @-A@ selects from it and once it has.  Where the command line
+-- can hold a byte with no UTF-8 reading (POSIX), each value it gives
+-- keeps that byte.
+testTargetArgsCLI :: IO [Bool]
+testTargetArgsCLI = do
+  putStrLn "cli/target-args"
+  shell <- findTestShell
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-target-args"
+      isolatedEnv =
+        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
+          : ("XDG_CONFIG_HOME", root </> "config")
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME", "NIX_PATH"]) ambient
+      runCLI args =
+        Proc.readCreateProcessWithExitCode
+          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
+          ""
+      build args = runCLI (["build", "--store", root </> "store", "--no-out-link"] ++ args)
+      builder = nixQuotedPath (T.unpack shell)
+      derivationWriting name content = "derivation { name = " <> name <> "; system = builtins.currentSystem; builder = " <> builder <> "; args = [ \"-c\" \"printf " <> content <> " > $out\" ]; }"
+      files =
+        [ ("f.nix", "{ x, y ? 2 }: x + y"),
+          ("needs.nix", "{ x, y }: x"),
+          ("only-x.nix", "{ x }: x"),
+          ("evaldir" </> "default.nix", "\"read from default.nix\""),
+          ("pkg" </> "default.nix", "{ name ? \"pkg\" }: " <> derivationWriting "name" "pkg"),
+          ("nixpkgs" </> "default.nix", "{ ... }: { hello = " <> derivationWriting "\"hello\"" "hello" <> "; }"),
+          ("ellipsis.nix", "{ x, ... }@given: given.z"),
+          ("functor.nix", "{ k = 10; __functor = self: { x }: x + self.k; }")
+        ]
+      -- A store path holding a default.nix whose value is a path literal,
+      -- which names a place in the store path when the file is read as
+      -- import reads it, and the file's on-disk directory otherwise.
+      storeDerivation = "derivation { name = \"store-target\"; system = builtins.currentSystem; builder = " <> builder <> "; args = [ \"-c\" \"mkdir $out; printf ./data > $out/default.nix; printf hi > $out/data\" ]; }"
+      md5OfFf = "\"00594fd4f42ba43fc1ca0427a0576295\""
+      lastLine out = listToMaybe (reverse (filter (not . null) (lines (filter (/= '\r') out))))
+      printed (code, out, _) = case code of
+        ExitSuccess -> lastLine out
+        ExitFailure _ -> Nothing
+      errorLines (code, _, err) = (code, lines (filter (/= '\r') err))
+      outcome (code, out, err) = "exit " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err
+      prints expected run = if printed run == Just expected then Pass else Fail (outcome run)
+      missingLines name =
+        [ "error: cannot evaluate a function that has an argument without a value ('" <> name <> "')",
+          "       Nix attempted to evaluate a function as a top level expression; in",
+          "       this case it must have its arguments supplied either by default",
+          "       values, or passed explicitly with '--arg' or '--argstr'. See",
+          "       https://nixos.org/manual/nix/stable/language/constructs.html#functions."
+        ]
+      at = (root </>)
+  bracket_
+    ( do
+        forceRemoveIfExists root
+        mapM_ (\(name, source) -> createDirectoryIfMissing True (takeDirectory (at name)) >> BS.writeFile (at name) (TE.encodeUtf8 source)) files
+    )
+    (forceRemoveIfExists root)
+    ( do
+        uncalled <- runCLI ["eval", at "f.nix"]
+        called <- runCLI ["eval", "--arg", "x", "1", at "f.nix"]
+        stringArg <- runCLI ["eval", "--argstr", "s", "hi", "--expr", "{ s }: s + \"!\""]
+        missing <- runCLI ["eval", "--arg", "y", "1", at "needs.nix"]
+        unused <- runCLI ["eval", "--arg", "x", "1", "--arg", "z", "throw \"never\"", at "only-x.nix"]
+        directory <- runCLI ["eval", at "evaldir"]
+        defaulted <- build [at "pkg"]
+        renamed <- build ["--argstr", "name", "renamed", at "pkg"]
+        found <- build ["--nix-path", "nixpkgs=" <> at "nixpkgs", "<nixpkgs>", "-A", "hello"]
+        imported <- build ["--nix-path", "nixpkgs=" <> at "nixpkgs", "--expr", "(import <nixpkgs> { }).hello"]
+        notFound <- build ["<nope>"]
+        builtContent <- traverse BS.readFile (printed found)
+        ellipsis <- runCLI ["eval", "--arg", "x", "1", "--arg", "z", "2", at "ellipsis.nix"]
+        functor <- runCLI ["eval", "--arg", "x", "1", at "functor.nix"]
+        strictCalled <- runCLI ["eval", "--strict", "--arg", "x", "1", "--expr", "{ x }: { a = x + 1; }"]
+        lazyCalled <- runCLI ["eval", "--arg", "x", "1", "--expr", "{ x }: { a = x + 1; }"]
+        aterm <- runCLI ["eval", "--aterm", at "pkg"]
+        storeOutput <- build ["--expr", T.unpack storeDerivation]
+        let storeBase = maybe "" takeFileName (printed storeOutput)
+            storeEntry = "st=/nix/store/" <> storeBase
+        storeTarget <- runCLI ["eval", "--store", root </> "store", "--nix-path", storeEntry, "<st>"]
+        storeImport <- runCLI ["eval", "--store", root </> "store", "--nix-path", storeEntry, "--expr", "import <st>"]
+        bytes <-
+          if SI.os == "mingw32"
+            then [True] <$ putStrLn "  SKIP  a command-line value keeps a byte with no UTF-8 reading: a Windows command line cannot hold one"
+            else do
+              (_, listed, _) <- Proc.readCreateProcessWithExitCode (Proc.proc "cabal" ["list-bin", "-v0", "exe:nova-nix"]) ""
+              -- The shell makes the byte, 0xFF, so no codec on this side
+              -- stands between it and the binary's arguments, and the
+              -- binary runs itself: cabal run drops such a byte from the
+              -- arguments it passes on (cabal-install 3.18.2).
+              let withFf script =
+                    Proc.readCreateProcessWithExitCode
+                      ((Proc.proc (T.unpack shell) ["-c", "ff=$(printf '\\377'); " <> script, fromMaybe "nova-nix" (lastLine listed), at "evaldir"]) {Proc.env = Just isolatedEnv})
+                      ""
+              argstr <- withFf "exec \"$0\" eval --argstr s \"$ff\" --expr '{ s }: builtins.hashString \"md5\" s'"
+              argExpr <- withFf "exec \"$0\" eval --arg s \"\\\"$ff\\\"\" --expr '{ s }: builtins.hashString \"md5\" s'"
+              expr <- withFf "exec \"$0\" eval --expr \"builtins.hashString \\\"md5\\\" \\\"$ff\\\"\""
+              searchName <- withFf "NIX_PATH=\"$ff=$1\" exec \"$0\" eval \"<$ff>\""
+              badName <- withFf "exec \"$0\" eval --arg \"$ff\" 1 --expr '{ ... }: 1'"
+              sequence
+                [ runTest "--argstr keeps a byte with no UTF-8 reading" $
+                    prints md5OfFf argstr,
+                  runTest "--arg parses its expression's bytes" $
+                    prints md5OfFf argExpr,
+                  runTest "--expr parses its expression's bytes" $
+                    prints md5OfFf expr,
+                  runTest "a <NAME> is looked up by its bytes" $
+                    prints "\"read from default.nix\"" searchName,
+                  runTest "an argument name with no UTF-8 reading is refused, as an attribute name here is text" $
+                    assertEqual "name" (ExitFailure 1, ["error: --arg: invalid UTF-8 in argument name"]) (errorLines badName)
+                ]
+        (++ bytes)
+          <$> sequence
+            [ runTest "eval prints a function given no argument, as nix-instantiate --eval does" $
+                prints "<LAMBDA>" uncalled,
+              runTest "eval calls a function with --arg, its default filling the rest" $
+                prints "3" called,
+              runTest "eval calls a function with --argstr's string" $
+                prints "\"hi!\"" stringArg,
+              runTest "a function missing an argument fails with upstream's message" $
+                assertEqual "missing" (ExitFailure 1, missingLines "x") (errorLines missing),
+              runTest "an --arg the function does not take is neither passed nor evaluated" $
+                prints "1" unused,
+              runTest "eval reads a directory's default.nix" $
+                prints "\"read from default.nix\"" directory,
+              runTest "build reads a directory's default.nix and calls its function with the defaults" $
+                case printed defaulted of
+                  Just path | "-pkg" `isSuffixOf` path -> Pass
+                  _ -> Fail (outcome defaulted),
+              runTest "build calls the function with --argstr's string" $
+                case printed renamed of
+                  Just path | "-renamed" `isSuffixOf` path -> Pass
+                  _ -> Fail (outcome renamed),
+              runTest "build <nixpkgs> -A hello calls the function the search path finds and selects from what it gives" $
+                if isJust (printed found) && printed found == printed imported && builtContent == Just "hello"
+                  then Pass
+                  else Fail (outcome found <> "; the import: " <> outcome imported),
+              runTest "a <NAME> the search path does not hold fails as the expression <NAME> does" $
+                assertEqual "not found" (ExitFailure 1, ["error: file 'nope' was not found in the Nix search path (add it using $NIX_PATH or -I)"]) (errorLines notFound),
+              runTest "a function that takes ... is passed every argument" $
+                prints "2" ellipsis,
+              runTest "a set with __functor is called as the function its functor gives" $
+                prints "11" functor,
+              runTest "--strict evaluates the whole of what the call gives" $
+                prints "{ a = 2; }" strictCalled `andThen` prints "{ a = <CODE>; }" lazyCalled,
+              runTest "--aterm takes a file target and calls its function with the defaults" $
+                case printed aterm of
+                  Just line | "Derive(" `isPrefixOf` line, "-pkg\"" `isInfixOf` line -> Pass
+                  _ -> Fail (outcome aterm),
+              runTest "a <NAME> in the store is read as import <NAME> reads it, its path literals naming places in the store path" $
+                case (printed storeTarget, printed storeImport) of
+                  (Just fromTarget, Just fromImport)
+                    | not (null storeBase), fromTarget == fromImport, fromTarget == "/nix/store/" <> storeBase <> "/data" -> Pass
+                  _ -> Fail (outcome storeOutput <> "; the target: " <> outcome storeTarget <> "; the import: " <> outcome storeImport)
+            ]
+    )
+
 -- | The link a build makes to its output, through the real CLI run in a
 -- directory of the test's own: @./result@ when no flag names another,
 -- with @-NAME@ appended for an output other than @out@, each a root that
@@ -25213,18 +25440,20 @@ testCliReference = do
               prefix <- nub (concatMap cliPrefixes Ref.commandNames ++ [cliWords name ++ cliOperands name flagName | name <- Ref.commandNames]),
               let args = prefix ++ [T.unpack spelling]
             ],
-        -- A flag with a value is asked for one when it ends the line; one
-        -- without parses when it ends a complete line, where a clause that
-        -- wanted a value would have nothing to take.
-        runTest "a flag asks for a value exactly when its entry names one" $
+        -- A flag with values is asked for them when the line ends before
+        -- it has them all; one without parses when it ends a complete
+        -- line, where a clause that wanted a value would have nothing to
+        -- take.
+        runTest "a flag asks for values exactly when its entry names them" $
           allPass
-            [ let missing = Left (T.unpack spelling <> " requires a value")
-                  args = prefix ++ [T.unpack spelling]
+            [ let values = cliValue entry
+                  missing = Left (T.unpack spelling <> cliShortfall values)
+                  given count = Cli.optCommand <$> Cli.parseArgs (prefix ++ [T.unpack spelling] ++ take count values)
                   complete = prefix ++ operands ++ [T.unpack spelling]
-               in case (Ref.flagArgument entry, Cli.optCommand <$> Cli.parseArgs args, Cli.parseArgs complete) of
-                    (Just _, result, _) | result == missing -> Pass
-                    (Nothing, result, Right _) | result /= missing -> Pass
-                    (_, result, completed) -> Fail (T.pack (unwords args <> ": " <> show result <> "; " <> unwords complete <> ": " <> show (Cli.optCommand <$> completed)))
+               in case (values, Cli.parseArgs complete) of
+                    (_ : _, _) | all ((== missing) . given) [0 .. length values - 1] -> Pass
+                    ([], Right _) | given 0 /= missing -> Pass
+                    (_, completed) -> Fail (T.pack (unwords (prefix ++ [T.unpack spelling]) <> ": " <> show (map given [0 .. length values]) <> "; " <> unwords complete <> ": " <> show (Cli.optCommand <$> completed)))
             | (flagName, entry) <- referenceFlags,
               (prefix, operands) <- case Ref.flagScope entry of
                 Ref.GlobalFlag -> [([], [])]
@@ -25346,9 +25575,16 @@ globalAnswer flagName = case flagName of
   Ref.VersionFlag -> Just Cli.CmdVersion
   _ -> Nothing
 
--- | A value for a flag that takes one, which the parser accepts unchecked.
+-- | A value for each value a flag takes, which the parser accepts
+-- unchecked: one for each name its entry gives.
 cliValue :: Ref.FlagEntry -> [String]
-cliValue entry = ["value" | Just _ <- [Ref.flagArgument entry]]
+cliValue entry = maybe [] (map (const "value") . T.words) (Ref.flagArgument entry)
+
+-- | What the parser says to a flag given fewer values than it takes.
+cliShortfall :: [String] -> String
+cliShortfall values = case values of
+  [_, _] -> " requires a name and a value"
+  _ -> " requires a value"
 
 -- | What completes a command line once a flag is in it: the operands the
 -- command needs, but an expression when the flag is @--expr@, which gives
@@ -25367,8 +25603,7 @@ cliOperands name flagName = case name of
 -- | Whether a parsed command is the reference's command.
 cliSelects :: Ref.CommandName -> Cli.Command -> Bool
 cliSelects name parsed = case (name, parsed) of
-  (Ref.EvalCommand, Cli.CmdEvalExpr _) -> True
-  (Ref.EvalCommand, Cli.CmdEvalFile _) -> True
+  (Ref.EvalCommand, Cli.CmdEval _) -> True
   (Ref.BuildCommand, Cli.CmdBuild {}) -> True
   (Ref.TrustCommand, Cli.CmdTrust {}) -> True
   (Ref.PushCommand, Cli.CmdPush _) -> True
@@ -30417,6 +30652,8 @@ runSuite = do
           testCheckCLI,
           testBuildCoresCLI,
           testOutLinkCLI,
+          testTargetArgs,
+          testTargetArgsCLI,
           testUncaughtIOFailureCLI,
           testClosedStdoutCLI,
           testCliReference,

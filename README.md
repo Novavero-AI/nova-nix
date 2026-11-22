@@ -279,8 +279,8 @@ installing. `pkgs\windows\default.nix` is the whole Windows package set, and
 
 ### Get a package from cache.nixos.org on macOS or Linux
 
-Unpack a nixpkgs revision in the working directory, then import and call
-it in an expression:
+Unpack a nixpkgs revision in the working directory, then evaluate an
+expression that imports it, or build one of its packages with `-A`:
 
 ```sh
 curl -fsSL https://github.com/NixOS/nixpkgs/archive/6f06d204d8f2d8761d9da78778745974a3216381.tar.gz | tar -xz
@@ -290,7 +290,7 @@ mv nixpkgs-6f06d204d8f2d8761d9da78778745974a3216381 nixpkgs
 ```console
 $ nova-nix eval --expr '(import ./nixpkgs { }).hello.version'
 "2.12.3"
-$ nova-nix build --store ~/nix/store --expr '(import ./nixpkgs { }).hello' --substituter https://cache.nixos.org --trusted-key cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+$ nova-nix build --store ~/nix/store ./nixpkgs -A hello --substituter https://cache.nixos.org --trusted-key cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
   [subst]  hello-2.12.3
 /Users/me/nix/store/0blwcqcg0swwz9x748rhyzbfyaybmql8-hello-2.12.3
 ```
@@ -300,7 +300,7 @@ runs only from a store at `/nix/store`. From `~/nix/store`, macOS stops it with
 `Library not loaded: /nix/store/...`. On Linux with `/nix` set up:
 
 ```console
-$ nova-nix build --expr '(import ./nixpkgs { }).hello' --substituter https://cache.nixos.org --trusted-key cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+$ nova-nix build ./nixpkgs -A hello --substituter https://cache.nixos.org --trusted-key cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
   [subst]  hello-2.12.3
 /nix/store/fkv51s1m2gsy6pz71nnyqyprbvfg7sd7-hello-2.12.3
 $ ./result/bin/hello
@@ -315,10 +315,9 @@ path or the `result` link a build makes instead), and a daemon for a
 multi-user store. Builds are not sandboxed on any platform: a builder can read
 and write outside its build directory and reach the network.
 
-`eval` and `build` take a file or `--expr`, not a directory or a search-path
-argument such as `<nixpkgs>` (an expression can use one). They take no `--arg`
-or `--argstr` and do not call a function the file evaluates to, and `build`
-builds one derivation, where `nix-build` builds each one in a list or set.
+A target is a file, a directory or a `<NAME>` the search path finds, not a
+URL, and `build` builds one derivation, where `nix-build` builds each one in a
+list or set.
 `builtins.fetchurl` runs `curl`, `builtins.fetchTarball` runs `sh`, `curl` and
 `tar`, and `builtins.fetchGit` runs `git`, each from `PATH`.
 

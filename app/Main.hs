@@ -32,21 +32,25 @@ import GHC.Profiling (requestHeapCensus)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, execWrapperConfig, substituteFromCaches)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builtins (isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
-import Nix.Cli.Args (BuildTarget (..), CliOpts (..), Command (..), OutLink, PushArgs (..), outLinkFor, parseArgs)
+import Nix.Cli.Args (AutoArg (..), CliOpts (..), Command (..), OutLink, PushArgs (..), Target (..), outLinkFor, parseArgs)
 import Nix.Cli.Reference (Host (..), SystemConfDirSource (..), currentHost, helpLines, systemConfDirSource)
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import Nix.DependencyGraph (DepNode (..), buildDepGraph)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
-import Nix.Environment (EnvLookup (..), lookupEnvBytes)
-import Nix.Eval (AttrSet, Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetLookup, compileSource, deepForce, evalBytecode, evalParsed, force, readThunkValue)
+import Nix.Environment (EnvLookup (..), argumentBytes, lookupEnvBytes)
+import Nix.Eval (AttrSet, Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetLookup, compileSource, deepForce, evalBytecode, evalParsed, evaluated, findInSearchPath, force, readThunkValue)
 import Nix.Eval.AttrPath (selectAttrPath)
+import Nix.Eval.AutoCall (AutoArgs, autoCallFunction)
 import Nix.Eval.CRegion (Regions (..), regionFigures, renderRegionFigures)
+import Nix.Eval.CRoots (crootsAddThunk)
 import Nix.Eval.CStats (CRoot (..), countSites, renderCensus, takeCensus, valueRoots)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
-import Nix.Eval.IO (EvalIO, EvalState (..), SessionSettings (..), allowEvalPath, evalBaseEnv, evalSearchPath, nixPathValue, renderEvalFailure, runEvalIOTraced, withEvalSession)
+import Nix.Eval.IO (EvalIO, EvalState (..), SessionSettings (..), allowEvalPath, evalBaseEnv, evalSearchPath, nixPathValue, readImportTarget, renderEvalFailure, resolveImportTarget, runEvalIOTraced, withEvalSession)
 import Nix.Eval.Print (printAmbiguous)
+import Nix.Eval.Symbol (symbolIntern)
+import Nix.Eval.Types (mkStrBytes, mkThunkBc)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.HostPath (hostPathFromBytes)
 import Nix.Http (defaultFetchRetryPolicy)
@@ -61,7 +65,7 @@ import Nix.Trust (ContentFacts, fetchedByBuiltin, fixedOutputInputs, renderTrust
 import Nix.Trust.Scan (scanFetched)
 import qualified NovaCache.NAR as NAR
 import Paths_nova_nix (getDataDir, version)
-import System.Directory (Permissions (executable), canonicalizePath, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, makeAbsolute)
+import System.Directory (Permissions (executable), canonicalizePath, doesDirectoryExist, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, makeAbsolute)
 import qualified System.Directory.OsPath as OsDir
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
@@ -180,10 +184,9 @@ main = do
   -- each as one error line and exits 1 (libmain/shared.cc at 2.24.9):
   -- checkInterrupt throws Interrupted, a BaseError like any other failure.
   handleJust userInterrupt (const reportInterrupt) . handle reportIOFailure . handle reportWalkFailure $ case optCommand opts of
-    CmdEvalFile filePath -> evalFile config opts storeDir dataDir filePath
-    CmdEvalExpr expr
-      | optAterm opts -> evalExprAterm config opts storeDir dataDir expr
-      | otherwise -> evalExpr config opts storeDir dataDir expr
+    CmdEval target
+      | optAterm opts -> evalAterm config opts storeDir dataDir target
+      | otherwise -> evalCommand config opts storeDir dataDir target
     CmdBuild target attrPath outLink -> buildCommand config opts storeDir dataDir target attrPath outLink
     CmdTrust target attrPath -> trustCommand config opts storeDir dataDir target attrPath
     CmdPush pushArgs -> pushCommand storeDir pushArgs
@@ -257,17 +260,23 @@ ioFailureMessage failure
 versionLine :: String
 versionLine = "nova-nix " <> showVersion version
 
--- | Canonicalize and read a source file.  The canonicalization matters:
--- relative path literals inside the file resolve against the file's
--- directory ('esBaseDir'), and a relative base dir would be re-prefixed on
--- every resolution (doubling it).  An unreadable argument (missing file,
--- a directory, no permission) is a clean CLI error, never an uncaught
--- exception.  Only 'IOException' is caught: an interrupt or any other
--- async exception must abort the run, not print as a read failure.
+-- | Canonicalize and read a source file, or the @default.nix@ of a
+-- directory, which upstream's @resolveExprPath@ appends to a path that is
+-- one and resolves no further (eval.cc:2983-2985 at 2.24.9), so relative
+-- paths in it resolve against the directory.  The canonicalization
+-- matters: relative path literals inside the file resolve against the
+-- file's directory ('esBaseDir'), and a relative base dir would be
+-- re-prefixed on every resolution (doubling it).  An unreadable argument
+-- (a missing file, a directory with no @default.nix@, no permission) is a
+-- clean CLI error, never an uncaught exception.  Only 'IOException' is
+-- caught: an interrupt or any other async exception must abort the run,
+-- not print as a read failure.
 readSourceFile :: FilePath -> IO (FilePath, BS.ByteString)
 readSourceFile rawPath = do
   attempt <- try $ do
-    path <- canonicalizePath rawPath
+    canonical <- canonicalizePath rawPath
+    isDirectory <- doesDirectoryExist canonical
+    let path = if isDirectory then canonical </> directoryExprFile else canonical
     source <- BS.readFile path
     pure (path, source)
   case attempt of
@@ -275,8 +284,13 @@ readSourceFile rawPath = do
       failWith ("cannot read " <> T.pack rawPath <> ": " <> T.pack (displayException e))
     Right ok -> pure ok
 
--- | Where @--expr@ source comes from: text with no file to point at, which
--- its parse errors name @<expr>@ and its positions name no file.
+-- | The file a directory target stands for.
+directoryExprFile :: FilePath
+directoryExprFile = "default.nix"
+
+-- | Where @--expr@ and @--arg@ source comes from: text with no file to
+-- point at, which its parse errors name @<expr>@ and its positions name
+-- no file.
 exprOrigin :: SourceOrigin
 exprOrigin = SourceText "<expr>"
 
@@ -352,44 +366,112 @@ withCliSession opts config storeDir dataDir baseDir regions action = do
 parseForEval :: CliOpts -> NixConfig -> FilePath -> SourceOrigin -> BS.ByteString -> Either SourceError ParsedSource
 parseForEval opts config = parseNixWithScope (rootScopeNames (evalPolicyFor opts config))
 
--- | Evaluate a .nix file and print the result.
-evalFile :: NixConfig -> CliOpts -> StoreDir -> FilePath -> FilePath -> IO ()
-evalFile config opts storeDir dataDir rawFilePath = do
-  (filePath, source) <- readSourceFile rawFilePath
-  case parseForEval opts config (takeDirectory filePath) (SourceFile (T.pack filePath)) source of
-    Left err -> failSource err
-    Right parsed -> do
-      regions <- regionsWanted
-      withCliSession opts config storeDir dataDir (takeDirectory filePath) regions $ \st -> do
-        result <- runEvalIOTraced st (evalRooted (optStrict opts) (evalBaseEnv st) parsed)
-        case result of
-          Left failure -> do
-            TIO.hPutStrLn stderr (renderEvalFailure failure)
-            exitFailure
-          Right (env, forced) -> printResult forced >> writeCensus env forced >> writeRegionCensus
-
--- | Evaluate an inline expression and print the result.
-evalExpr :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
-evalExpr config opts storeDir dataDir source = do
+-- | Run an action on a target in the evaluation session of one command,
+-- in the order upstream's commands take them (nix-instantiate.cc:157-188
+-- and nix-build.cc:289-368 at 2.24.9): the session, then the cells
+-- @--arg@ and @--argstr@ give ('sessionAutoArgs'), then the target,
+-- found, read and parsed.  The action runs with the target's directory
+-- as the session's base, and gets the cells and the parsed target.  A
+-- failure to find, read or parse is reported and exits.
+withTarget :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Regions -> Target -> (EvalState -> AutoArgs -> ParsedSource -> IO a) -> IO a
+withTarget config opts storeDir dataDir regions target action = do
   cwd <- getCurrentDirectory
-  case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
-    Left err -> failSource err
-    Right parsed -> do
-      regions <- regionsWanted
-      withCliSession opts config storeDir dataDir cwd regions $ \st -> do
-        result <- runEvalIOTraced st (evalRooted (optStrict opts) (evalBaseEnv st) parsed)
-        case result of
-          Left failure -> do
-            TIO.hPutStrLn stderr (renderEvalFailure failure)
-            exitFailure
-          Right (env, forced) -> printResult forced >> writeCensus env forced >> writeRegionCensus
+  withCliSession opts config storeDir dataDir cwd regions $ \st -> do
+    autoArgs <- sessionAutoArgs opts config cwd st
+    (baseDir, origin, source) <- targetSource cwd st target
+    case parseForEval opts config baseDir origin source of
+      Left err -> failSource err
+      Right parsed -> action (st {esBaseDir = baseDir}) autoArgs parsed
 
--- | Evaluate the source in the root environment to the result 'finalize'
--- gives, with that environment, which 'writeCensus' counts as held.
-evalRooted :: Bool -> Env -> ParsedSource -> EvalIO (Env, NixValue)
-evalRooted strict env parsed = do
+-- | The cells a target's function is called with, made in name order,
+-- each name interned after its expression, as upstream's @getAutoArgs@
+-- makes them (common-eval-args.cc:146-168 at 2.24.9).  An @--arg@
+-- expression is parsed from the argument's bytes, relative paths against
+-- the working directory, before anything else is read, and evaluated in
+-- the root environment only when the function uses it; an @--argstr@
+-- value is a string of the argument's bytes.  A name is an attribute
+-- name, which is text here, so one whose bytes have no UTF-8 reading is
+-- refused where upstream keeps the bytes.  Each cell outlives the step
+-- that makes it, so it is registered as a root ("Nix.Eval.CRoots").
+sessionAutoArgs :: CliOpts -> NixConfig -> FilePath -> EvalState -> IO AutoArgs
+sessionAutoArgs opts config cwd st = do
+  prepared <- traverse prepare (Map.toAscList (optAutoArgs opts))
+  Map.fromList <$> evalOrExit st (traverse cell prepared)
+  where
+    prepare (rawName, arg) = do
+      let flag = autoArgFlag arg
+      nameBytes <- commandLineBytes flag rawName
+      name <- either (const (failWith ("error: " <> flag <> ": invalid UTF-8 in argument name"))) pure (TE.decodeUtf8' nameBytes)
+      made <- case arg of
+        AutoArgExpr source ->
+          commandLineBytes flag source >>= either failSource (pure . Left) . parseForEval opts config cwd exprOrigin
+        AutoArgString value -> Right <$> commandLineBytes flag value
+      pure (name, made)
+    cell (name, made) = do
+      thunk <- either (compileSource >=> mkThunkBc (evalBaseEnv st)) (evaluated . mkStrBytes) made
+      crootsAddThunk (unThunk thunk)
+      (name, thunk) <$ symbolIntern name
+    autoArgFlag (AutoArgExpr _) = "--arg"
+    autoArgFlag (AutoArgString _) = "--argstr"
+
+-- | The bytes of a command-line argument ('argumentBytes'), the command
+-- failing for a Windows argument with no UTF-8 form.
+commandLineBytes :: T.Text -> String -> IO BS.ByteString
+commandLineBytes what arg =
+  argumentBytes arg
+    >>= maybe (failWith ("error: " <> what <> " holds an unpaired UTF-16 surrogate, which has no UTF-8 form")) pure
+
+-- | Where a target's expression is read from: the directory relative
+-- paths in it resolve against, its origin and its bytes.  A @\<NAME\>@
+-- is found and read as @import \<NAME\>@ finds and reads its file
+-- ('findInSearchPath', 'resolveImportTarget'), failing as that does, so
+-- a file in the store keeps its store path's spelling and a path literal
+-- in it names a place in that store path.
+targetSource :: FilePath -> EvalState -> Target -> IO (FilePath, SourceOrigin, BS.ByteString)
+targetSource _ _ (TargetFile path) = fileSource path
+targetSource cwd st (TargetSearchPath name) = do
+  nameBytes <- commandLineBytes "<NAME>" name
+  (target, source) <- evalOrExit st $ do
+    located@(target, _) <- findInSearchPath (evalSearchPath st) nameBytes >>= resolveImportTarget cwd
+    (,) target <$> readImportTarget located
+  pure (takeDirectory target, SourceFile (T.pack target), source)
+targetSource cwd _ (TargetExpr source) = (,,) cwd exprOrigin <$> commandLineBytes "--expr" source
+
+-- | A target file's directory, origin and bytes ('readSourceFile').
+fileSource :: FilePath -> IO (FilePath, SourceOrigin, BS.ByteString)
+fileSource rawPath = do
+  (filePath, source) <- readSourceFile rawPath
+  pure (takeDirectory filePath, SourceFile (T.pack filePath), source)
+
+-- | Run an evaluation, reporting a failure and exiting.
+evalOrExit :: EvalState -> EvalIO a -> IO a
+evalOrExit st action =
+  runEvalIOTraced st action >>= \case
+    Left failure -> do
+      TIO.hPutStrLn stderr (renderEvalFailure failure)
+      exitFailure
+    Right value -> pure value
+
+-- | Evaluate a target and print its value.  A function is called first
+-- when an argument is given, as @nix-instantiate --eval@ calls it only
+-- then (nix-instantiate.cc:47-52 at 2.24.9).
+evalCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> IO ()
+evalCommand config opts storeDir dataDir target = do
+  regions <- regionsWanted
+  withTarget config opts storeDir dataDir regions target $ \st autoArgs parsed -> do
+    let call
+          | Map.null autoArgs = pure
+          | otherwise = autoCallFunction autoArgs
+    (env, forced) <- evalOrExit st (evalRooted (optStrict opts) (evalBaseEnv st) call parsed)
+    printResult forced >> writeCensus env forced >> writeRegionCensus
+
+-- | Evaluate the source in the root environment, pass the value through
+-- @call@, and give the result 'finalize' gives, with that environment,
+-- which 'writeCensus' counts as held.
+evalRooted :: Bool -> Env -> (NixValue -> EvalIO NixValue) -> ParsedSource -> EvalIO (Env, NixValue)
+evalRooted strict env call parsed = do
   code <- compileSource parsed
-  forced <- evalBytecode env code >>= finalize strict
+  forced <- evalBytecode env code >>= call >>= finalize strict
   pure (env, forced)
 
 -- | The variable naming the file 'writeCensus' writes.
@@ -461,40 +543,24 @@ writeRegionCensus = do
         Left failure -> failWith ("error: " <> T.pack (displayException failure))
         Right found -> OsFile.writeFile' path (renderRegionFigures found)
 
--- | Evaluate an inline expression to a derivation and print its ATerm (.drv
+-- | Evaluate a target to a derivation and print its ATerm (.drv
 -- contents), for diffing nova-nix's serialization against upstream Nix.
-evalExprAterm :: NixConfig -> CliOpts -> StoreDir -> FilePath -> T.Text -> IO ()
-evalExprAterm config opts storeDir dataDir source = do
-  cwd <- getCurrentDirectory
-  case parseForEval opts config cwd exprOrigin (TE.encodeUtf8 source) of
-    Left err -> failSource err
-    Right parsed -> withCliSession opts config storeDir dataDir cwd RegionsCollect $ \st -> do
-      result <- runEvalIOTraced st $ do
-        val <- evalParsed (pure (evalBaseEnv st)) parsed
-        forceDerivationAttrs val
-        pure val
-      case result of
-        Left failure -> do
-          TIO.hPutStrLn stderr (renderEvalFailure failure)
-          exitFailure
-        Right val -> do
-          drvSP <- derivationPath val
-          drvClosure <- readIORef (esDrvClosure st)
-          aterm <- recordedAterm drvClosure drvSP
-          -- The recorded bytes, not a re-serialization: these are what the
-          -- path hashes.  BC.putStrLn bypasses the handle encoding, so the
-          -- printed .drv diffs byte-exactly against upstream's.
-          toStdout (BC.putStrLn aterm)
-
--- | Where a build reads its expression, and the directory relative paths
--- inside it resolve against.
-loadBuildSource :: BuildTarget -> IO (FilePath, SourceOrigin, BS.ByteString)
-loadBuildSource (TargetFile rawFilePath) = do
-  (filePath, source) <- readSourceFile rawFilePath
-  pure (takeDirectory filePath, SourceFile (T.pack filePath), source)
-loadBuildSource (TargetExpr source) = do
-  cwd <- getCurrentDirectory
-  pure (cwd, exprOrigin, TE.encodeUtf8 source)
+-- A function is called first, whether or not an argument is given, as
+-- @nix-instantiate@ calls one before it writes a derivation
+-- (get-drvs.cc:360 at 2.24.9).
+evalAterm :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> IO ()
+evalAterm config opts storeDir dataDir target =
+  withTarget config opts storeDir dataDir RegionsCollect target $ \st autoArgs parsed -> do
+    val <- evalOrExit st $ do
+      val <- evalParsed (pure (evalBaseEnv st)) parsed >>= autoCallFunction autoArgs
+      val <$ forceDerivationAttrs val
+    drvSP <- derivationPath val
+    drvClosure <- readIORef (esDrvClosure st)
+    aterm <- recordedAterm drvClosure drvSP
+    -- The recorded bytes, not a re-serialization: these are what the
+    -- path hashes.  BC.putStrLn bypasses the handle encoding, so the
+    -- printed .drv diffs byte-exactly against upstream's.
+    toStdout (BC.putStrLn aterm)
 
 -- | Force the attributes 'derivationPath' goes on to read.  @derivation@
 -- is a lazy wrapper, and 'readThunkValue' answers 'Nothing' for a thunk that
@@ -517,38 +583,36 @@ derivationAttrKeys = ["type", "drvPath", "outputName"]
 -- | Evaluate a build or trust target and select the attribute path, when
 -- one is given, with the attributes 'derivationPath' reads forced, and
 -- run an action in the session with the state the evaluation recorded
--- and the selected value.  The action reads what the command needs out
--- of them: the session's end frees the value.  A failure is reported and
--- exits.
-evalTarget :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> (EvalState -> NixValue -> IO a) -> IO a
-evalTarget config opts storeDir dataDir target attrPath action = do
-  (baseDir, origin, source) <- loadBuildSource target
-  case parseForEval opts config baseDir origin source of
-    Left err -> failSource err
-    Right parsed -> withCliSession opts config storeDir dataDir baseDir RegionsCollect $ \st -> do
-      result <- runEvalIOTraced st $ do
-        root <- evalParsed (pure (evalBaseEnv st)) parsed
-        selected <- case attrPath of
-          Nothing -> pure (Right root)
-          Just path -> selectAttrPath path root
-        -- Forced after selection, not before: forcing the root leaves the
-        -- selected value's own attributes unforced, and derivationPath
-        -- then reports a real derivation as not being one.
-        either (pure . Left) (\val -> Right val <$ forceDerivationAttrs val) selected
-      case result of
-        Left failure -> do
-          TIO.hPutStrLn stderr (renderEvalFailure failure)
-          exitFailure
-        Right (Left selectionErr) -> do
-          TIO.hPutStrLn stderr ("error: " <> selectionErr)
-          exitFailure
-        Right (Right val) -> action st val
+-- and the selected value.  A function is called with the command line's
+-- arguments before each component of the path is selected from it, and
+-- once the path has selected it, as @nix-build@ calls one
+-- (attr-path.cc:58 and get-drvs.cc:360 at 2.24.9).  The action reads what
+-- the command needs out of them: the session's end frees the value.  A
+-- failure is reported and exits.
+evalTarget :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> (EvalState -> NixValue -> IO a) -> IO a
+evalTarget config opts storeDir dataDir target attrPath action =
+  withTarget config opts storeDir dataDir RegionsCollect target $ \st autoArgs parsed -> do
+    let call = autoCallFunction autoArgs
+    selected <- evalOrExit st $ do
+      root <- evalParsed (pure (evalBaseEnv st)) parsed
+      chosen <- case attrPath of
+        Nothing -> pure (Right root)
+        Just path -> selectAttrPath call path root
+      -- Forced after selection, not before: forcing the root leaves the
+      -- selected value's own attributes unforced, and derivationPath
+      -- then reports a real derivation as not being one.
+      traverse (call >=> \val -> val <$ forceDerivationAttrs val) chosen
+    case selected of
+      Left selectionErr -> do
+        TIO.hPutStrLn stderr ("error: " <> selectionErr)
+        exitFailure
+      Right val -> action st val
 
 -- | Parse, evaluate, extract the derivation, build it, and print its
 -- output path.  A store directory upstream Nix's database also manages
 -- is refused before evaluation, which can write to the store too
 -- ("Nix.Store.Upstream").
-buildCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> OutLink -> IO ()
+buildCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> OutLink -> IO ()
 buildCommand config opts storeDir dataDir target attrPath outLink = do
   upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("build: " <>))
   let caches = resolveCaches config (optSubstituter opts) (optTrustedKey opts)
@@ -611,7 +675,7 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
 -- fixed-output input does not open it.  A store directory upstream Nix's
 -- database also manages is refused before it is opened, as a build
 -- refuses one ("Nix.Store.Upstream").
-trustCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> BuildTarget -> Maybe T.Text -> IO ()
+trustCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> IO ()
 trustCommand config opts storeDir dataDir target attrPath = do
   (drvSP, drvClosure) <- evalTarget config opts storeDir dataDir target attrPath $ \st val ->
     (,) <$> derivationPath val <*> readIORef (esDrvClosure st)
