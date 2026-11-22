@@ -1,0 +1,422 @@
+name: cargo (libnix) demo
+
+# How far nova-nix gets with a project that cargo (libnix) builds: the
+# cargo fork at github.com/nixcloud/cargo whose nix backend writes one
+# derivation per unit under target/<profile>/nix/ and builds them.  cargo
+# evaluates that build system with nix-instantiate and builds it over the
+# nix-daemon's socket, and nova-nix has neither, so cargo cannot run
+# against nova-nix.  The upstream job builds a small project with cargo
+# and upstream Nix and records the store paths of the build system cargo
+# generated.  The nova-nix job evaluates that same build system, compares
+# its store paths with upstream's, builds it and runs the binary.  A
+# demonstration, not a gate: each step that measures something lets the
+# run go on, and the summary job tabulates what each one did.
+
+on:
+  push:
+    branches: [demo/cargo-libnix]
+
+# Drop the default GITHUB_TOKEN to read-only; nothing here writes via it.
+permissions:
+  contents: read
+
+# A newer push supersedes the run in flight.
+concurrency:
+  group: cargo-libnix-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # parity.yml pairs this Nix with nixpkgs 26.05, the nixpkgs the
+  # generated build system pins.
+  NIX_VERSION: "2.34.9"
+  # The libfenix revision whose default devShell has the
+  # libnix-1.99.0+v3 release of cargo (libnix) as its cargo, and sets
+  # CARGO_BACKEND=nix.  Pinned, so that every run generates the same
+  # build system.
+  LIBFENIX: github:nixcloud/libfenix/25f5678f3125a41f3e2d6d1e8fdb3d437182424c
+  # cargo new names the package, and so its binary, after the directory.
+  CRATE: cargo-demo
+  # The same absolute path in every job: cargo generates the build system
+  # where the project is, and the nova-nix job evaluates it there, so any
+  # path the generated code names is the same for both evaluators.
+  PROJECT: ${{ github.workspace }}/cargo-demo
+  CALLER: ${{ github.workspace }}/cargo-demo/target/debug/nix/cargo_build_caller.nix
+  # Each job's logs and recorded values, named apart across the jobs so
+  # that the summary job can download them into one directory.
+  RESULTS: ${{ github.workspace }}/results
+  # cargo's own call (build_runner.rs, `instantiate`), run with
+  # `--argstr cargo_libnix_caller` naming the caller.  The attribute is
+  # what cargo roots so that a collection keeps what the build used.
+  CARGO_EXPR: >-
+    { cargo_libnix_caller, ... }@args:
+    let c = import (/. + cargo_libnix_caller) (removeAttrs args [ "cargo_libnix_caller" ]);
+    in [ c.target c."cargo-libnix-retained-paths-units-crates-toolchain-deps" ]
+  # What both evaluators compute, from this one text: the drvPath of
+  # target and of the retained paths, then their outPath.  nova-nix takes
+  # no --argstr, so the caller's path comes from the environment.
+  PATHS_EXPR: >-
+    let c = import (/. + builtins.getEnv "CALLER") { };
+    r = c."cargo-libnix-retained-paths-units-crates-toolchain-deps";
+    in [ c.target.drvPath r.drvPath c.target.outPath r.outPath ]
+
+jobs:
+  upstream:
+    name: cargo (libnix) with upstream Nix
+    runs-on: ubuntu-latest
+    # Room for the measured steps' own limits, and for the uploads after
+    # them, which a job that reaches its own limit never runs.
+    timeout-minutes: 90
+    env:
+      ITOA_VERSION: "1.0.19"
+    outputs:
+      cargo-build: ${{ steps.cargo-build.outcome }}
+      cargo-run: ${{ steps.cargo-run.outcome }}
+      eval: ${{ steps.eval.outcome }}
+    steps:
+      # The action's nix.conf turns on nix-command and flakes, and on a
+      # runner with systemd it installs the daemon, which cargo builds
+      # through.
+      - name: Install Nix
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+        with:
+          install_url: https://releases.nixos.org/nix/nix-${{ env.NIX_VERSION }}/install
+
+      # A binary and one crates.io dependency without a build script: two
+      # units, the library and the binary that links it.
+      - name: Create the project
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULTS"
+          nix develop "$LIBFENIX" --command cargo new --vcs none --bin "$PROJECT"
+          nix develop "$LIBFENIX" --command cargo add --manifest-path "$PROJECT/Cargo.toml" "itoa@=$ITOA_VERSION"
+          cat > "$PROJECT/src/main.rs" <<'EOF'
+          fn main() {
+              let mut buffer = itoa::Buffer::new();
+              println!("{} built by cargo (libnix)", buffer.format(1999u32));
+          }
+          EOF
+
+      - name: cargo build with CARGO_BACKEND=nix
+        id: cargo-build
+        continue-on-error: true
+        timeout-minutes: 30
+        working-directory: ${{ env.PROJECT }}
+        env:
+          CARGO_BACKEND: nix
+        run: |
+          set -euo pipefail
+          nix develop "$LIBFENIX" --command cargo build 2>&1 | tee "$RESULTS/upstream-cargo-build.log"
+
+      - name: Run the binary cargo built
+        id: cargo-run
+        if: steps.cargo-build.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          "$PROJECT/target/debug/$CRATE" 2>&1 | tee "$RESULTS/upstream-cargo-run.log"
+
+      # cargo leaves what it evaluated under target/debug/nix/gc, in one
+      # directory per selection of units: links to the two .drv files and,
+      # after a build, to their outputs.  The step runs cargo's call again,
+      # without --add-root, which only roots the .drv files and prints the
+      # roots in their place, then PATHS_EXPR, and checks that both agree
+      # with cargo's links, so the paths recorded are those of cargo's own
+      # evaluation.  --read-write-mode keeps the --eval call in the mode
+      # cargo's call runs in, which writes the derivations.
+      - name: Evaluate the build system with nix-instantiate
+        id: eval
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          {
+            nix-instantiate --version
+            nix-instantiate --expr "$CARGO_EXPR" --argstr cargo_libnix_caller "$CALLER" \
+              | tee "$RESULTS/upstream-drvs.txt"
+            printed=$(nix-instantiate --eval --strict --read-write-mode --expr "$PATHS_EXPR")
+            echo "$printed"
+            grep -o '"[^"]*"' <<<"$printed" | tr -d '"' > "$RESULTS/upstream-paths.txt" \
+              || { echo "printed no store path" >&2; exit 1; }
+            [ "$(wc -l < "$RESULTS/upstream-paths.txt")" -eq 4 ] \
+              || { echo "expected four store paths" >&2; exit 1; }
+            head -n 2 "$RESULTS/upstream-paths.txt" | diff "$RESULTS/upstream-drvs.txt" - \
+              || { echo "the drvPaths differ from the derivations cargo's call printed" >&2; exit 1; }
+            evaluated=("$PROJECT"/target/debug/nix/gc/*/create-symlinks.drv)
+            [ "${#evaluated[@]}" -eq 1 ] && [ -L "${evaluated[0]}" ] \
+              || { echo "expected the roots of one selection under target/debug/nix/gc" >&2; exit 1; }
+            roots=$(dirname "${evaluated[0]}")
+            for link in create-symlinks.drv retained-paths-units-crates-toolchain-deps.drv; do
+              readlink "$roots/$link"
+            done | diff "$RESULTS/upstream-drvs.txt" - \
+              || { echo "the derivations differ from those cargo evaluated" >&2; exit 1; }
+            if [ -L "$roots/create-symlinks" ]; then
+              for link in create-symlinks retained-paths-units-crates-toolchain-deps; do
+                readlink "$roots/$link"
+              done | diff <(tail -n 2 "$RESULTS/upstream-paths.txt") - \
+                || { echo "the outPaths differ from the outputs cargo built" >&2; exit 1; }
+            fi
+          } 2>&1 | tee "$RESULTS/upstream-eval.log"
+
+      # The sources and the generated build system, without the GC roots
+      # under nix/gc, which point into this runner's store.
+      - name: Upload the project
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cargo-demo-project
+          path: |
+            ${{ env.PROJECT }}/Cargo.toml
+            ${{ env.PROJECT }}/Cargo.lock
+            ${{ env.PROJECT }}/src
+            ${{ env.PROJECT }}/target/debug/nix
+            !${{ env.PROJECT }}/target/debug/nix/gc
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload the results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-upstream
+          path: ${{ env.RESULTS }}
+          if-no-files-found: warn
+          retention-days: 14
+
+  nova-nix:
+    name: The build system with nova-nix
+    needs: [upstream]
+    runs-on: ubuntu-latest
+    # Room for parity.yml's setup, a Cabal build included, the measured
+    # steps' own limits and the upload after them.
+    timeout-minutes: 130
+    env:
+      NIXOS_CACHE_URL: https://cache.nixos.org
+      NIXOS_CACHE_KEY: cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+      TARGET_EXPR: '(import (/. + builtins.getEnv "CALLER") { }).target'
+    outputs:
+      eval: ${{ steps.eval.outcome }}
+      drvpath: ${{ steps.compare.outputs.drvpath }}
+      outpath: ${{ steps.compare.outputs.outpath }}
+      build: ${{ steps.build.outcome }}
+      run: ${{ steps.run.outcome }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
+        id: setup
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      # The store's key names this plan (.github/actions/cabal-store).
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
+
+      - name: Build nova-nix
+        run: |
+          set -euo pipefail
+          cabal build exe:nova-nix
+          bin=$(cabal list-bin exe:nova-nix)
+          echo "NOVA_NIX=$bin" >> "$GITHUB_ENV"
+
+      # nova-nix's default store is /nix/store, which it creates when /nix
+      # is the runner's.  No upstream Nix is installed here, so it is
+      # nova-nix's alone.  A program cache.nixos.org built finds its
+      # libraries only under /nix/store.
+      - name: Give the runner /nix
+        run: sudo mkdir -m 0755 /nix && sudo chown "$USER" /nix
+
+      - name: Download the project
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cargo-demo-project
+          path: ${{ env.PROJECT }}
+
+      - name: Download upstream's results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: results-upstream
+          path: ${{ env.RESULTS }}
+
+      # The binary runs outside cabal, so the <nix/*> expressions come
+      # from the checkout.
+      - name: Evaluate the build system with nova-nix
+        id: eval
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          {
+            printed=$("$NOVA_NIX" eval --strict --nix-path "nix=$GITHUB_WORKSPACE/data/nix" --expr "$PATHS_EXPR")
+            echo "$printed"
+            grep -o '"[^"]*"' <<<"$printed" | tr -d '"' > "$RESULTS/nova-nix-paths.txt" \
+              || { echo "printed no store path" >&2; exit 1; }
+            [ "$(wc -l < "$RESULTS/nova-nix-paths.txt")" -eq 4 ] \
+              || { echo "expected four store paths" >&2; exit 1; }
+          } 2>&1 | tee "$RESULTS/nova-nix-eval.log"
+
+      # PATHS_EXPR lists the two drvPaths first, then the two outPaths.
+      - name: Compare the store paths with upstream's
+        id: compare
+        if: steps.eval.outcome == 'success' && needs.upstream.outputs.eval == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          compare() {
+            if diff <(sed -n "$2p" "$RESULTS/upstream-paths.txt") <(sed -n "$2p" "$RESULTS/nova-nix-paths.txt"); then
+              echo "$1: match"
+              echo "$1=match" >> "$GITHUB_OUTPUT"
+            else
+              echo "$1: mismatch (upstream <, nova-nix >)"
+              echo "$1=mismatch" >> "$GITHUB_OUTPUT"
+            fi
+          }
+          {
+            compare drvpath 1,2
+            compare outpath 3,4
+          } 2>&1 | tee "$RESULTS/nova-nix-compare.log"
+
+      # Runs whether or not the evaluation step succeeded: the build
+      # evaluates target itself, and a failure shows where that stops.
+      - name: Build target with nova-nix
+        id: build
+        continue-on-error: true
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          {
+            "$NOVA_NIX" build --nix-path "nix=$GITHUB_WORKSPACE/data/nix" \
+              --substituter "$NIXOS_CACHE_URL" --trusted-key "$NIXOS_CACHE_KEY" \
+              --expr "$TARGET_EXPR" \
+              | tee "$RESULTS/nova-nix-out.txt"
+          } 2>&1 | tee "$RESULTS/nova-nix-build.log"
+
+      # target is cargo's create-symlinks script, which cargo runs on the
+      # target directory after a build: it links each binary under the
+      # profile's directory there.  The binary prints what the one cargo
+      # built printed.
+      - name: Run the binary nova-nix built
+        id: run
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          {
+            out=$(cat "$RESULTS/nova-nix-out.txt")
+            links="$RUNNER_TEMP/target"
+            mkdir -p "$links/debug"
+            "$out/bin/create-symlinks" "$links"
+            "$links/debug/$CRATE" 2>&1 | tee "$RESULTS/nova-nix-run.out"
+            diff "$RESULTS/upstream-cargo-run.log" "$RESULTS/nova-nix-run.out" \
+              || { echo "the output differs from that of the binary cargo built" >&2; exit 1; }
+          } 2>&1 | tee "$RESULTS/nova-nix-run.log"
+
+      - name: Upload the results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-nova-nix
+          path: ${{ env.RESULTS }}/nova-nix-*
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Runs whatever the jobs before it did, so that one run shows each step.
+  summary:
+    name: Summary
+    needs: [upstream, nova-nix]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # A pattern, which matches no artifact without failing, where a job
+      # before this one uploaded nothing.
+      - name: Download the results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: results-*
+          path: ${{ env.RESULTS }}
+          merge-multiple: true
+
+      - name: Write the summary
+        env:
+          UPSTREAM_JOB: ${{ needs.upstream.result }}
+          NOVA_NIX_JOB: ${{ needs.nova-nix.result }}
+          UPSTREAM_CARGO_BUILD: ${{ needs.upstream.outputs.cargo-build }}
+          UPSTREAM_CARGO_RUN: ${{ needs.upstream.outputs.cargo-run }}
+          UPSTREAM_EVAL: ${{ needs.upstream.outputs.eval }}
+          NOVA_NIX_EVAL: ${{ needs.nova-nix.outputs.eval }}
+          NOVA_NIX_DRVPATH: ${{ needs.nova-nix.outputs.drvpath }}
+          NOVA_NIX_OUTPATH: ${{ needs.nova-nix.outputs.outpath }}
+          NOVA_NIX_BUILD: ${{ needs.nova-nix.outputs.build }}
+          NOVA_NIX_RUN: ${{ needs.nova-nix.outputs.run }}
+        run: |
+          set -euo pipefail
+          tail_lines=30
+          # Each row: its log under RESULTS, its label, and what it did,
+          # a step's outcome or a comparison's result; empty where the
+          # step never ran.
+          rows=(
+            "upstream-cargo-build|Upstream cargo build|$UPSTREAM_CARGO_BUILD"
+            "upstream-cargo-run|Upstream binary runs|$UPSTREAM_CARGO_RUN"
+            "upstream-eval|Upstream eval|$UPSTREAM_EVAL"
+            "nova-nix-eval|nova-nix eval|$NOVA_NIX_EVAL"
+            "nova-nix-compare|drvPath match|$NOVA_NIX_DRVPATH"
+            "nova-nix-compare|outPath match|$NOVA_NIX_OUTPATH"
+            "nova-nix-build|nova-nix build|$NOVA_NIX_BUILD"
+            "nova-nix-run|nova-nix binary runs|$NOVA_NIX_RUN"
+          )
+          values=("target drvPath" "retained paths drvPath" "target outPath" "retained paths outPath")
+          {
+            echo "## cargo (libnix) with nova-nix"
+            echo
+            echo "Upstream Nix $NIX_VERSION, cargo (libnix) from \`$LIBFENIX\`."
+            echo
+            echo "Jobs: upstream $UPSTREAM_JOB, nova-nix $NOVA_NIX_JOB."
+            echo
+            echo "| Step | Result |"
+            echo "| --- | --- |"
+            for row in "${rows[@]}"; do
+              IFS='|' read -r _ label result <<<"$row"
+              echo "| $label | ${result:-not run} |"
+            done
+            echo
+            echo "| Store path | Upstream | nova-nix |"
+            echo "| --- | --- | --- |"
+            for i in "${!values[@]}"; do
+              line=$((i + 1))
+              upstream=$(sed -n "${line}p" "$RESULTS/upstream-paths.txt" 2>/dev/null || true)
+              nova=$(sed -n "${line}p" "$RESULTS/nova-nix-paths.txt" 2>/dev/null || true)
+              echo "| ${values[$i]} | \`${upstream:-none}\` | \`${nova:-none}\` |"
+            done
+            shown=()
+            for row in "${rows[@]}"; do
+              IFS='|' read -r log label result <<<"$row"
+              case "$result" in
+                failure | mismatch) ;;
+                *) continue ;;
+              esac
+              case " ${shown[*]} " in
+                *" $log "*) continue ;;
+              esac
+              shown+=("$log")
+              echo
+              echo "### $label: the last $tail_lines lines"
+              echo
+              echo '```text'
+              tail -n "$tail_lines" "$RESULTS/$log.log" 2>/dev/null || echo "(no log)"
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
