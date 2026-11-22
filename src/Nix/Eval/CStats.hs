@@ -14,8 +14,9 @@
 --
 -- Once 'countSites' turns counting on, the allocators also count each
 -- environment and attribute set under its site ("Nix.Eval.AllocSite"),
--- which 'siteCounts' and every census after it read.  With counting off,
--- an allocation tests one C flag and counts nothing.
+-- and @//@ the entries it copies, which 'siteCounts' and every census
+-- after it read.  With counting off, an allocation tests one C flag and
+-- counts nothing.
 --
 -- What it reaches is exact for the roots it is given, and how close that
 -- is to what the process still uses depends on the roots.  Haskell holds
@@ -149,6 +150,9 @@ foreign import ccall unsafe "nn_stats_env_sizes"
 
 foreign import ccall unsafe "nn_stats_set_sites"
   c_nn_stats_set_sites :: Ptr Word64 -> Ptr Word64 -> Ptr Word64 -> Word32 -> IO Word32
+
+foreign import ccall unsafe "nn_stats_update_copied"
+  c_nn_stats_update_copied :: IO Word64
 
 -- ---------------------------------------------------------------------------
 -- Kinds of object
@@ -305,7 +309,10 @@ data SiteCounts = SiteCounts
     -- | The environments allocated, by size; sizes none had are absent.
     sitesEnvSizes :: !(Map EnvSize Word64),
     -- | Every set site, with what it allocated.
-    sitesSets :: !(Map SetSite SetSiteFigures)
+    sitesSets :: !(Map SetSite SetSiteFigures),
+    -- | The entries @//@ copied into the sets it made, which upstream
+    -- counts in @nrOpUpdateValuesCopied@.
+    sitesUpdateCopied :: !Word64
   }
   deriving (Eq, Show)
 
@@ -337,7 +344,8 @@ siteCounts = do
         counts <- peekArray (fromIntegral (min buckets envSizeBuckets)) buf
         pure (Map.fromList [(bucket i, n) | (i, n) <- zip [0 ..] counts, n /= 0])
       sets <- readSites setSiteCount c_nn_stats_set_sites
-      pure (Just (SiteCounts (siteMap envSiteIndex envFigures envs) sizes (siteMap setSiteIndex setFigures sets)))
+      Just . SiteCounts (siteMap envSiteIndex envFigures envs) sizes (siteMap setSiteIndex setFigures sets)
+        <$> c_nn_stats_update_copied
   where
     bucket i
       | i < envSizeOpen = EnvSlots i
@@ -524,8 +532,9 @@ readSetSizes = alloca $ \distinctPtr -> do
 -- | A census as lines of a name and a value, each set size a line of its
 -- own with the size and the number of reached sets that have it.  A
 -- count no allocator keeps has no line.  With counting by site on, the
--- environments' slots and sizes follow, the open size written @N+@, and
--- then each site's figures, environments first.
+-- environments' slots and sizes follow, the open size written @N+@, then
+-- each site's figures, environments first, and last the entries @//@
+-- copied.
 renderCensus :: Census -> BS.ByteString
 renderCensus census =
   BL.toStrict . BB.toLazyByteString $
@@ -549,11 +558,12 @@ renderCensus census =
     seconds s = BB.string7 (showFFloat (Just secondsDigits) s "")
     setSize (size, count) =
       field "attrsets.reached.size" (BB.word32Dec size <> BB.char7 ' ' <> BB.word64Dec count)
-    siteLines (SiteCounts envs sizes sets) =
+    siteLines (SiteCounts envs sizes sets copied) =
       field "envs.allocated.slots" (BB.word64Dec (sum (fmap envSiteSlots envs)))
         <> foldMap envSize (Map.toAscList sizes)
         <> foldMap envSite (Map.toAscList envs)
         <> foldMap setSite (Map.toAscList sets)
+        <> field "attrsets.update.copied" (BB.word64Dec copied)
     envSize (size, count) =
       field "envs.allocated.size" (sizeName size <> BB.char7 ' ' <> BB.word64Dec count)
     sizeName (EnvSlots n) = BB.word32Dec n

@@ -79,7 +79,7 @@ import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.Builtin (Builtin, builtinIndex, builtinName, builtinNamed)
 import qualified Nix.Eval.Builtin as Builtin
-import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion)
+import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion, cattrsetUpdate)
 import Nix.Eval.CBytecode (attrkeyStatic, attrsRec, binaryAdd, bindNamed, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcEmitString, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, cbcString, cbcStringText, formalName, formalNamedSet, formalSet, formalSharedDefault, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
 import Nix.Eval.CEnv (cenvNameTable, cenvParent)
@@ -1967,14 +1967,15 @@ testCensus = do
                 `andThen` assertEqual "some builtins reached" True (fromMaybe 0 (figuresCount (kindThunks (censusReached census))) > 0),
       runTest "a census renders as a name and a value per line, with no line for a count no allocator keeps" $
         assertEqual "report" renderedSample (renderCensus sampleCensus),
-      runTest "a census counting by site renders the envs' slots and sizes, then three figures for each site, after the rest" $
+      runTest "a census counting by site renders the envs' slots and sizes, then three figures for each site, then the entries // copied, after the rest" $
         let rendered = BS8.lines (renderCensus sampleCensus {censusSites = Just sampleSites})
             before = BS8.lines renderedSample
             sites = drop (length before) rendered
             siteCount = length [minBound .. maxBound :: EnvSite] + length [minBound .. maxBound :: SetSite]
          in assertEqual "the lines without sites" before (take (length before) rendered)
               `andThen` assertEqual "slots and sizes" ["envs.allocated.slots 6", "envs.allocated.size 2 1", "envs.allocated.size 32+ 1"] (take 3 sites)
-              `andThen` assertEqual "figures" (3 * siteCount) (length sites - 3)
+              `andThen` assertEqual "figures" (3 * siteCount) (length sites - 4)
+              `andThen` assertEqual "the entries // copied, last" ["attrsets.update.copied 5"] (drop (length sites - 1) sites)
               `andThen` assertEqual
                 "a site's figures"
                 []
@@ -2058,7 +2059,8 @@ testCensus = do
       SiteCounts
         { sitesEnvs = Map.insert EnvLet (EnvSiteFigures 2 6 192) (Map.fromList [(site, EnvSiteFigures 0 0 0) | site <- [minBound .. maxBound]]),
           sitesEnvSizes = Map.fromList [(EnvSlots 2, 1), (EnvSlotsAtLeast 32, 1)],
-          sitesSets = Map.insert SetUpdate (SetSiteFigures 3 2 184) (Map.fromList [(site, SetSiteFigures 0 0 0) | site <- [minBound .. maxBound]])
+          sitesSets = Map.insert SetUpdate (SetSiteFigures 3 2 184) (Map.fromList [(site, SetSiteFigures 0 0 0) | site <- [minBound .. maxBound]]),
+          sitesUpdateCopied = 5
         }
     renderedSample =
       BS8.unlines
@@ -2107,7 +2109,8 @@ sitesAdded action = do
         SiteCounts
           { sitesEnvs = gained envMinus (EnvSiteFigures 0 0 0) (sitesEnvs later) (sitesEnvs earlier),
             sitesEnvSizes = gained (-) 0 (sitesEnvSizes later) (sitesEnvSizes earlier),
-            sitesSets = gained setMinus (SetSiteFigures 0 0 0) (sitesSets later) (sitesSets earlier)
+            sitesSets = gained setMinus (SetSiteFigures 0 0 0) (sitesSets later) (sitesSets earlier),
+            sitesUpdateCopied = sitesUpdateCopied later - sitesUpdateCopied earlier
           }
     _ -> Left "counting by site is off"
   where
@@ -2116,20 +2119,26 @@ sitesAdded action = do
     envMinus (EnvSiteFigures a b c) (EnvSiteFigures x y z) = EnvSiteFigures (a - x) (b - y) (c - z)
     setMinus (SetSiteFigures a b c) (SetSiteFigures x y z) = SetSiteFigures (a - x) (b - y) (c - z)
 
--- | What evaluating a source adds at each site but the root's, whose
--- environment and sets each evaluation builds.  The IO evaluator runs
--- it, as @nova-nix eval@ does: the pure one evaluates a thunk again each
--- time it is forced, and so allocates again too.
-sitesOfEval :: FilePath -> Text -> IO (Either Text (Map.Map EnvSite EnvSiteFigures, Map.Map SetSite SetSiteFigures))
-sitesOfEval baseDir source = do
+-- | What evaluating a source adds to the counts by site.  The IO
+-- evaluator runs it, as @nova-nix eval@ does: the pure one evaluates a
+-- thunk again each time it is forced, and so allocates again too.
+countsOfEval :: FilePath -> Text -> IO (Either Text SiteCounts)
+countsOfEval baseDir source = do
   outcome <- newIORef (Right ())
   added <- sitesAdded (evalNixIO baseDir source >>= writeIORef outcome . void)
   failure <- readIORef outcome
-  pure (failure >> fmap (\counts -> (Map.delete EnvRoot (sitesEnvs counts), Map.delete SetRoot (sitesSets counts))) added)
+  pure (failure >> added)
+
+-- | What evaluating a source adds at each site but the root's, whose
+-- environment and sets each evaluation builds, under the IO evaluator as
+-- 'countsOfEval' runs it.
+sitesOfEval :: FilePath -> Text -> IO (Either Text (Map.Map EnvSite EnvSiteFigures, Map.Map SetSite SetSiteFigures))
+sitesOfEval baseDir source =
+  fmap (\counts -> (Map.delete EnvRoot (sitesEnvs counts), Map.delete SetRoot (sitesSets counts))) <$> countsOfEval baseDir source
 
 -- | The deferred applications evaluating a source allocates, by the
 -- census's count before and after, under the IO evaluator as
--- 'sitesOfEval' runs it.
+-- 'countsOfEval' runs it.
 appsOfEval :: FilePath -> Text -> IO (Either Text Word64)
 appsOfEval baseDir source = do
   before <- censusOf []
@@ -2577,6 +2586,27 @@ testAllocSites = do
           sitesAdded $
             mapM_ (\(AttrSet left, AttrSet right) -> void (cattrsetUnion SetUpdate left right)) [(one, none), (none, one), (one, one)]
         pure (assertEqual "update" (Right (Map.singleton SetUpdate (SetSiteFigures 3 2 (3 * setHeaderSize + 4 * setEntrySize)))) (fmap sitesSets added)),
+      -- Upstream adds the size of the set an update merges to
+      -- nrOpUpdateValuesCopied (eval.cc:1934 at 2.24.9, :1988 at 2.34.9).
+      runTestM "an update counts the entries of the set it makes as copied, and a union counts none" $ do
+        pool <- mapM (\i -> symbolIntern ("copied_" <> T.pack (show (i :: Int)))) [1 .. 30]
+        let build keys = do
+              set <- cattrsetNew SetLiteral (length keys)
+              mapM_ (\key -> cattrsetInsert set key noPos cthunkNull) keys
+              cattrsetFreeze set
+              pure set
+        quickCheckPasses $
+          QC.forAll ((,) <$> QC.sublistOf pool <*> QC.sublistOf pool) $ \(left, right) -> QC.ioProperty $ do
+            leftSet <- build left
+            rightSet <- build right
+            made <- newIORef 0
+            updated <- sitesAdded (cattrsetUpdate SetUpdate leftSet rightSet >>= cattrsetSize >>= writeIORef made)
+            size <- readIORef made
+            merged <- sitesAdded (void (cattrsetUnion SetUpdate leftSet rightSet))
+            let expected = Set.size (Set.fromList (left ++ right))
+            pure $
+              (fromIntegral size, fmap sitesUpdateCopied updated, fmap sitesUpdateCopied merged)
+                QC.=== (expected, Right (fromIntegral expected), Right 0),
       -- Each source's figures are worked out by hand from the evaluator:
       -- an env is an 8-byte word with 8 bytes a slot, which holds the
       -- parent of an env of one to seven slots and no scopes and is
@@ -2633,6 +2663,21 @@ testAllocSites = do
         "builtins.deepSeq ({ a = 1; } // { b = 2; }) null"
         []
         [(SetLiteral, SetSiteFigures 2 0 112), (SetUpdate, SetSiteFigures 1 0 72)],
+      copiesTest
+        "an update with an empty operand copies nothing"
+        "builtins.deepSeq [ ({ } // { a = 1; }) ({ b = 2; } // { }) ] null"
+        0,
+      copiesTest
+        "an update copies every entry of the set it makes, a name both operands hold once"
+        "builtins.deepSeq ({ a = 1; b = 2; } // { b = 3; c = 4; }) null"
+        3,
+      -- `a // b // c` parses as `a // (b // c)`, and each update merges,
+      -- as upstream 2.24.9's does: the right one makes a set of two, then
+      -- the left one a set of four.
+      copiesTest
+        "a chain of updates copies the set each update makes"
+        "builtins.deepSeq ({ a = 1; b = 2; } // { c = 3; } // { d = 4; }) null"
+        6,
       sitesTest
         "removeAttrs of every attribute makes an empty set of its own, and of an empty set none"
         "builtins.deepSeq [ (builtins.removeAttrs { a = 1; } [ \"a\" ]) (builtins.removeAttrs { } [ \"a\" ]) ] null"
@@ -2722,6 +2767,11 @@ testAllocSites = do
         tmpBase <- getTemporaryDirectory
         added <- appsOfEval tmpBase source
         pure (assertEqual "applications" (Right expected) added)
+    copiesTest name source expected =
+      runTestM name $ do
+        tmpBase <- getTemporaryDirectory
+        added <- countsOfEval tmpBase source
+        pure (assertEqual "entries copied" (Right expected) (fmap sitesUpdateCopied added))
     genEnvAllocation = EnvAllocation <$> QC.arbitraryBoundedEnum <*> QC.chooseInt (0, 5)
     genSetAllocation = SetAllocation <$> QC.arbitraryBoundedEnum <*> QC.chooseInt (0, 4)
     allocateEnv (EnvAllocation site n) = do
