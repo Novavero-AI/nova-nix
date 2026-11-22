@@ -79,7 +79,7 @@ import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
 import Nix.Eval.Builtin (Builtin, builtinIndex, builtinName, builtinNamed)
 import qualified Nix.Eval.Builtin as Builtin
-import Nix.Eval.CAttrSet (cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSize, cattrsetUnion, cattrsetUpdate)
+import Nix.Eval.CAttrSet (CAttrSetStep (..), cattrsetFind, cattrsetFreeze, cattrsetFromNames, cattrsetIndex, cattrsetInsert, cattrsetLookup, cattrsetMember, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize, cattrsetUnion, cattrsetUpdate, cattrsetWalk, cattrsetWalkNext, flatCAttrSet)
 import Nix.Eval.CBytecode (attrkeyStatic, attrsRec, binaryAdd, bindNamed, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcEmitString, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, cbcString, cbcStringText, formalName, formalNamedSet, formalSet, formalSharedDefault, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
 import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
 import Nix.Eval.CEnv (cenvNameTable, cenvParent)
@@ -105,7 +105,7 @@ import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecor
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolCount, symbolIntern, symbolLen, symbolText)
-import Nix.Eval.Types (AttrSet (..), Env (..), Pending (..), attrSetFromEntries, attrSetFromSymbolEntriesSizedFor, attrSetKeys, attrSetRemoveKeys, attrSetToMap, buildCaptureEnv, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkApply2Thunk, mkApplyThunk, mkThunkBc, newEnv, newScopeEnv, pushLazyWithScope, readComputed, readPending, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
+import Nix.Eval.Types (AttrEntry (..), AttrSet (..), Env (..), Pending (..), attrSetAllPairs, attrSetFindName, attrSetFoldM, attrSetFromEntries, attrSetFromSymbolEntriesSizedFor, attrSetKeys, attrSetLookupSymbolEntry, attrSetMemberSymbol, attrSetRemoveKeys, attrSetToMap, buildCaptureEnv, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkApply2Thunk, mkApplyThunk, mkThunkBc, newEnv, newScopeEnv, pushLazyWithScope, readComputed, readPending, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -819,6 +819,15 @@ testEvalComparison = do
         "== decides at the pair whose name was interned first"
         "builtins.trace ({ zb = 1; za = throw \"a\"; } == { zb = 2; za = 1; }) null"
         ["trace: false"],
+      emits
+        "== forces each pair's values, left then right, up to the pair whose values differ, and no value past it"
+        "builtins.trace ({ za = builtins.trace \"a1\" 1; zb = builtins.trace \"b1\" 2; zc = builtins.trace \"c1\" 3; } == { za = builtins.trace \"a2\" 1; zb = builtins.trace \"b2\" 5; zc = builtins.trace \"c2\" 3; }) null"
+        ["trace: a1", "trace: a2", "trace: b1", "trace: b2", "trace: false"],
+      -- zc is interned before zb, so the second pair is zc and zb.
+      emits
+        "== forces no value past the pair whose names differ"
+        "builtins.trace ({ za = builtins.trace \"a1\" 1; zc = builtins.trace \"c1\" 1; } == { za = builtins.trace \"a2\" 1; zb = builtins.trace \"b2\" 1; }) null"
+        ["trace: a1", "trace: a2", "trace: false"],
       runTest "== takes a smaller set as unequal without forcing a value" $
         assertEval "eq-set-smaller" "{ zs1 = throw \"a\"; } == { zs1 = throw \"a\"; zs2 = 1; }" (VBool False),
       runTest "== takes a larger set as unequal without forcing a value" $
@@ -26989,6 +26998,7 @@ testCallErrorsIO = do
       fails "a function a formal defaults to is anonymous" "({ g ? { a }: a }: g { }) { }" (missing "anonymous lambda" "a"),
       fails "a function under an assert is anonymous" "let f = assert true; { a }: a; in f { }" (missing "anonymous lambda" "a"),
       fails "an unexpected argument names the function" "let f = { }: 1; in f { a = 1; }" (callFailure "f" "with unexpected argument 'a'"),
+      fails "a call with an unexpected argument forces no value of its argument" "({ za }: za) { za = throw \"a\"; zb = throw \"b\"; }" (unexpected "zb"),
       fails
         "an argument that is not a set"
         "({ a }: a) 1"
@@ -27384,12 +27394,12 @@ testCAttrSet = do
         result <- cattrsetLookup set kName
         pure (assertEqual "size and value" (1, Just second) (n, result)),
       -- Inserted from the highest symbol id down, so freeze has to sort.
-      runTestM "keys returned sorted" $ do
+      runTestM "a walk reads the keys in symbol order" $ do
         set <- cattrsetNew SetLiteral 8
         inserted <- mapM symbolIntern ["zzz", "aaa", "mmm"]
         mapM_ (\key -> cattrsetInsert set key noPos cthunkNull) (sortOn Down inserted)
         cattrsetFreeze set
-        keys <- cattrsetKeys set
+        keys <- map (\(name, _, _) -> name) <$> walkedEntries set
         pure (assertEqual "keys" (sort inserted) keys),
       runTestM "union right-biased" $ do
         setA <- cattrsetNew SetLiteral 4
@@ -27426,16 +27436,13 @@ testCAttrSet = do
               then Pass
               else Fail ("size=" <> T.pack (show n))
           ),
-      -- Grown from the default capacity, so every doubling runs; the
-      -- index of an absent key is the C side's NN_ATTRSET_NOT_FOUND.
-      runTestM "index finds each key at its sorted position and none for an absent key" $ do
-        set <- cattrsetNew SetLiteral 0
+      -- The index of an absent name is the C side's NN_ATTRSET_NOT_FOUND.
+      runTestM "a name table's index finds each name at its sorted position and none for an absent name" $ do
         syms <- mapM (\i -> symbolIntern ("index_" <> T.pack (show (i :: Int)))) [1 .. 100]
-        mapM_ (\sym -> cattrsetInsert set sym noPos cthunkNull) syms
-        cattrsetFreeze set
         absent <- symbolIntern "index_absent"
-        found <- mapM (cattrsetIndex set) (sort syms)
-        missing <- cattrsetIndex set absent
+        table <- cattrsetFromNames SetScope (reverse syms)
+        found <- mapM (cattrsetIndex table) (sort syms)
+        missing <- cattrsetIndex table absent
         pure
           ( if found == map Just [0 .. 99] && isNothing missing
               then Pass
@@ -27467,16 +27474,100 @@ testCAttrSet = do
                   let leftModel = Map.fromList left
                       rightModel = Map.fromList right
                   pure (actual QC.=== [leftModel, Map.union rightModel leftModel, Map.withoutKeys leftModel (Set.fromList removed)])
-        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
-        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+        quickCheckPasses property,
+      -- lookup answers Nothing for a value not filled yet; find finds it.
+      runTestM "a name table finds each name with no value until its value is written" $ do
+        written <- symbolIntern "table_written"
+        unwritten <- symbolIntern "table_unwritten"
+        cell <- textCell "filled"
+        table <- cattrsetFromNames SetScope [written, unwritten]
+        let set = flatCAttrSet table
+        before <- mapM (cattrsetFind set) [written, unwritten]
+        cattrsetIndex table written >>= mapM_ (\i -> cattrsetSetValue table i cell)
+        after <- mapM (cattrsetFind set) [written, unwritten]
+        members <- mapM (cattrsetMember set) [written, unwritten]
+        lookups <- mapM (cattrsetLookup set) [written, unwritten]
+        pure
+          ( assertEqual "before the write" [Just (noPos, nullPtr), Just (noPos, nullPtr)] before
+              `andThen` assertEqual "after the write" [Just (noPos, cell), Just (noPos, nullPtr)] after
+              `andThen` assertEqual "members" [True, True] members
+              `andThen` assertEqual "lookups" [Just cell, Nothing] lookups
+          ),
+      -- A set holds the last insert of each name, in symbol order, which
+      -- a map of the inserts models.  A walk reads every entry in that
+      -- order, and a find of a name its entry, the null pointer of a name
+      -- table not yet filled among the values.  The inserts repeat names
+      -- and pass the 64 entries at which freeze changes sorts.
+      runTestM "a walk of a set and a find of each name read the last insert of each name, in symbol order" $ do
+        pool <- mapM (\i -> symbolIntern ("walk_" <> T.pack (show (i :: Int)))) [1 .. 100]
+        absent <- symbolIntern "walk_absent"
+        cells <- mapM textCell ["one", "two", "three"]
+        let names = absent : pool
+            asEntry entry = (entryPos entry, unThunk (entryThunk entry))
+        quickCheckPasses $
+          QC.forAll (QC.resize 200 ((,) <$> genValuedInserts pool (nullPtr : cells) <*> QC.sublistOf pool)) $ \(inserts, wanted) -> QC.ioProperty $ do
+            set <- buildValued inserts
+            walked <- walkedEntries set
+            folded <- reverse <$> attrSetFoldM (\acc name entry -> pure ((name, entryPos entry, unThunk (entryThunk entry)) : acc)) [] (AttrSet set)
+            keys <- attrSetKeys (AttrSet set)
+            asMap <- attrSetToMap (AttrSet set)
+            found <- mapM (cattrsetFind set) names
+            entries <- mapM (\name -> fmap asEntry <$> attrSetLookupSymbolEntry name (AttrSet set)) names
+            members <- mapM (cattrsetMember set) names
+            setMembers <- mapM (\name -> attrSetMemberSymbol name (AttrSet set)) names
+            firstWanted <- attrSetFindName (`elem` wanted) (AttrSet set)
+            let model = insertsModel inserts
+                byName = Map.fromList [(name, (pos, value)) | (name, pos, value) <- model]
+                modelNames = [name | (name, _, _) <- model]
+                modelFound = map (`Map.lookup` byName) names
+                modelMembers = map (`Map.member` byName) names
+            pure $
+              (walked, folded, keys, asMap, found, entries, members, setMembers, firstWanted)
+                QC.=== (model, model, map symbolText modelNames, Map.fromList [(symbolText name, Thunk value) | (name, _, value) <- model], modelFound, modelFound, modelMembers, modelMembers, find (`elem` wanted) modelNames),
+      -- The action answers False the nth time it is asked, so a walk in
+      -- lockstep asks of the first n pairs and no more, or of every pair
+      -- when the sets end first.
+      runTestM "a walk of two sets in lockstep asks of each pair in order and of none past the first it fails" $ do
+        pool <- mapM (\i -> symbolIntern ("lockstep_" <> T.pack (show (i :: Int)))) [1 .. 30]
+        cells <- mapM textCell ["one", "two"]
+        quickCheckPasses $
+          QC.forAll ((,,) <$> genValuedInserts pool cells <*> genValuedInserts pool cells <*> QC.chooseInt (1, 40)) $ \(leftInserts, rightInserts, failAt) -> QC.ioProperty $ do
+            left <- buildValued leftInserts
+            right <- buildValued rightInserts
+            let leftEntries = insertsModel leftInserts
+                rightEntries = insertsModel rightInserts
+            asked <- newIORef []
+            let holds pairLeft pairRight = do
+                  modifyIORef' asked ((pairLeft, pairRight) :)
+                  (/= failAt) . length <$> readIORef asked
+                pairs = zip [(name, Thunk value) | (name, _, value) <- leftEntries] [(name, Thunk value) | (name, _, value) <- rightEntries]
+            answer <- attrSetAllPairs holds (AttrSet left) (AttrSet right)
+            askedPairs <- reverse <$> readIORef asked
+            pure $
+              (answer, askedPairs)
+                QC.=== (failAt > length pairs && length leftEntries == length rightEntries, take failAt pairs)
     ]
   where
     -- A new cell per call, so a lookup's answer identifies the entry it found.
     textCell text = unThunk <$> evaluated (mkStr text)
-    entryPositions set = do
-      n <- cattrsetSize set
-      entries <- mapM (\i -> (,) <$> cattrsetGetKey set i <*> (unPosIdx <$> cattrsetGetPos set i)) (takeWhile (< n) [0 ..])
-      pure (Map.fromList entries)
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    entryPositions set = Map.fromList . map (\(name, PosIdx pos, _) -> (name, pos)) <$> walkedEntries set
+    genValuedInserts pool values = QC.listOf ((,,) <$> QC.elements pool <*> (PosIdx <$> QC.arbitrary) <*> QC.elements values)
+    buildValued inserts = do
+      set <- cattrsetNew SetLiteral 0
+      mapM_ (\(name, pos, value) -> cattrsetInsert set name pos value) inserts
+      cattrsetFreeze set
+      pure set
+    -- The entries a set built from these inserts holds: the last insert
+    -- of each name, in symbol order.
+    insertsModel inserts = [(name, pos, value) | (name, (pos, value)) <- Map.toAscList (Map.fromList [(name, (pos, value)) | (name, pos, value) <- inserts])]
+    walkedEntries set = cattrsetWalk set >>= walkFrom
+    walkFrom walk =
+      cattrsetWalkNext walk >>= \case
+        CAttrSetDone -> pure []
+        CAttrSetEntry name pos value rest -> ((name, pos, value) :) <$> walkFrom rest
 
 -- ---------------------------------------------------------------------------
 -- C thunk arena (FFI)

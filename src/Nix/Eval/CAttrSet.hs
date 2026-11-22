@@ -8,6 +8,11 @@
 -- Construction is two-phase: insert entries, then freeze (sort + dedup).
 -- After freeze, lookup is O(log n) binary search over contiguous memory.
 --
+-- A set is read by name ('cattrsetLookup', 'cattrsetFind',
+-- 'cattrsetMember') or walked in symbol order ('cattrsetWalk').  Only a
+-- name table ('cattrsetFromNames'), a t'FlatCAttrSet', is read and
+-- written by index into its arrays.
+--
 -- Values are 'CThunkPtr' cells stored as @void*@ on the C side.  The set
 -- never dereferences them, and the census ("Nix.Eval.CStats") follows
 -- them.  The thunk arena owns the cells, so freeing a set frees its own
@@ -23,12 +28,15 @@
 -- 'Nix.Eval.CStatus.CStatusError' instead of leaving a NULL or a short
 -- set behind.
 module Nix.Eval.CAttrSet
-  ( -- * Opaque handle
+  ( -- * Opaque handles
     CAttrSet,
+    FlatCAttrSet,
+    flatCAttrSet,
 
     -- * Lifecycle
     cattrsetNew,
     cattrsetEmpty,
+    cattrsetFromNames,
 
     -- * Construction
     cattrsetInsert,
@@ -36,15 +44,21 @@ module Nix.Eval.CAttrSet
 
     -- * Query
     cattrsetLookup,
+    cattrsetFind,
+    cattrsetMember,
+
+    -- * Walks
+    CAttrSetWalk,
+    CAttrSetStep (..),
+    cattrsetWalk,
+    cattrsetWalkNext,
+
+    -- * Name tables by index
     cattrsetIndex,
-    cattrsetGetValue,
     cattrsetSetValue,
-    cattrsetGetKey,
-    cattrsetGetPos,
 
     -- * Bulk access
     cattrsetSize,
-    cattrsetKeys,
 
     -- * Set operations
     cattrsetUnion,
@@ -53,16 +67,18 @@ module Nix.Eval.CAttrSet
   )
 where
 
-import Control.Monad (unless)
+import Control.Monad (forM_, unless)
 import Data.Word (Word32)
 import Foreign.C.Types (CInt (..))
-import Foreign.Marshal.Array (peekArray, withArray)
-import Foreign.Ptr (Ptr, castPtr, nullPtr)
+import Foreign.Marshal.Alloc (allocaBytesAligned)
+import Foreign.Marshal.Array (withArray)
+import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
+import Foreign.Storable (alignment, peek, sizeOf)
 import Nix.Eval.AllocSite (SetSite, setSiteIndex)
 import Nix.Eval.CData (MonadCData, cdataIO)
 import Nix.Eval.CStatus (cStatusFailure, checkedCPtr)
 import Nix.Eval.CThunk (CThunkPtr)
-import Nix.Eval.SourcePos (PosIdx (..))
+import Nix.Eval.SourcePos (PosIdx (..), noPos)
 import Nix.Eval.Symbol (Symbol (..))
 
 -- | Opaque handle to a C-allocated attribute set.
@@ -71,6 +87,16 @@ data NnAttrSet
 
 -- | Convenience alias.
 type CAttrSet = Ptr NnAttrSet
+
+-- | A frozen set whose own arrays hold every entry it binds, sorted by
+-- symbol, so that an index into them names one of its entries: the set
+-- 'cattrsetIndex' and 'cattrsetSetValue' take.  The constructor is not
+-- exported, so every one is a name table 'cattrsetFromNames' made.
+newtype FlatCAttrSet = FlatCAttrSet CAttrSet
+
+-- | The set a t'FlatCAttrSet' is.
+flatCAttrSet :: FlatCAttrSet -> CAttrSet
+flatCAttrSet (FlatCAttrSet set) = set
 
 -- ---------------------------------------------------------------------------
 -- FFI imports (all unsafe - no callbacks, fast data access)
@@ -97,6 +123,9 @@ foreign import ccall unsafe "nn_attrset_freeze"
 foreign import ccall unsafe "nn_attrset_lookup"
   c_nn_attrset_lookup :: CAttrSet -> Word32 -> IO (Ptr ())
 
+foreign import ccall unsafe "nn_attrset_find"
+  c_nn_attrset_find :: CAttrSet -> Word32 -> Ptr Word32 -> Ptr (Ptr ()) -> IO CInt
+
 foreign import ccall unsafe "nn_attrset_index"
   c_nn_attrset_index :: CAttrSet -> Word32 -> IO Word32
 
@@ -115,8 +144,8 @@ foreign import ccall unsafe "nn_attrset_get_pos"
 foreign import ccall unsafe "nn_attrset_size"
   c_nn_attrset_size :: CAttrSet -> IO Word32
 
-foreign import ccall unsafe "nn_attrset_keys_ptr"
-  c_nn_attrset_keys_ptr :: CAttrSet -> IO (Ptr Word32)
+foreign import ccall unsafe "nn_attrset_layer_count"
+  c_nn_attrset_layer_count :: CAttrSet -> IO Word32
 
 foreign import ccall unsafe "nn_attrset_union"
   c_nn_attrset_union :: CAttrSet -> CAttrSet -> Word32 -> IO CAttrSet
@@ -145,6 +174,18 @@ cattrsetNew site expected = cdataIO (checkedCPtr "nn_attrset_new" =<< c_nn_attrs
   where
     capacity = fromIntegral (max 0 (min expected entryCeiling))
     entryCeiling = fromIntegral (maxBound :: Word32)
+
+-- | A frozen set at a site binding each name to no value, a null
+-- pointer, at no position: a table whose values are written afterwards,
+-- by index ('cattrsetSetValue').  No names give the shared empty set,
+-- which holds no index to write at.
+cattrsetFromNames :: (MonadCData m) => SetSite -> [Symbol] -> m FlatCAttrSet
+cattrsetFromNames _ [] = pure (FlatCAttrSet cattrsetEmpty)
+cattrsetFromNames site names = do
+  set <- cattrsetNew site (length names)
+  forM_ names $ \name -> cattrsetInsert set name noPos nullPtr
+  cattrsetFreeze set
+  pure (FlatCAttrSet set)
 
 -- ---------------------------------------------------------------------------
 -- Construction
@@ -176,27 +217,82 @@ cattrsetLookup set (Symbol sym) = cdataIO $ do
   ptr <- c_nn_attrset_lookup set sym
   pure (if ptr == nullPtr then Nothing else Just (castPtr ptr))
 
+-- | The position a set binds a name at and the value it binds it to, or
+-- 'Nothing' if it binds no such name.  A value not filled yet, the null
+-- pointer a name table holds until its frame fills it, is found as such,
+-- where 'cattrsetLookup' answers 'Nothing'.
+cattrsetFind :: (MonadCData m) => CAttrSet -> Symbol -> m (Maybe (PosIdx, CThunkPtr))
+cattrsetFind set (Symbol sym) = cdataIO $
+  allocaBytesAligned findOutputBytes findOutputAlignment $ \outputs -> do
+    let valuePtr = castPtr outputs
+        posPtr = outputs `plusPtr` findPositionOffset
+    found <- c_nn_attrset_find set sym posPtr valuePtr
+    if found == 0
+      then pure Nothing
+      else (\pos value -> Just (PosIdx pos, castPtr value)) <$> peek posPtr <*> peek valuePtr
+
+-- | One buffer holds both of @nn_attrset_find@'s outputs, so a find
+-- allocates once: the value's pointer at its start, aligned for a
+-- pointer, and the position right after it, at an offset of a pointer's
+-- size, which its own alignment divides.
+findPositionOffset, findOutputBytes, findOutputAlignment :: Int
+findPositionOffset = sizeOf (nullPtr :: Ptr ())
+findOutputBytes = findPositionOffset + sizeOf (0 :: Word32)
+findOutputAlignment = alignment (nullPtr :: Ptr ())
+
+-- | Whether a set binds a name, one whose value is not filled yet among
+-- them, as 'cattrsetFind' finds it, with nothing read back.
+cattrsetMember :: (MonadCData m) => CAttrSet -> Symbol -> m Bool
+cattrsetMember set (Symbol sym) = cdataIO ((/= 0) <$> c_nn_attrset_find set sym nullPtr nullPtr)
+
+-- ---------------------------------------------------------------------------
+-- Walks
+-- ---------------------------------------------------------------------------
+
+-- | A walk over a set's entries in symbol order, at the entry it reads
+-- next: the set, that entry's index into the set's arrays, and how many
+-- entries they hold.
+data CAttrSetWalk = CAttrSetWalk !CAttrSet !Word32 !Word32
+
+-- | What a walk reads next.
+data CAttrSetStep
+  = -- | The end of the set.
+    CAttrSetDone
+  | -- | An entry, its name, the position it was defined at and its value,
+    -- with the walk past it.
+    CAttrSetEntry !Symbol !PosIdx !CThunkPtr !CAttrSetWalk
+
+-- | A walk from a set's first entry, which reads the set's arrays in
+-- place, one entry at a time.  A frozen set's entries never move, so
+-- whatever runs between two steps, the walk reads each entry once.
+{-# INLINE cattrsetWalk #-}
+cattrsetWalk :: (MonadCData m) => CAttrSet -> m CAttrSetWalk
+cattrsetWalk set = cdataIO (CAttrSetWalk set 0 <$> c_nn_attrset_layer_count set)
+
+-- | The entry a walk reads next, or 'CAttrSetDone' past the last.
+{-# INLINE cattrsetWalkNext #-}
+cattrsetWalkNext :: (MonadCData m) => CAttrSetWalk -> m CAttrSetStep
+cattrsetWalkNext (CAttrSetWalk set idx count)
+  | idx >= count = pure CAttrSetDone
+  | otherwise = cdataIO $ do
+      name <- c_nn_attrset_get_key set idx
+      pos <- c_nn_attrset_get_pos set idx
+      value <- c_nn_attrset_get_value set idx
+      pure (CAttrSetEntry (Symbol name) (PosIdx pos) (castPtr value) (CAttrSetWalk set (idx + 1) count))
+
+-- ---------------------------------------------------------------------------
+-- Name tables by index
+-- ---------------------------------------------------------------------------
+
 -- | Find the index of a key, or 'Nothing' if not found.
-cattrsetIndex :: (MonadCData m) => CAttrSet -> Symbol -> m (Maybe Word32)
-cattrsetIndex set (Symbol sym) = cdataIO $ do
+cattrsetIndex :: (MonadCData m) => FlatCAttrSet -> Symbol -> m (Maybe Word32)
+cattrsetIndex (FlatCAttrSet set) (Symbol sym) = cdataIO $ do
   idx <- c_nn_attrset_index set sym
   pure (if idx == indexNotFound then Nothing else Just idx)
 
--- | Get the value at a known index.
-cattrsetGetValue :: (MonadCData m) => CAttrSet -> Word32 -> m CThunkPtr
-cattrsetGetValue set idx = cdataIO (castPtr <$> c_nn_attrset_get_value set idx)
-
 -- | Update the value at a known index (for two-phase construction).
-cattrsetSetValue :: (MonadCData m) => CAttrSet -> Word32 -> CThunkPtr -> m ()
-cattrsetSetValue set idx ptr = cdataIO (c_nn_attrset_set_value set idx (castPtr ptr))
-
--- | Get the key symbol at a known index.
-cattrsetGetKey :: (MonadCData m) => CAttrSet -> Word32 -> m Symbol
-cattrsetGetKey set idx = cdataIO (Symbol <$> c_nn_attrset_get_key set idx)
-
--- | Get the position of the entry at a known index.
-cattrsetGetPos :: (MonadCData m) => CAttrSet -> Word32 -> m PosIdx
-cattrsetGetPos set idx = cdataIO (PosIdx <$> c_nn_attrset_get_pos set idx)
+cattrsetSetValue :: (MonadCData m) => FlatCAttrSet -> Word32 -> CThunkPtr -> m ()
+cattrsetSetValue (FlatCAttrSet set) idx ptr = cdataIO (c_nn_attrset_set_value set idx (castPtr ptr))
 
 -- ---------------------------------------------------------------------------
 -- Bulk access
@@ -205,14 +301,6 @@ cattrsetGetPos set idx = cdataIO (PosIdx <$> c_nn_attrset_get_pos set idx)
 -- | Number of entries (unique keys after freeze).
 cattrsetSize :: (MonadCData m) => CAttrSet -> m Word32
 cattrsetSize = cdataIO . c_nn_attrset_size
-
--- | Read all keys as a list of symbols (sorted).
-cattrsetKeys :: (MonadCData m) => CAttrSet -> m [Symbol]
-cattrsetKeys set = cdataIO $ do
-  n <- cattrsetSize set
-  ptr <- c_nn_attrset_keys_ptr set
-  raw <- peekArray (fromIntegral n) ptr
-  pure (map Symbol raw)
 
 -- ---------------------------------------------------------------------------
 -- Set operations

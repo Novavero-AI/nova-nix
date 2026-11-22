@@ -35,7 +35,7 @@ import Nix.Eval.Types
     MonadEval (..),
     NixValue (..),
     Thunk (..),
-    attrSetAt,
+    attrSetAllPairs,
     attrSetLookup,
     attrSetSize,
     typeName,
@@ -275,7 +275,7 @@ nixEqual forceFn (VList clA) (VList clB) = do
       listEqual forceFn as bs
 -- Upstream's @eqValues@ on two sets (eval.cc:2763-2782 at 2.24.9): two
 -- derivations by their outPaths, then sets of different sizes unequal
--- with no value forced, then 'attrsEqualFrom'.
+-- with no value forced, then 'attrsEqual'.
 nixEqual forceFn (VAttrs as) (VAttrs bs) = do
   drvOutPaths <- derivationOutPathPair forceFn as bs
   case drvOutPaths of
@@ -283,13 +283,13 @@ nixEqual forceFn (VAttrs as) (VAttrs bs) = do
     Nothing -> do
       sizeA <- attrSetSize as
       sizeB <- attrSetSize bs
-      if sizeA /= sizeB then pure False else attrsEqualFrom forceFn as bs 0
+      if sizeA /= sizeB then pure False else attrsEqual forceFn as bs
 nixEqual _ _ _ = pure False
 
 -- | Upstream's walk over two sets of one size (eval.cc:2776-2781 at
--- 2.24.9): both in their arrays' order from the index given, each pair's
--- names compared and then its values, stopping at the first difference,
--- so no value past it is forced.  Upstream's @Bindings@ are sorted by
+-- 2.24.9): both in their arrays' order, each pair's names compared and
+-- then its values, stopping at the first difference, so no value past it
+-- is forced ('attrSetAllPairs').  Upstream's @Bindings@ are sorted by
 -- @Symbol@, whose id is the order its table interned the name in
 -- (attr-set.hh and symbol-table.hh), and the arrays here are sorted by
 -- symbol id the same way.  Two sets therefore compare in upstream's order
@@ -298,18 +298,12 @@ nixEqual _ _ _ = pure False
 -- where upstream's parser interns it, and each name @listToAttrs@,
 -- @groupBy@ and @fromJSON@ make where those builtins intern it upstream.
 -- No string value takes a symbol in either.
-attrsEqualFrom :: (MonadEval m) => Force m -> AttrSet -> AttrSet -> Int -> m Bool
-attrsEqualFrom forceFn as bs i = do
-  entryA <- attrSetAt as i
-  entryB <- attrSetAt bs i
-  case (entryA, entryB) of
-    (Just (nameA, a), Just (nameB, b))
-      | nameA /= nameB -> pure False
-      | otherwise -> do
-          eq <- thunkPairEqual forceFn (a, b)
-          if eq then attrsEqualFrom forceFn as bs (i + 1) else pure False
-    (Nothing, Nothing) -> pure True
-    _ -> pure False
+attrsEqual :: (MonadEval m) => Force m -> AttrSet -> AttrSet -> m Bool
+attrsEqual forceFn = attrSetAllPairs samePair
+  where
+    samePair (nameA, a) (nameB, b)
+      | nameA /= nameB = pure False
+      | otherwise = thunkPairEqual forceFn (a, b)
 
 -- | When both attr sets are derivations (a @type@ attr forcing to the string
 -- @"derivation"@) and both carry an @outPath@, the pair of outPath thunks.

@@ -163,8 +163,8 @@ import Nix.Eval.Types
     StringContext (..),
     StringContextElement (..),
     Thunk (..),
-    attrSetAt,
     attrSetElems,
+    attrSetFindName,
     attrSetFoldM,
     attrSetFromMap,
     attrSetFromSymbolEntries,
@@ -200,6 +200,7 @@ import Nix.Eval.Types
     envWithScopesRaw,
     evaluated,
     fillCAttrSetValues,
+    flatCAttrSet,
     frameThunkBc,
     heldString,
     mkApply2Thunk,
@@ -904,9 +905,9 @@ scopeBindingFrame kind values env bindings captureInfo = do
   names <- bcBindingStaticKeys bindings
   scope <- buildCAttrSetKeys names
   parent <- buildBcCaptureEnv (frameCaptureSite kind) env captureInfo
-  frame <- newScopeEnv (frameSite kind) (Just parent) (AttrSet scope)
+  frame <- newScopeEnv (frameSite kind) (Just parent) (AttrSet (flatCAttrSet scope))
   statics <- case values of
-    MaybeThunkValues -> bindScopedStatics (AttrSet scope) frame env bindings
+    MaybeThunkValues -> bindScopedStatics (AttrSet (flatCAttrSet scope)) frame env bindings
     ThunkValues -> bindStaticAttrs mkThunkBc frame env bindings
   fillCAttrSetValues scope (Map.map entryThunk statics)
   pure (frame, statics)
@@ -1278,14 +1279,10 @@ callSiteError = addErrorTrace (pure "from call site")
 checkExtraKeys :: (MonadEval m) => LambdaName -> [EvalFormal] -> Int -> AttrSet -> m ()
 checkExtraKeys lambdaName formals given attrs = do
   size <- attrSetSize attrs
-  when (given /= size) (unexpectedFrom 0)
+  when (given /= size) $
+    attrSetFindName (`notElem` map efName formals) attrs >>= mapM_ unexpected
   where
-    unexpectedFrom i =
-      attrSetAt attrs i >>= \case
-        Just (name, _)
-          | name `elem` map efName formals -> unexpectedFrom (i + 1)
-          | otherwise -> callSiteError (throwEvalError ("function '" <> lambdaNameText lambdaName <> "' called with unexpected argument '" <> printSymbol (symbolText name) <> "'"))
-        Nothing -> pure ()
+    unexpected name = callSiteError (throwEvalError ("function '" <> lambdaNameText lambdaName <> "' called with unexpected argument '" <> printSymbol (symbolText name) <> "'"))
 
 -- | What fills a formal's slot at a call.
 data FormalSlot

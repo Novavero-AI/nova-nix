@@ -176,11 +176,12 @@ void nn_stats_reached(uint64_t *counts, uint64_t *bytes);
  * and their bytes, and the pointers it could not place. */
 void nn_stats_visited(uint64_t *objects, uint64_t *bytes, uint64_t *unplaced);
 
-/* The reached attribute sets by their number of entries, in ascending
- * order of that number: up to `max` distinct sizes go to `sizes`, with
- * how many reached sets have each in `counts`, and the number of distinct
- * sizes, which may exceed `max`, to *distinct.  Returns 0, or -1 when the
- * sizes cannot be sorted for want of memory.  Read after the last mark. */
+/* The reached attribute sets by the number of entries each holds in its
+ * own arrays (nn_attrset_layer_count), in ascending order of that number:
+ * up to `max` distinct sizes go to `sizes`, with how many reached sets
+ * have each in `counts`, and the number of distinct sizes, which may
+ * exceed `max`, to *distinct.  Returns 0, or -1 when the sizes cannot be
+ * sorted for want of memory.  Read after the last mark. */
 int nn_stats_reached_set_sizes(uint32_t *sizes, uint64_t *counts, uint32_t max,
                                uint32_t *distinct);
 

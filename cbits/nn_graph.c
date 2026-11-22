@@ -103,11 +103,12 @@ static void env_children(const nn_env_t *env, const nn_graph_visitor_t *v, void 
 
 static void attrset_children(const nn_attrset_t *set, const nn_graph_visitor_t *v, void *ctx)
 {
-    uint32_t n = nn_attrset_size(set), i;
-    const nn_symbol_t *keys = nn_attrset_keys_ptr(set);
+    uint32_t n = nn_attrset_layer_count(set), i;
+    const nn_symbol_t *keys = nn_attrset_layer_keys(set);
+    void *const *values = nn_attrset_layer_values(set);
     for (i = 0; i < n; i++) {
         v->symbol(ctx, keys[i]);
-        object(v, ctx, NN_GRAPH_THUNK, nn_attrset_get_value(set, i));
+        object(v, ctx, NN_GRAPH_THUNK, values[i]);
     }
 }
 
