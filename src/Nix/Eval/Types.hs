@@ -24,8 +24,9 @@ module Nix.Eval.Types
     attrSetLookupEntry,
     attrSetLookupSymbolEntry,
     attrSetKeys,
-    attrSetAt,
     attrSetFoldM,
+    attrSetFindName,
+    attrSetAllPairs,
     attrSetToMap,
     emptyAttrSet,
     attrSetFromMap,
@@ -41,6 +42,8 @@ module Nix.Eval.Types
     attrSetToAscList,
     attrSetMapWithKey,
     attrSetRemoveKeys,
+    FlatCAttrSet,
+    flatCAttrSet,
     buildCAttrSetKeys,
     fillCAttrSetValues,
 
@@ -142,7 +145,6 @@ import qualified Data.ByteString as BS
 import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -157,7 +159,7 @@ import GHC.Float (castWord64ToDouble)
 import Nix.Derivation (Derivation)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.Builtin (Builtin, builtinAtIndex, builtinIndex, builtinName)
-import Nix.Eval.CAttrSet (CAttrSet, cattrsetEmpty, cattrsetFreeze, cattrsetGetKey, cattrsetGetPos, cattrsetGetValue, cattrsetIndex, cattrsetInsert, cattrsetKeys, cattrsetLookup, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize)
+import Nix.Eval.CAttrSet (CAttrSet, CAttrSetStep (..), FlatCAttrSet, cattrsetEmpty, cattrsetFind, cattrsetFreeze, cattrsetFromNames, cattrsetIndex, cattrsetInsert, cattrsetLookup, cattrsetMember, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize, cattrsetWalk, cattrsetWalkNext, flatCAttrSet)
 import Nix.Eval.CBytecode (cbcArg1, cbcArg2, cbcCountedPayload, cbcData, cbcOpcode, cbcShortArg, cbcString, cbcStringBytes, strpartLit, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpStr, pattern OpVar)
 import Nix.Eval.CCtxStr (CCtxStrPtr, cctxstrCtxCount, cctxstrElemHash, cctxstrElemName, cctxstrElemOutput, cctxstrElemTag, cctxstrNew, cctxstrSetAllOutputs, cctxstrSetDrvOutput, cctxstrSetPlain, cctxstrText, pattern SceAllOutputs, pattern SceDrvOutput, pattern ScePlain)
 import Nix.Eval.CData (CData, MonadCData (..), cdataIO, runCDataPure)
@@ -467,7 +469,7 @@ attrSetLookupSymbol sym (AttrSet cset) = fmap Thunk <$> cattrsetLookup cset sym
 -- | Whether a set binds an interned name, a name table whose entry is not
 -- filled yet among them.
 attrSetMemberSymbol :: (MonadCData m) => Symbol -> AttrSet -> m Bool
-attrSetMemberSymbol sym (AttrSet cset) = isJust <$> cattrsetIndex cset sym
+attrSetMemberSymbol sym (AttrSet cset) = cattrsetMember cset sym
 
 -- | 'attrSetLookupSymbol' for a name given as text, which is interned
 -- first, so a name no symbol holds yet takes its place in symbol order.
@@ -478,9 +480,7 @@ attrSetLookup key attrs = do
 
 -- | 'attrSetLookupSymbol' with the attribute's position.
 attrSetLookupSymbolEntry :: (MonadCData m) => Symbol -> AttrSet -> m (Maybe AttrEntry)
-attrSetLookupSymbolEntry sym (AttrSet cset) = do
-  midx <- cattrsetIndex cset sym
-  traverse (\idx -> AttrEntry <$> cattrsetGetPos cset idx <*> (Thunk <$> cattrsetGetValue cset idx)) midx
+attrSetLookupSymbolEntry sym (AttrSet cset) = fmap (\(pos, ptr) -> AttrEntry pos (Thunk ptr)) <$> cattrsetFind cset sym
 
 -- | 'attrSetLookup' with the attribute's position.
 attrSetLookupEntry :: (MonadCData m) => Text -> AttrSet -> m (Maybe AttrEntry)
@@ -489,47 +489,63 @@ attrSetLookupEntry key attrs = do
   attrSetLookupSymbolEntry sym attrs
 
 -- | All keys, as symbol text from C, in the C array's order: by interned
--- symbol, not by name.
+-- symbol, not by name ('attrSetFoldM').
 attrSetKeys :: (MonadCData m) => AttrSet -> m [Text]
-attrSetKeys (AttrSet cset) = map symbolText <$> cattrsetKeys cset
-
--- | The name and value at an index of the C array, which holds a set's
--- attributes in interned-symbol order; 'Nothing' outside it.  A walk by
--- index reads one entry at a time, where 'attrSetToMap' copies them all.
-attrSetAt :: (MonadCData m) => AttrSet -> Int -> m (Maybe (Symbol, Thunk))
-attrSetAt attrs@(AttrSet cset) i = do
-  size <- attrSetSize attrs
-  if i < 0 || i >= size
-    then pure Nothing
-    else do
-      let idx = fromIntegral i
-      name <- cattrsetGetKey cset idx
-      ptr <- cattrsetGetValue cset idx
-      pure (Just (name, Thunk ptr))
+attrSetKeys attrs = reverse <$> attrSetFoldM (\names name _ -> pure (symbolText name : names)) [] attrs
 
 -- | Fold an action over a set's attributes, each its name and its entry,
 -- first to last in the C array's order, by interned symbol, as upstream
 -- walks the @Attr@s of a set's @Bindings@, which are sorted by @Symbol@
 -- (attr-set.hh:30-33 and :91-95 at 2.24.9).  It reads one entry at a
--- time and forces the accumulator at each.
+-- time ('cattrsetWalk') and forces the accumulator at each.
 {-# INLINE attrSetFoldM #-}
 attrSetFoldM :: (MonadCData m) => (a -> Symbol -> AttrEntry -> m a) -> a -> AttrSet -> m a
-attrSetFoldM step initial (AttrSet cset) = do
-  size <- cattrsetSize cset
-  let go !acc idx
-        | idx >= size = pure acc
-        | otherwise = do
-            name <- cattrsetGetKey cset idx
-            entry <- AttrEntry <$> cattrsetGetPos cset idx <*> (Thunk <$> cattrsetGetValue cset idx)
-            step acc name entry >>= \next -> go next (idx + 1)
-  go initial 0
+attrSetFoldM step initial (AttrSet cset) = cattrsetWalk cset >>= go initial
+  where
+    go !acc walk =
+      cattrsetWalkNext walk >>= \case
+        CAttrSetDone -> pure acc
+        CAttrSetEntry name pos ptr rest -> step acc name (AttrEntry pos (Thunk ptr)) >>= \next -> go next rest
+
+-- | The first name of a set, in the order 'attrSetFoldM' walks it, that a
+-- test holds for, or 'Nothing' if it holds for none.  The walk stops at
+-- that name and forces no value.
+attrSetFindName :: (MonadCData m) => (Symbol -> Bool) -> AttrSet -> m (Maybe Symbol)
+attrSetFindName holds (AttrSet cset) = cattrsetWalk cset >>= go
+  where
+    go walk =
+      cattrsetWalkNext walk >>= \case
+        CAttrSetDone -> pure Nothing
+        CAttrSetEntry name _ _ rest
+          | holds name -> pure (Just name)
+          | otherwise -> go rest
+
+-- | Whether an action answers 'True' for every pair of attributes, each a
+-- name and its value, that two sets hold at one place in the order
+-- 'attrSetFoldM' walks them, asked first to last.  The walk stops at the
+-- first pair the action answers 'False' for, so it asks of no pair past
+-- it, and answers 'False' where one set ends before the other.
+attrSetAllPairs :: (MonadCData m) => ((Symbol, Thunk) -> (Symbol, Thunk) -> m Bool) -> AttrSet -> AttrSet -> m Bool
+attrSetAllPairs holds (AttrSet left) (AttrSet right) = do
+  leftWalk <- cattrsetWalk left
+  rightWalk <- cattrsetWalk right
+  go leftWalk rightWalk
+  where
+    go leftWalk rightWalk = do
+      leftStep <- cattrsetWalkNext leftWalk
+      rightStep <- cattrsetWalkNext rightWalk
+      case (leftStep, rightStep) of
+        (CAttrSetEntry leftName _ leftPtr leftRest, CAttrSetEntry rightName _ rightPtr rightRest) -> do
+          held <- holds (leftName, Thunk leftPtr) (rightName, Thunk rightPtr)
+          if held then go leftRest rightRest else pure False
+        (CAttrSetDone, CAttrSetDone) -> pure True
+        _ -> pure False
 
 -- | Check key membership without materializing thunks.
 attrSetMember :: (MonadCData m) => Text -> AttrSet -> m Bool
-attrSetMember key (AttrSet cset) = do
+attrSetMember key attrs = do
   sym <- symbolIntern key
-  midx <- cattrsetIndex cset sym
-  pure (case midx of Nothing -> False; Just _ -> True)
+  attrSetMemberSymbol sym attrs
 
 -- | Check if the attribute set is empty.
 attrSetNull :: (MonadCData m) => AttrSet -> m Bool
@@ -540,19 +556,10 @@ attrSetSize :: (MonadCData m) => AttrSet -> m Int
 attrSetSize (AttrSet cset) = fromIntegral <$> cattrsetSize cset
 
 -- | Full materialization: build a 'Map Text Thunk' from all entries.
--- Iterates the C array and builds a Haskell Map.  Expensive on large
--- sets - avoid on the hot path.
+-- Walks the C array ('attrSetFoldM') and builds a Haskell Map.  Expensive
+-- on large sets - avoid on the hot path.
 attrSetToMap :: (MonadCData m) => AttrSet -> m (Map Text Thunk)
-attrSetToMap (AttrSet cset) = do
-  n <- cattrsetSize cset
-  if n == 0
-    then pure Map.empty
-    else Map.fromList <$> mapM materializeEntry [0 .. n - 1]
-  where
-    materializeEntry i = do
-      sym <- cattrsetGetKey cset i
-      ptr <- cattrsetGetValue cset i
-      pure (symbolText sym, Thunk ptr)
+attrSetToMap = attrSetFoldM (\acc name entry -> pure (Map.insert (symbolText name) (entryThunk entry) acc)) Map.empty
 
 -- | All thunk values (materialized).
 attrSetElems :: (MonadCData m) => AttrSet -> m [Thunk]
@@ -670,24 +677,19 @@ newFrozenAttrSet site symbolOf posOf thunkOf m
       pure cset
 
 -- | Allocate a CAttrSet skeleton with keys only (NULL values), for an
--- environment's name table.
+-- environment's name table ('cattrsetFromNames').
 -- Used for two-phase construction in @rec {}@ and @let@ (knot-tying):
 -- keys are known before thunks, so the CAttrSet is built first, then
 -- values are filled via 'fillCAttrSetValues'.  The table is never a
 -- value, so its entries carry no position.  A table of no keys is the
 -- shared empty set, which 'fillCAttrSetValues' finds no key in.
-buildCAttrSetKeys :: (MonadCData m) => [Symbol] -> m CAttrSet
-buildCAttrSetKeys [] = pure cattrsetEmpty
-buildCAttrSetKeys keys = do
-  cset <- cattrsetNew SetScope (length keys)
-  forM_ keys $ \sym -> cattrsetInsert cset sym noPos nullPtr
-  cattrsetFreeze cset
-  pure cset
+buildCAttrSetKeys :: (MonadCData m) => [Symbol] -> m FlatCAttrSet
+buildCAttrSetKeys = cattrsetFromNames SetScope
 
 -- | Fill values into a pre-allocated CAttrSet (two-phase construction).
 -- Looks up each key's index and writes the CThunkPtr at that position.
 -- A key the set does not hold has no entry to fill and is skipped.
-fillCAttrSetValues :: (MonadCData m) => CAttrSet -> Map Symbol Thunk -> m ()
+fillCAttrSetValues :: (MonadCData m) => FlatCAttrSet -> Map Symbol Thunk -> m ()
 fillCAttrSetValues cset thunkMap =
   forM_ (Map.toList thunkMap) $ \(sym, Thunk ptr) -> do
     midx <- cattrsetIndex cset sym

@@ -287,6 +287,16 @@ void *nn_attrset_lookup(const nn_attrset_t *set, nn_symbol_t key)
     return set->values[idx];
 }
 
+int nn_attrset_find(const nn_attrset_t *set, nn_symbol_t key,
+                    uint32_t *pos, void **value)
+{
+    uint32_t idx = bsearch_key(set->keys, set->count, key);
+    if (idx == NN_ATTRSET_NOT_FOUND) return 0;
+    if (pos) *pos = set->positions[idx];
+    if (value) *value = set->values[idx];
+    return 1;
+}
+
 uint32_t nn_attrset_index(const nn_attrset_t *set, nn_symbol_t key)
 {
     return bsearch_key(set->keys, set->count, key);
@@ -319,11 +329,6 @@ uint32_t nn_attrset_get_pos(const nn_attrset_t *set, uint32_t idx)
 uint32_t nn_attrset_size(const nn_attrset_t *set)
 {
     return set->count;
-}
-
-const nn_symbol_t *nn_attrset_keys_ptr(const nn_attrset_t *set)
-{
-    return set->keys;
 }
 
 /* --- Set operations --- */
@@ -425,6 +430,21 @@ uint64_t nn_attrset_bytes(const nn_attrset_t *set)
 {
     return sizeof(*set) + (uint64_t)names_block_bytes(set->capacity)
          + (uint64_t)set->capacity * sizeof(void *);
+}
+
+uint32_t nn_attrset_layer_count(const nn_attrset_t *set)
+{
+    return set->count;
+}
+
+const nn_symbol_t *nn_attrset_layer_keys(const nn_attrset_t *set)
+{
+    return set->keys;
+}
+
+void *const *nn_attrset_layer_values(const nn_attrset_t *set)
+{
+    return set->values;
 }
 
 /* --- Internal: tagged sort comparator --- */

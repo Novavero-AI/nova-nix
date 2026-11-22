@@ -915,7 +915,7 @@ int nn_stats_reached_set_sizes(uint32_t *sizes, uint64_t *counts, uint32_t max,
     if (!all) return -1;
     for (i = 0; i < g.sets.count; i++) {
         if (bit_get(g.sets.bits, i))
-            all[reached++] = nn_attrset_size((const nn_attrset_t *)g.sets.objects[i]);
+            all[reached++] = nn_attrset_layer_count((const nn_attrset_t *)g.sets.objects[i]);
     }
     qsort(all, reached, sizeof(uint32_t), cmp_u32);
     for (i = 0; i < reached; i++) {

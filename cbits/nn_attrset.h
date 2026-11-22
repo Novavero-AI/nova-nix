@@ -101,6 +101,15 @@ void nn_attrset_freeze(nn_attrset_t *set);
  * the key is not present.  O(log n) binary search. */
 void *nn_attrset_lookup(const nn_attrset_t *set, nn_symbol_t key);
 
+/* Whether the set binds `key`, writing its entry's position through
+ * `pos` and its value through `value`, each only when not NULL.  A value
+ * that is NULL, as a name table's is until its frame fills it, is found
+ * as well, where nn_attrset_lookup answers NULL as for a key not bound.
+ * Returns 1 when the set binds the key, else 0 with nothing written.
+ * O(log n) binary search. */
+int nn_attrset_find(const nn_attrset_t *set, nn_symbol_t key,
+                    uint32_t *pos, void **value);
+
 /* Return the index of a key, or NN_ATTRSET_NOT_FOUND.
  * Useful for updating value slots in place. */
 uint32_t nn_attrset_index(const nn_attrset_t *set, nn_symbol_t key);
@@ -123,10 +132,6 @@ uint32_t nn_attrset_get_pos(const nn_attrset_t *set, uint32_t idx);
 
 /* Number of entries (after freeze: unique keys). */
 uint32_t nn_attrset_size(const nn_attrset_t *set);
-
-/* Direct pointer to the sorted keys array (count elements).
- * Valid until the set is freed. */
-const nn_symbol_t *nn_attrset_keys_ptr(const nn_attrset_t *set);
 
 /* --- Lifecycle: bulk cleanup --- */
 
@@ -180,5 +185,15 @@ void nn_attrset_sweep(uint32_t from, nn_tracker_keep_t keep, void *ctx);
 /* Bytes a set holds from the allocator: its header, and its keys,
  * positions and values at its capacity. */
 uint64_t nn_attrset_bytes(const nn_attrset_t *set);
+
+/* The entries a frozen set's own arrays hold, in symbol order: their
+ * number, and the arrays of their keys and their values, which hold that
+ * many and are valid until the set is freed.  Before freeze the arrays
+ * hold the inserts in their order, a name repeated among them, and move
+ * when the set grows.  The object graph follows a set by them
+ * (nn_graph.h), and the census counts its size by them. */
+uint32_t nn_attrset_layer_count(const nn_attrset_t *set);
+const nn_symbol_t *nn_attrset_layer_keys(const nn_attrset_t *set);
+void *const *nn_attrset_layer_values(const nn_attrset_t *set);
 
 #endif /* NN_ATTRSET_H */
