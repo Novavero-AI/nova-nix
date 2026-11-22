@@ -59,6 +59,10 @@ module Nix.Builder
     -- * Pure pieces (exported for tests)
     AttrsDelivery (..),
     attrsDelivery,
+    BuildPlace (..),
+    BuildLayout (..),
+    BuilderInvocation (..),
+    builderInvocation,
     BuilderSpawn (..),
     buildPath,
     closureUnder,
@@ -686,6 +690,9 @@ runPlannedBuild :: BuildConfig -> CaseSensitivity -> Derivation -> FilePath -> [
 runPlannedBuild config sensitivity drv buildDir plans finish = do
   let scratchDir p = storePathToFilePath (bcStoreDir config) (opScratch p)
       outputDirs = [(opName p, scratchDir p) | p <- plans]
+      -- The builder runs where its directory and outputs are, so it is
+      -- told of each where it is on disk.
+      layout = BuildLayout (inPlace buildDir) [(name, inPlace dir) | (name, dir) <- outputDirs]
       -- Every scratch path is the build's to use: the ones that are final
       -- paths may hold a tree an interrupted run left behind, and the
       -- fallbacks may hold one an interrupted run failed to discard.
@@ -704,58 +711,18 @@ runPlannedBuild config sensitivity drv buildDir plans finish = do
         done <- readIORef committed
         unless done clearScratch
   ( do
-      -- 4. Decode builder/args/env for the spawn boundary.  Derivation
-      --    strings are BYTES (identity); spawning a process needs real
-      --    text, so invalid UTF-8 in any of them is a clean build
-      --    failure, never a mojibake spawn.  An attribute that reaches
-      --    the builder as a file stays bytes ('attrsDelivery').  The
-      --    builtin builders skip this - they read the byte fields
-      --    directly.
+      -- 4. Run the builder.  A builtin builder runs in this process and
+      --    writes the outputs where they are on disk; a spawned one starts
+      --    as 'builderInvocation' says.
       exitResult <- case drvBuilder drv of
         b
           | b == builtinFetchurlBuilder -> first (uncurry BuilderRefused) <$> runBuiltinFetchurl (bcFetchRetry config) sensitivity drv outputDirs
           | b == builtinUnpackBuilder -> first (uncurry BuilderRefused) <$> runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv outputDirs
-        _ -> case (execWrapperFor config drv, decodeBuilderStrings drv) of
-          (SpawnUnsupported system, _) ->
-            pure
-              ( Left
-                  ( BuilderRefused
-                      1
-                      ( "no way to run a "
-                          <> system
-                          <> " builder on this machine; pass --exec-wrapper "
-                          <> system
-                          <> "=PATH to name a launcher for it"
-                      )
-                  )
-              )
-          (_, Left errMsg) -> pure (Left (BuilderRefused 1 errMsg))
-          (spawn, Right (builderText, argTexts)) ->
-            let builderPath = T.unpack (onStore config builderText)
-                builderArgs = map (T.unpack . buildRewrite config outputDirs) argTexts
-                -- Env still names the real builder - a launcher only
-                -- changes what's spawned, not what the derivation says.
-                (spawnPath, spawnArgs) = case spawn of
-                  SpawnThrough launcher -> (launcher, builderPath : builderArgs)
-                  _ -> (builderPath, builderArgs)
-                -- Only a fixed-output derivation's impureEnvVars reach
-                -- the spawn.  Upstream passes them to a derivation whose
-                -- type is not sandboxed (local-derivation-goal.cc:1176 at
-                -- 2.24.9): a fixed-output one, or an impure one
-                -- (derivations.cc:99-112 and 746), which takes the
-                -- impure-derivations experimental feature nova-nix does
-                -- not implement.
-                impureVars delivery = case fixedOutput drv of
-                  Just _ -> adImpureEnvVars delivery
-                  Nothing -> Right []
-             in case attrsDelivery config drv buildDir outputDirs of
-                  Left err -> pure (Left (BuilderRefused 1 err))
-                  Right delivery -> case impureVars delivery of
-                    Left err -> pure (Left (BuilderRefused 1 err))
-                    Right passed -> do
-                      for_ (adFiles delivery) (uncurry BS.writeFile)
-                      -- 5. Run the builder
-                      runBuilder (bcBuildLog config) spawnPath spawnArgs (buildEnvironment config (adEnv delivery) builderPath buildDir) passed buildDir
+        _ -> case builderInvocation config drv layout of
+          Left reason -> pure (Left (BuilderRefused 1 reason))
+          Right invocation -> do
+            for_ (invFiles invocation) (uncurry BS.writeFile)
+            runBuilder (bcBuildLog config) invocation
       case exitResult of
         Left failure -> do
           -- Whatever the builder wrote is in the store now, so failure has
@@ -764,7 +731,7 @@ runPlannedBuild config sensitivity drv buildDir plans finish = do
           clearScratch
           pure (Left (builderStop failure))
         Right () -> do
-          -- 6. Success: validate that the builder created all expected
+          -- 5. Success: validate that the builder created all expected
           --    outputs.  Outputs may be files or directories - both are
           --    valid (real Nix allows $out to be a single file, a
           --    directory tree, or a symlink).
@@ -939,6 +906,102 @@ formatSP sp = spHash sp <> "-" <> spName sp
 -- Environment
 -- ---------------------------------------------------------------------------
 
+-- | A path a build uses: where its builder is told it is, and where it is
+-- on disk, which is where this process writes and reads it.  The two
+-- differ when the builder's view of the filesystem is not this
+-- process's.
+data BuildPlace = BuildPlace
+  { -- | The path as the builder is told of it.
+    placeSeen :: !FilePath,
+    -- | The path on disk.
+    placeOnDisk :: !FilePath
+  }
+  deriving (Eq, Show)
+
+-- | A path the builder is told of where it is on disk.
+inPlace :: FilePath -> BuildPlace
+inPlace path = BuildPlace path path
+
+-- | Where a build's directory and its outputs are.
+data BuildLayout = BuildLayout
+  { -- | The build directory, upstream's @tmpDir@ on disk and
+    -- @tmpDirInSandbox@ as the builder sees it
+    -- (local-derivation-goal.cc:1084-1091 at 2.24.9).
+    layoutBuildDir :: !BuildPlace,
+    -- | Each output by name, at the path the builder writes it to.
+    layoutOutputs :: ![(Text, BuildPlace)]
+  }
+  deriving (Eq, Show)
+
+-- | How a spawned builder is started.
+data BuilderInvocation = BuilderInvocation
+  { -- | The program spawned: the builder, or the launcher that runs it.
+    invProgram :: !FilePath,
+    -- | Its arguments.
+    invArgs :: ![String],
+    -- | The build's environment, before the ambient variables a builder
+    -- may inherit ('scrubAmbient').
+    invEnv :: !(Map Text Text),
+    -- | The ambient variables copied into it, the @impureEnvVars@
+    -- carve-out.
+    invImpureVars :: ![Text],
+    -- | The files written before it starts, at their paths on disk.
+    invFiles :: ![(FilePath, BS.ByteString)],
+    -- | The directory it is started in, on disk.
+    invWorkDir :: !FilePath
+  }
+  deriving (Eq, Show)
+
+-- | How a derivation's builder is started, given where the build's
+-- directory and outputs are.  What the builder is told of, its arguments
+-- and environment, names the build directory and each output as the
+-- builder sees it, as upstream's environment names @tmpDirInSandbox@
+-- (local-derivation-goal.cc:1112-1129 and 1218-1221 at 2.24.9); the files
+-- it finds are written, and it is started, where the directory is on
+-- disk.
+--
+-- Derivation strings are bytes, and spawning a process needs text, so
+-- invalid UTF-8 in the builder, an argument or a variable refuses the
+-- build rather than spawning a mangled one.  An attribute that reaches
+-- the builder as a file stays bytes ('attrsDelivery').
+builderInvocation :: BuildConfig -> Derivation -> BuildLayout -> Either Text BuilderInvocation
+builderInvocation config drv layout = case (execWrapperFor config drv, decodeBuilderStrings drv) of
+  (SpawnUnsupported system, _) ->
+    Left ("no way to run a " <> system <> " builder on this machine; pass --exec-wrapper " <> system <> "=PATH to name a launcher for it")
+  (_, Left errMsg) -> Left errMsg
+  (spawn, Right (builderText, argTexts)) -> do
+    let builderPath = T.unpack (onStore config builderText)
+        builderArgs = map (T.unpack . buildRewrite config seenOutputs) argTexts
+        -- Env still names the real builder - a launcher only
+        -- changes what's spawned, not what the derivation says.
+        (spawnPath, spawnArgs) = case spawn of
+          SpawnThrough launcher -> (launcher, builderPath : builderArgs)
+          _ -> (builderPath, builderArgs)
+        -- Only a fixed-output derivation's impureEnvVars reach
+        -- the spawn.  Upstream passes them to a derivation whose
+        -- type is not sandboxed (local-derivation-goal.cc:1176 at
+        -- 2.24.9): a fixed-output one, or an impure one
+        -- (derivations.cc:99-112 and 746), which takes the
+        -- impure-derivations experimental feature nova-nix does
+        -- not implement.
+        impureVars delivery = case fixedOutput drv of
+          Just _ -> adImpureEnvVars delivery
+          Nothing -> Right []
+    delivery <- attrsDelivery config drv (placeSeen buildDir) seenOutputs
+    passed <- impureVars delivery
+    Right
+      BuilderInvocation
+        { invProgram = spawnPath,
+          invArgs = spawnArgs,
+          invEnv = buildEnvironment config (adEnv delivery) builderPath (placeSeen buildDir),
+          invImpureVars = passed,
+          invFiles = [(placeOnDisk buildDir </> name, bytes) | (name, bytes) <- adFiles delivery],
+          invWorkDir = placeOnDisk buildDir
+        }
+  where
+    buildDir = layoutBuildDir layout
+    seenOutputs = [(name, placeSeen place) | (name, place) <- layoutOutputs layout]
+
 -- | Replace each output's @builtins.placeholder@ sentinel with its
 -- build-time path (the same value @$out@ carries).  Only the args and the
 -- environment are rewritten; the builder path is left alone, matching
@@ -986,7 +1049,8 @@ rewriteEnv rewrite = Map.fromList . map rewritePair . Map.toList
 data AttrsDelivery = AttrsDelivery
   { -- | Variables the derivation contributes to the environment.
     adEnv :: !(Map Text Text),
-    -- | Files written into the build directory before the builder starts.
+    -- | Files the builder finds in its build directory when it starts,
+    -- by name in that directory.
     adFiles :: ![(FilePath, BS.ByteString)],
     -- | The @impureEnvVars@ attribute, which matters only to a fixed-output
     -- derivation, so a malformed one fails only such a build, as upstream.
@@ -1015,17 +1079,20 @@ data AttrsDelivery = AttrsDelivery
 -- as upstream applies it, after rendering; the JSON file's strings take it
 -- before they are escaped, so a store directory holding backslashes still
 -- yields JSON.
+--
+-- The build directory and the outputs are given where the builder sees
+-- them, and the files are named in that directory, so they can be
+-- written wherever it is on disk.
 attrsDelivery :: BuildConfig -> Derivation -> FilePath -> [(Text, FilePath)] -> Either Text AttrsDelivery
 attrsDelivery config drv buildDir outputDirs = case Map.lookup structuredAttrsKey env of
   Nothing -> do
     let (variables, passed) = splitPassAsFile env
-        passedPath name = buildDir </> passedFileName name
-        pathVars = Map.fromList [(name <> passedFileVarSuffix, T.pack (passedPath name)) | name <- Map.keys passed]
+        pathVars = Map.fromList [(name <> passedFileVarSuffix, T.pack (buildDir </> passedFileName name)) | name <- Map.keys passed]
     decoded <- Map.traverseWithKey decodeVariable variables
     Right
       AttrsDelivery
         { adEnv = unionEnvs [Map.withoutKeys outputEnv (Map.keysSet passed), rewriteEnv rewrite (unionEnvs [decoded, pathVars])],
-          adFiles = [(passedPath name, passedContents name value) | (name, value) <- Map.toList passed],
+          adFiles = [(passedFileName name, passedContents name value) | (name, value) <- Map.toList passed],
           -- Read from the whole environment, as upstream's getStringsAttr
           -- reads it, so passing the attribute as a file does not drop it.
           adImpureEnvVars = T.words <$> decodeVariable envImpureEnvVars (Map.findWithDefault "" envImpureEnvVars env)
@@ -1034,14 +1101,16 @@ attrsDelivery config drv buildDir outputDirs = case Map.lookup structuredAttrsKe
     encoded <- decodeVariable structuredAttrsKey encodedBytes
     attrs <- first (("cannot process " <> structuredAttrsKey <> " attribute of '" <> formatDrvName drv <> "': ") <>) (decodeStructuredAttrs encoded)
     let prepared = withOutputPlaceholders (map fst outputDirs) attrs
-        jsonFile = buildDir </> attrsJsonFileName
-        shellFile = buildDir </> attrsShellFileName
     Right
       AttrsDelivery
-        { adEnv = Map.fromList [(envNixAttrsJsonFile, T.pack jsonFile), (envNixAttrsShFile, T.pack shellFile)],
+        { adEnv =
+            Map.fromList
+              [ (envNixAttrsJsonFile, T.pack (buildDir </> attrsJsonFileName)),
+                (envNixAttrsShFile, T.pack (buildDir </> attrsShellFileName))
+              ],
           adFiles =
-            [ (jsonFile, renderAttrsJson rewrite prepared),
-              (shellFile, TE.encodeUtf8 (rewrite (renderAttrsShell prepared)))
+            [ (attrsJsonFileName, renderAttrsJson rewrite prepared),
+              (attrsShellFileName, TE.encodeUtf8 (rewrite (renderAttrsShell prepared)))
             ],
           adImpureEnvVars = fromMaybe [] <$> stringsAttr envImpureEnvVars attrs
         }
@@ -1078,7 +1147,8 @@ passedFileName :: Text -> FilePath
 passedFileName name = T.unpack (passedFilePrefix <> Nix32.encode (sha256Digest (TE.encodeUtf8 name)))
 
 -- | Build the process environment from the derivation's contribution
--- ('adEnv') + standard vars.
+-- ('adEnv') + standard vars, naming the build directory as the builder
+-- sees it.
 -- The builder path is used to derive PATH entries - the builder's own
 -- directory and its sibling @usr\/bin@ are included so that coreutils
 -- shipped alongside the builder (e.g. Git for Windows' MSYS2 tools)
@@ -1203,32 +1273,25 @@ homeEnvVar =
 -- 'scrubAmbient'\'s allowance - the ambient environment does not flow
 -- through.  Filesystem and process isolation remain future work.
 --
--- @impureVars@ is the impureEnvVars carve-out: the caller passes the
--- names a fixed-output derivation listed (empty otherwise), and each
--- is copied from the ambient environment - the EMPTY STRING when
+-- 'invImpureVars' is the impureEnvVars carve-out: the names a
+-- fixed-output derivation listed (empty otherwise), each copied from
+-- the ambient environment - the EMPTY STRING when
 -- absent, not omitted, matching upstream's @getEnv(i).value_or("")@.
 -- Upstream writes these last in initEnv, so they win even over the
 -- derivation's own values.  Names match exactly, as upstream's do.
-runBuilder ::
-  System.IO.Handle ->
-  FilePath ->
-  [String] ->
-  Map Text Text ->
-  [Text] ->
-  FilePath ->
-  IO (Either BuilderFailure ())
-runBuilder buildLog builderPath builderArgs buildEnv impureVars workDir = do
+runBuilder :: System.IO.Handle -> BuilderInvocation -> IO (Either BuilderFailure ())
+runBuilder buildLog invocation = do
   systemEnv <- System.Environment.getEnvironment
   let systemMap = Map.fromList [(T.pack k, T.pack v) | (k, v) <- systemEnv]
       impureAllowance =
-        Map.fromList [(var, Map.findWithDefault "" var systemMap) | var <- impureVars]
+        Map.fromList [(var, Map.findWithDefault "" var systemMap) | var <- invImpureVars invocation]
       -- Impure carve-out wins, then build env, displacing case variants
       -- on Windows; the scrubbed ambient allowance fills underneath.
-      mergedEnv = unionEnvs [impureAllowance, buildEnv, scrubAmbient systemMap]
+      mergedEnv = unionEnvs [impureAllowance, invEnv invocation, scrubAmbient systemMap]
       envList = [(T.unpack k, T.unpack v) | (k, v) <- Map.toList mergedEnv]
       spawnWith toLog =
-        (mkBuilderProcess builderPath builderArgs)
-          { Proc.cwd = Just workDir,
+        (mkBuilderProcess (invProgram invocation) (invArgs invocation))
+          { Proc.cwd = Just (invWorkDir invocation),
             Proc.env = Just envList,
             Proc.std_in = Proc.CreatePipe,
             -- The spawn closes this process's copy of the write end, so

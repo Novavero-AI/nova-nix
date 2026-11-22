@@ -61,7 +61,7 @@ import GHC.IO.Exception (IOErrorType (..), IOException (..))
 import HttpFixture (Reply (..), httpResponse, withDirectoryServer, withFetchurlServer, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildResult (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, checkDerivation, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substituteFromCaches, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildLayout (..), BuildPlace (..), BuildResult (..), BuilderInvocation (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, builderInvocation, checkDerivation, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substituteFromCaches, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.BuildDir (buildDirFor, createBuildDir)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
@@ -11108,7 +11108,7 @@ testPassAsFile = do
   sequence
     [ runTest "an attribute passAsFile names becomes upstream's file and a Path variable" $
         assertRight "delivery" (deliver [("foo", "xyzzy"), ("passAsFile", "foo")]) $ \delivery ->
-          assertEqual "files" [(fooFile, "xyzzy")] (adFiles delivery)
+          assertEqual "files" [(fooName, "xyzzy")] (adFiles delivery)
             `andThen` assertEqual "fooPath" (Just (T.pack fooFile)) (Map.lookup "fooPath" (adEnv delivery))
             `andThen` assertEqual "foo" Nothing (Map.lookup "foo" (adEnv delivery))
             `andThen` assertEqual "passAsFile" (Just "foo") (Map.lookup "passAsFile" (adEnv delivery)),
@@ -11124,22 +11124,22 @@ testPassAsFile = do
       runTest "an attribute called <name>Path keeps its own value" $
         assertRight "delivery" (deliver [("foo", "x"), ("fooPath", "literal"), ("passAsFile", "foo")]) $ \delivery ->
           assertEqual "fooPath" (Just "literal") (Map.lookup "fooPath" (adEnv delivery))
-            `andThen` assertEqual "files" [(fooFile, "x")] (adFiles delivery),
+            `andThen` assertEqual "files" [(fooName, "x")] (adFiles delivery),
       -- The derivation's out is the final path; the build writes elsewhere
       -- when that path is already valid, and the file says where.
       runTest "an output passed as a file leaves the environment for the path it is written to" $
         assertRight "delivery" (deliver [("out", "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-p"), ("passAsFile", "out")]) $ \delivery ->
           assertEqual "out" Nothing (Map.lookup "out" (adEnv delivery))
             `andThen` case Map.lookup "outPath" (adEnv delivery) of
-              Just path -> assertEqual "files" [(T.unpack path, TE.encodeUtf8 (T.pack scratchOut))] (adFiles delivery)
+              Just path -> assertEqual "files" [(takeFileName (T.unpack path), TE.encodeUtf8 (T.pack scratchOut))] (adFiles delivery)
               Nothing -> Fail "no outPath variable",
       runTest "a value passed as a file stays bytes" $
-        assertRight "as a file" (deliver [("foo", "\xff\xfe"), ("passAsFile", "foo")]) (assertEqual "files" [(fooFile, "\xff\xfe")] . adFiles)
+        assertRight "as a file" (deliver [("foo", "\xff\xfe"), ("passAsFile", "foo")]) (assertEqual "files" [(fooName, "\xff\xfe")] . adFiles)
           `andThen` assertLeft "as a variable" (deliver [("foo", "\xff\xfe")]),
       runTest "structured attributes ignore passAsFile" $
         let json = "{\"foo\":\"xyzzy\",\"passAsFile\":[\"foo\"]}"
          in assertRight "delivery" (deliver [("__json", json), ("foo", "xyzzy"), ("passAsFile", "foo")]) $ \delivery ->
-              assertEqual "files" [buildDir </> ".attrs.json", buildDir </> ".attrs.sh"] (map fst (adFiles delivery))
+              assertEqual "files" [".attrs.json", ".attrs.sh"] (map fst (adFiles delivery))
                 `andThen` assertEqual "variables" ["NIX_ATTRS_JSON_FILE", "NIX_ATTRS_SH_FILE"] (Map.keys (adEnv delivery)),
       -- The law passAsFile exists for: moving an attribute from the
       -- environment to a file changes where the builder reads it, not what
@@ -11153,7 +11153,7 @@ testPassAsFile = do
                   bytes = TE.encodeUtf8 value
                in case (deliverWith config [("foo", bytes)], deliverWith config [("foo", bytes), ("passAsFile", "foo")]) of
                     (Right variable, Right file) ->
-                      let found = lookup fooFile (adFiles file)
+                      let found = lookup fooName (adFiles file)
                        in QC.counterexample "no file" (isJust found)
                             QC..&&. ((TE.encodeUtf8 <$> Map.lookup "foo" (adEnv variable)) QC.=== found)
                     _ -> QC.counterexample "delivery failed" False
@@ -11161,7 +11161,8 @@ testPassAsFile = do
     ]
   where
     buildDir = "/build"
-    fooFile = buildDir </> ".attr-1bp7cri8hplaz6hbz0v4f0nl44rl84q1sg25kgwqzipzd1mv89ic"
+    fooName = ".attr-1bp7cri8hplaz6hbz0v4f0nl44rl84q1sg25kgwqzipzd1mv89ic"
+    fooFile = buildDir </> fooName
     scratchOut = "/scratch/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-p"
     outputDirs = [("out", scratchOut), ("dev", "/scratch/cccccccccccccccccccccccccccccccc-p-dev")]
     deliverWith config env =
@@ -11185,6 +11186,82 @@ testPassAsFile = do
                 "\128512"
               ]
           )
+
+-- | A spawned builder is told of its build directory and outputs where it
+-- sees them, and is started, with its files written, where they are on
+-- disk ('builderInvocation').  Here the two differ, as they do for a
+-- builder whose view of the filesystem is not this process's.
+testBuilderLayout :: IO [Bool]
+testBuilderLayout = do
+  putStrLn "builder/layout"
+  sequence
+    [ runTest "the environment names the build directory where the builder sees it, and it starts where the directory is on disk" $
+        assertRight "invocation" (invoke [] []) $ \invocation ->
+          assertEqual "the build directory's variables" (map (const (Just (T.pack seenTop))) topVars) (map (`Map.lookup` invEnv invocation) topVars)
+            `andThen` assertEqual "the working directory" diskTop (invWorkDir invocation),
+      runTest "outputs and their placeholders name each output where the builder sees it" $
+        assertRight "invocation" (invoke [("lib", hashPlaceholder "out" <> "/lib")] ["-c", hashPlaceholder "dev"]) $ \invocation ->
+          assertEqual "the outputs" [Just (T.pack seenOut), Just (T.pack seenDev)] (map (`Map.lookup` invEnv invocation) ["out", "dev"])
+            `andThen` assertEqual "a placeholder in a variable" (Just (T.pack seenOut <> "/lib")) (Map.lookup "lib" (invEnv invocation))
+            `andThen` assertEqual "the arguments" ["-c", seenDev] (invArgs invocation),
+      runTest "a file passed is named where the builder sees it and written where the directory is on disk" $
+        assertRight "invocation" (invoke [("foo", hashPlaceholder "out"), ("passAsFile", "foo")] []) $ \invocation ->
+          case invFiles invocation of
+            [(written, bytes)] ->
+              assertEqual "written in" diskTop (takeDirectory written)
+                `andThen` assertEqual "fooPath" (Just (T.pack (seenTop </> takeFileName written))) (Map.lookup "fooPath" (invEnv invocation))
+                `andThen` assertEqual "what it holds" (TE.encodeUtf8 (T.pack seenOut)) bytes
+            other -> Fail ("expected one file, got " <> T.pack (show other)),
+      runTest "structured attributes are named where the builder sees them and hold the outputs it sees" $
+        assertRight "invocation" (invoke [("__json", "{\"ref\":\"" <> hashPlaceholder "dev" <> "\"}")] []) $ \invocation ->
+          assertEqual
+            "the variables"
+            [Just (T.pack (seenTop </> ".attrs.json")), Just (T.pack (seenTop </> ".attrs.sh"))]
+            (map (`Map.lookup` invEnv invocation) ["NIX_ATTRS_JSON_FILE", "NIX_ATTRS_SH_FILE"])
+            `andThen` assertEqual "the files" [diskTop </> ".attrs.json", diskTop </> ".attrs.sh"] (map fst (invFiles invocation))
+            `andThen` assertEqual
+              "the outputs they name"
+              [(True, True, False) | _ <- invFiles invocation]
+              [(BS.isInfixOf (encoded seenOut) bytes, BS.isInfixOf (encoded seenDev) bytes, BS.isInfixOf (TE.encodeUtf8 diskRoot) bytes) | (_, bytes) <- invFiles invocation],
+      runTestM "nothing a builder is told of names a place on disk, and every file it finds is written in the directory on disk" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll genInvocation $ \(env, args) ->
+              case invoke env args of
+                Left err -> QC.counterexample (T.unpack err) False
+                Right invocation ->
+                  let told = Map.keys (invEnv invocation) <> Map.elems (invEnv invocation) <> map T.pack (invArgs invocation)
+                      onDisk (path, bytes) = takeDirectory path == diskTop && not (BS.isInfixOf (TE.encodeUtf8 diskRoot) bytes)
+                   in QC.counterexample (show invocation) (not (any (diskRoot `T.isInfixOf`) told) && all onDisk (invFiles invocation))
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    ]
+  where
+    seenTop = "/build"
+    diskRoot = "/disk"
+    diskTop = T.unpack diskRoot </> "builds" </> "0123"
+    seenOut = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-p"
+    seenDev = "/nix/store/cccccccccccccccccccccccccccccccc-p-dev"
+    onDiskAt seen = BuildPlace seen (T.unpack diskRoot <> seen)
+    layout = BuildLayout (BuildPlace seenTop diskTop) [("out", onDiskAt seenOut), ("dev", onDiskAt seenDev)]
+    topVars = ["NIX_BUILD_TOP", "TMPDIR", "TEMPDIR", "TMP", "TEMP", if SI.os == "mingw32" then "USERPROFILE" else "HOME"]
+    encoded = TE.encodeUtf8 . T.pack
+    invoke :: [(Text, Text)] -> [Text] -> Either Text BuilderInvocation
+    invoke env args =
+      builderInvocation
+        (defaultBuildConfig defaultStoreDir)
+        (mkTestBuildDrv "sh" (StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "p") "")
+          { drvArgs = map TE.encodeUtf8 args,
+            drvEnv = Map.fromList [(name, TE.encodeUtf8 value) | (name, value) <- env]
+          }
+        layout
+    piece = QC.elements ["/nix/store/", hashPlaceholder "out", hashPlaceholder "dev", hashPlaceholder "lib", "/", " ", "x"]
+    genValue = T.concat <$> QC.listOf piece
+    genInvocation = do
+      names <- QC.sublistOf ["a", "b", "c"]
+      values <- traverse (const genValue) names
+      passed <- QC.sublistOf names
+      args <- QC.listOf genValue
+      pure (("passAsFile", T.unwords passed) : zip names values, args)
 
 -- ---------------------------------------------------------------------------
 -- Tests: Store.DB (Phase 2, Batch 1)
@@ -30398,6 +30475,7 @@ runSuite = do
           testPushDirectory,
           testBuildOrchestrator,
           testPassAsFile,
+          testBuilderLayout,
           testStoreDB,
           testParseStorePath,
           testStoreMetadata,
