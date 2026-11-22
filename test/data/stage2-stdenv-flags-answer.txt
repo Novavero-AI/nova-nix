@@ -1,0 +1,15 @@
+gcc: C 201710, time stamp 0
+cc: C 201710, time stamp 0
+gcc -std=c99: C 199901, time stamp 0
+g++: C++ 202002, time stamp 0
+c++: C++ 202002, time stamp 0
+make's gcc: C 201710, time stamp 0
+ld: time stamp 0
+gcc -v exits 0
+CPATH: not named by gcc and g++, named by gcc-native-x86_64's gcc.exe and g++.exe
+C_INCLUDE_PATH: not named by gcc and g++, named by gcc-native-x86_64's gcc.exe and g++.exe
+CPLUS_INCLUDE_PATH: not named by gcc and g++, named by gcc-native-x86_64's gcc.exe and g++.exe
+COMPILER_PATH: not named by gcc and g++, named by gcc-native-x86_64's gcc.exe and g++.exe
+LIBRARY_PATH: not named by gcc and g++, named by gcc-native-x86_64's gcc.exe and g++.exe
+LPATH: not named by gcc and g++, named by gcc-native-x86_64's gcc.exe and g++.exe
+GCC_EXEC_PREFIX: not named by gcc and g++, named by gcc-native-x86_64's gcc.exe and g++.exe

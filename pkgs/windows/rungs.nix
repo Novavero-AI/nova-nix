@@ -97,4 +97,8 @@
     "binutils-native-x86_64"
     "gcc-native-x86_64"
   ];
+
+  # The stage-2 stdenv's compiler and linker wrappers on that toolchain,
+  # the Stage-2 stdenv stage.
+  stage2-stdenv = [ "stage2Stdenv.cc" ];
 }

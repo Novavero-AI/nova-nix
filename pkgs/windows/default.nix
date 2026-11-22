@@ -8,8 +8,14 @@
 #   stdenv/                               the transitional stage-1 stdenv on
 #                                         them: mkDerivation, setup.sh,
 #                                         cc-wrapper.sh
-#   seed-stdenv/                          its replacement, on tools built from
-#                                         the seed: mkDerivation, setup.sh
+#   seed-stdenv/                          the seed ladder's stdenv, on tools
+#                                         built from the seed: mkDerivation,
+#                                         setup.sh
+#   stage2-stdenv/                        the stage-1 stdenv's replacement:
+#                                         the seed stdenv's tools with the
+#                                         ladder's native x86_64 toolchain,
+#                                         through compiler and linker
+#                                         wrappers
 #   lib.nix                               callPackage and friends
 #
 # The set is a fixpoint: callPackage reads each package.nix's formal parameters
@@ -54,6 +60,7 @@ let
 
     stdenv = import ./stdenv;
     seedStdenv = callPackage ./seed-stdenv { };
+    stage2Stdenv = callPackage ./stage2-stdenv { };
     fetchurl = import ./fetchurl.nix;
   };
 in

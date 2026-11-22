@@ -17261,7 +17261,7 @@ testChecksForbidSubstitutes = do
     ]
   where
     checkFiles :: [Text]
-    checkFiles = ["binutils.nix", "binutils-native-x86_64.nix", "binutils-x86_64.nix", "busybox.nix", "gcc-core.nix", "gcc-core-x86_64.nix", "gcc-latest.nix", "gcc-native-x86_64.nix", "gcc-x86_64.nix", "gcc10.nix", "gcc46.nix", "gcc46-cxx.nix", "gnumake.nix", "mes.nix", "mingw-w64-latest.nix", "mingw-w64-x86_64.nix", "run-command.nix", "seed-stdenv.nix", "tinycc.nix"]
+    checkFiles = ["binutils.nix", "binutils-native-x86_64.nix", "binutils-x86_64.nix", "busybox.nix", "gcc-core.nix", "gcc-core-x86_64.nix", "gcc-latest.nix", "gcc-native-x86_64.nix", "gcc-x86_64.nix", "gcc10.nix", "gcc46.nix", "gcc46-cxx.nix", "gnumake.nix", "mes.nix", "mingw-w64-latest.nix", "mingw-w64-x86_64.nix", "run-command.nix", "seed-stdenv.nix", "stage2-stdenv.nix", "tinycc.nix"]
 
 -- | @pkgs/windows@'s seed stdenv, read back as the build driver reads it:
 -- what the stdenv and GNU Hello built with it, @test\/data\/seed-stdenv.nix@'s
@@ -19533,6 +19533,179 @@ testGccNativeX8664Windows = do
       ["gcc-" <> version, "hello-c.sh", "hello-cxx.sh", "stamps.sh"]
         ++ concat [[name, name <> "-builder"] | name <- ["gcc-native-x86_64-hello-c", "gcc-native-x86_64-hello-cxx", "gcc-native-x86_64-stamps"]]
 
+-- | @pkgs\/windows@'s stage-2 stdenv, read back as the build driver reads
+-- it: what its wrappers and @test\/data\/stage2-stdenv.nix@'s checks, GNU
+-- Hello built with it and flags, add to the closure of the tools it is
+-- made of, busybox-w32, GNU make, the seed stdenv's applets and the native
+-- x86_64 binutils and GCC.  The one leaf it adds is Hello's archive, every
+-- derivation but that fetch is x86_64-windows, and it reads no input
+-- source but the stdenv's own files, the flags check's sources and what
+-- evaluation writes as text.  Its builds run the seed stdenv's
+-- @setup.sh@, with the applets, GNU make and the wrappers on @PATH@ and
+-- neither toolchain's bin directory, whose programs GNU make would run
+-- before a wrapper of the same name; @CC@, @CXX@ and @LD@ name the
+-- wrappers, @AR@ binutils' archiver, and nothing sets the
+-- @C_INCLUDE_PATH@ the seed stdenv sets for TinyCC.  The wrappers are
+-- written from gcc-native-x86_64's drivers and binutils-native-x86_64's
+-- linker.  Neither of the stage-1 stdenv's seeds is in Hello's closure,
+-- where both are in the closure of the same package built with the
+-- stage-1 stdenv, which the test reads too, so that the check is known
+-- to find them.
+testStage2StdenvWindows :: IO [Bool]
+testStage2StdenvWindows = do
+  putStrLn "pkgs/stage2-stdenv"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
+      checksOf name = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> name)
+      source =
+        T.concat
+          [ "let pkgs = ",
+            windows,
+            "; checks = ",
+            checksOf "stage2-stdenv.nix",
+            "; seedChecks = ",
+            checksOf "seed-stdenv.nix",
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+              closureOf attrs = sessionClosure (mapMaybe (`Map.lookup` rootOf) attrs)
+          tools <- closureOf toolRoots
+          stage2 <- closureOf [wrappersRoot, helloRoot, flagsRoot]
+          hello <- closureOf [helloRoot]
+          stage1 <- closureOf [stage1Hello]
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, tools, stage2, hello, stage1, full)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  writes <- readIORef (esStoreWriteCache st)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, tools, stage2, hello, stage1, full) -> do
+      let added = Map.elems (Map.difference stage2 tools)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
+          seedsIn closure = [attr | attr <- stage1Seeds, Just path <- [Map.lookup attr rootOf], Map.member path closure]
+          derivationAt root = Map.lookup root rootOf >>= (`Map.lookup` full)
+          -- The output of a root's derivation, as a variable spells a
+          -- store path, or a word no variable holds where the root is
+          -- missing.
+          outputOf root = maybe "<no output>" (storePathToText defaultStoreDir . doPath) (derivationAt root >>= listToMaybe . drvOutputs)
+          stage2Hello = derivationAt helloRoot
+          seedHello = derivationAt seedHelloRoot
+          wrappers = derivationAt wrappersRoot
+          wordsOf name = maybe [] (T.words . variableOf name)
+          storePathIn = parseStorePath defaultStoreDir
+          -- The script a derivation's builder runs: the second argument,
+          -- after busybox's applet name, sh.
+          scriptOf drv = case drvArgs drv of
+            [_, script] -> storePathIn (bytesText script)
+            _ -> Nothing
+          configSiteOf drv = storePathIn (variableOf "CONFIG_SITE" drv)
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "every derivation it adds but the fetch is x86_64-windows" $
+            case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= X86_64_Windows] of
+              [] -> Pass
+              named -> Fail ("not x86_64-windows: " <> T.intercalate ", " named),
+          runTest "the one leaf it adds is hello's archive, fetched fixed-output" $
+            assertEqual
+              "leaves added"
+              ([helloArchive], True)
+              (map nameOf addedLeaves, all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          runTest "it reads no input source but what evaluation writes as text, the stdenv's own files and the flags check's sources" $
+            assertEqual
+              "input sources not written as text"
+              (sort ["cc-wrapper.sh", "config.site", "ld-wrapper.sh", "link.specs", "setup.sh", "stage2-stdenv-flags", "wrap.sh"])
+              (sort (map spName (nub [path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]))),
+          runTest "hello built with it runs the seed stdenv's setup.sh under busybox's sh, with a config.site that is not the seed stdenv's" $
+            assertEqual
+              "the builder, the script and whether it is the seed stdenv's, and CONFIG_SITE and whether it is the seed stdenv's"
+              (outputOf busyboxRoot <> "/bin/busybox.exe", Just "setup.sh", True, Just "config.site", False)
+              ( maybe "" (bytesText . drvBuilder) stage2Hello,
+                spName <$> (scriptOf =<< stage2Hello),
+                (scriptOf =<< stage2Hello) == (scriptOf =<< seedHello),
+                spName <$> (configSiteOf =<< stage2Hello),
+                (configSiteOf =<< stage2Hello) == (configSiteOf =<< seedHello)
+              ),
+          runTest "its builds' PATH is the seed stdenv's applets, GNU make and the wrappers, with neither toolchain's bin directory on it" $
+            assertEqual
+              "initialPath and buildInputs"
+              ([outputOf appletsRoot, outputOf gnumakeRoot, outputOf wrappersRoot], [])
+              (wordsOf "initialPath" stage2Hello, wordsOf "buildInputs" stage2Hello),
+          runTest "CC, CXX and LD name the wrappers, AR binutils-native-x86_64's archiver, configure's build is x86_64-w64-mingw32, and nothing sets C_INCLUDE_PATH" $
+            assertEqual
+              "CC, CXX, LD, AR, buildTriple, and whether C_INCLUDE_PATH is set"
+              (Just ("gcc", "g++", "ld", outputOf binutilsNativeRoot <> "/bin/ar.exe", target, False))
+              ( stage2Hello <&> \drv ->
+                  ( variableOf "CC" drv,
+                    variableOf "CXX" drv,
+                    variableOf "LD" drv,
+                    variableOf "AR" drv,
+                    variableOf "buildTriple" drv,
+                    Map.member "C_INCLUDE_PATH" (drvEnv drv)
+                  )
+              ),
+          runTest "the wrappers are written from gcc-native-x86_64's drivers and binutils-native-x86_64's linker" $
+            assertEqual
+              "compilers and linker"
+              (Just (outputOf gccNativeRoot <> "/bin", outputOf binutilsNativeRoot <> "/bin/ld.exe"))
+              (wrappers <&> \drv -> (variableOf "compilers" drv, variableOf "linker" drv)),
+          runTest "both stage-1 seeds are in the closure of hello built with the stage-1 stdenv" $
+            assertEqual "stage-1 seeds in it" stage1Seeds (seedsIn stage1),
+          runTest "neither stage-1 seed is in the closure of hello built with the stage-2 stdenv" $
+            assertEqual "stage-1 seeds in it" [] (seedsIn hello)
+        ]
+  where
+    instantiates :: Text
+    instantiates = "the stage-2 stdenv and its checks instantiate, adding four to the closure of their tools"
+    target :: Text
+    target = "x86_64-w64-mingw32"
+    busyboxRoot :: Text
+    busyboxRoot = "pkgs.busybox-w32"
+    gnumakeRoot :: Text
+    gnumakeRoot = "pkgs.gnumake"
+    appletsRoot :: Text
+    appletsRoot = "pkgs.seedStdenv.applets"
+    binutilsNativeRoot :: Text
+    binutilsNativeRoot = "pkgs.binutils-native-x86_64"
+    gccNativeRoot :: Text
+    gccNativeRoot = "pkgs.gcc-native-x86_64"
+    toolRoots :: [Text]
+    toolRoots = [busyboxRoot, gnumakeRoot, appletsRoot, binutilsNativeRoot, gccNativeRoot]
+    wrappersRoot :: Text
+    wrappersRoot = "pkgs.stage2Stdenv.cc"
+    helloRoot :: Text
+    helloRoot = "checks.hello"
+    flagsRoot :: Text
+    flagsRoot = "checks.flags"
+    seedHelloRoot :: Text
+    seedHelloRoot = "seedChecks.hello"
+    stage1Hello :: Text
+    stage1Hello = "pkgs.hello"
+    stage1Seeds :: [Text]
+    stage1Seeds = ["pkgs.stdenv.mingwSeed", "pkgs.stdenv.msysSeed"]
+    roots :: [Text]
+    roots = toolRoots ++ [wrappersRoot, helloRoot, flagsRoot, seedHelloRoot, stage1Hello] ++ stage1Seeds
+    helloArchive :: Text
+    helloArchive = "hello-2.12.3.tar.gz"
+    addedNames :: [Text]
+    addedNames = [helloArchive, "gcc-wrapper-16.2.0", "hello", "stage2-stdenv-flags"]
+
 -- | @pkgs\/windows\/sources.nix@ against the package set whose sources it
 -- lists: the fetches in the closure of every derivation in the set are the
 -- list's, each fixed-output and listed once.  A package that fetches a
@@ -19736,12 +19909,13 @@ testWindowsRungs = do
         ("gcc-latest", "gcc-latest-windows"),
         ("x86_64", "x86_64-windows"),
         ("gcc-x86_64", "gcc-x86_64-windows"),
-        ("native-x86_64", "native-x86_64-windows")
+        ("native-x86_64", "native-x86_64-windows"),
+        ("stage2-stdenv", "stage2-stdenv-windows")
       ]
     -- The rung each stage ends on, so that a workflow read as building
     -- nothing does not pass against an empty list.
     knownRungs :: [(Text, Text)]
-    knownRungs = [("mes", "mes.libc"), ("tinycc", "seedStdenv.applets"), ("gcc46", "gcc46"), ("gcc46-cxx", "gcc46-cxx"), ("gcc10", "mingw-w64-crt-latest"), ("gcc-latest", "gcc-latest"), ("x86_64", "mingw-w64-crt-x86_64"), ("gcc-x86_64", "gcc-x86_64"), ("native-x86_64", "gcc-native-x86_64")]
+    knownRungs = [("mes", "mes.libc"), ("tinycc", "seedStdenv.applets"), ("gcc46", "gcc46"), ("gcc46-cxx", "gcc46-cxx"), ("gcc10", "mingw-w64-crt-latest"), ("gcc-latest", "gcc-latest"), ("x86_64", "mingw-w64-crt-x86_64"), ("gcc-x86_64", "gcc-x86_64"), ("native-x86_64", "gcc-native-x86_64"), ("stage2-stdenv", "stage2Stdenv.cc")]
     -- What ends a stage's rungs in the string the expression returns: no
     -- attribute path is spelled so.
     stageEnd :: Text
@@ -29752,6 +29926,7 @@ runSuite = do
           testGccX8664Windows,
           testBinutilsNativeX8664Windows,
           testGccNativeX8664Windows,
+          testStage2StdenvWindows,
           testChecksForbidSubstitutes,
           testWindowsSources,
           testWindowsRungs,
