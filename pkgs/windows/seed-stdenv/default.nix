@@ -1,6 +1,7 @@
-# nova-nix seed stdenv: mkDerivation on tools built from the seed, the
-# replacement for the stage-1 stdenv (../stdenv), whose header says when
-# that one is deleted.
+# nova-nix seed stdenv: mkDerivation on tools built from the seed, which
+# the seed ladder's rungs build with.  The stage-2 stdenv
+# (../stage2-stdenv), which replaces the stage-1 stdenv (../stdenv), is its
+# builder and tools with the ladder's native x86_64 toolchain.
 #
 # The stage-1 stdenv's interface, so a package builds with either:
 #
@@ -13,7 +14,8 @@
 # make is gnumake, and the C compiler is tinycc-native, on msvcrt.dll.
 # setup.sh says where its genericBuild differs from the stage-1 stdenv's.
 #
-# Everything on the ladder is i686, and so is everything this builds.
+# Its tools are i686 programs, and so are the programs it builds but the
+# native x86_64 rungs', which its x86_64 cross compiler links.
 {
   busybox-w32,
   gnumake,

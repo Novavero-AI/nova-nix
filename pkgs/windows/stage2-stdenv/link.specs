@@ -1,0 +1,16 @@
+# nova-nix stage-2 stdenv: the specs the compiler drivers' wrappers give
+# gcc-native-x86_64 with -specs, which it reads after its own
+# (gcc/gcc.cc:4567-4579 and 8663-8667 in GCC 16.2.0), skipping a line
+# that begins with # (gcc/gcc.cc:1580-1585).
+#
+# A spec whose text begins with + and a space is added to the end of the
+# spec of that name (gcc/gcc.cc:2147-2150).  The link spec is in what the
+# driver runs only when it links (gcc/gcc.cc:1186-1203 and 1757), so every
+# link it makes gets --no-insert-timestamp (ld-wrapper.sh says why), and a
+# command that links nothing gets no linker option.  -Wl, which the
+# stage-1 stdenv's wrapper adds to each command it finds no compile-only
+# option in, is an input file to the driver, so with it gcc -v, which
+# prints the configuration and stops, goes on to link a program from no
+# object (gcc/gcc.cc:4453-4470, 8985-8990 and 9004-9005).
+*link:
++ --no-insert-timestamp

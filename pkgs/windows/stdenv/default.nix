@@ -1,11 +1,11 @@
 # nova-nix stage-1 stdenv: mkDerivation on prebuilt MSYS2 and MinGW-w64
 # packages.
 #
-# Transitional.  The seed stdenv (../seed-stdenv) replaces it, and this
-# directory and ../bootstrap are deleted once the seed ladder builds every
-# package this stdenv builds.  Until then it is the package set's stdenv,
-# which CI's E2E (Windows), publish and public-cache jobs build GNU Hello
-# with.
+# Transitional.  The stage-2 stdenv (../stage2-stdenv), on the seed
+# ladder's toolchain, replaces it, and this directory and ../bootstrap are
+# deleted once that stdenv builds every package this one builds.  Until
+# then it is the package set's stdenv, which CI's E2E (Windows), publish
+# and public-cache jobs build GNU Hello with.
 #
 # Wraps the low-level `derivation` builtin so a Windows package builds with just
 #

@@ -1,0 +1,16 @@
+# The defaults the stage-2 stdenv's builds take in place of configure's,
+# read through CONFIG_SITE by each autoconf configure script the stdenv
+# runs, unless the package points CONFIG_SITE elsewhere.  What configure
+# cannot detect about PATH, ../seed-stdenv/setup.sh exports.  configure
+# finds GCC and GNU ld to be what they are unaided, where the seed
+# stdenv's config.site has to tell it so of TinyCC.
+
+# configure gives GCC -g -O2 where neither the package nor the environment
+# sets CFLAGS, and the same for CXXFLAGS.  GCC's debugging information
+# names the directory it ran in, and nova-nix runs a build in
+# .nova-nix/builds/<hash> in the store directory, the hash being its first
+# output's (buildDirFor in src/Nix/Builder/BuildDir.hs), so a program
+# built with -g names both, and the stdenv has no phase that strips it.
+# So the default is -O2 alone, and a package's own flags still win.
+test "${CFLAGS+set}" = set || CFLAGS=-O2
+test "${CXXFLAGS+set}" = set || CXXFLAGS=-O2

@@ -3,13 +3,15 @@ name: Ladder
 # One Windows leg of the seed ladder, the rungs pkgs/windows builds from its
 # 1,623-byte seed, as a chain of jobs: one for each stage
 # pkgs/windows/rungs.nix lists, Mes, TinyCC, GCC 4.6.4, GCC 4.6.4 C++,
-# GCC 10, GCC 16, x86_64, GCC 16 x86_64 and Native x86_64.  A stage's job
-# builds its rungs, runs its checks, and starts from the store paths the
-# job before it built.  ci.yml calls this workflow once for each leg
-# Ladder (mode) names, so each leg's chain runs on its own: a stage that
-# fails stops the stages after it on its own leg alone.
+# GCC 10, GCC 16, x86_64, GCC 16 x86_64, Native x86_64 and Stage-2
+# stdenv.  A stage's job builds its rungs, runs its checks, and starts
+# from the store paths the job before it built.  ci.yml calls this
+# workflow once for each leg Ladder (mode) names, so each leg's chain runs
+# on its own: a stage that fails stops the stages after it on its own leg
+# alone.
 #
-# The rungs are i686 programs but Native x86_64's, which are x86_64 ones.
+# The rungs are i686 programs but Native x86_64's, which are x86_64 ones,
+# as is what the Stage-2 stdenv stage builds with them.
 # The x64 leg runs i686 programs through WoW64 and the ARM64 leg through
 # ARM64 Windows' x86 emulator; the x64 leg runs x86_64 programs natively
 # and the ARM64 leg through its x64 emulator, as it runs the x64 nova-nix
@@ -2471,6 +2473,232 @@ jobs:
             fi
           done
           exit "$status"
+
+      # --all is every valid path but the derivations: the sources, the rungs
+      # and the checks' outputs.  push skips what the handoff already holds.
+      - name: Hand the store to the Stage-2 stdenv stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
+            --compression zstd --all
+
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # The handoff for the stage after this one.  Its NARs are compressed
+      # already, so the zip stores them as they are.  Kept a day: a re-run
+      # of a failed stage within it finds the handoff, and after it the run
+      # is re-run whole.
+      - name: Upload the handoff
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: handoff-native-x86_64-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
+        if: inputs.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+  # ---------------------------------------------------------------------------
+  # Stage-2 stdenv: the stdenv the stage-1 one is to give way to, the seed
+  # stdenv's builder and tools with the native x86_64 toolchain, whose
+  # compilers and linker its builds run through the wrappers
+  # stage2Stdenv.cc writes, and GNU Hello built with it, which runs here
+  # and names neither the store directory nor its build directory.
+  # test/data/stage2-stdenv.nix's flags has the stdenv's commands compile
+  # and link programs, and finds C compiled at -std=gnu17 and C++ at the
+  # compiler's default, no time stamp in a program any of them links, and
+  # no directory that a variable of the environment names among those the
+  # compiler searches.
+  #
+  # The timeout is twice an estimate of this stage on the ARM64 leg, about
+  # 12 minutes: the stage-1 stdenv builds Hello with GCC in under 2 minutes
+  # on x64, the seed stdenv's Hello takes three times as long on ARM64 as on
+  # x64, and the stage's other steps, the native toolchain taken from the
+  # handoff among them, take about 6.
+  # ---------------------------------------------------------------------------
+  stage2-stdenv-windows:
+    name: Stage-2 stdenv
+    needs: [native-x86_64-windows]
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 24
+    environment:
+      name: ${{ inputs.publish && 'cache' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download nova-nix
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stage0-nova-nix
+          path: ${{ runner.temp }}
+
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
+
+      - name: Download the Native x86_64 stage's handoff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: handoff-native-x86_64-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      - name: Serve the handoff
+        shell: bash
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
+
+      # The handoff for every step below: what a stage before this one
+      # built, the sources among it, comes from there.
+      - name: Name the handoff as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY"
+
+      # The rungs of the stage before (pkgs/windows/rungs.nix), each from the
+      # handoff, which holds them all.  The script fails if one is built: a
+      # handoff that answers and cannot be used would have this job build
+      # the stages before it again and stay green.  It runs before the
+      # public cache is named, which would serve an unchanged rung in the
+      # handoff's place.  The builds below take what else they reach of
+      # the stages before from the handoff.
+      - name: Take the Native x86_64 stage's rungs from the handoff
+        shell: bash
+        run: CACHE_URL=$HANDOFF_URL bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" native-x86_64 fail
+
+      # Substitute mode names the public cache after the handoff, so that
+      # only what no stage before this one built comes from it.
+      - name: Name the handoff and the public cache as substituters
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY" "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+
+      # This stage's rungs, each downloaded where the public cache holds it
+      # and built where the change alters it.  The script fails if a rung
+      # the cache holds is built, for the reason the handoff's check does.
+      # The build steps below then find each rung valid, and the time each
+      # prints is the time to find it so.
+      - name: Take the unchanged rungs from the public cache
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" stage2-stdenv build
+
+      # The stage-2 stdenv's wrappers, and GNU Hello built with it:
+      # pkgs/windows' hello package, configured, compiled and installed by
+      # busybox's sh, its applets, GNU make and the native x86_64 toolchain
+      # through the wrappers, each timed.
+      - name: Build GNU Hello with the stage-2 stdenv
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A stage2Stdenv.cc
+          echo "== stage2Stdenv.cc built in $((SECONDS - start)) s"
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build test/data/stage2-stdenv.nix -A hello
+          echo "== hello built in $((SECONDS - start)) s"
+
+      # hello prints its greeting, or the one --greeting gives it, and its
+      # version, each line ending in a carriage return, as msvcrt's
+      # text-mode stdout writes it.  Each greeting is checked against bytes
+      # the runner's own printf writes, and the first line of --version
+      # with its carriage return removed.
+      - name: GNU Hello built with the stage-2 stdenv runs
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/stage2-stdenv.nix -A hello | tail -n 1); then
+            echo "::error::hello did not build"
+            exit 1
+          fi
+          hello=$(cygpath -u "$out")/bin/hello.exe
+          work="$(cygpath -u "$RUNNER_TEMP")/stage2-hello"
+          mkdir "$work"
+          status=0
+          runs() {
+            local want_out=$1 code=0
+            shift
+            "$hello" "$@" > "$work/out.txt" || code=$?
+            printf '%s\r\n' "$want_out" > "$work/want.txt"
+            if [ "$code" = 0 ] && cmp "$work/want.txt" "$work/out.txt"; then
+              echo "ok    hello.exe${*:+ $*} prints $want_out"
+            else
+              echo "::error::hello.exe${*:+ $*} exited $code and printed $(wc -c < "$work/out.txt") bytes:"
+              od -A d -t x1 "$work/out.txt" | head -n 8
+              status=1
+            fi
+          }
+          runs 'Hello, world!'
+          runs 'Hello from the stage-2 stdenv' --greeting='Hello from the stage-2 stdenv'
+          code=0
+          out=$("$hello" --version) || code=$?
+          version=${out%%$'\n'*}
+          version=${version%$'\r'}
+          if [ "$code" = 0 ] && [ "$version" = 'hello (GNU Hello) 2.12.3' ]; then
+            echo "ok    hello.exe --version prints $version"
+          else
+            echo "::error::hello.exe --version exited $code and printed $version"
+            status=1
+          fi
+          exit "$status"
+
+      # GNU Hello as the stage-2 stdenv builds it, with the default CFLAGS
+      # its config.site gives configure, names neither the store directory
+      # nor its build directory (.github/bootstrap/no-build-path.sh says
+      # why).
+      - name: GNU Hello built with the stage-2 stdenv names no store or build directory
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/stage2-stdenv.nix -A hello | tail -n 1); then
+            echo "::error::hello did not build"
+            exit 1
+          fi
+          bash .github/bootstrap/no-build-path.sh hello "$out" bin/hello.exe
+
+      # test/data/stage2-stdenv.nix's flags has busybox's sh run
+      # stage2-stdenv-flags/flags.sh with the stdenv's PATH: gcc, cc, g++
+      # and c++ by name, gcc with -std=c99 and from a make recipe, each
+      # compile and link a program that prints the standard it was compiled
+      # as, ld links one, and each program's line has the time stamp of its
+      # PE header; gcc -v exits 0; and for each variable that names
+      # directories GCC searches, the stdenv's gcc and g++ name no directory
+      # it names where gcc-native-x86_64's own drivers do.  The lines are
+      # compared with test/data/stage2-stdenv-flags-answer.txt.
+      - name: The stage-2 stdenv's compilers take C at gnu17, link with no time stamp and search no directory from the environment
+        shell: bash
+        run: |
+          set -uo pipefail
+          expected=test/data/stage2-stdenv-flags-answer.txt
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/stage2-stdenv.nix -A flags | tail -n 1); then
+            echo "::error::flags did not build"
+            exit 1
+          fi
+          lines=$(cygpath -u "$out")
+          if cmp "$expected" "$lines"; then
+            echo "ok    flags wrote the lines of $expected"
+          else
+            echo "::error::flags' lines differ from $expected:"
+            diff "$expected" "$lines"
+            exit 1
+          fi
 
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server
