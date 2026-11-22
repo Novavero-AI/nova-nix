@@ -27,8 +27,9 @@
  * Every env and attribute set allocation also names its site: the
  * construct or builtin that makes it, which the evaluator numbers
  * (Nix.Eval.AllocSite).  Once nn_stats_count_sites turns counting on, the
- * allocators count each allocation under its site; until then an
- * allocation reads nn_stats_counting and does nothing more.
+ * allocators count each allocation under its site, and `//` counts the
+ * entries it copies; until then an allocation reads nn_stats_counting and
+ * does nothing more.
  */
 
 #ifndef NN_STATS_H
@@ -94,6 +95,11 @@ void nn_stats_count_env(uint32_t site, uint32_t slots, uint64_t bytes);
 void nn_stats_count_env_bytes(uint32_t site, uint64_t bytes);
 void nn_stats_count_set(uint32_t site, uint64_t bytes, int shareable);
 
+/* nn_attrset_update's half, called only while nn_stats_counting is
+ * nonzero: the entries it copied into the set it made, which upstream
+ * counts in nrOpUpdateValuesCopied. */
+void nn_stats_count_update(uint64_t copied);
+
 /* What counting has found since nn_stats_count_sites, zero where it has
  * never run: per env site the envs, their slots and their bytes; per
  * slot count the envs; per set site the sets, the shareable ones among
@@ -103,6 +109,10 @@ void nn_stats_count_set(uint32_t site, uint64_t bytes, int shareable);
 uint32_t nn_stats_env_sites(uint64_t *envs, uint64_t *slots, uint64_t *bytes, uint32_t max);
 uint32_t nn_stats_env_sizes(uint64_t *envs, uint32_t max);
 uint32_t nn_stats_set_sites(uint64_t *sets, uint64_t *shareable, uint64_t *bytes, uint32_t max);
+
+/* The entries `//` has copied since nn_stats_count_sites, zero where
+ * counting has never run. */
+uint64_t nn_stats_update_copied(void);
 
 /* --- Session --- */
 

@@ -146,6 +146,16 @@ void nn_attrset_free_all(void);
 nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b,
                                uint32_t site);
 
+/* `a // b`: the set nn_attrset_union makes of `a` and `b` at `site`.
+ * While the census counts sites (nn_stats.h), the entries the result
+ * holds count as copied, as upstream's ExprOpUpdate::eval adds the
+ * merged set's size to nrOpUpdateValuesCopied.  The evaluator gives the
+ * other operand for an empty one, as upstream does before it counts, and
+ * so calls this with two sets that hold entries (eval.cc:1920-1930 and
+ * :1988 at 2.34.9).  Returns NULL as nn_attrset_union does. */
+nn_attrset_t *nn_attrset_update(const nn_attrset_t *a, const nn_attrset_t *b,
+                                uint32_t site);
+
 /* Create a new set at `site` with the given keys removed.  Input must be
  * frozen.
  * The result is returned frozen and is arena-tracked (freed by

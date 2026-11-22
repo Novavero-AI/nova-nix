@@ -26,7 +26,7 @@ import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval.AllocSite (SetSite (SetUpdate))
-import Nix.Eval.CAttrSet (cattrsetUnion)
+import Nix.Eval.CAttrSet (cattrsetUpdate)
 import Nix.Eval.CData (MonadCData)
 import Nix.Eval.CList (clistFromThunks, clistLen, clistThunks)
 import Nix.Eval.Print (PrintOptions (..), printValue)
@@ -409,8 +409,11 @@ evalUpdate evalLeft evalRight = do
 -- the other operand's set itself, the left checked first, as upstream's
 -- @ExprOpUpdate::eval@ copies the other operand's @Value@ (eval.cc:1908-1909
 -- at 2.24.9): no set is made, and a printer, which enters a set by its
--- bindings, finds the operand's.  Otherwise C-side @nn_attrset_union@
--- merges the two sorted arrays into a new set, O(n+m).
+-- bindings, finds the operand's.  Otherwise C-side @nn_attrset_update@
+-- merges the two sorted arrays into a new set, O(n+m), and the census
+-- counts the entries it holds as copied, as upstream adds the merged
+-- set's size to @nrOpUpdateValuesCopied@ (eval.cc:1934 at 2.24.9, :1988
+-- at 2.34.9).  An empty operand copies and counts nothing in either.
 mergeAttrSets :: (MonadCData m) => AttrSet -> AttrSet -> m AttrSet
 mergeAttrSets left@(AttrSet a) right@(AttrSet b) = do
   leftSize <- attrSetSize left
@@ -418,4 +421,4 @@ mergeAttrSets left@(AttrSet a) right@(AttrSet b) = do
   case (leftSize, rightSize) of
     (0, _) -> pure right
     (_, 0) -> pure left
-    _ -> AttrSet <$> cattrsetUnion SetUpdate a b
+    _ -> AttrSet <$> cattrsetUpdate SetUpdate a b

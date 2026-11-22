@@ -967,8 +967,10 @@ write_regions() {
 
 # The census's environments and attribute sets by the site that allocated
 # them, as rows of the memory table: the environments' slots beside
-# upstream's values in environments, their sizes, then each site that
-# allocated anything, most bytes first.  A set is shareable when it was
+# upstream's values in environments, their sizes and each site that
+# allocated any, most bytes first; then the shareable sets, the entries
+# `//` copied beside upstream's nrOpUpdateValuesCopied, and each site that
+# allocated any set, most bytes first.  A set is shareable when it was
 # made equal to one that already existed, which upstream would not make
 # (nn_stats_count_set in cbits/nn_stats.h); the evaluator makes none, so
 # the figure is 0 unless that regresses.
@@ -989,6 +991,8 @@ write_site_rows() {
   scoreboard_row "C attribute sets: shareable" \
     "$(awk '{ n = split($1, part, ".") } n == 4 && part[1] == "attrsets" && part[2] == "site" && part[4] == "shareable" { total += $2 }
       END { print total + 0 }' "$census")" ""
+  scoreboard_row "C attribute sets: entries \`//\` copied" "$(named_value "$census" attrsets.update.copied)" \
+    "$(figure_or "$(upstream_stat "$stats" .nrOpUpdateValuesCopied)" "values copied" "")"
   while read -r name count figure bytes; do
     scoreboard_row "C attribute sets at \`$name\`" "$count sets, $figure shareable, $(mib "$bytes")" ""
   done < <(site_figures "$census" attrsets shareable)

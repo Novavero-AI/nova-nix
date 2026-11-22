@@ -375,6 +375,14 @@ nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b,
     return result;
 }
 
+nn_attrset_t *nn_attrset_update(const nn_attrset_t *a, const nn_attrset_t *b,
+                                uint32_t site)
+{
+    nn_attrset_t *result = nn_attrset_union(a, b, site);
+    if (result && nn_stats_counting) nn_stats_count_update(result->count);
+    return result;
+}
+
 nn_attrset_t *nn_attrset_remove_keys(
     const nn_attrset_t *set,
     const nn_symbol_t *keys,

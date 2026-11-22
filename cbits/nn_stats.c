@@ -146,6 +146,7 @@ static struct {
     uint64_t set_count[NN_STATS_SET_SITES];
     uint64_t set_shareable[NN_STATS_SET_SITES];
     uint64_t set_bytes[NN_STATS_SET_SITES];
+    uint64_t update_copied;
 } sites;
 
 void nn_stats_count_sites(void)
@@ -180,6 +181,11 @@ void nn_stats_count_set(uint32_t site, uint64_t bytes, int shareable)
     if (shareable) sites.set_shareable[site]++;
 }
 
+void nn_stats_count_update(uint64_t copied)
+{
+    sites.update_copied += copied;
+}
+
 /* The first `max` of `n` figures from `from` to `to`.  No copy for none:
  * memcpy takes no NULL, whatever the length. */
 static void copy_figures(uint64_t *to, const uint64_t *from, uint32_t n, uint32_t max)
@@ -208,6 +214,11 @@ uint32_t nn_stats_set_sites(uint64_t *sets, uint64_t *shareable, uint64_t *bytes
     copy_figures(shareable, sites.set_shareable, NN_STATS_SET_SITES, max);
     copy_figures(bytes, sites.set_bytes, NN_STATS_SET_SITES, max);
     return NN_STATS_SET_SITES;
+}
+
+uint64_t nn_stats_update_copied(void)
+{
+    return sites.update_copied;
 }
 
 /* Every env, when counting has covered every one; NN_STATS_UNCOUNTED

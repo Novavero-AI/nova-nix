@@ -48,6 +48,7 @@ module Nix.Eval.CAttrSet
 
     -- * Set operations
     cattrsetUnion,
+    cattrsetUpdate,
     cattrsetRemoveKeys,
   )
 where
@@ -119,6 +120,9 @@ foreign import ccall unsafe "nn_attrset_keys_ptr"
 
 foreign import ccall unsafe "nn_attrset_union"
   c_nn_attrset_union :: CAttrSet -> CAttrSet -> Word32 -> IO CAttrSet
+
+foreign import ccall unsafe "nn_attrset_update"
+  c_nn_attrset_update :: CAttrSet -> CAttrSet -> Word32 -> IO CAttrSet
 
 foreign import ccall unsafe "nn_attrset_remove_keys"
   c_nn_attrset_remove_keys :: CAttrSet -> Ptr Word32 -> Word32 -> Word32 -> IO CAttrSet
@@ -217,6 +221,12 @@ cattrsetKeys set = cdataIO $ do
 -- | Right-biased union (// semantics) at a site.  Result is frozen.
 cattrsetUnion :: (MonadCData m) => SetSite -> CAttrSet -> CAttrSet -> m CAttrSet
 cattrsetUnion site a b = cdataIO (checkedCPtr "nn_attrset_union" =<< c_nn_attrset_union a b (setSiteIndex site))
+
+-- | @a // b@ at a site: the set 'cattrsetUnion' makes, whose entries the
+-- census counts as copied while it counts sites ("Nix.Eval.CStats"), as
+-- upstream counts them in @nrOpUpdateValuesCopied@.  Result is frozen.
+cattrsetUpdate :: (MonadCData m) => SetSite -> CAttrSet -> CAttrSet -> m CAttrSet
+cattrsetUpdate site a b = cdataIO (checkedCPtr "nn_attrset_update" =<< c_nn_attrset_update a b (setSiteIndex site))
 
 -- | Remove a list of keys, making the result at a site.  Result is frozen.
 cattrsetRemoveKeys :: (MonadCData m) => SetSite -> CAttrSet -> [Symbol] -> m CAttrSet
