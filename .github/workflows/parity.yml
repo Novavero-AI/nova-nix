@@ -5,7 +5,8 @@ name: Parity
 # byte-match what upstream Nix (nix-instantiate) computes from the SAME
 # nixpkgs tree.  A derivation store-path hash transitively encodes the hash
 # of every input derivation, so one matching path validates the whole
-# build-time closure at once.
+# build-time closure at once.  Beside the evaluator, it checks that upstream
+# substitutes from a binary cache that `nova-nix push` writes to a directory.
 #
 # Linux-only on purpose: it is the one place a real Nix exists to diff
 # against.  The "runs natively on Windows" claim is proven separately by the
@@ -164,6 +165,15 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           NOVA_NIX_BIN=$(cabal list-bin exe:nova-nix) .github/parity/derivation-cases.sh
+
+      # A file:// cache that nova-nix pushes, signed with a key made for the
+      # run and then made read-only, which this row's upstream must
+      # substitute from under that key and refuse under another.  It reads nothing of the nixpkgs tree, so
+      # it runs whatever the evaluator cases found.
+      - name: Upstream substitutes from a cache nova-nix pushes
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          NOVA_NIX_BIN=$(cabal list-bin exe:nova-nix) .github/parity/push-cases.sh
 
   # The one context branch protection requires of this workflow, so that
   # bumping a matrix row leaves the required name unchanged.  A required

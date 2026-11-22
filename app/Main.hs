@@ -11,7 +11,7 @@
 module Main (main) where
 
 import Control.Exception (AsyncException (UserInterrupt), bracket, displayException, handle, handleJust, try)
-import Control.Monad (mfilter, void, when)
+import Control.Monad (mfilter, void, when, (>=>))
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
@@ -51,7 +51,8 @@ import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.HostPath (hostPathFromBytes)
 import Nix.Http (defaultFetchRetryPolicy)
 import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
-import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), defaultPartSize, isDerivationPath, loadApiKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
+import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), defaultPartSize, isDerivationPath, loadKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
+import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), loadSecretKeyFile, pushTarget, pushToDirectory)
 import Nix.Realise (BuildMode (..), ClosureOutcome (..), Fallback (..), SubstitutesSetting (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), addOutLinkRoot, canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, queryAllValidPaths, resolveDeleteTarget, storeEntryNameText, upstreamManagedRefusal, writeDrv, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
@@ -976,24 +977,34 @@ buildAndRegister store caches fallback substitutes mode cores wrappers drvClosur
 -- Push command
 -- ---------------------------------------------------------------------------
 
--- | Push the closure of the selected store paths to a binary cache.
+-- | Push the closure of the selected store paths to a binary cache: a
+-- nova-cache server, or a directory.
 pushCommand :: StoreDir -> PushArgs -> IO ()
 pushCommand storeDir pushArgs = do
-  cacheUrl <- case paCacheUrl pushArgs of
-    Just url -> pure (T.dropWhileEnd (== '/') (T.pack url))
-    Nothing -> failWith "push: --cache URL is required"
+  url <- maybe (failWith "push: --cache URL is required") pure (paCacheUrl pushArgs)
+  target <- either (failWith . ("push: " <>)) pure (pushTarget url (paKeyFile pushArgs) (paSecretKeyFile pushArgs))
   case (paAll pushArgs, paPaths pushArgs) of
     (True, _ : _) -> failWith "push: --all and explicit paths are mutually exclusive"
     (False, []) -> failWith "push: name store paths to push, or pass --all"
     _ -> pure ()
-  apiKey <- case paKeyFile pushArgs of
-    Nothing -> pure Nothing
-    Just path -> do
-      loaded <- loadApiKeyFile path
-      either failWith (pure . Just) loaded
   compression <- case paCompressionArg pushArgs of
     Nothing -> pure PushNone
     Just value -> either (failWith . ("push: " <>)) pure (parsePushCompression (T.pack value))
+  push <- case target of
+    ServerTarget cacheUrl apiKeyFile -> do
+      apiKey <- traverse (loadKeyFile >=> either failWith pure) apiKeyFile
+      pure $
+        pushPaths
+          PushConfig
+            { pcCacheUrl = cacheUrl,
+              pcApiKey = apiKey,
+              pcCompression = compression,
+              pcPartSize = defaultPartSize,
+              pcRetry = defaultFetchRetryPolicy
+            }
+    DirectoryTarget dir secretKeyFile -> do
+      secretKey <- loadSecretKeyFile secretKeyFile >>= either failWith pure
+      pure (pushToDirectory (DirectoryPush dir secretKey compression))
   store <- openStore storeDir
   rootsResult <- resolvePushRoots store pushArgs
   case rootsResult of
@@ -1001,15 +1012,7 @@ pushCommand storeDir pushArgs = do
       closeStore store
       failWith err
     Right roots -> do
-      let config =
-            PushConfig
-              { pcCacheUrl = cacheUrl,
-                pcApiKey = apiKey,
-                pcCompression = compression,
-                pcPartSize = defaultPartSize,
-                pcRetry = defaultFetchRetryPolicy
-              }
-      result <- pushPaths config store roots
+      result <- push store roots
       closeStore store
       case result of
         Left err -> failWith ("push failed: " <> err)

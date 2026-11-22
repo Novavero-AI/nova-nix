@@ -2,7 +2,8 @@
 
 -- | Scoped loopback HTTP servers for the download tests: the mirrors
 -- @builtin:fetchurl@ tries, and the binary cache the substituter reads;
--- and for the push tests, a server that reads each request's body.
+-- and for the push tests, a server that reads each request's body, and
+-- one that serves a directory's files.
 module HttpFixture
   ( Reply (..),
     FixtureRequest (..),
@@ -10,6 +11,7 @@ module HttpFixture
     withHttpServer,
     withFetchurlServer,
     withRequestServer,
+    withDirectoryServer,
   )
 where
 
@@ -25,6 +27,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as Socket
+import System.FilePath (joinPath, (</>))
 
 -- | How the server answers one request.
 data Reply
@@ -93,6 +96,25 @@ withRequestServer handler = withLoopbackServer $ \client -> do
       | otherwise = do
           chunk <- Socket.recv client headerChunkBytes
           if BS.null chunk then fail "incomplete fixture request body" else readBody client len (bytes <> chunk)
+
+-- | A static file server over a directory, as a web server serving a
+-- binary cache's directory is: a GET answers the file under the directory
+-- that its target names, and a request for anything else is a 404.  The
+-- callback gets the base URL.
+withDirectoryServer :: FilePath -> (Text -> IO a) -> IO a
+withDirectoryServer root = withRequestServer serve
+  where
+    serve request = case (frMethod request, servedFile (frTarget request)) of
+      ("GET", Just relative) -> do
+        found <- try (BS.readFile (root </> relative)) :: IO (Either IOException BS.ByteString)
+        pure (Send (either (const notFound) (httpResponse "200 OK") found))
+      _ -> pure (Send notFound)
+    notFound = httpResponse "404 Not Found" "not found"
+    -- A target's path below the directory, never one that leaves it.
+    servedFile target = case BSC.split '/' target of
+      "" : segments@(_ : _)
+        | all (`notElem` ["", ".", ".."]) segments -> Just (joinPath (map BSC.unpack segments))
+      _ -> Nothing
 
 -- | Serve each client the listener accepts with the action, for as long
 -- as the callback runs, on a loopback port the callback gets as a base
