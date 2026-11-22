@@ -72,7 +72,8 @@ envSiteName site = case site of
 data SetSite
   = -- | The root environment's sets: @builtins@, the names around every
     -- expression, a @scopedImport@'s scope, the @derivation@ wrapper's
-    -- scope, and the search path's entries.
+    -- scope, the search path's entries, and the argument a command line's
+    -- target is called with ("Nix.Eval.AutoCall").
     SetRoot
   | -- | A non-recursive attribute set literal.
     SetLiteral

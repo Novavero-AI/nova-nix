@@ -24,6 +24,10 @@ module Nix.Eval.IO
     withEvalSession,
     nixPathSearchPath,
 
+    -- * Source files
+    resolveImportTarget,
+    readImportTarget,
+
     -- * State
     EvalState
       ( esDrvModuloCache,
@@ -72,9 +76,10 @@ import GHC.IO.Exception (ioe_errno)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath, rootScopeNames)
 import Nix.Derivation (fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
-import Nix.Eval (deepForce, eval, evalBytecode, evalParsed)
+import Nix.Eval (deepForce, eval, evalBytecode, evalParsed, findInSearchPath)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
 import Nix.Eval.AttrPath (selectAttrPath)
+import Nix.Eval.AutoCall (AutoArgs, autoCallFunction)
 import Nix.Eval.CData (MonadCData (..), runCData)
 import Nix.Eval.CList (CList (..))
 import Nix.Eval.CRegion (Regions (..), inRegion, regionsRunning, withRegions)
@@ -408,7 +413,8 @@ instance Monad EvalIO where
 -- (evalParsed for this module's import and scopedImport and for the
 -- executable's evaluation, evalBytecode for the executable's evaluation
 -- that keeps its root environment for a census, eval for an expression
--- built by hand, and --strict and attribute selection) for EvalIO alone, and the library's
+-- built by hand, --strict and attribute selection, and the lookup and the
+-- call of a command line's target) for EvalIO alone, and the library's
 -- specialisation flags carry that through everything they reach.  Each
 -- pragma exports a rule that sends a call at EvalIO in any module
 -- importing this one to that code.  The flags alone leave no rule for an
@@ -423,7 +429,11 @@ instance Monad EvalIO where
 
 {-# SPECIALIZE deepForce :: NixValue -> EvalIO () #-}
 
-{-# SPECIALIZE selectAttrPath :: Text -> NixValue -> EvalIO (Either Text NixValue) #-}
+{-# SPECIALIZE selectAttrPath :: (NixValue -> EvalIO NixValue) -> Text -> NixValue -> EvalIO (Either Text NixValue) #-}
+
+{-# SPECIALIZE autoCallFunction :: AutoArgs -> NixValue -> EvalIO NixValue #-}
+
+{-# SPECIALIZE findInSearchPath :: [Thunk] -> BS.ByteString -> EvalIO Text #-}
 
 -- ---------------------------------------------------------------------------
 -- MonadEval instance
@@ -509,7 +519,7 @@ instance MonadEval EvalIO where
     case Map.lookup target cache of
       Just (Thunk cell) -> readComputed cell
       Nothing -> do
-        source <- sourceIO ReadFile (T.pack target) (BS.readFile ioTarget)
+        source <- readImportTarget (target, ioTarget)
         let fileDir = takeDirectory target
         case parseNixWithScope (rootScopeNames policy) fileDir (SourceFile (T.pack target)) source of
           Left err -> rejectSource "import" target err
@@ -657,8 +667,8 @@ instance MonadEval EvalIO where
     baseDir <- EvalIO (asks esBaseDir)
     baseEnv <- EvalIO (asks esBaseEnv)
     policy <- EvalIO (asks esPolicy)
-    (target, ioTarget) <- resolveImportTarget baseDir rawPath
-    source <- sourceIO ReadFile (T.pack target) (BS.readFile ioTarget)
+    located@(target, _) <- resolveImportTarget baseDir rawPath
+    source <- readImportTarget located
     scopeNames <- attrSetKeys scope
     let fileDir = takeDirectory target
     case parseNixWithScope (Set.union (Set.fromList scopeNames) (rootScopeNames policy)) fileDir (SourceFile (T.pack target)) source of
@@ -1276,12 +1286,13 @@ rejectSource builtinName target err = throwEvalError $ case err of
 
 -- | Resolve an import's raw path to the value-domain target (the import
 -- cache key, the parse name, and the base dir the file's relative path
--- literals resolve against) and the filesystem location to read, with
--- both the path named and the file resolved checked against the policy:
--- upstream's @resolveExprPath@ walks the path it is handed, and
--- @parseExprFromFile@ walks the file it reads after @default.nix@ has
--- been appended, so a directory whose @default.nix@ is a symlink is
--- refused at the link's target.
+-- literals resolve against) and the filesystem location to read, as
+-- @import@, @scopedImport@ and a command line's @\<NAME\>@ target find
+-- their file, with both the path named and the file resolved checked
+-- against the policy: upstream's @resolveExprPath@ walks the path it is
+-- handed, and @parseExprFromFile@ walks the file it reads after
+-- @default.nix@ has been appended, so a directory whose @default.nix@ is
+-- a symlink is refused at the link's target.
 --
 -- Store text stays canonical in the value domain: 'Dir.canonicalizePath'
 -- would attach the working drive to the rooted @/nix@ prefix on Windows,
@@ -1315,6 +1326,11 @@ resolveImportTarget baseDir rawPath = do
           isDir <- sourceIO StatPath (T.pack canonical) (statSource canonical >> Dir.doesDirectoryExist canonical)
           let target = if isDir then canonical </> "default.nix" else canonical
           pure (target, target)
+
+-- | Read the file 'resolveImportTarget' located, failing as an import
+-- that cannot read its file fails.
+readImportTarget :: (FilePath, FilePath) -> EvalIO BS.ByteString
+readImportTarget (target, ioTarget) = sourceIO ReadFile (T.pack target) (BS.readFile ioTarget)
 
 -- | Classify a filesystem path as @"regular"@, @"directory"@, @"symlink"@,
 -- or @"unknown"@ - matching Nix's @builtins.readDir@ / @readFileType@.

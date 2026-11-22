@@ -92,6 +92,7 @@ library
     Nix.Eval.Compile
     Nix.Eval.EvalFormals
     Nix.Eval.AttrPath
+    Nix.Eval.AutoCall
     Nix.Eval.CStatus
     Nix.Eval.CData
     Nix.Store

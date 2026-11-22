@@ -89,6 +89,9 @@ module Nix.Eval
     -- * Builtin definitions
     listedBuiltins,
 
+    -- * Search path
+    findInSearchPath,
+
     -- * Platform
     currentSystemStr,
   )
@@ -3520,9 +3523,16 @@ builtinFindFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinFindFile (VList cl) nameVal = do
   entries <- listThunks cl >>= mapM forceSearchEntry
   name <- structuredStringValue RefuseContext nameVal
-  findFirst entries name
+  VPath <$> findFirst entries name
 builtinFindFile other _ =
   throwEvalError ("builtins.findFile: expected a list, got " <> typeName other)
+
+-- | The path a name is found at in a search path's entries, failing as a
+-- @\<name\>@ lookup does: upstream's @EvalState::findFile@, which both the
+-- builtin and a command line's @\<name\>@ argument call (eval.cc:3043-3068
+-- and common-eval-args.cc:188-191 at 2.24.9).
+findInSearchPath :: (MonadEval m) => [Thunk] -> BS.ByteString -> m Text
+findInSearchPath entryThunks name = mapM forceSearchEntry entryThunks >>= (`findFirst` name)
 
 -- | Extract {prefix, path} from a search path entry thunk, as the bytes
 -- the entry holds.  Upstream keeps both as byte strings, so an entry
@@ -3571,10 +3581,10 @@ searchPathMiss name = do
 -- back) and quieter than 2.33.2 (which refuses from here), and which
 -- gives no caller an existence oracle over paths it may not read.
 --
--- A matching entry's candidate becomes a path value, which is text, so
--- one with no UTF-8 reading is an error where upstream would probe the
--- bytes; a lossy spelling would probe a different file.
-findFirst :: (MonadEval m) => [(BS.ByteString, BS.ByteString)] -> BS.ByteString -> m NixValue
+-- A matching entry's candidate is a path value's text, so one with no
+-- UTF-8 reading is an error where upstream would probe the bytes; a lossy
+-- spelling would probe a different file.
+findFirst :: (MonadEval m) => [(BS.ByteString, BS.ByteString)] -> BS.ByteString -> m Text
 findFirst [] name = searchPathMiss (bytesToTextLossy name)
 findFirst ((prefix, path) : rest) name = case searchPathSuffix prefix name of
   Nothing -> findFirst rest name
@@ -3582,7 +3592,7 @@ findFirst ((prefix, path) : rest) name = case searchPathSuffix prefix name of
     candidate <- canonPathValue <$> decodedText "builtins.findFile" (if BS.null suffix then path else path <> "/" <> suffix)
     exists <- doesPathExist ExistsAsEntry candidate
     if exists
-      then pure (VPath candidate)
+      then pure candidate
       else findFirst rest name
 
 -- | The part of a looked-up name below a search path prefix that names

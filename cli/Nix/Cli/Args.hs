@@ -4,13 +4,15 @@
 -- What each command and flag means is documented in "Nix.Cli.Reference",
 -- which @--help@ prints.  The test suite checks every flag that reference
 -- lists against this parser: each command listed for a flag accepts it,
--- and the flag takes a value exactly when its entry names one.  The parser
--- also accepts some flags where they have no effect, such as @--fallback@
--- after @eval@, which the reference does not list.
+-- and the flag takes the values its entry names, and none when it names
+-- none.  The parser also accepts some flags where they have no effect,
+-- such as @--fallback@ after @eval@, which the reference does not list.
 module Nix.Cli.Args
   ( CliOpts (..),
     Command (..),
-    BuildTarget (..),
+    Target (..),
+    fileTarget,
+    AutoArg (..),
     OutLink (..),
     outLinkFor,
     PushArgs (..),
@@ -18,11 +20,18 @@ module Nix.Cli.Args
   )
 where
 
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 
 -- | Parsed CLI options.
 data CliOpts = CliOpts
   { optNixPaths :: ![T.Text],
+    -- | @--arg@ and @--argstr@: what a function the target evaluates to
+    -- is called with, by name as the command line spells it.  A later
+    -- flag for a name replaces an earlier one, as upstream's
+    -- @insert_or_assign@ does (common-eval-args.cc:62 and 70 at 2.24.9).
+    optAutoArgs :: !(Map String AutoArg),
     optStrict :: !Bool,
     optAterm :: !Bool,
     -- | Store directory override (default: the platform store).
@@ -52,12 +61,12 @@ data CliOpts = CliOpts
 
 -- | The command an invocation runs.
 data Command
-  = CmdEvalFile !FilePath
-  | CmdEvalExpr !T.Text
-  | CmdBuild !BuildTarget !(Maybe T.Text) !OutLink
+  = -- | @eval@: evaluate the target and print its value.
+    CmdEval !Target
+  | CmdBuild !Target !(Maybe T.Text) !OutLink
   | -- | @trust@: report what the closure of the target's derivation, at
     -- the attribute path when one is given, relies on.
-    CmdTrust !BuildTarget !(Maybe T.Text)
+    CmdTrust !Target !(Maybe T.Text)
   | CmdPush !PushArgs
   | CmdStoreDelete ![String]
   | -- | @store gc@: collect, or with the flag only list the roots.
@@ -71,13 +80,44 @@ data Command
   | CmdVersion
   deriving (Eq, Show)
 
--- | Where a build's expression comes from.
-data BuildTarget
-  = -- | A @.nix@ file.  Relative paths inside it resolve beside the file.
+-- | Where a command's expression comes from.  A name or an expression is
+-- the argument as 'System.Environment.getArgs' gave it, whose bytes the
+-- command reads ("Nix.Environment"'s @argumentBytes@), as upstream reads
+-- the bytes it was given.
+data Target
+  = -- | A @.nix@ file, or a directory standing for its @default.nix@, as
+    -- upstream's @resolveExprPath@ reads one (eval.cc:2968-2985 at
+    -- 2.24.9).  Relative paths inside it resolve beside the file.
     TargetFile !FilePath
+  | -- | @\<NAME\>@: the file the search path finds for the name, as
+    -- @\<NAME\>@ in an expression finds it, read as 'TargetFile' reads
+    -- one.
+    TargetSearchPath !String
   | -- | An inline expression.  Relative paths inside it resolve against the
     -- working directory, since there is no file to sit beside.
-    TargetExpr !T.Text
+    TargetExpr !String
+  deriving (Eq, Show)
+
+-- | The target a file argument names: a search path lookup when it is
+-- longer than two characters and written in angle brackets, as upstream's
+-- @lookupFileArg@ reads one (common-eval-args.cc:188-191 at 2.24.9), and
+-- otherwise a file or directory.
+fileTarget :: String -> Target
+fileTarget arg = case arg of
+  '<' : rest
+    | '>' : nameReversed@(_ : _) <- reverse rest -> TargetSearchPath (reverse nameReversed)
+  _ -> TargetFile arg
+
+-- | A value the function a target evaluates to is called with, the
+-- argument as 'System.Environment.getArgs' gave it, whose bytes the
+-- command reads.
+data AutoArg
+  = -- | @--arg@: an expression, evaluated in the root environment when
+    -- the function uses it, its relative paths resolved against the
+    -- working directory.
+    AutoArgExpr !String
+  | -- | @--argstr@: a string holding the argument's bytes.
+    AutoArgString !String
   deriving (Eq, Show)
 
 -- | Where a build links its output.
@@ -129,7 +169,7 @@ targetWord kind = case kind of
 
 -- | Arguments to a target command, while the target is still unknown.
 data BuildArgs = BuildArgs
-  { baTarget :: !(Maybe BuildTarget),
+  { baTarget :: !(Maybe Target),
     baAttrPath :: !(Maybe T.Text),
     -- | Where @build@ links its output.  Only @build@ takes a flag that
     -- sets it.
@@ -161,12 +201,14 @@ emptyPushArgs = PushArgs Nothing Nothing Nothing Nothing False []
 -- silent drop: an unknown or misspelled flag fails the parse, so nothing
 -- after it (a requested @--substituter@, say) is quietly discarded.
 parseArgs :: [String] -> Either String CliOpts
-parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False False False False CmdUsage)
+parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] False False False False False CmdUsage)
   where
     go opts [] = Right opts
     go opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
     go opts ("--nix-path" : val : rest) =
       go (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
+    go opts (flag : name : value : rest)
+      | Just arg <- autoArg flag value = go (withAutoArg name arg opts) rest
     go opts ("--strict" : rest) =
       go (opts {optStrict = True}) rest
     go opts ("--aterm" : rest) =
@@ -194,6 +236,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
     go opts ("store" : rest) = goStore opts rest
     go _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    go _ (flag : _)
+      | flag `elem` autoArgFlags = Left (flag ++ autoArgShortfall)
     go _ (arg : _) = Left ("unknown argument: " ++ arg ++ " (run nova-nix --help for usage)")
     -- Sub-parser for eval: handles --strict and --expr interleaved with the file arg.
     goEval opts [] = Right opts
@@ -202,6 +246,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
     goEval opts ("--aterm" : rest) = goEval (opts {optAterm = True}) rest
     goEval opts ("--nix-path" : val : rest) =
       goEval (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
+    goEval opts (flag : name : value : rest)
+      | Just arg <- autoArg flag value = goEval (withAutoArg name arg opts) rest
     -- Accepted here as well as at the top level, like build and push:
     -- eval-side reads follow the selected store, so the flag means as
     -- much after the subcommand as before it.
@@ -216,12 +262,14 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
     goEval opts ("--fallback" : rest) =
       goEval (opts {optFallback = True}) rest
     goEval opts ("--expr" : expr : rest) =
-      go (opts {optCommand = CmdEvalExpr (T.pack expr)}) rest
+      go (opts {optCommand = CmdEval (TargetExpr expr)}) rest
     goEval _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goEval _ (flag : _)
+      | flag `elem` autoArgFlags = Left (flag ++ autoArgShortfall)
     goEval _ (arg@('-' : _) : _) = Left ("unknown eval flag: " ++ arg)
     goEval opts (path : rest) =
-      go (opts {optCommand = CmdEvalFile path}) rest
+      go (opts {optCommand = CmdEval (fileTarget path)}) rest
     -- Sub-parser for build and trust: the target, -A, and the shared flags
     -- in any order, and for build its own flags.  The shared flags are
     -- handled here rather than deferred back to 'go' so that one can follow
@@ -237,6 +285,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
       goTarget kind (opts {optTrustedKey = Just key}) targetArgs rest
     goTarget kind opts targetArgs ("--nix-path" : val : rest) =
       goTarget kind (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) targetArgs rest
+    goTarget kind opts targetArgs (flag : name : value : rest)
+      | Just arg <- autoArg flag value = goTarget kind (withAutoArg name arg opts) targetArgs rest
     goTarget BuildsTarget opts targetArgs ("--exec-wrapper" : spec : rest) =
       goTarget BuildsTarget (opts {optExecWrappers = optExecWrappers opts ++ [spec]}) targetArgs rest
     goTarget kind opts targetArgs ("--restrict-eval" : rest) =
@@ -250,7 +300,7 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
     goTarget BuildsTarget opts targetArgs ("--check" : rest) =
       goTarget BuildsTarget (opts {optCheck = True}) targetArgs rest
     goTarget kind opts targetArgs ("--expr" : expr : rest) =
-      withTarget kind opts targetArgs (TargetExpr (T.pack expr)) rest
+      withTarget kind opts targetArgs (TargetExpr expr) rest
     goTarget kind opts targetArgs (flag : path : rest)
       | flag `elem` attrFlags = case baAttrPath targetArgs of
           Just _ -> Left (targetWord kind ++ " accepts one attribute path")
@@ -264,16 +314,18 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
       | flag `elem` noOutLinkFlags = goTarget BuildsTarget opts (targetArgs {baOutLink = NoOutLink}) rest
     goTarget _ _ _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goTarget _ _ _ (flag : _)
+      | flag `elem` autoArgFlags = Left (flag ++ autoArgShortfall)
     goTarget kind _ _ (arg@('-' : _) : _) = Left ("unknown " ++ targetWord kind ++ " flag: " ++ arg)
     goTarget kind opts targetArgs (path : rest) =
-      withTarget kind opts targetArgs (TargetFile path) rest
+      withTarget kind opts targetArgs (fileTarget path) rest
     -- A target command evaluates one expression, so a second target is a
     -- mistake worth naming rather than a silent last-one-wins.
     withTarget kind opts targetArgs target rest = case baTarget targetArgs of
-      Just _ -> Left (targetWord kind ++ " takes one FILE.nix or one --expr, not both")
+      Just _ -> Left (targetWord kind ++ " takes one PATH, <NAME> or --expr, not two")
       Nothing -> goTarget kind opts (targetArgs {baTarget = Just target}) rest
     finishTarget kind opts targetArgs = case (baTarget targetArgs, kind) of
-      (Nothing, _) -> Left (targetWord kind ++ " requires a FILE.nix argument or --expr EXPR")
+      (Nothing, _) -> Left (targetWord kind ++ " requires a PATH, <NAME> or --expr EXPR")
       (Just target, BuildsTarget) -> Right opts {optCommand = CmdBuild target (baAttrPath targetArgs) (baOutLink targetArgs)}
       (Just target, TrustsTarget) -> Right opts {optCommand = CmdTrust target (baAttrPath targetArgs)}
     -- Sub-parser for push: flags and explicit store paths in any order.
@@ -340,3 +392,10 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
     outLinkFlags = ["-o", "--out-link"]
     -- No result link, under both of nix-build's spellings.
     noOutLinkFlags = ["--no-out-link", "--no-link"]
+    -- The flags that pass a function an argument, each followed by the
+    -- argument's name and its value, and what each makes of the value.
+    autoArgKinds = [("--arg", AutoArgExpr), ("--argstr", AutoArgString)]
+    autoArgFlags = map fst autoArgKinds
+    autoArg flag value = ($ value) <$> lookup flag autoArgKinds
+    autoArgShortfall = " requires a name and a value"
+    withAutoArg name arg opts = opts {optAutoArgs = Map.insert name arg (optAutoArgs opts)}

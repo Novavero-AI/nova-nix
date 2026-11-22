@@ -202,10 +202,12 @@ command name = case name of
   EvalCommand ->
     CommandEntry
       { commandForms =
-          Form "FILE.nix" "Evaluate a .nix file, print result"
-            :| [Form "--expr 'EXPR'" "Evaluate an inline expression"],
+          Form "PATH" "Evaluate a .nix file, or a directory's default.nix, print result"
+            :| [ Form "'<NAME>'" "Evaluate the file the search path finds for NAME",
+                 Form "--expr 'EXPR'" "Evaluate an inline expression"
+               ],
         commandDescription =
-          "Evaluates the expression in `FILE.nix`, or the one `--expr` gives, and prints its value as `nix-instantiate --eval` prints it. A part of the value the evaluation never needed prints as `<CODE>`; with `--strict` the whole value is evaluated first. A relative path resolves against the file's directory, or for `--expr` against the working directory. A `<name>` path is looked up in the entries `--nix-path` adds, then `NIX_PATH`'s, then the `<nix/*>` expressions nova-nix ships with. An evaluation that writes to the store, as `builtins.toFile`, `builtins.path` and the fetchers do, stops with an error at its first write to a store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed; one that writes nothing is not refused. With `NOVA_NIX_C_STATS` set to a file, an evaluation that succeeds writes to it a census of the memory its C data layer holds: the objects and bytes of each kind allocated, those its result, the root environment, the import cache and the search path still reach, and what finding them cost. With `NOVA_NIX_REGION_STATS` set to a file, it writes a census of regions: at the end of each force of a thunk, the bytes the force allocated and the bytes of them still reachable, and the most bytes collectors freeing at those points would have held.",
+          "Evaluates the expression in " <> targetSource <> ", and prints its value as `nix-instantiate --eval` prints it. With an argument from `--arg` or `--argstr`, the value is called first, as `nix-instantiate --eval` calls it: " <> callRule <> " Without one it is not called, and a function prints as `<LAMBDA>`; with `--aterm` it is called either way, as `nix-instantiate` calls it before it writes a derivation. A part of the value the evaluation never needed prints as `<CODE>`; with `--strict` the whole value is evaluated first. A relative path resolves against the file's directory, or for `--expr` and an `--arg` expression against the working directory. A `<name>` path, and a `<NAME>` argument, is looked up in the entries `--nix-path` adds, then `NIX_PATH`'s, then the `<nix/*>` expressions nova-nix ships with. An evaluation that writes to the store, as `builtins.toFile`, `builtins.path` and the fetchers do, stops with an error at its first write to a store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed; one that writes nothing is not refused. With `NOVA_NIX_C_STATS` set to a file, an evaluation that succeeds writes to it a census of the memory its C data layer holds: the objects and bytes of each kind allocated, those its result, the root environment, the import cache and the search path still reach, and what finding them cost. With `NOVA_NIX_REGION_STATS` set to a file, it writes a census of regions: at the end of each force of a thunk, the bytes the force allocated and the bytes of them still reachable, and the most bytes collectors freeing at those points would have held.",
         commandExamples =
           Example "Evaluate an expression." ("eval" :| ["--expr", "1 + 2"]) ["3"]
             :| [ Example
@@ -221,6 +223,14 @@ command name = case name of
                    ("eval" :| ["--aterm", "--expr", "derivation { name = \"hello\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }"])
                    ["Derive([(\"out\",\"/nix/store/pnwh4xsfs4j508bs9iw6bpkyc4zw6ryx-hello\",\"\",\"\")],[],[],\"x86_64-linux\",\"/bin/sh\",[],[(\"builder\",\"/bin/sh\"),(\"name\",\"hello\"),(\"out\",\"/nix/store/pnwh4xsfs4j508bs9iw6bpkyc4zw6ryx-hello\"),(\"system\",\"x86_64-linux\")])"],
                  Example
+                   "Call a function with an argument, its default filling the other."
+                   ("eval" :| ["--arg", "x", "2", "--expr", "{ x, y ? 3 }: x * y"])
+                   ["6"],
+                 Example
+                   "Call a function with a string argument."
+                   ("eval" :| ["--argstr", "name", "world", "--expr", "{ name }: \"hello \" + name"])
+                   ["\"hello world\""],
+                 Example
                    "Evaluate an expression from a nixpkgs checkout in the working directory."
                    ("eval" :| ["--nix-path", "nixpkgs=./nixpkgs", "--expr", "(import <nixpkgs/lib>).version"])
                    []
@@ -229,10 +239,12 @@ command name = case name of
   BuildCommand ->
     CommandEntry
       { commandForms =
-          Form "FILE.nix" "Build a derivation from a .nix file"
-            :| [Form "--expr 'EXPR'" "Build a derivation from an inline expression"],
+          Form "PATH" "Build a derivation from a .nix file, or a directory's default.nix"
+            :| [ Form "'<NAME>'" "Build a derivation from the file the search path finds for NAME",
+                 Form "--expr 'EXPR'" "Build a derivation from an inline expression"
+               ],
         commandDescription =
-          "Evaluates `FILE.nix`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. The outputs of a derivation whose `allowSubstitutes` attribute is false are built instead, unless `always-allow-substitutes` is on. A substituter that fails stops the build unless `fallback` is on. With `--check` the derivation is checked as `nix-build --check` checks one: an output of its that is not valid is first downloaded from a substituter that holds it, the derivations it depends on are built or downloaded as ever, and then it is built again beside its outputs, never downloaded, and each output is compared with the one in the store. The rebuild changes nothing in the store and what it wrote is discarded; the downloads and builds before it add to the store as in any build. An output that comes out different fails the command with status 104, so a path a substituter supplied can be held to a build. The output is linked from `./result`, or from the path `--out-link` gives, with `-NAME` appended for an output `NAME` other than `out`, as `nix-build` links it, and the link is a root the garbage collector keeps; it replaces a link already there that points into the store, and anything else there fails the command. With `--no-out-link` nothing is linked. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is evaluated.",
+          "Evaluates " <> targetSource <> ", selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. " <> targetCalls <> " A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. The outputs of a derivation whose `allowSubstitutes` attribute is false are built instead, unless `always-allow-substitutes` is on. A substituter that fails stops the build unless `fallback` is on. With `--check` the derivation is checked as `nix-build --check` checks one: an output of its that is not valid is first downloaded from a substituter that holds it, the derivations it depends on are built or downloaded as ever, and then it is built again beside its outputs, never downloaded, and each output is compared with the one in the store. The rebuild changes nothing in the store and what it wrote is discarded; the downloads and builds before it add to the store as in any build. An output that comes out different fails the command with status 104, so a path a substituter supplied can be held to a build. The output is linked from `./result`, or from the path `--out-link` gives, with `-NAME` appended for an output `NAME` other than `out`, as `nix-build` links it, and the link is a root the garbage collector keeps; it replaces a link already there that points into the store, and anything else there fails the command. With `--no-out-link` nothing is linked. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is evaluated.",
         commandExamples =
           Example
             "Build GNU Hello for Windows from the directory a release unpacks to, with the public cache as a substituter."
@@ -247,6 +259,10 @@ command name = case name of
                    ("build" :| ["pkgs/windows/hello.nix", "--no-out-link"])
                    [],
                  Example
+                   "Build GNU Hello from a nixpkgs checkout in the working directory: nixpkgs is a function, called with its defaults before `hello` is selected from it."
+                   ("build" :| ["--nix-path", "nixpkgs=./nixpkgs", "<nixpkgs>", "-A", "hello"])
+                   [],
+                 Example
                    "Build a derivation written inline, on Linux or macOS."
                    ("build" :| ["--expr", "derivation { name = \"greeting\"; system = builtins.currentSystem; builder = \"/bin/sh\"; args = [ \"-c\" \"echo hello > $out\" ]; }"])
                    [],
@@ -259,10 +275,12 @@ command name = case name of
   TrustCommand ->
     CommandEntry
       { commandForms =
-          Form "FILE.nix" "Report what a derivation's closure relies on"
-            :| [Form "--expr 'EXPR'" "Report what an inline derivation's closure relies on"],
+          Form "PATH" "Report what the closure of a derivation in a .nix file, or a directory's default.nix, relies on"
+            :| [ Form "'<NAME>'" "Report what the closure of a derivation in the file the search path finds for NAME relies on",
+                 Form "--expr 'EXPR'" "Report what an inline derivation's closure relies on"
+               ],
         commandDescription =
-          "Evaluates `FILE.nix`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, and reports what the closure of the derivation that results relies on. A closure bottoms out in fixed-output derivations, whose outputs are held to the hash their recipe states, whether a builtin fetches them or the closure builds them. First come those a build runs as builders, where a derivation's builder is inside one's output, or inside the tree a builtin such as `builtin:unpack` makes from it and any others; then those whose files hold prebuilt code, each with the files found; then those not fully read, each with what was not. Each says whether a builtin fetched it or the closure built it, and names any other with the same hash. Then come how many hold no prebuilt code, the builders the closure does not contain, such as a program on the host, the builders in its input sources, the builtins nova-nix runs itself, and how many input sources its derivations take, store paths none of them builds. A fixed-output derivation whose builder is a builtin and which has no inputs is fetched first, or downloaded from a substituter, so that its bytes can be read; any other is only downloaded, with the paths it references, from a substituter that holds it, since making it would run its builder, and is read only when one does or the store already holds it. A fetch that fails stops the command, and so does a failed download of one that no builtin fetches. The scan finds prebuilt code by its header: a PE image, an ELF or Mach-O file, a COFF object, or an ar archive, whose members it does not read. It looks in a fetched file, in each file of a fetched tree, and in each file of a tar archive, plain or compressed with gzip, bzip2, xz or zstd, that one of those is; it does not open an archive inside another, and it reports a file in another archive format it knows, such as zip, as not read. It reports what the closure relies on, not whether any of it is safe. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is fetched or read.",
+          "Evaluates " <> targetSource <> ", selects the attribute `-A` names when it is given, and reports what the closure of the derivation that results relies on. " <> targetCalls <> " A closure bottoms out in fixed-output derivations, whose outputs are held to the hash their recipe states, whether a builtin fetches them or the closure builds them. First come those a build runs as builders, where a derivation's builder is inside one's output, or inside the tree a builtin such as `builtin:unpack` makes from it and any others; then those whose files hold prebuilt code, each with the files found; then those not fully read, each with what was not. Each says whether a builtin fetched it or the closure built it, and names any other with the same hash. Then come how many hold no prebuilt code, the builders the closure does not contain, such as a program on the host, the builders in its input sources, the builtins nova-nix runs itself, and how many input sources its derivations take, store paths none of them builds. A fixed-output derivation whose builder is a builtin and which has no inputs is fetched first, or downloaded from a substituter, so that its bytes can be read; any other is only downloaded, with the paths it references, from a substituter that holds it, since making it would run its builder, and is read only when one does or the store already holds it. A fetch that fails stops the command, and so does a failed download of one that no builtin fetches. The scan finds prebuilt code by its header: a PE image, an ELF or Mach-O file, a COFF object, or an ar archive, whose members it does not read. It looks in a fetched file, in each file of a fetched tree, and in each file of a tar archive, plain or compressed with gzip, bzip2, xz or zstd, that one of those is; it does not open an archive inside another, and it reports a file in another archive format it knows, such as zip, as not read. It reports what the closure relies on, not whether any of it is safe. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is fetched or read.",
         commandExamples =
           Example
             "Report what GNU Hello for Windows relies on, from the directory a release unpacks to, with the public cache as a substituter."
@@ -324,6 +342,20 @@ command name = case name of
             :| [Example "List the roots, each as the link that names it and the path it keeps." ("store" :| ["gc", "--print-roots"]) []]
       }
 
+-- | What a command that takes a target evaluates, as its description
+-- names it.
+targetSource :: Text
+targetSource = "the file `PATH` names, or its `default.nix` when `PATH` is a directory, the file the search path finds for `<NAME>`, or the expression `--expr` gives"
+
+-- | How a value is called with the arguments @--arg@ and @--argstr@
+-- give, upstream's @autoCallFunction@.
+callRule :: Text
+callRule = "a set with `__functor` stands for what its functor returns given the set, which is called in turn; a function with a set pattern is called with every argument when it takes `...` and otherwise with those its formals name, its defaults filling the rest, and a formal with neither an argument nor a default fails the command; any other value is left as it is."
+
+-- | When @build@ and @trust@ call a function, as @nix-build@ does.
+targetCalls :: Text
+targetCalls = "Before each component of the `-A` path is selected from it, and once the path has selected it, the value is called as `nix-build` calls it, with the arguments from `--arg` and `--argstr` or with none: " <> callRule
+
 -- ---------------------------------------------------------------------------
 -- Flags
 -- ---------------------------------------------------------------------------
@@ -338,6 +370,8 @@ data FlagName
   | StrictFlag
   | AtermFlag
   | NixPathFlag
+  | ArgFlag
+  | ArgStrFlag
   | RestrictEvalFlag
   | PureEvalFlag
   | TraceVerboseFlag
@@ -419,9 +453,13 @@ flag name = case name of
   StrictFlag ->
     long "strict" Nothing "Deep-force all thunks before printing (warning: OOM on large results)" evalOnly
   AtermFlag ->
-    long "aterm" Nothing "With `--expr`, print the derivation's `.drv` ATerm" evalOnly
+    long "aterm" Nothing "Print the `.drv` ATerm of the derivation the target evaluates to, in place of its value" evalOnly
   NixPathFlag ->
     long "nix-path" (Just "NAME=PATH") "Add search path (repeatable, merged with `NIX_PATH`)" evalBuildAndTrust
+  ArgFlag ->
+    long "arg" (Just "NAME EXPR") "Pass the value of `EXPR` as the argument `NAME` to a function the target evaluates to" evalBuildAndTrust
+  ArgStrFlag ->
+    long "argstr" (Just "NAME STRING") "Pass `STRING`, as a string, as the argument `NAME` to a function the target evaluates to" evalBuildAndTrust
   RestrictEvalFlag ->
     long "restrict-eval" Nothing "Confine reads to the search path roots and what the evaluation itself writes; fetch only `allowed-uris`" evalBuildAndTrust
   PureEvalFlag ->
