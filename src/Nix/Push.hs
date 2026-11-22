@@ -1,6 +1,8 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | Push store paths to a nova-cache binary cache.
+-- | Push store paths to a nova-cache binary cache.  "Nix.Push.Directory"
+-- writes them to a binary cache in a local directory instead, from the
+-- same pieces.
 --
 -- == The push choreography
 --
@@ -80,7 +82,16 @@ module Nix.Push
     pushPaths,
     computeClosure,
     preparePath,
-    loadApiKeyFile,
+    loadKeyFile,
+
+    -- * Cache layout
+    narInfoFileName,
+    narDirSegment,
+
+    -- * Progress lines
+    logSkipped,
+    logNar,
+    logPushed,
 
     -- * Pure pieces (exported for tests)
     parsePushCompression,
@@ -138,7 +149,8 @@ import System.IO (stderr)
 narinfoHashesEndpoint :: Text
 narinfoHashesEndpoint = "narinfo-hashes"
 
--- | URL path segment under which NAR files live.
+-- | The directory of a cache, and the first segment of a NAR's URL, under
+-- which NAR files live.
 narDirSegment :: Text
 narDirSegment = "nar"
 
@@ -273,16 +285,17 @@ data PushSummary = PushSummary
 -- Key loading
 -- ---------------------------------------------------------------------------
 
--- | Read an API key from a file, dropping byte-order marks and surrounding
--- whitespace.  Key files written by Windows tooling are a known source of
--- BOM contamination; 'normalizeKeyText' makes the transfer byte-clean.
+-- | Read a key from a file, a cache's API key or a secret signing key's
+-- text, dropping byte-order marks and surrounding whitespace.  Key files
+-- written by Windows tooling are a known source of BOM contamination;
+-- 'normalizeKeyText' makes the transfer byte-clean.
 --
 -- The bytes are decoded as UTF-8 EXPLICITLY: locale text IO decodes by
 -- console code page, which turns the BOM bytes into codepage characters
 -- that no normalizer recognizes - on the very consoles the BOM handling
 -- exists for.
-loadApiKeyFile :: FilePath -> IO (Either Text Text)
-loadApiKeyFile path = do
+loadKeyFile :: FilePath -> IO (Either Text Text)
+loadKeyFile path = do
   attempt <- try (BS.readFile path)
   pure $ case attempt of
     Left (e :: IOException) -> Left ("cannot read key file: " <> T.pack (show e))
@@ -352,6 +365,10 @@ stripHashPrefix h = case T.breakOn ":" h of
   (_, rest) | not (T.null rest) -> T.drop 1 rest
   _ -> h
 
+-- | The name of a path's narinfo in a cache, @\<hash\>.narinfo@.
+narInfoFileName :: StorePath -> Text
+narInfoFileName sp = spHash sp <> narInfoExtension
+
 -- | The NAR object filename for a given (uncompressed) NAR hash.
 narFileName :: Text -> Text
 narFileName narHash = stripHashPrefix narHash <> narExtension
@@ -409,14 +426,19 @@ mkPushArtifact compression narHash narBytes = case compression of
 -- is internally consistent by construction.  The @StorePath@ uses
 -- the canonical @\/nix\/store@ form; references and the deriver are
 -- basenames, matching the wire format.
+--
+-- The file hash and size are forced into their @Just@, as the other
+-- fields taken from the artifact are by their strictness, so a narinfo
+-- holds no thunk over the artifact, whose bytes are the whole NAR: a
+-- push that keeps its narinfos until every NAR is in place keeps no NAR.
 mkNarInfo :: PushArtifact -> StorePath -> [StorePath] -> Maybe StorePath -> NarInfo
 mkNarInfo artifact sp refs deriver =
   NarInfo
     { niStorePath = storePathToText defaultStoreDir sp,
       niUrl = narDirSegment <> "/" <> paObjectName artifact,
       niCompression = paCompressionText artifact,
-      niFileHash = Just (paFileHash artifact),
-      niFileSize = Just (fromIntegral (paFileSize artifact)),
+      niFileHash = Just $! paFileHash artifact,
+      niFileSize = Just $! fromIntegral (paFileSize artifact),
       niNarHash = paNarHash artifact,
       niNarSize = fromIntegral (paNarSize artifact),
       niReferences = sort (map storePathBasename refs),
@@ -460,9 +482,11 @@ pushPaths cfg store roots =
       remote <- fetchRemoteHashes manager cfg
       let missing = planMissing remote closure
           skipped = length closure - length missing
-      when (skipped > 0) $
-        logLine ("[skip]  " <> T.pack (show skipped) <> " path(s) already cached")
-      -- Phase 1: NARs.  One at a time; bytes are dropped after upload.
+      logSkipped skipped
+      -- Phase 1: NARs, one at a time.  What is kept for phase 2 is each
+      -- path's narinfo and how its upload ended, and neither holds the
+      -- NAR's bytes ('mkNarInfo' forces what it takes from the artifact),
+      -- so each NAR is dropped once uploaded.
       uploaded <- forM missing $ \sp -> do
         (narInfo, upload) <- uploadNar manager cfg store 0 sp
         pure (sp, narInfo, upload)
@@ -474,7 +498,7 @@ pushPaths cfg store roots =
       -- references.
       forM_ uploaded $ \(sp, narInfo, upload) -> do
         publishNarInfo manager cfg store sp narInfo upload
-        logLine ("[push]  " <> storePathBasename sp)
+        logPushed sp
       -- Round-trip: the first pushed narinfo must come back signed.
       case uploaded of
         ((sp, _, _) : _) -> verifySignedRoundTrip manager cfg sp
@@ -506,13 +530,7 @@ fetchRemoteHashes manager cfg = do
 uploadNar :: HTTP.Manager -> PushConfig -> Store -> Int -> StorePath -> ExceptT Text IO (NarInfo, NarUpload)
 uploadNar manager cfg store begun sp = do
   (artifact, narInfo) <- preparePath (pcCompression cfg) store sp
-  logLine
-    ( "[nar]   "
-        <> storePathBasename sp
-        <> " ("
-        <> T.pack (show (paNarSize artifact))
-        <> " bytes)"
-    )
+  logNar sp artifact
   upload <- sendNar manager cfg begun (niUrl narInfo) (paBytes artifact)
   pure (narInfo, upload)
 
@@ -589,20 +607,20 @@ publishNarInfo manager cfg store sp narInfo upload = do
   unless (status == HTTP.status200) $ case upload of
     NarUnconfirmed begun completion
       | status == HTTP.status400 && begun < maxNarUploads -> do
-          logLine ("[retry] " <> refused <> "; uploading the NAR again")
+          logLine (retryTag <> refused <> "; uploading the NAR again")
           (resent, reupload) <- uploadNar manager cfg store begun sp
           publishNarInfo manager cfg store sp resent reupload
       | otherwise ->
           throwError (refused <> "; the NAR's last completion: " <> completion <> " (" <> countedUploads begun <> " begun)")
     NarStored -> throwError refused
   where
-    object = spHash sp <> narInfoExtension
+    object = narInfoFileName sp
     label = "PUT " <> object
 
 -- | Fetch a just-pushed narinfo back and require a signature on it.
 verifySignedRoundTrip :: HTTP.Manager -> PushConfig -> StorePath -> ExceptT Text IO ()
 verifySignedRoundTrip manager cfg sp = do
-  let object = spHash sp <> narInfoExtension
+  let object = narInfoFileName sp
       url = pcCacheUrl cfg <> "/" <> object
   response <- httpRequest manager "GET" url [] Nothing
   expectOk ("GET " <> object) response
@@ -675,7 +693,7 @@ uploadInParts manager cfg begun object bytes = do
   started <- beginUpload manager cfg uploads
   case started of
     NoMultipart -> do
-      logLine ("[nar]   POST " <> uploads <> " returned HTTP 404, so the NAR goes in one request")
+      logLine (narTag <> "POST " <> uploads <> " returned HTTP 404, so the NAR goes in one request")
       putWholeNar manager cfg object bytes
     Begun (UploadId uploadId) -> do
       let upload = uploads <> "/" <> uploadId
@@ -684,7 +702,7 @@ uploadInParts manager cfg begun object bytes = do
         PartsHeld -> completeUpload manager cfg (begun + 1) upload (length parts) (BS.length bytes)
         PartsLost lost
           | begun + 1 < maxNarUploads -> do
-              logLine ("[retry] " <> lost <> "; beginning a new upload")
+              logLine (retryTag <> lost <> "; beginning a new upload")
               uploadInParts manager cfg (begun + 1) object bytes
           | otherwise ->
               throwError (lost <> " (" <> countedUploads maxNarUploads <> " begun)")
@@ -754,7 +772,7 @@ completeUpload manager cfg begun upload count size = do
     Right response | HTTP.responseStatus response == HTTP.status200 -> pure NarStored
     unconfirmed -> do
       let completion = either (attemptFailureMessage . transportFailure label) (describeResponse label) unconfirmed
-      logLine ("[nar]   " <> completion <> "; the narinfo decides whether the NAR is stored")
+      logLine (narTag <> completion <> "; the narinfo decides whether the NAR is stored")
       pure (NarUnconfirmed begun completion)
   where
     label = "POST " <> upload
@@ -882,3 +900,37 @@ parseRefText store txt = case parseStorePath (stDir store) txt of
 -- | Progress line on stderr (stdout stays reserved for results).
 logLine :: Text -> ExceptT Text IO ()
 logLine = liftIO . TIO.hPutStrLn stderr
+
+-- ---------------------------------------------------------------------------
+-- Progress lines
+-- ---------------------------------------------------------------------------
+
+-- | The tag of the line for paths a cache holds already.
+skipTag :: Text
+skipTag = "[skip]  "
+
+-- | The tag of a NAR's lines.
+narTag :: Text
+narTag = "[nar]   "
+
+-- | The tag of the line for a path a cache now holds.
+pushTag :: Text
+pushTag = "[push]  "
+
+-- | The tag of the line for a NAR upload the push begins again.
+retryTag :: Text
+retryTag = "[retry] "
+
+-- | Report how many paths of the closure the cache holds already, if any.
+logSkipped :: Int -> ExceptT Text IO ()
+logSkipped skipped =
+  when (skipped > 0) $
+    logLine (skipTag <> T.pack (show skipped) <> " path(s) already cached")
+
+-- | Report a path's NAR, packaged for the cache, with the NAR's size.
+logNar :: StorePath -> PushArtifact -> ExceptT Text IO ()
+logNar sp artifact = logLine (narTag <> storePathBasename sp <> " (" <> T.pack (show (paNarSize artifact)) <> " bytes)")
+
+-- | Report a path whose narinfo the cache now holds.
+logPushed :: StorePath -> ExceptT Text IO ()
+logPushed sp = logLine (pushTag <> storePathBasename sp)

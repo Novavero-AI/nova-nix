@@ -144,6 +144,9 @@ emptyBuildArgs = BuildArgs Nothing Nothing defaultOutLink
 data PushArgs = PushArgs
   { paCacheUrl :: !(Maybe String),
     paKeyFile :: !(Maybe FilePath),
+    -- | The file holding the secret key that signs a directory cache's
+    -- narinfos.
+    paSecretKeyFile :: !(Maybe FilePath),
     paCompressionArg :: !(Maybe String),
     paAll :: !Bool,
     paPaths :: ![String]
@@ -152,7 +155,7 @@ data PushArgs = PushArgs
 
 -- | Push arguments before any flag is parsed.
 emptyPushArgs :: PushArgs
-emptyPushArgs = PushArgs Nothing Nothing Nothing False []
+emptyPushArgs = PushArgs Nothing Nothing Nothing Nothing False []
 
 -- | Parse the command line.  A malformed invocation is an error, never a
 -- silent drop: an unknown or misspelled flag fails the parse, so nothing
@@ -282,6 +285,8 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
       goPush opts (pushArgs {paCacheUrl = Just url}) rest
     goPush opts pushArgs ("--key-file" : path : rest) =
       goPush opts (pushArgs {paKeyFile = Just path}) rest
+    goPush opts pushArgs ("--secret-key-file" : path : rest) =
+      goPush opts (pushArgs {paSecretKeyFile = Just path}) rest
     goPush opts pushArgs ("--compression" : value : rest) =
       goPush opts (pushArgs {paCompressionArg = Just value}) rest
     goPush opts pushArgs ("--all" : rest) =
@@ -326,7 +331,7 @@ parseArgs = go (CliOpts [] False False Nothing Nothing Nothing [] False False Fa
     answered _ = Nothing
     -- Flags that consume the following argument as their value.
     valueFlags =
-      ["--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--compression"]
+      ["--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--secret-key-file", "--compression"]
         ++ attrFlags
         ++ outLinkFlags
     -- Attribute selection, under both of upstream's spellings.

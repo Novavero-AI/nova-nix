@@ -120,6 +120,7 @@ library
     Nix.Environment
     Nix.HostPath
     Nix.Push
+    Nix.Push.Directory
     Nix.Realise
     Nix.Substituter
     Nix.Trust

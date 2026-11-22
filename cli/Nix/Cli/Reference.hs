@@ -290,13 +290,17 @@ command name = case name of
           Form "--cache URL PATH..." "Push store paths (and their closures) to a binary cache"
             :| [Form "--cache URL --all" "Push every valid path except derivations, and their closures"],
         commandDescription =
-          "Uploads the closure of each `PATH`, or with `--all` every valid path except derivations, to the nova-cache server at `URL`, which signs what it receives. A `PATH` is a store path, in full or as its base name; a derivation is refused, since a binary cache serves outputs. Paths the cache already holds are skipped, every NAR is uploaded before any narinfo announces it, and a narinfo is read back to check that the server signed it. It prints how many paths it pushed and how many the cache already held.",
+          "Copies the closure of each `PATH`, or with `--all` every valid path except derivations, to the binary cache at `URL`. A `PATH` is a store path, in full or as its base name; a derivation is refused, since a binary cache serves outputs. Paths the cache already holds are skipped, and every NAR is in place before any narinfo announces it. An `http://` or `https://` `URL` is a nova-cache server, which signs what it receives, and a narinfo is read back to check that the server signed it. A `file://` `URL` names a directory, which gets the layout upstream's `nix copy --to file://` writes, so that any web server can serve it: `nix-cache-info`, a narinfo for each path, signed with the secret key in `--secret-key-file`, and the NARs under `nar/`. The key file is one `nix-store --generate-binary-cache-key` writes, and a substituter of the cache trusts its public key. It prints how many paths it pushed and how many the cache already held.",
         commandExamples =
           Example
             "Push every path in the store except derivations, compressed with zstd, to a cache that takes the API key in `cache-api-key`."
             ("push" :| ["--cache", "https://cache.example.org", "--key-file", "cache-api-key", "--compression", "zstd", "--all"])
             []
-            :| []
+            :| [ Example
+                   "Write the closure of a build's output, here GNU Hello's, to a binary cache in `/srv/cache`, signed with the secret key in `cache-secret-key`; `HASH` stands for the hash in its path."
+                   ("push" :| ["--cache", "file:///srv/cache", "--secret-key-file", "cache-secret-key", "/nix/store/HASH-hello"])
+                   []
+               ]
       }
   StoreDeleteCommand ->
     CommandEntry
@@ -345,6 +349,7 @@ data FlagName
   | CacheFlag
   | AllFlag
   | KeyFileFlag
+  | SecretKeyFileFlag
   | CompressionFlag
   | PrintRootsFlag
   | StoreFlag
@@ -434,11 +439,13 @@ flag name = case name of
   ExecWrapperFlag ->
     long "exec-wrapper" (Just "S=PATH") "Run system `S`'s derivations through `PATH` (repeatable), e.g. `x86_64-windows=/usr/bin/wine`" buildOnly
   CacheFlag ->
-    long "cache" (Just "URL") "The nova-cache server to push to (required)" pushOnly
+    long "cache" (Just "URL") "The cache to push to: a nova-cache server's `http://` or `https://` URL, or a directory's `file://` URL (required)" pushOnly
   AllFlag ->
     long "all" Nothing "Select every valid path except derivations, in place of `PATH...`" pushOnly
   KeyFileFlag ->
-    long "key-file" (Just "PATH") "File holding the cache API key" pushOnly
+    long "key-file" (Just "PATH") "File holding a nova-cache server's API key" pushOnly
+  SecretKeyFileFlag ->
+    long "secret-key-file" (Just "PATH") "File holding the secret key that signs a `file://` cache's narinfos (required there)" pushOnly
   CompressionFlag ->
     long "compression" (Just "KIND") ("Artifact packaging (" <> pushCompressionValues <> "; default none)") pushOnly
   PrintRootsFlag ->

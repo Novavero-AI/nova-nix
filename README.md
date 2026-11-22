@@ -24,7 +24,8 @@ and `nova-nix build` take the place of `nix-instantiate --eval` and
 - **Closure reports.** `trust` lists the fixed-output derivations a closure
   bottoms out in, and which of them run as builders or hold prebuilt code.
 - **Cache uploads.** `push` uploads store paths and their closures to a
-  [nova-cache] server.
+  [nova-cache] server, or writes them to a directory as a signed binary cache
+  that any web server can serve.
 
 nova-nix is experimental; [Status](#status) says what it does not do.
 
