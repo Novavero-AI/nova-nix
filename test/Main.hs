@@ -8170,6 +8170,27 @@ runRealiseWorld settings world failing nodes root =
     (Realise.realise settings (fakeRealiseEffects failing) (DepGraph.DepGraph (Map.fromList nodes)) (fakePath (root <> ".drv")))
     world
 
+-- | Run 'Realise.realiseRequests' under 'Realise.NoFallback' over a graph,
+-- each request a node's name and the outputs it asks of it, in a world,
+-- returning the result, the events in order, and the world it ends in.
+runRequests ::
+  FakeWorld ->
+  Set.Set Text ->
+  [(StorePath, DepGraph.DepNode)] ->
+  [(Text, [Text])] ->
+  (Either Realise.RequestsFailure (), [RealiseEvent], FakeWorld)
+runRequests world failing nodes requests =
+  let (result, final) =
+        runState
+          ( Realise.realiseRequests
+              (Realise.RealiseSettings Realise.NoFallback Realise.HeedAllowSubstitutes Realise.BuildNormal)
+              (fakeRealiseEffects failing)
+              (DepGraph.DepGraph (Map.fromList nodes))
+              [(fakePath (name <> ".drv"), Set.fromList outputs) | (name, outputs) <- requests]
+          )
+          world
+   in (result, reverse (fwEvents final), final)
+
 -- | Only the fetches, builds and checks of a run, the part that costs
 -- anything.
 realiseWork :: [RealiseEvent] -> [RealiseEvent]
@@ -8252,6 +8273,39 @@ genCheckCase = do
         ccFallback = fallback
       }
 
+-- | What a 'CheckCase' runs in: the world, the names of the outputs whose
+-- derivations fail to build, the graph's nodes, and the root's name.
+data CheckSetup = CheckSetup
+  { csWorld :: !FakeWorld,
+    csFailing :: !(Set.Set Text),
+    csNodes :: ![(StorePath, DepGraph.DepNode)],
+    csRoot :: !Text
+  }
+
+-- | The 'CheckSetup' of a 'CheckCase'.  A failing node is named by its
+-- first output, as 'fakeDrvName' names it.
+checkSetup :: CheckCase -> CheckSetup
+checkSetup checkCase =
+  CheckSetup
+    { csWorld =
+        (fakeWorld [] (ccValid checkCase))
+          { fwCache = Map.fromList [(fakePath output, map fakePath refs) | (output, refs) <- Map.toList (ccCache checkCase)],
+            fwBroken = paths (ccBroken checkCase),
+            fwUnreachable = paths (ccUnreachable checkCase),
+            fwUnstable = paths (ccUnstable checkCase)
+          },
+      csFailing = Set.fromList (concatMap (take 1 . outputsOf) (ccFailing checkCase)),
+      csNodes = [fakeNodeWith (env node) (name node) (outputsOf node) [(name dep, wanted) | (dep, wanted) <- below] | (node, below) <- Map.toList (ccDeps checkCase)],
+      csRoot = name (maximum (0 : Map.keys (ccDeps checkCase)))
+    }
+  where
+    name node = "n" <> T.pack (show node)
+    outputsOf = checkCaseOutputs (ccTwoOutputs checkCase)
+    paths = Set.fromList . map fakePath
+    env node
+      | node `elem` ccForbidding checkCase = Map.singleton "allowSubstitutes" ""
+      | otherwise = Map.empty
+
 -- | Run a 'CheckCase' from its root under a build mode: the result, the
 -- events with the outputs that were valid before each, those valid at the
 -- end, and each build's event name with the outputs its request asked, in
@@ -8262,30 +8316,19 @@ runCheckCase ::
   (Either Realise.RealiseFailure (), [(Set.Set StorePath, RealiseEvent)], Set.Set StorePath, [(Text, Set.Set Text)])
 runCheckCase mode checkCase = (result, steps, fwValid ended, reverse (fwBuiltFor ended))
   where
+    setup = checkSetup checkCase
     events = reverse (fwEvents ended)
-    steps = zip (scanl landed (fwValid world) events) events
-    name node = "n" <> T.pack (show node)
+    steps = zip (scanl landed (fwValid (csWorld setup)) events) events
     nodes = Map.keys (ccDeps checkCase)
-    root = maximum (0 : nodes)
     outputsOf = checkCaseOutputs (ccTwoOutputs checkCase)
     paths = Set.fromList . map fakePath
-    env node
-      | node `elem` ccForbidding checkCase = Map.singleton "allowSubstitutes" ""
-      | otherwise = Map.empty
-    world =
-      (fakeWorld [] (ccValid checkCase))
-        { fwCache = Map.fromList [(fakePath output, map fakePath refs) | (output, refs) <- Map.toList (ccCache checkCase)],
-          fwBroken = paths (ccBroken checkCase),
-          fwUnreachable = paths (ccUnreachable checkCase),
-          fwUnstable = paths (ccUnstable checkCase)
-        }
     (result, ended) =
       runRealiseWorld
         (Realise.RealiseSettings (ccFallback checkCase) Realise.HeedAllowSubstitutes mode)
-        world
-        (Set.fromList (concatMap (take 1 . outputsOf) (ccFailing checkCase)))
-        [fakeNodeWith (env node) (name node) (outputsOf node) [(name dep, wanted) | (dep, wanted) <- below] | (node, below) <- Map.toList (ccDeps checkCase)]
-        (name root)
+        (csWorld setup)
+        (csFailing setup)
+        (csNodes setup)
+        (csRoot setup)
     -- A build makes every output of its derivation valid, and its event
     -- names the first.
     builtOutputs = Map.fromList [(first, paths outputs) | node <- nodes, outputs@(first : _) <- [outputsOf node]]
@@ -8406,6 +8449,29 @@ realiseLaw checkCase =
         | otherwise -> closeUnder (Set.insert output seen) (Map.findWithDefault [] output (ccCache checkCase) ++ rest)
     partlyWanted = or [length wanted < length (outputsOf dep) | (dep, wanted) <- edges]
     askedDifferently = or [Set.size (Set.fromList [Set.fromList wanted | (dep, wanted) <- edges, dep == node]) > 1 | node <- nodes]
+
+-- | The law of a lone request, for one 'CheckCase': a request for every
+-- output of the root realises the graph as 'Realise.realise' does under
+-- 'Realise.BuildNormal', to the same result, through the same events and
+-- builds, and to the same valid paths.  Cases that fail and cases that
+-- succeed are each held to a share well under what 'genCheckCase' gives
+-- them.
+loneRequestLaw :: CheckCase -> QC.Property
+loneRequestLaw checkCase =
+  QC.cover 10 (isLeft requested) "the request failed"
+    . QC.cover 10 (isRight requested) "the request was realised"
+    $ alone QC.=== observed (either (Left . Realise.FailedWith) Right <$> Realise.realise settings effects graph rootDrv)
+  where
+    setup = checkSetup checkCase
+    settings = Realise.RealiseSettings (ccFallback checkCase) Realise.HeedAllowSubstitutes Realise.BuildNormal
+    effects = fakeRealiseEffects (csFailing setup)
+    graph = DepGraph.DepGraph (Map.fromList (csNodes setup))
+    rootDrv = fakePath (csRoot setup <> ".drv")
+    everyOutput = Set.fromList (checkCaseOutputs (ccTwoOutputs checkCase) (maximum (0 : Map.keys (ccDeps checkCase))))
+    alone@(requested, _, _, _) = observed (Realise.realiseRequests settings effects graph [(rootDrv, everyOutput)])
+    observed action =
+      let (result, final) = runState action (csWorld setup)
+       in (result, reverse (fwEvents final), fwValid final, fwBuiltFor final)
 
 -- | A random reference graph: each node references only lower nodes, so the
 -- graph is acyclic, and some nodes are absent from the cache.
@@ -9017,6 +9083,112 @@ testRealise = do
                 Realise.MissingOutputs helloDrv ("dev" :| [])
               ]
           ),
+      -- realiseContext asks for one output of a derivation
+      -- (primops.cc:54-58 at 2.24.9), and the goal it gets substitutes the
+      -- outputs it wants alone (DerivationGoal::haveDerivation).
+      runTest "a request for one output of three substitutes it alone, asks about no other, and builds nothing" $
+        let (result, events, final) =
+              runRequests (fakeWorld [("lib-out", []), ("lib-dev", []), ("lib-doc", [])] []) Set.empty [threeOutputLib] [("lib", ["lib-dev"])]
+         in assertEqual
+              "requests"
+              (Right (), [EvFetched [fakePath "lib-dev"]], [fakePath "lib-dev"], Set.singleton (fakePath "lib-dev"))
+              (result, realiseWork events, [path | EvQueried path <- events], fwValid final),
+      -- One worker keeps one goal for a derivation, whichever request
+      -- reaches it (Worker::makeDerivationGoalCommon, worker.cc:46-61).
+      runTest "an input two requests share is realised once" $
+        let (result, events, _) =
+              runRequests
+                (fakeWorld [] [])
+                Set.empty
+                [ fakeNode "left" ["left-out"] [("base", ["base-out"])],
+                  fakeNode "right" ["right-out"] [("base", ["base-out"])],
+                  fakeNode "base" ["base-out"] []
+                ]
+                [("left", ["left-out"]), ("right", ["right-out"])]
+         in assertEqual
+              "requests"
+              (Right (), [EvReported Realise.Built "base-out", EvReported Realise.Built "left-out", EvReported Realise.Built "right-out"])
+              (result, [event | event@(EvReported _ _) <- events]),
+      runTest "two requests for outputs of one derivation are realised as one request for both" $
+        let (result, events, _) =
+              runRequests
+                (fakeWorld [("pkg-bin", []), ("pkg-lib", [])] [])
+                Set.empty
+                [fakeNode "pkg" ["pkg-bin", "pkg-lib"] []]
+                [("pkg", ["pkg-lib"]), ("pkg", ["pkg-bin"])]
+         in assertEqual
+              "requests"
+              (Right (), [EvFetched [fakePath "pkg-bin", fakePath "pkg-lib"]], [Realise.Substituted])
+              (result, realiseWork events, [status | EvReported status _ <- events]),
+      -- A failed goal ends every other unless keep-going is set
+      -- (Worker::removeGoal, worker.cc:162-168 at 2.24.9), and buildPaths
+      -- then names every request its worker did not finish
+      -- (entry-points.cc:41-47).
+      runTest "a request that fails leaves the ones after it unrealised, and the call names each" $
+        let (result, events, _) =
+              runRequests
+                (fakeWorld [] [])
+                (Set.singleton "a-out")
+                [fakeNode "a" ["a-out"] [], fakeNode "b" ["b-out"] [], fakeNode "c" ["c-out"] []]
+                [("c", ["c-out"]), ("a", ["a-out"]), ("b", ["b-out"])]
+            leaving = Realise.FailedLeaving (Realise.BuildFailed "building a-out failed") (fakePath "a.drv") (fakePath "b.drv" :| [fakePath "c.drv"])
+         in assertEqual "requests" (Left leaving, []) (result, realiseWork events)
+              `andThen` assertEqual
+                "message"
+                ("build of " <> T.intercalate ", " ["'/nix/store/" <> T.replicate 32 name <> "-" <> name <> ".drv'" | name <- ["a", "b", "c"]] <> " failed")
+                (Realise.requestsFailureMessage defaultStoreDir leaving)
+              `andThen` assertEqual "status" 1 (Realise.requestsFailureStatus leaving),
+      runTest "a request that fails once every other is realised is reported as its own failure" $
+        let (result, events, _) =
+              runRequests (fakeWorld [] []) (Set.singleton "b-out") [fakeNode "a" ["a-out"] [], fakeNode "b" ["b-out"] []] [("a", ["a-out"]), ("b", ["b-out"])]
+         in assertEqual "requests" (Left (Realise.FailedWith (Realise.BuildFailed "building b-out failed")), [EvBuilt "a-out"]) (result, realiseWork events),
+      -- The worker's first pass finishes a goal whose outputs are valid
+      -- (worker.cc:319-333), before any build can fail.
+      runTest "a request whose outputs are valid is realised before the others, and a failure does not name it" $
+        let (result, events, _) =
+              runRequests (fakeWorld [] ["z-out"]) (Set.singleton "a-out") [fakeNode "a" ["a-out"] [], fakeNode "z" ["z-out"] []] [("a", ["a-out"]), ("z", ["z-out"])]
+         in assertEqual
+              "requests"
+              (Left (Realise.FailedWith (Realise.BuildFailed "building a-out failed")), [EvReported Realise.AlreadyValid "z-out"])
+              (result, [event | event@(EvReported _ _) <- events]),
+      -- c's goal is b's input goal, so it is done when d's build fails.
+      runTest "a request realised as an input of one that fails is not named among those it leaves" $
+        let (result, events, _) =
+              runRequests
+                (fakeWorld [] [])
+                (Set.singleton "d-out")
+                [fakeNode "b" ["b-out"] [("c", ["c-out"]), ("d", ["d-out"])], fakeNode "c" ["c-out"] [], fakeNode "d" ["d-out"] []]
+                [("b", ["b-out"]), ("c", ["c-out"])]
+         in assertEqual "requests" (Left (Realise.FailedWith (Realise.BuildFailed "building d-out failed")), [EvBuilt "c-out"]) (result, realiseWork events),
+      -- A failed query is rethrown out of the worker
+      -- (substitution-goal.cc:90-94), so buildPaths does not catch it.
+      runTest "a cache that cannot be asked stops the call and is reported as it is, though requests are left" $
+        let (result, events, _) =
+              runRequests
+                (fakeWorld [] []) {fwUnreachable = Set.singleton (fakePath "a-out")}
+                Set.empty
+                [fakeNode "a" ["a-out"] [], fakeNode "b" ["b-out"] []]
+                [("a", ["a-out"]), ("b", ["b-out"])]
+         in assertEqual
+              "requests"
+              (Left (Realise.FailedWith (Realise.CacheQueryFailed (fakeQueryFailure (fakePath "a-out")))), [])
+              (result, realiseWork events),
+      -- checkPathValidity throws in the worker's first pass
+      -- (derivation-goal.cc:1500-1503), before any goal has built.
+      runTest "a request for an output its derivation lacks stops the call before any request is realised" $
+        let (result, events, _) =
+              runRequests (fakeWorld [] []) Set.empty [fakeNode "a" ["a-out"] [], fakeNode "b" ["b-out"] []] [("a", ["a-out"]), ("b", ["b-man"])]
+         in assertEqual "requests" (Left (Realise.FailedWith (Realise.MissingOutputs (fakePath "b.drv") ("b-man" :| []))), []) (result, realiseWork events)
+              `andThen` assertEqual
+                "message"
+                (Left ("derivation '/nix/store/" <> T.replicate 32 "b" <> "-b.drv' does not have wanted outputs 'b-man'"))
+                (either (Left . Realise.requestsFailureMessage defaultStoreDir) Right result),
+      runTest "a call exits with its one failure's status, however it is reported" $
+        let differs = Realise.NotDeterministic helloDrv helloOut
+         in assertEqual
+              "statuses"
+              [104, 104]
+              (map Realise.requestsFailureStatus [Realise.FailedWith differs, Realise.FailedLeaving differs helloDrv (fakePath "other.drv" :| [])]),
       -- 'checkLaw', over random graphs of one- and two-output derivations,
       -- caches, valid sets and faults, with each class of case it speaks
       -- about held to a share of the cases generated.
@@ -9025,7 +9197,10 @@ testRealise = do
       -- 'realiseLaw', over the same graphs, where an input is asked for
       -- some of its outputs.
       runTestM "a build waits for the outputs it wants of its inputs and leaves the root's outputs valid" $
-        property (QC.checkCoverage (QC.forAll genCheckCase realiseLaw))
+        property (QC.checkCoverage (QC.forAll genCheckCase realiseLaw)),
+      -- 'loneRequestLaw', over the same graphs.
+      runTestM "a request for every output of the root realises it as a build of the root does" $
+        property (QC.checkCoverage (QC.forAll genCheckCase loneRequestLaw))
     ]
   where
     forbidding = Map.singleton "allowSubstitutes" ""
