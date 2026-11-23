@@ -61,7 +61,7 @@ import GHC.IO.Exception (IOErrorType (..), IOException (..))
 import HttpFixture (Reply (..), httpResponse, withDirectoryServer, withFetchurlServer, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildLayout (..), BuildPlace (..), BuildResult (..), BuilderInvocation (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, builderInvocation, checkDerivation, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substituteFromCaches, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
+import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildLayout (..), BuildPlace (..), BuildResult (..), BuildStop (..), BuilderInvocation (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, builderInvocation, checkDerivation, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substituteFromCaches, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.BuildDir (buildDirFor, createBuildDir)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
@@ -119,14 +119,16 @@ import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), PushSummary (..), checkRecordedNarHash, computeClosure, defaultPartSize, isDerivationPath, loadKeyFile, mkNarInfo, mkPartSize, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, partSizeBytes, planMissing, preparePath, pushPaths, splitParts, storePathBasename, stripHashPrefix)
 import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), cacheInfoFileName, cacheInfoText, checkCacheInfo, ed25519SeedBytes, loadSecretKeyFile, pushTarget, pushToDirectory, signNarInfo)
 import qualified Nix.Realise as Realise
-import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalizeMetadata, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (MetadataChange (..), NodeKind (..), NodeMetadata (..), Ownership (..), canonicalPermissions, executablePermissions, metadataChanges, readOnlyPermissions, storeModificationTime)
+import Nix.Store.Ops (EvalObjects (..), StoreOps (..), withLocalStore, withOpenedOnFirstUse)
 import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, qualifyPathText, storePathHashLen, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import Nix.Store.Path.Internal (StorePath (..))
+import Nix.Store.Upstream (UpstreamHazard (..), upstreamManagedRefusal)
 import qualified Nix.Substituter as Subst
 import qualified Nix.Trust as Trust
 import Nix.Trust.Scan (scanFetched)
@@ -143,6 +145,7 @@ import qualified System.Directory as Dir
 import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv, setEnv, unsetEnv)
 import qualified System.Environment.Blank as Blank
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
+import qualified System.FileLock as FileLock
 import System.FilePath (dropDrive, joinPath, makeRelative, pathSeparator, searchPathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
 import System.IO (BufferMode (..), IOMode (..), hClose, hPutStrLn, hSetBuffering, stderr, stdout, withBinaryFile)
 import System.IO.Error (ioeGetErrorString, isAlreadyExistsError, mkIOError, resourceVanishedErrorType)
@@ -8133,7 +8136,7 @@ runRealiseIn ::
   [(StorePath, DepGraph.DepNode)] ->
   Text ->
   (Either Realise.RealiseFailure (), [RealiseEvent], Set.Set StorePath)
-runRealiseIn fallback = runRealiseUnder (Realise.RealiseSettings fallback Realise.HeedAllowSubstitutes Realise.BuildNormal)
+runRealiseIn fallback = runRealiseUnder (Realise.RealiseSettings fallback Realise.HeedAllowSubstitutes) Realise.BuildNormal
 
 -- | 'runRealiseIn' checking the root: under 'Realise.BuildCheck'.
 runCheckIn ::
@@ -8143,7 +8146,7 @@ runCheckIn ::
   [(StorePath, DepGraph.DepNode)] ->
   Text ->
   (Either Realise.RealiseFailure (), [RealiseEvent], Set.Set StorePath)
-runCheckIn fallback = runRealiseUnder (Realise.RealiseSettings fallback Realise.HeedAllowSubstitutes Realise.BuildCheck)
+runCheckIn fallback = runRealiseUnder (Realise.RealiseSettings fallback Realise.HeedAllowSubstitutes) Realise.BuildCheck
 
 -- | 'runCheckIn' under 'Realise.NoFallback', in a world without faults.
 runCheck ::
@@ -8155,29 +8158,31 @@ runCheck ::
   (Either Realise.RealiseFailure (), [RealiseEvent], Set.Set StorePath)
 runCheck failing nodes cache valid = runCheckIn Realise.NoFallback (fakeWorld cache valid) failing nodes
 
--- | 'runRealise' in a given world, under given settings.
+-- | 'runRealise' in a given world, under given settings and build mode.
 runRealiseUnder ::
   Realise.RealiseSettings ->
+  Realise.BuildMode ->
   FakeWorld ->
   Set.Set Text ->
   [(StorePath, DepGraph.DepNode)] ->
   Text ->
   (Either Realise.RealiseFailure (), [RealiseEvent], Set.Set StorePath)
-runRealiseUnder settings world failing nodes root =
-  let (result, final) = runRealiseWorld settings world failing nodes root
+runRealiseUnder settings mode world failing nodes root =
+  let (result, final) = runRealiseWorld settings mode world failing nodes root
    in (result, reverse (fwEvents final), fwValid final)
 
 -- | 'runRealiseUnder', answering the world it ends in.
 runRealiseWorld ::
   Realise.RealiseSettings ->
+  Realise.BuildMode ->
   FakeWorld ->
   Set.Set Text ->
   [(StorePath, DepGraph.DepNode)] ->
   Text ->
   (Either Realise.RealiseFailure (), FakeWorld)
-runRealiseWorld settings world failing nodes root =
+runRealiseWorld settings mode world failing nodes root =
   runState
-    (Realise.realise settings (fakeRealiseEffects failing) (DepGraph.DepGraph (Map.fromList nodes)) (fakePath (root <> ".drv")))
+    (Realise.realise settings mode (fakeRealiseEffects failing) (DepGraph.DepGraph (Map.fromList nodes)) (fakePath (root <> ".drv")))
     world
 
 -- | Run 'Realise.realiseRequests' under 'Realise.NoFallback' over a graph,
@@ -8193,7 +8198,7 @@ runRequests world failing nodes requests =
   let (result, final) =
         runState
           ( Realise.realiseRequests
-              (Realise.RealiseSettings Realise.NoFallback Realise.HeedAllowSubstitutes Realise.BuildNormal)
+              (Realise.RealiseSettings Realise.NoFallback Realise.HeedAllowSubstitutes)
               (fakeRealiseEffects failing)
               (DepGraph.DepGraph (Map.fromList nodes))
               [(fakePath (name <> ".drv"), Set.fromList outputs) | (name, outputs) <- requests]
@@ -8334,7 +8339,8 @@ runCheckCase mode checkCase = (result, steps, fwValid ended, reverse (fwBuiltFor
     paths = Set.fromList . map fakePath
     (result, ended) =
       runRealiseWorld
-        (Realise.RealiseSettings (ccFallback checkCase) Realise.HeedAllowSubstitutes mode)
+        (Realise.RealiseSettings (ccFallback checkCase) Realise.HeedAllowSubstitutes)
+        mode
         (csWorld setup)
         (csFailing setup)
         (csNodes setup)
@@ -8470,10 +8476,10 @@ loneRequestLaw :: CheckCase -> QC.Property
 loneRequestLaw checkCase =
   QC.cover 10 (isLeft requested) "the request failed"
     . QC.cover 10 (isRight requested) "the request was realised"
-    $ alone QC.=== observed (either (Left . Realise.FailedWith) Right <$> Realise.realise settings effects graph rootDrv)
+    $ alone QC.=== observed (either (Left . Realise.FailedWith) Right <$> Realise.realise settings Realise.BuildNormal effects graph rootDrv)
   where
     setup = checkSetup checkCase
-    settings = Realise.RealiseSettings (ccFallback checkCase) Realise.HeedAllowSubstitutes Realise.BuildNormal
+    settings = Realise.RealiseSettings (ccFallback checkCase) Realise.HeedAllowSubstitutes
     effects = fakeRealiseEffects (csFailing setup)
     graph = DepGraph.DepGraph (Map.fromList (csNodes setup))
     rootDrv = fakePath (csRoot setup <> ".drv")
@@ -8886,7 +8892,7 @@ testRealise = do
          in assertEqual "realise" (Right (), [EvFetched [fakePath "lib-out"], EvFetched [fakePath "app-out"]]) (result, realiseWork events),
       runTest "under always-allow-substitutes it is substituted" $
         let (result, events, _) =
-              runRealiseUnder alwaysAllowing (fakeWorld [("hello-out", [])] []) Set.empty [fakeNodeWith forbidding "hello" ["hello-out"] []] "hello"
+              runRealiseUnder alwaysAllowing Realise.BuildNormal (fakeWorld [("hello-out", [])] []) Set.empty [fakeNodeWith forbidding "hello" ["hello-out"] []] "hello"
          in assertEqual "realise" (Right (), [EvFetched [fakePath "hello-out"]]) (result, realiseWork events),
       runTest "a structured allowSubstitutes that is no Boolean stops the build, naming the derivation as upstream does" $
         let (result, events, _) =
@@ -8910,7 +8916,7 @@ testRealise = do
       runTest "it is not read for a derivation whose outputs are valid, nor under always-allow-substitutes" $
         let nodes = [fakeNodeWith mistyped "hello" ["hello-out"] []]
             (valid, _, _) = runRealise Set.empty nodes [] ["hello-out"] "hello"
-            (always, _, _) = runRealiseUnder alwaysAllowing (fakeWorld [("hello-out", [])] []) Set.empty nodes "hello"
+            (always, _, _) = runRealiseUnder alwaysAllowing Realise.BuildNormal (fakeWorld [("hello-out", [])] []) Set.empty nodes "hello"
          in assertEqual "valid" (Right ()) valid `andThen` assertEqual "always" (Right ()) always,
       runTest "allowSubstitutes is read as upstream's getBoolAttr reads it" $
         let cases =
@@ -8945,7 +8951,7 @@ testRealise = do
               `andThen` assertEqual
                 "always"
                 refused
-                (stopped (runRealiseUnder alwaysAllowing (fakeWorld [("hello-out", [])] []) Set.empty nodes "hello")),
+                (stopped (runRealiseUnder alwaysAllowing Realise.BuildNormal (fakeWorld [("hello-out", [])] []) Set.empty nodes "hello")),
       runTestM "in the environment only 1 allows substitutes" $
         property $
           QC.forAll (QC.oneof [pure "1", BS.pack <$> QC.listOf QC.arbitrary]) $ \value ->
@@ -9216,7 +9222,7 @@ testRealise = do
     forbidding = Map.singleton "allowSubstitutes" ""
     structured = Map.singleton "__json"
     mistyped = structured "{\"allowSubstitutes\":\"no\"}"
-    alwaysAllowing = Realise.RealiseSettings Realise.NoFallback Realise.AlwaysAllowSubstitutes Realise.BuildNormal
+    alwaysAllowing = Realise.RealiseSettings Realise.NoFallback Realise.AlwaysAllowSubstitutes
     helloDrv = fakePath "hello.drv"
     helloOut = fakePath "hello-out"
     helloAndGcc = [fakeNode "hello" ["hello-out"] [("gcc", ["gcc-out"])], fakeNode "gcc" ["gcc-out"] []]
@@ -9306,8 +9312,22 @@ testDepGraph = do
       readSelf sp
         | sp == spA = Right drvSelf
         | otherwise = Left ("unknown drv: " <> spName sp)
+      -- D and B read from one lookup, as a store holds every .drv.
+      readStored sp
+        | sp == spD = Right drvD
+        | otherwise = readDiamond sp
+      rootsGraph roots = runIdentity (DepGraph.buildDepGraphFrom (Identity . readStored) roots)
   sequence
-    [ -- Single node
+    [ runTest "a graph from several roots reads each root and holds every derivation one of them reaches" $
+        assertEqual
+          "graph"
+          (Right (Map.fromList [(spB, drvB), (spC, drvC), (spD, drvD)]))
+          (Map.map DepGraph.dnDerivation . DepGraph.unDepGraph <$> rootsGraph [spD, spB, spD]),
+      runTest "a graph from several roots fails on a root that cannot be read" $
+        assertEqual "graph" (Left "unknown drv: a.drv") (DepGraph.unDepGraph <$> rootsGraph [spB, spA]),
+      runTest "a graph from one root is the graph from that root read" $
+        assertEqual "graph" (pureDepGraph readStored drvD spD) (rootsGraph [spD]),
+      -- Single node
       runTest "single node graph" $ case pureDepGraph readSingle drvA spA of
         Right (DepGraph.DepGraph g) -> assertEqual "single-size" 1 (Map.size g)
         Left err -> Fail ("unexpected error: " <> err),
@@ -14018,6 +14038,165 @@ testDependentBuildIO = do
           [ runTest "dependent build succeeds with root output" $
               Fail ("dependency-aware build failed (exit " <> T.pack (show code) <> "): " <> msg)
           ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: store operations
+-- ---------------------------------------------------------------------------
+
+-- | Evaluate an expression against a store directory, its relative paths
+-- under a base directory, and answer what the session recorded for a
+-- store to add, as the build command reads it from the session.
+evalObjectsOf :: StoreDir -> FilePath -> Text -> IO (Either Text EvalObjects)
+evalObjectsOf storeDir baseDir source = do
+  st <- testEvalState storeDir baseDir
+  evaluatedTo <- evalNixIOIn st baseDir source
+  recorded <- EvalObjects <$> readIORef (esSourcePathCache st) <*> readIORef (esStoreWriteCache st) <*> readIORef (esDrvClosure st)
+  pure (recorded <$ evaluatedTo)
+
+-- | The store paths a database registered, in the order their rows
+-- landed.
+registrationOrder :: StoreDir -> IO [Text]
+registrationOrder dir =
+  bracket (SQL.open (unStoreDir dir </> metaDirName </> dbFileName)) SQL.close $ \conn ->
+    map SQL.fromOnly <$> SQL.query_ conn "SELECT path FROM ValidPaths ORDER BY id"
+
+testStoreOpsIO :: IO [Bool]
+testStoreOpsIO = do
+  putStrLn "store/operations-record"
+  shell <- findTestShell
+  tmpBase <- getTemporaryDirectory
+  let root = tmpBase </> "nova-nix-test-store-ops"
+      fresh = forceRemoveIfExists root >> createDirectoryIfMissing True root
+      metaDir dir = unStoreDir dir </> metaDirName
+      noObjects = EvalObjects Map.empty Map.empty Map.empty
+      -- Whether a handle holds the store's collector lock: an exclusive
+      -- hold of it is refused while one does, the handle's own included.
+      leaseHeld dir = do
+        probe <- FileLock.tryLockFile (gcLockFilePath dir) FileLock.Exclusive
+        maybe (pure True) (\lock -> False <$ FileLock.unlockFile lock) probe
+  storeDir <- canonicalStoreDir (StoreDir (root </> "store"))
+  let config = defaultBuildConfig storeDir
+      inStore = T.pack . storePathToFilePath storeDir
+  results <-
+    sequence
+      [ runTestM "a resource opened on first use is opened once, answered the same after, and closed once when the action ends" $ do
+          counts <- newIORef (0 :: Int, 0 :: Int)
+          let open = atomicModifyIORef' counts (\(opened, closed) -> ((opened + 1, closed), opened + 1))
+              close _ = modifyIORef' counts (\(opened, closed) -> (opened, closed + 1))
+          unused <- withOpenedOnFirstUse open close (const (readIORef counts))
+          afterUnused <- readIORef counts
+          used <- withOpenedOnFirstUse open close (\use -> (,,) <$> use <*> use <*> readIORef counts)
+          afterUsed <- readIORef counts
+          pure $
+            assertEqual "unused" ((0, 0), (0, 0)) (unused, afterUnused)
+              `andThen` assertEqual "used" ((1, 1, (1, 0)), (1, 1)) (used, afterUsed),
+        runTestM "a resource opened on first use is closed once when the action fails, and a use after that is refused" $ do
+          closes <- newIORef (0 :: Int)
+          escaped <- newIORef Nothing
+          failed <-
+            try
+              ( withOpenedOnFirstUse (pure ()) (\() -> modifyIORef' closes (+ 1)) $ \use -> do
+                  use
+                  writeIORef escaped (Just use)
+                  throwIO (userError "the action failed") :: IO ()
+              )
+          closed <- readIORef closes
+          later <- readIORef escaped >>= traverse try
+          pure $ case (failed, closed, later) of
+            (Left (thrown :: IOException), 1, Just (Left refused))
+              | ioeGetErrorString thrown == "the action failed", ioe_type refused == IllegalOperation -> Pass
+            (thrown, count, refusal) -> Fail ("expected the failure, one close and a refusal, got: " <> T.pack (show (thrown, count, refusal))),
+        runTestM "the local store opens at its first operation, holds its lease while open, and closes when the action ends" $ do
+          fresh
+          untouched <- withLocalStore config (const (Dir.doesDirectoryExist (metaDir storeDir)))
+          during <- withLocalStore config $ \ops -> do
+            added <- soAddEvalObjects ops noObjects
+            (,) added <$> leaseHeld storeDir
+          after <- leaseHeld storeDir
+          pure $
+            assertEqual "unopened" False untouched
+              `andThen` assertEqual "open" (Right (), True) during
+              `andThen` assertEqual "closed" False after,
+        -- A tree evaluation wrote references the source it names, and the
+        -- derivation both: each is registered after what it references.
+        runTestM "an add registers an evaluation's sources, then its trees, then its derivations, each with its references" $ do
+          fresh
+          createDirectoryIfMissing True (root </> "src")
+          TIO.writeFile (root </> "src" </> "hello.txt") "hello"
+          recorded <-
+            evalObjectsOf
+              storeDir
+              root
+              "(let src = ./src; note = builtins.toFile \"note\" \"see ${src}\"; in derivation { name = \"ops\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; inherit src note; }).drvPath"
+          let named = mapMaybe (parseStorePath defaultStoreDir)
+          case (named . Map.elems . eoSources <$> recorded, named . Map.keys . eoStoreWrites <$> recorded, named . Map.keys . eoDerivations <$> recorded, recorded) of
+            (Right [src], Right [note], Right [drv], Right objects) -> do
+              added <- withLocalStore config (`soAddEvalObjects` objects)
+              (valid, references) <-
+                bracket (openStore storeDir) closeStore $ \store ->
+                  (,) <$> filterM (isValid store) [src, note, drv] <*> traverse (fmap Set.fromList . queryReferences (stDB store)) [src, note, drv]
+              landed <- registrationOrder storeDir
+              pure $
+                assertEqual "added" (Right ()) added
+                  `andThen` assertEqual "valid" [src, note, drv] valid
+                  `andThen` assertEqual "references" [Set.empty, Set.singleton (inStore src), Set.fromList [inStore src, inStore note]] references
+                  `andThen` assertEqual "order" (map inStore [src, note, drv]) landed
+            (sources, trees, derivations, _) -> pure (Fail ("expected one source, one tree and one derivation, got: " <> T.pack (show (sources, trees, derivations)))),
+        runTestM "an add, a build or a check in a store upstream's database manages is refused before the store is opened" $ do
+          fresh
+          let planted = StoreDir (root </> "nix" </> "store")
+              upstreamDb = root </> "nix" </> "var" </> "nix" </> "db" </> "db.sqlite"
+          createDirectoryIfMissing True (takeDirectory upstreamDb)
+          BS.writeFile upstreamDb ""
+          createDirectoryIfMissing True (unStoreDir planted)
+          plantedDir <- canonicalStoreDir planted
+          refusal <- upstreamManagedRefusal ReplacesUpstreamPaths plantedDir
+          (added, built, checked) <-
+            withLocalStore (defaultBuildConfig plantedDir) $ \ops ->
+              (,,)
+                <$> soAddEvalObjects ops noObjects
+                <*> soBuild ops []
+                <*> soCheck ops (StorePath (T.replicate 32 "c") "checked.drv")
+          opened <- Dir.doesDirectoryExist (metaDir plantedDir)
+          pure $ case refusal of
+            Just reason ->
+              assertEqual "add" (Left reason) added
+                `andThen` assertEqual "build" (Left (BuildStop reason 1)) built
+                `andThen` assertEqual "check" (Left (BuildStop reason 1)) checked
+                `andThen` assertEqual "opened" False opened
+            Nothing -> Fail "the planted store was not refused",
+        runTestM "a build or a check through the store's operations stops as buildWithDeps stops, and builds and checks what it does" $ do
+          fresh
+          let failingOut = StorePath (T.replicate 32 "f") "ops-failing"
+              failingDrv = StorePath (T.replicate 32 "g") "ops-failing.drv"
+              buildingOut = StorePath (T.replicate 32 "h") "ops-building"
+              buildingDrv = StorePath (T.replicate 32 "i") "ops-building.drv"
+              failing = mkTestBuildDrv shell failingOut "exit 3"
+              building = mkTestBuildDrv shell buildingOut "mkdir -p $out && echo built > $out/value"
+              recipes = noObjects {eoDerivations = Map.fromList [(storePathToText defaultStoreDir sp, toATerm drv) | (sp, drv) <- [(failingDrv, failing), (buildingDrv, building)]]}
+          (directBuild, directCheck) <-
+            bracket (openStore storeDir) closeStore $ \store ->
+              (,) <$> buildWithDeps config store failing failingDrv <*> buildWithDeps config {bcMode = Realise.BuildCheck} store failing failingDrv
+          (added, stopped, unchecked, built, checked) <- withLocalStore config $ \ops ->
+            (,,,,)
+              <$> soAddEvalObjects ops recipes
+              <*> soBuild ops [(failingDrv, Set.singleton "out")]
+              <*> soCheck ops failingDrv
+              <*> soBuild ops [(buildingDrv, Set.singleton "out")]
+              <*> soCheck ops buildingDrv
+          value <- try (T.strip <$> TIO.readFile (storePathToFilePath storeDir buildingOut </> "value"))
+          pure $ case (directBuild, directCheck) of
+            (BuildFailure buildMsg buildCode, BuildFailure checkMsg checkCode) ->
+              assertEqual "added" (Right ()) added
+                `andThen` assertEqual "stopped" (Left (BuildStop buildMsg buildCode)) stopped
+                `andThen` assertEqual "unchecked" (Left (BuildStop checkMsg checkCode)) unchecked
+                `andThen` assertEqual "built" (Right ()) built
+                `andThen` assertEqual "checked" (Right ()) checked
+                `andThen` assertEqual "value" (Right "built" :: Either IOException Text) value
+            other -> Fail ("expected buildWithDeps to fail to build and to check, got: " <> T.pack (show other))
+      ]
+  forceRemoveIfExists root
+  pure results
 
 -- | 'buildWithDeps' under 'Realise.BuildCheck', and 'checkDerivation',
 -- against a real store: the builder runs again beside the valid outputs,
@@ -30803,6 +30982,7 @@ runSuite = do
           testUnpackBuildIO,
           testDependentBuildIO,
           testBuildCheckIO,
+          testStoreOpsIO,
           testReferenceClosureIO,
           testOutputOrderIO,
           testOutputCycleBuildIO,
