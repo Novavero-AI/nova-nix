@@ -473,6 +473,31 @@ jobs:
         if: runner.os == 'Linux'
         uses: ./.github/actions/sandbox-helper
 
+      # Upstream's worker-protocol fixtures are the bytes its own
+      # serialiser tests read and write.  They are LGPL-2.1, so they are
+      # fetched rather than kept here, at the release whose protocol
+      # nova-nix follows, and the tag is held to the commit it named when
+      # it was pinned.  The suite's daemon/fixtures group reads the
+      # directory this names and skips where it is not named; the codec is
+      # pure Haskell, so one OS reads them.
+      - name: Fetch upstream's worker-protocol fixtures (Linux)
+        if: runner.os == 'Linux'
+        env:
+          NIX_TAG: "2.35.4"
+          NIX_COMMIT: 21286d605815196c3fff1960550ab08700fc4e6f
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/nix-$NIX_TAG"
+          git -c advice.detachedHead=false clone -q --depth 1 --branch "$NIX_TAG" \
+            --filter=blob:none --sparse https://github.com/NixOS/nix "$dir"
+          git -C "$dir" sparse-checkout set src/libstore-tests/data/worker-protocol
+          actual=$(git -C "$dir" rev-parse HEAD)
+          if [ "$actual" != "$NIX_COMMIT" ]; then
+            echo "::error::tag $NIX_TAG names $actual, not the pinned $NIX_COMMIT"
+            exit 1
+          fi
+          echo "NOVA_NIX_TEST_WORKER_PROTOCOL_DIR=$dir/src/libstore-tests/data/worker-protocol" >> "$GITHUB_ENV"
+
       # The suite runs directly rather than through cabal test, which
       # reports a suite killed by a signal as a bare FAIL: its exit status
       # survives, so a crash names its signal (128 + the number on POSIX).
