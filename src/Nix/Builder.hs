@@ -985,16 +985,18 @@ data BuilderInvocation = BuilderInvocation
 --
 -- Derivation strings are bytes, and spawning a process needs text, so
 -- invalid UTF-8 in the builder, an argument or a variable refuses the
--- build rather than spawning a mangled one.  An attribute that reaches
--- the builder as a file stays bytes ('attrsDelivery').
+-- build rather than spawning a mangled one.  The builder and each
+-- argument end at their first NUL, as exec takes them ('asExecString').
+-- An attribute that reaches the builder as a file stays bytes
+-- ('attrsDelivery').
 builderInvocation :: BuildConfig -> Derivation -> BuildLayout -> Either Text BuilderInvocation
 builderInvocation config drv layout = case (execWrapperFor config drv, decodeBuilderStrings drv) of
   (SpawnUnsupported system, _) ->
     Left ("no way to run a " <> system <> " builder on this machine; pass --exec-wrapper " <> system <> "=PATH to name a launcher for it")
   (_, Left errMsg) -> Left errMsg
   (spawn, Right (builderText, argTexts)) -> do
-    let builderPath = T.unpack (onStore config builderText)
-        builderArgs = map (T.unpack . buildRewrite config seenOutputs) argTexts
+    let builderPath = T.unpack (asExecString (onStore config builderText))
+        builderArgs = map (T.unpack . asExecString . buildRewrite config seenOutputs) argTexts
         -- Env still names the real builder - a launcher only
         -- changes what's spawned, not what the derivation says.
         (spawnPath, spawnArgs) = case spawn of
@@ -1294,7 +1296,8 @@ homeEnvVar =
 --
 -- The child's environment is exactly the build environment plus
 -- 'scrubAmbient'\'s allowance - the ambient environment does not flow
--- through.  Filesystem and process isolation remain future work.
+-- through ('builderProcessEnv').  Filesystem and process isolation remain
+-- future work.
 --
 -- 'invImpureVars' is the impureEnvVars carve-out: the names a
 -- fixed-output derivation listed (empty otherwise), each copied from
@@ -1304,15 +1307,8 @@ homeEnvVar =
 -- derivation's own values.  Names match exactly, as upstream's do.
 runBuilder :: System.IO.Handle -> BuilderInvocation -> IO (Either BuilderFailure ())
 runBuilder buildLog invocation = do
-  systemEnv <- System.Environment.getEnvironment
-  let systemMap = Map.fromList [(T.pack k, T.pack v) | (k, v) <- systemEnv]
-      impureAllowance =
-        Map.fromList [(var, Map.findWithDefault "" var systemMap) | var <- invImpureVars invocation]
-      -- Impure carve-out wins, then build env, displacing case variants
-      -- on Windows; the scrubbed ambient allowance fills underneath.
-      mergedEnv = unionEnvs [impureAllowance, invEnv invocation, scrubAmbient systemMap]
-      envList = [(T.unpack k, T.unpack v) | (k, v) <- Map.toList mergedEnv]
-      spawnWith toLog =
+  envList <- builderProcessEnv invocation
+  let spawnWith toLog =
         (mkBuilderProcess (invProgram invocation) (invArgs invocation))
           { Proc.cwd = Just (invWorkDir invocation),
             Proc.env = Just envList,
@@ -1346,6 +1342,41 @@ runBuilder buildLog invocation = do
   pure $ case exitCode of
     ExitSuccess -> Right ()
     ExitFailure code -> Left (BuilderExited code)
+
+-- | A builder's string as exec takes it, a C string: its text up to the
+-- first NUL, as upstream's execve takes each argument and each
+-- @NAME=VALUE@ entry it builds (stringsToCharPtrs, util.cc:44-50 at
+-- 2.24.9, and local-derivation-goal.cc:2000-2004 and 2231).  Cut here, a
+-- NUL never reaches the process library, which refuses one in an
+-- environment entry and on Windows would end an entry or the command line
+-- at it.
+asExecString :: Text -> Text
+asExecString = T.takeWhile (/= '\0')
+
+-- | The environment a builder process gets, as the entries of its exec:
+-- the invocation's, the @impureEnvVars@ carve-out over it, and
+-- 'scrubAmbient'\'s allowance under it ('runBuilder'), each @NAME=VALUE@
+-- ending at its first NUL ('asExecString').
+builderEnvironment :: BuilderInvocation -> IO [Text]
+builderEnvironment invocation = do
+  systemEnv <- System.Environment.getEnvironment
+  let systemMap = Map.fromList [(T.pack k, T.pack v) | (k, v) <- systemEnv]
+      impureAllowance =
+        Map.fromList [(var, Map.findWithDefault "" var systemMap) | var <- invImpureVars invocation]
+  -- Impure carve-out wins, then build env, displacing case variants on
+  -- Windows; the scrubbed ambient allowance fills underneath.
+  pure [asExecString (name <> "=" <> value) | (name, value) <- Map.toList (unionEnvs [impureAllowance, invEnv invocation, scrubAmbient systemMap])]
+
+-- | 'builderEnvironment' as the process library takes one: a name and a
+-- value, which it joins with @=@.  An entry with no @=@, which a name
+-- holding a NUL leaves, is one it cannot pass, and is left out; upstream
+-- passes it, and no getenv finds a variable in it.
+builderProcessEnv :: BuilderInvocation -> IO [(String, String)]
+builderProcessEnv invocation = mapMaybe asPair <$> builderEnvironment invocation
+  where
+    asPair entry = case T.breakOn "=" entry of
+      (name, rest) | Just (_, value) <- T.uncons rest -> Just (T.unpack name, T.unpack value)
+      _ -> Nothing
 
 -- | Create the appropriate process spec for the builder.
 --

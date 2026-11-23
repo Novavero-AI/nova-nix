@@ -24524,6 +24524,30 @@ testBuilder = do
         pure $ case result of
           BuildSuccess _ -> Pass
           BuildFailure msg code -> Fail ("ambient leaked into a non-fixed-output build (" <> T.pack (show code) <> "): " <> msg),
+      -- Exec takes each argument and NAME=VALUE entry as a C string, so
+      -- upstream's builder gets each up to its first NUL.  Uncut, a NUL in
+      -- an entry is one the process library refuses to spawn with, and on
+      -- Windows one that starts another variable or ends the command line.
+      runTestM "a NUL ends each argument and environment entry a builder gets, as exec ends them" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-nul"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz" "nul-ends"
+            script = "printf '%s|%s|%s|%s\\n' \"$0\" \"$1\" \"$smuggled\" \"${INJECTED-unset}\" > $out"
+            base = mkTestBuildDrv shell outSP script
+            drv =
+              base
+                { drvArgs = drvArgs base ++ ["zero\0dropped", "one\0dropped"],
+                  drvEnv = Map.insert "smuggled" "kept\0INJECTED=1" (drvEnv base)
+                }
+        result <- buildDerivation (defaultBuildConfig (stDir store)) store drv testDrvPath
+        seen <- case result of
+          BuildSuccess _ -> BS.readFile (storePathToFilePath (stDir store) outSP)
+          BuildFailure _ _ -> pure ""
+        closeStore store
+        forceRemoveIfExists tmpStore
+        pure (assertEqual "build" (BuildSuccess outSP) result `andThen` assertEqual "what the builder was given" "zero|one|kept|unset\n" seen),
       -- The carve-out is for upstream's fixed-output type alone: one
       -- output, out, with a hash that fixes it.  Each builder only logs
       -- what it saw, so every build fails for want of its outputs, which
