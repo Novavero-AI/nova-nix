@@ -224,6 +224,7 @@ import Nix.Eval.Types
     typeName,
     typeOfValue,
     unrestrictedPolicy,
+    warnMessage,
     withScopeAt,
   )
 import Nix.Expr.Resolve (undefinedVariableMessage)
@@ -3283,11 +3284,6 @@ emitWarning msgVal = case msgVal of
   other ->
     expectedFailure "a string" other
 
--- | Upstream's @warn@ from its own code rather than an expression, which
--- its logger prefixes @warning:@ (logging.cc:34-37 at 2.24.9).
-warn :: (MonadEval m) => Text -> m ()
-warn = traceMessage . ("warning: " <>)
-
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - graph traversal
 -- ---------------------------------------------------------------------------
@@ -4981,7 +4977,7 @@ readStructuredEntry drvName fieldContext role key val fields
         FixedOutputEntry field -> structuredStringValue RefuseContext val >>= \bytes -> withFixedOutputField field bytes entered
         PlainEntry -> pure entered
       when (Set.member key structuredDisabledChecks) $
-        warn (disabledByStructuredAttrs drvName key)
+        warnMessage (disabledByStructuredAttrs drvName key)
       pure (Just json, updated)
 
 -- | A fixed-output field read from its attribute's string.  The algorithm
@@ -5243,7 +5239,7 @@ newHashAllowEmpty expected original
       Nothing -> throwEvalError "empty hash requires explicit hash algorithm"
       Just algo -> do
         zero <- either throwEvalError (\size -> pure (BS.replicate size 0)) (parseHashAlgo algo)
-        warn ("found empty hash, assuming '" <> algo <> "-" <> bytesToBase64 zero <> "'")
+        warnMessage ("found empty hash, assuming '" <> algo <> "-" <> bytesToBase64 zero <> "'")
         pure (algo, zero)
   | otherwise = either throwEvalError pure (parseAnyHash expected original)
 

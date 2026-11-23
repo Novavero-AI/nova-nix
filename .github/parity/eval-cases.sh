@@ -465,6 +465,41 @@ if ! upstreamAtLeast 2.34.0 || upstreamAtLeast 2.35.0; then
 fi
 echo
 
+echo "== what allow-import-from-derivation and trace-import-from-derivation say =="
+# The settings act once the derivation is valid, so it has to be in the
+# store already: a fixed-output one, whose .drv nix-instantiate writes
+# (it runs read-write without --eval, nix-instantiate.cc:154-155) and
+# whose output nix-store --add-fixed adds where outputHash says it goes,
+# with nothing built.  nova-nix's store here is upstream's, where a tree
+# that exists counts as valid.  Each row passes its setting through
+# NIX_CONFIG, which both evaluators read.
+ifdOutput="$fixture/parity-ifd-settings"
+printf '"read from a derivation"' >"$ifdOutput"
+ifdHash=$(nix-hash --type sha256 --flat "$ifdOutput")
+ifdDrv="derivation { name = \"parity-ifd-settings\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHashMode = \"flat\"; outputHashAlgo = \"sha256\"; outputHash = \"$ifdHash\"; }"
+(cd "$fixture" && nix-instantiate -E "$ifdDrv" >/dev/null)
+nix-store --add-fixed sha256 "$ifdOutput" >/dev/null
+# A setting added to whatever NIX_CONFIG already holds, for one call.
+newline=$'\n'
+withConfig() {
+  local NIX_CONFIG="${NIX_CONFIG:+$NIX_CONFIG$newline}$1"
+  export NIX_CONFIG
+  shift
+  "$@"
+}
+# With the derivation and its output valid, both evaluators import from it
+# and build nothing.
+check "an import from a derivation whose output is valid" "import ($ifdDrv)"
+# The refusal comes after the validity checks and before any build, so an
+# output already valid is refused too (primops.cc:79-83 at 2.24.9).
+withConfig "allow-import-from-derivation = false" refused "an import from a derivation whose output is valid, with allow-import-from-derivation off" "import ($ifdDrv)"
+# trace-import-from-derivation arrives after 2.24.9 (primops.cc:115-116 at
+# 2.34.9), which names it an unknown setting.
+if upstreamAtLeast 2.34.0; then
+  withConfig "trace-import-from-derivation = true" check "an import from a derivation, warned of under trace-import-from-derivation" "import ($ifdDrv)"
+fi
+echo
+
 echo "== Nova's mirror interface preserves fixed-output identity =="
 for caseName in legacy sha256 sri order invalidUrls invalidHashes escapedUrl unicodeUrl; do
   check "fetchurl $caseName" "(import ./fetchurl-cases.nix).$caseName"

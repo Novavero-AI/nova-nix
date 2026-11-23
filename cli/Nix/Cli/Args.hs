@@ -50,6 +50,9 @@ data CliOpts = CliOpts
     optPureEval :: !Bool,
     -- | @--trace-verbose@: upstream's trace-verbose, turned on for this run.
     optTraceVerbose :: !Bool,
+    -- | @--no-allow-import-from-derivation@: upstream's
+    -- allow-import-from-derivation, turned off for this run.
+    optNoAllowImportFromDerivation :: !Bool,
     -- | @--fallback@: upstream's fallback, turned on for this run.
     optFallback :: !Bool,
     -- | @--check@: the build checks its derivation, as @nix-build --check@
@@ -201,7 +204,7 @@ emptyPushArgs = PushArgs Nothing Nothing Nothing Nothing False []
 -- silent drop: an unknown or misspelled flag fails the parse, so nothing
 -- after it (a requested @--substituter@, say) is quietly discarded.
 parseArgs :: [String] -> Either String CliOpts
-parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] False False False False False CmdUsage)
+parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] False False False False False False CmdUsage)
   where
     go opts [] = Right opts
     go opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
@@ -227,6 +230,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       go (opts {optPureEval = True}) rest
     go opts ("--trace-verbose" : rest) =
       go (opts {optTraceVerbose = True}) rest
+    go opts ("--no-allow-import-from-derivation" : rest) =
+      go (opts {optNoAllowImportFromDerivation = True}) rest
     go opts ("--fallback" : rest) =
       go (opts {optFallback = True}) rest
     go opts ("eval" : rest) = goEval opts rest
@@ -259,6 +264,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       goEval (opts {optPureEval = True}) rest
     goEval opts ("--trace-verbose" : rest) =
       goEval (opts {optTraceVerbose = True}) rest
+    goEval opts ("--no-allow-import-from-derivation" : rest) =
+      goEval (opts {optNoAllowImportFromDerivation = True}) rest
     goEval opts ("--fallback" : rest) =
       goEval (opts {optFallback = True}) rest
     goEval opts ("--expr" : expr : rest) =
@@ -295,6 +302,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       goTarget kind (opts {optPureEval = True}) targetArgs rest
     goTarget kind opts targetArgs ("--trace-verbose" : rest) =
       goTarget kind (opts {optTraceVerbose = True}) targetArgs rest
+    goTarget kind opts targetArgs ("--no-allow-import-from-derivation" : rest) =
+      goTarget kind (opts {optNoAllowImportFromDerivation = True}) targetArgs rest
     goTarget kind opts targetArgs ("--fallback" : rest) =
       goTarget kind (opts {optFallback = True}) targetArgs rest
     goTarget BuildsTarget opts targetArgs ("--check" : rest) =

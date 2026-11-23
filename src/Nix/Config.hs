@@ -4,8 +4,10 @@
 -- whether a derivation may forbid substitutes
 -- (@always-allow-substitutes@), how many cores a builder is told it may
 -- use (@cores@), how deep function calls may nest, how far an evaluation
--- may reach (@restrict-eval@, @pure-eval@, @allowed-uris@), and whether
--- @builtins.traceVerbose@ traces (@trace-verbose@).
+-- may reach (@restrict-eval@, @pure-eval@, @allowed-uris@), whether
+-- @builtins.traceVerbose@ traces (@trace-verbose@), and whether a path
+-- reader may build what its argument's context names
+-- (@allow-import-from-derivation@, @trace-import-from-derivation@).
 --
 -- == The format
 --
@@ -168,14 +170,19 @@ data NixConfig = NixConfig
     -- | Upstream @pure-eval@.
     ncPureEval :: !Bool,
     -- | Upstream @trace-verbose@.
-    ncTraceVerbose :: !Bool
+    ncTraceVerbose :: !Bool,
+    -- | Upstream @allow-import-from-derivation@.
+    ncAllowImportFromDerivation :: !Bool,
+    -- | Upstream @trace-import-from-derivation@.
+    ncTraceImportFromDerivation :: !Bool
   }
   deriving (Eq, Show)
 
 -- | The baseline the fold starts from: no substituters, no trusted keys,
 -- no fallback, @allowSubstitutes@ heeded, @cores@ unset so that the
 -- machine's default applies, upstream's call-depth ceiling, no allowed
--- URIs, both evaluation modes off, and @trace-verbose@ off.  The empty
+-- URIs, both evaluation modes off, @trace-verbose@ off, and an import
+-- from derivation allowed and not traced.  The empty
 -- substituter list is nova-nix's existing default (nothing is substituted
 -- unless configured), a deliberate divergence from upstream's
 -- cache.nixos.org default: turning a cache on for every machine is the
@@ -193,7 +200,9 @@ defaultNixConfig =
       ncAllowedUris = [],
       ncRestrictEval = False,
       ncPureEval = False,
-      ncTraceVerbose = False
+      ncTraceVerbose = False,
+      ncAllowImportFromDerivation = True,
+      ncTraceImportFromDerivation = False
     }
 
 -- ---------------------------------------------------------------------------
@@ -615,6 +624,8 @@ resolveName name =
       | n == restrictEvalKey = Just (BoolSetting RestrictEvalField)
       | n == pureEvalKey = Just (BoolSetting PureEvalField)
       | n == traceVerboseKey = Just (BoolSetting TraceVerboseField)
+      | n == allowImportFromDerivationKey = Just (BoolSetting AllowImportFromDerivationField)
+      | n == traceImportFromDerivationKey = Just (BoolSetting TraceImportFromDerivationField)
       | n == maxCallDepthKey = Just (ScalarSetting MaxCallDepthField)
       | n == coresKey || n == coresAlias = Just (ScalarSetting CoresField)
       | otherwise = Nothing
@@ -634,6 +645,8 @@ data BoolField
   | RestrictEvalField
   | PureEvalField
   | TraceVerboseField
+  | AllowImportFromDerivationField
+  | TraceImportFromDerivationField
   deriving (Eq, Show)
 
 -- | The scalar settings, which only ever replace.
@@ -673,6 +686,8 @@ boolFieldKey AlwaysAllowSubstitutesField = alwaysAllowSubstitutesKey
 boolFieldKey RestrictEvalField = restrictEvalKey
 boolFieldKey PureEvalField = pureEvalKey
 boolFieldKey TraceVerboseField = traceVerboseKey
+boolFieldKey AllowImportFromDerivationField = allowImportFromDerivationKey
+boolFieldKey TraceImportFromDerivationField = traceImportFromDerivationKey
 
 setBool :: BoolField -> Bool -> NixConfig -> NixConfig
 setBool FallbackField v config = config {ncFallback = v}
@@ -680,6 +695,8 @@ setBool AlwaysAllowSubstitutesField v config = config {ncAlwaysAllowSubstitutes 
 setBool RestrictEvalField v config = config {ncRestrictEval = v}
 setBool PureEvalField v config = config {ncPureEval = v}
 setBool TraceVerboseField v config = config {ncTraceVerbose = v}
+setBool AllowImportFromDerivationField v config = config {ncAllowImportFromDerivation = v}
+setBool TraceImportFromDerivationField v config = config {ncTraceImportFromDerivation = v}
 
 -- | Upstream's Boolean spellings (@BaseSetting\<bool\>::parse@): anything
 -- else is an error with upstream's wording, which names the setting alone,
@@ -737,12 +754,14 @@ coresKey, coresAlias :: ByteString
 coresKey = "cores"
 coresAlias = "build-cores"
 
-allowedUrisKey, alwaysAllowSubstitutesKey, maxCallDepthKey, pureEvalKey, restrictEvalKey, traceVerboseKey :: ByteString
+allowImportFromDerivationKey, allowedUrisKey, alwaysAllowSubstitutesKey, maxCallDepthKey, pureEvalKey, restrictEvalKey, traceImportFromDerivationKey, traceVerboseKey :: ByteString
+allowImportFromDerivationKey = "allow-import-from-derivation"
 allowedUrisKey = "allowed-uris"
 alwaysAllowSubstitutesKey = "always-allow-substitutes"
 maxCallDepthKey = "max-call-depth"
 pureEvalKey = "pure-eval"
 restrictEvalKey = "restrict-eval"
+traceImportFromDerivationKey = "trace-import-from-derivation"
 traceVerboseKey = "trace-verbose"
 
 extraPrefix :: ByteString

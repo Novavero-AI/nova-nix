@@ -375,6 +375,7 @@ data FlagName
   | RestrictEvalFlag
   | PureEvalFlag
   | TraceVerboseFlag
+  | NoAllowImportFromDerivationFlag
   | SubstituterFlag
   | TrustedKeyFlag
   | FallbackFlag
@@ -466,6 +467,8 @@ flag name = case name of
     long "pure-eval" Nothing "Confine reads as `--restrict-eval` does, with no search path but the bundled `<nix/*>`, no `currentTime`, `currentSystem` or `storePath`, and pinned fetches only (`allowed-uris` applies only under `--restrict-eval`)" evalBuildAndTrust
   TraceVerboseFlag ->
     long "trace-verbose" Nothing "Make `builtins.traceVerbose` behave as `builtins.trace`; without it, the first argument is never forced" evalBuildAndTrust
+  NoAllowImportFromDerivationFlag ->
+    long "no-allow-import-from-derivation" Nothing "Refuse to build or substitute what a path's context names when `import` or another builtin reads the path, even an output already valid" evalBuildAndTrust
   SubstituterFlag ->
     long "substituter" (Just "URL") "Try this binary cache before building" buildAndTrust
   TrustedKeyFlag ->
@@ -522,7 +525,8 @@ data Setting = Setting
     settingName :: !Text,
     -- | What it does, in a line.
     settingDescription :: !Text,
-    -- | The flag that adds to it on one invocation, where there is one.
+    -- | The flag that adds to it on one invocation, where there is one: an
+    -- entry to a list, or a Boolean moved from its default.
     settingFlag :: !(Maybe FlagName)
   }
   deriving (Eq, Show)
@@ -541,14 +545,16 @@ configuration =
                Setting "restrict-eval" "Turn on restricted evaluation" (Just RestrictEvalFlag),
                Setting "pure-eval" "Turn on pure evaluation" (Just PureEvalFlag),
                Setting "allowed-uris" "URI prefixes a fetch may reach under `restrict-eval`" Nothing,
-               Setting "trace-verbose" "Make `builtins.traceVerbose` trace" (Just TraceVerboseFlag)
+               Setting "trace-verbose" "Make `builtins.traceVerbose` trace" (Just TraceVerboseFlag),
+               Setting "allow-import-from-derivation" "Let a builtin that reads a path build or substitute what the path's context names (default: true)" (Just NoAllowImportFromDerivationFlag),
+               Setting "trace-import-from-derivation" "Warn, naming the first output, when a builtin that reads a path realises what its context names" Nothing
              ],
       configDescription =
         "`nix.conf` is read in upstream's order: `$NIX_CONF_DIR/nix.conf`, where `NIX_CONF_DIR` defaults to "
           <> codeSpan (systemConfDirName PosixHost)
           <> ", or "
           <> codeSpan (systemConfDirName WindowsHost)
-          <> " on Windows; the XDG `nix/nix.conf` files or `$NIX_USER_CONF_FILES`; then `$NIX_CONFIG`. A later source replaces an earlier one's value, an `extra-` prefix on a list setting adds to it instead, and a flag adds to whatever they configure."
+          <> " on Windows; the XDG `nix/nix.conf` files or `$NIX_USER_CONF_FILES`; then `$NIX_CONFIG`. A later source replaces an earlier one's value, an `extra-` prefix on a list setting adds to it instead, and a flag adds to whatever they configure: an entry to a list, or a Boolean moved from its default, which a flag cannot move back."
     }
 
 -- ---------------------------------------------------------------------------

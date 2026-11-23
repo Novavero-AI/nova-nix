@@ -356,7 +356,7 @@
     }
   ],
   "configuration": {
-    "description": "`nix.conf` is read in upstream's order: `$NIX_CONF_DIR/nix.conf`, where `NIX_CONF_DIR` defaults to `/etc/nix`, or `%ProgramData%\\nix` on Windows; the XDG `nix/nix.conf` files or `$NIX_USER_CONF_FILES`; then `$NIX_CONFIG`. A later source replaces an earlier one's value, an `extra-` prefix on a list setting adds to it instead, and a flag adds to whatever they configure.",
+    "description": "`nix.conf` is read in upstream's order: `$NIX_CONF_DIR/nix.conf`, where `NIX_CONF_DIR` defaults to `/etc/nix`, or `%ProgramData%\\nix` on Windows; the XDG `nix/nix.conf` files or `$NIX_USER_CONF_FILES`; then `$NIX_CONFIG`. A later source replaces an earlier one's value, an `extra-` prefix on a list setting adds to it instead, and a flag adds to whatever they configure: an entry to a list, or a Boolean moved from its default, which a flag cannot move back.",
     "settings": [
       {
         "description": "Binary caches a build substitutes from",
@@ -407,6 +407,16 @@
         "description": "Make `builtins.traceVerbose` trace",
         "flag": "--trace-verbose",
         "name": "trace-verbose"
+      },
+      {
+        "description": "Let a builtin that reads a path build or substitute what the path's context names (default: true)",
+        "flag": "--no-allow-import-from-derivation",
+        "name": "allow-import-from-derivation"
+      },
+      {
+        "description": "Warn, naming the first output, when a builtin that reads a path realises what its context names",
+        "flag": null,
+        "name": "trace-import-from-derivation"
       }
     ]
   },
@@ -559,6 +569,19 @@
       "name": "--trace-verbose",
       "spellings": [
         "--trace-verbose"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix eval",
+        "nova-nix build",
+        "nova-nix trust"
+      ],
+      "description": "Refuse to build or substitute what a path's context names when `import` or another builtin reads the path, even an output already valid",
+      "name": "--no-allow-import-from-derivation",
+      "spellings": [
+        "--no-allow-import-from-derivation"
       ]
     },
     {

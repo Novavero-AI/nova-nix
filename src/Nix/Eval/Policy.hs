@@ -1,7 +1,9 @@
 -- | The evaluation policy: upstream's @restrict-eval@ and @pure-eval@
 -- settings, the @allowed-uris@ list, and the pure decisions they drive,
 -- plus the @trace-verbose@ setting, which decides what
--- @builtins.traceVerbose@ does.
+-- @builtins.traceVerbose@ does, and @allow-import-from-derivation@ and
+-- @trace-import-from-derivation@, which decide whether a path reader may
+-- build what its argument's context names.
 --
 -- Upstream gates evaluation in two layers (@src/libexpr/eval.cc@ at
 -- 2.24.9).  Under either setting the root filesystem is wrapped in an
@@ -21,6 +23,7 @@
 module Nix.Eval.Policy
   ( -- * Policy
     EvalPolicy (..),
+    ImportFromDerivation (..),
     unrestrictedPolicy,
     pathsRestricted,
 
@@ -75,13 +78,33 @@ data EvalPolicy = EvalPolicy
     -- | Upstream @trace-verbose@: @builtins.traceVerbose@ traces as
     -- @builtins.trace@ does, where otherwise it returns its second
     -- argument without forcing its first.
-    epTraceVerbose :: !Bool
+    epTraceVerbose :: !Bool,
+    -- | Whether a path reader may build or substitute what its argument's
+    -- context names.
+    epImportFromDerivation :: !ImportFromDerivation
   }
   deriving (Eq, Show)
 
--- | Upstream's default: every setting off, nothing listed.
+-- | What upstream's @allow-import-from-derivation@ and
+-- @trace-import-from-derivation@ settings say together
+-- (eval-settings.hh:196-218 at 2.34.9): the second has no effect when the
+-- first is off, so the three cases are all there are.
+data ImportFromDerivation
+  = -- | @allow-import-from-derivation = false@: a context that names an
+    -- output is refused before anything is built, even an output that is
+    -- valid already.
+    RefuseImportFromDerivation
+  | -- | The default: an output a context names is realised.
+    AllowImportFromDerivation
+  | -- | @trace-import-from-derivation = true@ as well: it is realised after
+    -- a warning naming the first output.
+    TraceImportFromDerivation
+  deriving (Eq, Show)
+
+-- | Upstream's default: every confinement off, nothing listed, and an
+-- import from derivation allowed and not traced.
 unrestrictedPolicy :: EvalPolicy
-unrestrictedPolicy = EvalPolicy {epRestrictEval = False, epPureEval = False, epAllowedUris = [], epTraceVerbose = False}
+unrestrictedPolicy = EvalPolicy {epRestrictEval = False, epPureEval = False, epAllowedUris = [], epTraceVerbose = False, epImportFromDerivation = AllowImportFromDerivation}
 
 -- | Whether filesystem access goes through the allow list: upstream wraps
 -- the root filesystem when either setting is on.

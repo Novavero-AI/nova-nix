@@ -101,7 +101,7 @@ import qualified Nix.Eval.Context as Context
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), FormalDefault (..), LambdaName (..))
 import Nix.Eval.IO (EvalFailure (..), EvalState (..), SessionSettings (..), SessionStore (..), allowEvalPath, evalBaseEnv, newEvalStateWith, nixPathSearchPath, renderEvalFailure, runEvalIO, runEvalIOTraced, withEvalSession)
 import Nix.Eval.Operator (evalUpdate)
-import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
+import Nix.Eval.Policy (ImportFromDerivation (..), allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printSymbol, printValue)
 import Nix.Eval.RealiseContext (ContextRefusal (..), ContextRequest (..), PendingOrigin (..), Plan (..), SessionMode (..), contextRefusalMessage, findFileRefusalMessage, planRealisation, referenceClosure)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
@@ -25321,7 +25321,7 @@ testRealiseContext = do
       request = contextRequest (context [SCDrvOutput drv "out", SCDrvOutput drv "dev", SCPlain src])
       outputPaths = Map.fromList [((drv, "out"), out), ((drv, "dev"), dev)]
       computed paths = Map.fromList [(path, Computed) | path <- paths]
-      planned mode pending valid = planRealisation mode (computed pending) (Set.fromList valid) outputPaths request
+      planned mode pending valid = planRealisation AllowImportFromDerivation mode (computed pending) (Set.fromList valid) outputPaths request
       plainRequest path = contextRequest (context [SCPlain path])
       logical = storePathToText defaultStoreDir
       origins = QC.elements [Fetched, Computed]
@@ -25338,22 +25338,22 @@ testRealiseContext = do
       runTest "a read-only session refuses a derivation evaluation computed, as upstream's read-only evaluation never writes one" $
         assertEqual "plan" (Left (PathNotValid drv)) (planned ReadOnly [drv] [src]),
       runTest "a read-only session reads what a fetcher fetched, as upstream's fetchers add it in any mode, and adds nothing" $
-        assertEqual "plan" (Right (Plan False [] [])) (planRealisation ReadOnly (Map.singleton src Fetched) Set.empty Map.empty (plainRequest src)),
+        assertEqual "plan" (Right (Plan False [] [] Nothing)) (planRealisation AllowImportFromDerivation ReadOnly (Map.singleton src Fetched) Set.empty Map.empty (plainRequest src)),
       runTest "a read-only session reads outputs the store holds, and adds and builds nothing" $
-        assertEqual "plan" (Right (Plan False [] [dev, out])) (planned ReadOnly [] [drv, src, out, dev]),
+        assertEqual "plan" (Right (Plan False [] [dev, out] Nothing)) (planned ReadOnly [] [drv, src, out, dev]),
       runTest "a read-only session realises a derivation the store holds for its missing outputs, and adds nothing" $
-        assertEqual "plan" (Right (Plan False [(drv, Set.fromList ["dev", "out"])] [dev, out])) (planned ReadOnly [] [drv, src]),
+        assertEqual "plan" (Right (Plan False [(drv, Set.fromList ["dev", "out"])] [dev, out] Nothing)) (planned ReadOnly [] [drv, src]),
       runTest "an output name whose path is not known is left to the realisation, which refuses one a derivation does not have" $
         assertEqual
           "plan"
-          (Right (Plan False [(drv, Set.singleton "dev")] [out]))
-          (planRealisation ReadOnly Map.empty (Set.fromList [drv, src, out]) (Map.delete (drv, "dev") outputPaths) request),
+          (Right (Plan False [(drv, Set.singleton "dev")] [out] Nothing))
+          (planRealisation AllowImportFromDerivation ReadOnly Map.empty (Set.fromList [drv, src, out]) (Map.delete (drv, "dev") outputPaths) request),
       runTest "a read-write session counts what evaluation made as valid, adds it, and builds each derivation once for its missing outputs" $
-        assertEqual "plan" (Right (Plan True [(drv, Set.fromList ["dev", "out"])] [dev, out])) (planned ReadWrite [drv] [src]),
+        assertEqual "plan" (Right (Plan True [(drv, Set.fromList ["dev", "out"])] [dev, out] Nothing)) (planned ReadWrite [drv] [src]),
       runTest "a read-write session with every path valid adds and builds nothing" $
-        assertEqual "plan" (Right (Plan False [] [dev, out])) (planned ReadWrite [] [drv, src, out, dev]),
+        assertEqual "plan" (Right (Plan False [] [dev, out] Nothing)) (planned ReadWrite [] [drv, src, out, dev]),
       runTest "a read-write session adds what evaluation made before a read of it, and builds nothing" $
-        assertEqual "plan" (Right (Plan True [] [])) (planRealisation ReadWrite (computed [src]) Set.empty Map.empty (plainRequest src)),
+        assertEqual "plan" (Right (Plan True [] [] Nothing)) (planRealisation AllowImportFromDerivation ReadWrite (computed [src]) Set.empty Map.empty (plainRequest src)),
       -- Carried out, a plan leaves nothing pending: what it adds and builds
       -- the store then holds.
       runTestM "a plan carried out leaves nothing to add or build" $ do
@@ -25363,8 +25363,8 @@ testRealiseContext = do
               case planned ReadWrite pending valid of
                 Left _ -> QC.property True
                 Right plan ->
-                  planRealisation ReadWrite Map.empty (Set.fromList (pending <> valid <> planOutputs plan)) outputPaths request
-                    QC.=== Right (Plan False [] (planOutputs plan))
+                  planRealisation AllowImportFromDerivation ReadWrite Map.empty (Set.fromList (pending <> valid <> planOutputs plan)) outputPaths request
+                    QC.=== Right (Plan False [] (planOutputs plan) Nothing)
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
       -- A read-write session adds whatever a read-only one reads, so it
       -- refuses nothing the read-only one would read.
@@ -25372,20 +25372,48 @@ testRealiseContext = do
         result <-
           QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
             QC.forAll ((,) . Map.fromList <$> QC.listOf ((,) <$> QC.elements [drv, src] <*> origins) <*> QC.sublistOf [drv, src, out, dev]) $ \(pending, valid) ->
-              case planRealisation ReadOnly pending (Set.fromList valid) outputPaths request of
+              case planRealisation AllowImportFromDerivation ReadOnly pending (Set.fromList valid) outputPaths request of
                 Left _ -> QC.property True
-                Right _ -> QC.property (either (const False) (const True) (planRealisation ReadWrite pending (Set.fromList valid) outputPaths request))
+                Right _ -> QC.property (either (const False) (const True) (planRealisation AllowImportFromDerivation ReadWrite pending (Set.fromList valid) outputPaths request))
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      -- realiseContext refuses once every path is valid and before it
+      -- builds (primops.cc:79-83 at 2.24.9, :108-118 at 2.34.9), naming the
+      -- first Built element of its set, so a valid output is refused too.
+      runTest "with import from derivation off, a context naming an output is refused, though the output is valid" $
+        assertEqual "plan" (Left (ImportFromDerivationOff drv "dev")) (planRealisation RefuseImportFromDerivation ReadWrite Map.empty (Set.fromList [drv, src, out, dev]) outputPaths request),
+      runTest "with import from derivation off, a path that is not valid is refused first" $
+        assertEqual "plan" (Left (PathNotValid src)) (planRealisation RefuseImportFromDerivation ReadOnly Map.empty Set.empty outputPaths request),
+      runTest "with import from derivation off, a context that names no output is read" $
+        assertEqual "plan" (Right (Plan False [] [] Nothing)) (planRealisation RefuseImportFromDerivation ReadOnly Map.empty (Set.singleton src) Map.empty (plainRequest src)),
+      runTest "a traced import from derivation plans the warning naming its first output" $
+        assertEqual
+          "warning"
+          (Right (Just ("built '" <> logical drv <> "^dev' during evaluation due to an import from derivation")))
+          (planWarning <$> planRealisation TraceImportFromDerivation ReadWrite Map.empty (Set.fromList [drv, src, out, dev]) outputPaths request),
+      runTest "a traced context that names no output plans no warning" $
+        assertEqual "warning" (Right Nothing) (planWarning <$> planRealisation TraceImportFromDerivation ReadOnly Map.empty (Set.singleton src) Map.empty (plainRequest src)),
+      -- The trace setting changes nothing but the warning.
+      runTestM "a traced plan is the allowed one with its warning" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll ((,,) <$> QC.elements [ReadOnly, ReadWrite] <*> QC.sublistOf [drv, src] <*> QC.sublistOf [drv, src, out, dev]) $ \(mode, pending, valid) ->
+              let plan imports = planRealisation imports mode (computed pending) (Set.fromList valid) outputPaths request
+               in fmap (\traced -> traced {planWarning = Nothing}) (plan TraceImportFromDerivation) QC.=== plan AllowImportFromDerivation
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
       runTest "a refusal reads as upstream's" $
         assertEqual
           "messages"
           [ "path '" <> logical drv <> "' is not valid",
             "cannot find '/somewhere', since path '" <> T.replicate 32 "d" <> "-drv.drv' is not valid",
-            "the build's own words"
+            "the build's own words",
+            "cannot build '" <> logical drv <> "^out' during evaluation because the option 'allow-import-from-derivation' is disabled",
+            "cannot build '" <> logical drv <> "^out' during evaluation because the option 'allow-import-from-derivation' is disabled"
           ]
           [ contextRefusalMessage (PathNotValid drv),
             findFileRefusalMessage "/somewhere" (PathNotValid drv),
-            findFileRefusalMessage "/somewhere" (RealisationFailed "the build's own words")
+            findFileRefusalMessage "/somewhere" (RealisationFailed "the build's own words"),
+            contextRefusalMessage (ImportFromDerivationOff drv "out"),
+            findFileRefusalMessage "/somewhere" (ImportFromDerivationOff drv "out")
           ],
       runTest "a read-only substitution is refused in upstream's words" $
         assertEqual "message" ("cannot substitute path '" <> logical dev <> "' - no write access to the Nix store") (Realise.noWriteAccessMessage dev),
@@ -25420,9 +25448,17 @@ testRealiseContextIO = do
       outOfTwo = "\"${" <> twoOutputs <> "}\""
       fileUrl path = "file://" <> canonPathValue (T.pack path)
       nixString text = "\"" <> T.replace "\"" "\\\"" (T.replace "\\" "\\\\" text) <> "\""
-      evalWith store source = do
-        st <- newEvalStateWith unrestrictedPolicy [] store storeDir root
+      evalWith = evalUnder unrestrictedPolicy
+      evalUnder policy store source = do
+        st <- newEvalStateWith policy [] store storeDir root
         evalTracedIn st root source
+      refusingImports = unrestrictedPolicy {epImportFromDerivation = RefuseImportFromDerivation}
+      refusedImport failure =
+        "cannot build '/nix/store/" `T.isPrefixOf` failureMessage failure
+          && "-two.drv^out' during evaluation because the option 'allow-import-from-derivation' is disabled" `T.isSuffixOf` failureMessage failure
+      refusedBeforeRealising answer asked = case answer of
+        Left failure | refusedImport failure, FakeAdded `notElem` asked, null [() | FakeBuilt _ <- asked] -> Pass
+        other -> Fail ("expected the refusal before any add or build, got: " <> T.pack (show (other, asked)))
       notValidDerivation failure =
         T.isPrefixOf "path '/nix/store/" (failureMessage failure) && T.isSuffixOf "-two.drv' is not valid" (failureMessage failure)
       readOnlyAnswer source = do
@@ -25530,6 +25566,31 @@ testRealiseContextIO = do
             pure $ case (answer, asked) of
               (Right (VBool False), [FakeQueried _, FakeQueried _, FakeBuilt [(_, wanted)]]) | wanted == Set.singleton "out" -> Pass
               other -> Fail ("expected the output built and nothing added, got: " <> T.pack (show other)),
+          -- realiseContext refuses once every path is valid and before it
+          -- builds (primops.cc:79-83 at 2.24.9), whatever the session.
+          runTestM "with import from derivation off, a read-write session refuses before it adds or builds, though the outputs are valid" $ do
+            (ops, calls) <- fakeRealiseStore (const True) Nothing
+            answer <- evalUnder refusingImports (ReadWriteSession ops) ("builtins.pathExists " <> outOfTwo)
+            refusedBeforeRealising answer <$> calls,
+          runTestM "with import from derivation off, a read-only session refuses an output of a derivation the store holds before it builds" $ do
+            (ops, calls) <- fakeRealiseStore ((== "two.drv") . spName) Nothing
+            answer <- evalUnder refusingImports (readOnlyOver ops) ("builtins.readFile " <> outOfTwo)
+            refusedBeforeRealising answer <$> calls,
+          -- addPath realises with isIFD at its default, true
+          -- (primops.cc:2443 at 2.24.9).
+          runTestM "with import from derivation off, builtins.path refuses a path whose context names an output" $ do
+            (ops, calls) <- fakeRealiseStore (const True) Nothing
+            answer <- evalUnder refusingImports (ReadWriteSession ops) ("builtins.path { path = " <> outOfTwo <> "; }")
+            refusedBeforeRealising answer <$> calls,
+          -- tryEval catches only an AssertionError (primops.cc:914 at
+          -- 2.24.9), and the refusal is an EvalBaseError, an IFDError at
+          -- 2.34.9 (eval-error.hh:72).
+          runTestM "builtins.tryEval does not catch the refusal of an import from derivation" $ do
+            (ops, _) <- fakeRealiseStore (const True) Nothing
+            answer <- evalUnder refusingImports (ReadWriteSession ops) ("builtins.tryEval (import " <> outOfTwo <> ")")
+            pure $ case answer of
+              Left failure | refusedImport failure -> Pass
+              other -> Fail ("expected the refusal to escape tryEval, got: " <> T.pack (show other)),
           -- tryEval catches only an assertion (primops.cc:914 at 2.24.9).
           runTestM "builtins.tryEval does not catch a refusal" $
             refusedRead ("builtins.tryEval (import " <> twoOutputs <> ")"),
@@ -25691,15 +25752,16 @@ testImportFromDerivationCLI = do
   tmpBase <- getTemporaryDirectory
   ambient <- getEnvironment
   let root = tmpBase </> "nova-nix-test-cli-ifd"
-      isolatedEnv =
-        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
+      isolatedEnvWith extraConfig =
+        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n" <> extraConfig)
           : ("XDG_CONFIG_HOME", root </> "config")
           : ("XDG_CACHE_HOME", root </> "cache")
           : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"]) ambient
-      runCLI args =
+      runCLIWith extraConfig args =
         Proc.readCreateProcessWithExitCode
-          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
+          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just (isolatedEnvWith extraConfig)})
           ""
+      runCLI = runCLIWith ""
       nixString text = "\"" <> T.replace "${" "\\${" (T.replace "\"" "\\\"" (T.replace "\\" "\\\\" text)) <> "\""
       system = nixString (platformToText currentPlatform)
       derivationOf name script extra =
@@ -25738,13 +25800,17 @@ testImportFromDerivationCLI = do
           }
       evalAt store source = runCLI ["eval", "--expr", source, "--store", root </> store]
       lastLineOf err = listToMaybe (reverse (filter (not . T.null) (map T.strip (T.lines (T.pack err)))))
+      refusesImport line =
+        "error: cannot build '/nix/store/" `T.isPrefixOf` line
+          && "-ifd-made.drv^out' during evaluation because the option 'allow-import-from-derivation' is disabled" `T.isSuffixOf` line
       -- A store upstream Nix's database manages, holding the derivation
       -- of substitutable and not its output.
       upstreamRoot = root </> "upstream"
       upstreamStore = upstreamRoot </> "nix" </> "store"
       upstreamDb = upstreamRoot </> "nix" </> "var" </> "nix" </> "db" </> "db.sqlite"
       substitutableDrvPath = T.unpack ("(" <> substitutable <> ").drvPath")
-      build store source flags = runCLI (["build", "--expr", source, "--store", root </> store, "--no-out-link"] ++ flags)
+      buildWith extraConfig store source flags = runCLIWith extraConfig (["build", "--expr", source, "--store", root </> store, "--no-out-link"] ++ flags)
+      build = buildWith ""
       printed out = listToMaybe (reverse (filter (not . null) (lines (filter (/= '\r') out))))
       contentsOf out = maybe (pure Nothing) (fmap Just . BS.readFile) (printed out)
       outcome (code, out, err) = "exit " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err
@@ -25762,6 +25828,11 @@ testImportFromDerivationCLI = do
     ( do
         madeRun@(_, madeOut, _) <- build "built" built []
         made <- contentsOf madeOut
+        -- The same store, where the outputs are valid now.
+        flagOffRun@(flagOffCode, _, flagOffErr) <- build "built" built ["--no-allow-import-from-derivation"]
+        configOffRun@(configOffCode, _, configOffErr) <- buildWith "allow-import-from-derivation = false\n" "import-off" built []
+        tracedRun@(_, tracedOut, tracedErr) <- buildWith "trace-import-from-derivation = true\n" "traced" built []
+        traced <- contentsOf tracedOut
         restrictedRun@(_, restrictedOut, _) <- build "restricted" throughDependency ["--restrict-eval"]
         restricted <- contentsOf restrictedOut
         pureRun@(_, pureOut, _) <- build "pure" throughDependency ["--pure-eval"]
@@ -25800,6 +25871,24 @@ testImportFromDerivationCLI = do
         sequence
           [ runTest "build imports and reads an output it builds, and a value forced before the build reads the same after it" $
               if made == Just "keptbuiltdata" then Pass else Fail (outcome madeRun),
+            -- realiseContext refuses before it builds, once the paths are
+            -- valid (primops.cc:79-83 at 2.24.9), naming the first Built
+            -- element as upstream renders it (derived-path.cc:108-113).
+            runTest "--no-allow-import-from-derivation refuses an import from a derivation whose output is valid, in upstream's words" $
+              if flagOffCode == ExitFailure 1 && maybe False refusesImport (lastLineOf flagOffErr) then Pass else Fail (outcome flagOffRun),
+            runTest "allow-import-from-derivation = false in NIX_CONFIG refuses an import from a derivation before anything is built" $
+              if configOffCode == ExitFailure 1 && maybe False refusesImport (lastLineOf configOffErr) && not ("[build]" `isInfixOf` configOffErr)
+                then Pass
+                else Fail (outcome configOffRun),
+            -- The warning comes before the build (primops.cc:115-116 at
+            -- 2.34.9), so it precedes the build's own lines.
+            runTest "trace-import-from-derivation in NIX_CONFIG warns of the import, naming its output, before the build" $
+              case break ("[build]  ifd-made" `isInfixOf`) (lines tracedErr) of
+                (before, _ : _)
+                  | traced == Just "keptbuiltdata",
+                    any (\line -> "warning: built '/nix/store/" `isPrefixOf` line && "-ifd-made.drv^out' during evaluation due to an import from derivation" `isSuffixOf` line) before ->
+                      Pass
+                _ -> Fail (outcome tracedRun),
             runTest "build imports an output a cache holds, and runs no builder for it" $
               if fetched == Just "substituted" then Pass else Fail (outcome substitutedRun),
             runTest "an output built during evaluation, and a file in what it references, are readable under restrict-eval" $
@@ -27163,13 +27252,16 @@ testCliReference = do
                   && maybe True isAsciiLetter (Ref.flagShort entry)
            in assertEqual "malformed" [] [Ref.flagLong entry | (_, entry) <- referenceFlags, not (wellFormed entry)]
                 `andThen` assertEqual "repeated" [] [spelling | (spelling, count) <- Map.toList (Map.fromListWith (+) [(spelling, 1 :: Int) | spelling <- spellings]), count > 1],
+        -- A value of 1 or 0 moves each from its default, a Boolean that is
+        -- on by default by 0.
         runTest "every setting is one nix.conf resolves" $
-          allPass
-            [ case Config.resolveConfig [Config.ConfigAssignment (TE.encodeUtf8 (Ref.settingName setting)) "1"] of
-                Right config | config /= Config.defaultNixConfig -> Pass
-                other -> Fail (Ref.settingName setting <> ": " <> T.pack (show other))
-            | setting <- toList (Ref.configSettings Ref.configuration)
-            ],
+          let moves setting value = either (const False) (/= Config.defaultNixConfig) (Config.resolveConfig [Config.ConfigAssignment (TE.encodeUtf8 (Ref.settingName setting)) value])
+           in allPass
+                [ if any (moves setting) ["1", "0"] then Pass else Fail (Ref.settingName setting <> ": neither 1 nor 0 moves the configuration")
+                | setting <- toList (Ref.configSettings Ref.configuration)
+                ],
+        runTest "help lists --no-allow-import-from-derivation" $
+          if any ("--no-allow-import-from-derivation" `T.isInfixOf`) Ref.helpLines then Pass else Fail (T.unlines Ref.helpLines),
         runTest "marked text closes every code span, and help prints no marks" $
           let marked =
                 [ text
@@ -32731,6 +32823,12 @@ testEvalPolicyRules = do
         assertEqual "extra-bool" (Right False) (cfgPure ["extra-pure-eval = true"]),
       runTest "the default config has both modes off" $
         assertEqual "defaults" (Right (False, False, [])) ((\c -> (ncRestrictEval c, ncPureEval c, ncAllowedUris c)) <$> config []),
+      -- eval-settings.hh:145-154 at 2.24.9 and :196-218 at 2.34.9.
+      runTest "import from derivation is allowed and not traced by default, and nix.conf sets each" $
+        let imports = fmap (\c -> (ncAllowImportFromDerivation c, ncTraceImportFromDerivation c)) . config
+         in assertEqual "defaults" (Right (True, False)) (imports [])
+              `andThen` assertEqual "set" (Right (False, True)) (imports ["allow-import-from-derivation = false\ntrace-import-from-derivation = true"])
+              `andThen` assertEqual "later wins" (Right (True, False)) (imports ["allow-import-from-derivation = false", "allow-import-from-derivation = true"]),
       -- the builtins table
       runTest "currentTime and currentSystem are absent under pure-eval" $
         assertEqual "time" (Right (VBool False)) (evalNixWith purePolicy "builtins ? currentTime")
@@ -33056,7 +33154,13 @@ testEvalPolicyCLI = do
         -- prim_trace runs only once it has both arguments (callFunction,
         -- eval.cc at 2.24.9), so a partial application forces nothing.
         expectRun "under --trace-verbose a partial traceVerbose leaves its argument unforced" "" ["eval", "--trace-verbose", "--expr", "builtins.seq (builtins.traceVerbose (throw \"a\")) 1"] (ExitSuccess, ["1"], []),
-        expectOut "build accepts --trace-verbose before its target" "" ["build", "--trace-verbose", "--help"] helpFirstLine
+        expectOut "build accepts --trace-verbose before its target" "" ["build", "--trace-verbose", "--help"] helpFirstLine,
+        expectOut "build accepts --no-allow-import-from-derivation before its target" "" ["build", "--no-allow-import-from-derivation", "--help"] helpFirstLine,
+        expectOut "trust accepts --no-allow-import-from-derivation before its target" "" ["trust", "--no-allow-import-from-derivation", "--help"] helpFirstLine,
+        expectOut "eval accepts --no-allow-import-from-derivation" "" ["eval", "--no-allow-import-from-derivation", "--expr", "1"] "1",
+        -- A flag only moves a setting from its default, so none turns an
+        -- import from derivation the configuration refuses back on.
+        expectErr "there is no --allow-import-from-derivation to undo the configuration's refusal" "" ["eval", "--allow-import-from-derivation", "--expr", "1"] "unknown eval flag"
       ]
 
 -- | The eval result through the binary: stdout carries the printer's bytes
