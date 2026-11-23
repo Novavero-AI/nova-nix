@@ -114,6 +114,7 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder.BuildDir (createBuildDir, sandboxedBuildDir, withBuildDir)
+import Nix.Builder.Buildenv (builtinBuildenvBuilder, runBuiltinBuildenv)
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
 import Nix.Builder.Sandbox (HelperOutcome (..), Network, PathPresence (..), PlanInputs (..), SandboxConfig (..), SandboxFallback (..), SandboxPath (..), SandboxPlan, SandboxUse (..), chrootSkeleton, defaultSandboxConfig, helperOutcome, renderPlan, rootRefusal, sandboxHome, sandboxPlan, sandboxUse, unavailableMessage)
 import Nix.Builder.Sandbox.Spawn (HelperRun (..), bytesFilePath, filePathBytes, processIsRoot, runHelper, sandboxAvailability, sealChroot, warnFallback, withChroot)
@@ -809,6 +810,7 @@ runPlannedBuild config context drv buildDir plans finish = do
         b
           | b == builtinFetchurlBuilder -> builtin (runBuiltinFetchurl (bcFetchRetry config) sensitivity drv outputDirs)
           | b == builtinUnpackBuilder -> builtin (runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv outputDirs)
+          | b == builtinBuildenvBuilder -> builtin (runBuiltinBuildenv (bcStoreDir config) drv outputDirs)
         _ -> runSpawnedBuilder config context drv buildDir plans afterBuilder
       case ran of
         Left failure -> do
