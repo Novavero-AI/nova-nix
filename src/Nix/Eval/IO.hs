@@ -42,6 +42,8 @@ module Nix.Eval.IO
         esCallDepth,
         esAllowedPaths
       ),
+    SourceCopy (..),
+    sourceCopies,
     evalBaseEnv,
     evalSearchPath,
     newEvalStateWith,
@@ -183,6 +185,20 @@ errorPrefix = "error: "
 -- State
 -- ---------------------------------------------------------------------------
 
+-- | A path value's copy: the store path it is copied to, and the
+-- path-value text of the tree evaluation read for it, the path with its
+-- symlinks resolved, which the build driver restores the copy from.
+data SourceCopy = SourceCopy
+  { scStorePath :: !SP.StorePath,
+    scSource :: !Text
+  }
+  deriving (Eq, Show)
+
+-- | Each copy's store path with the text of the tree it is restored
+-- from: the sources of the t'EvalObjects' a session hands its store.
+sourceCopies :: Map Text SourceCopy -> Map SP.StorePath Text
+sourceCopies copies = Map.fromList [(scStorePath copy, scSource copy) | copy <- Map.elems copies]
+
 -- | Shared state for IO evaluation: an evaluation session.
 --
 -- The policy, the time and the search path are fixed as the session
@@ -211,9 +227,9 @@ data EvalState = EvalState
     -- this after evaluation to write every input @.drv@ to the store before
     -- building.
     esDrvClosure :: !(IORef (Map Text BS.ByteString)),
-    -- | Cache of source path to its store path (recursive NAR hash), so a path
-    -- literal used across many derivations is hashed only once.
-    esSourcePathCache :: !(IORef (Map Text Text)),
+    -- | Each path value coerced so far, by its text, with its copy, so a
+    -- path literal used across many derivations is hashed only once.
+    esSourcePathCache :: !(IORef (Map Text SourceCopy)),
     -- | Every store object evaluation made (store path to its
     -- references), written or, in a read-only session, only named, for
     -- the build driver to register before building.  All of them, not
@@ -674,7 +690,7 @@ instance MonadEval EvalIO where
     ref <- EvalIO (asks esSourcePathCache)
     cached <- EvalIO (liftIO (Map.lookup rawPath <$> readIORef ref))
     case cached of
-      Just hit -> pure hit
+      Just hit -> pure (canonicalStorePathText (scStorePath hit))
       Nothing -> do
         -- Upstream names the copy baseNameOf(canonicalized path); path
         -- values arrive canonicalized, so the last segment is the name.
@@ -707,7 +723,9 @@ instance MonadEval EvalIO where
         let narDigest = sha256Digest (NAR.serialise entry)
         sp <- storePathOrThrow (makeFixedOutputPath name "sha256" NarIngestion narDigest)
         let spText = canonicalStorePathText sp
-        EvalIO (liftIO (modifyIORef' ref (Map.insert rawPath spText)))
+        -- The copy records the tree it was hashed from, so the build
+        -- driver restores that tree rather than the path as written.
+        EvalIO (liftIO (modifyIORef' ref (Map.insert rawPath (SourceCopy sp resolvedText))))
         -- The copy is readable afterwards, as upstream's copyPathToStore
         -- allows its destination.
         allowPath spText
@@ -1157,7 +1175,8 @@ pendingPaths = do
     fetched <- readIORef (esFetched st)
     added <- readIORef (esAdded st)
     let originOf path = if path `Set.member` fetched then Fetched else Computed
-        made = filter (\path -> path `Set.notMember` added || path `Set.member` fetched) (Map.elems sources <> Map.keys writes <> Map.keys drvs)
+        copies = map (canonicalStorePathText . scStorePath) (Map.elems sources)
+        made = filter (\path -> path `Set.notMember` added || path `Set.member` fetched) (copies <> Map.keys writes <> Map.keys drvs)
     pure (Map.fromList [(sp, originOf path) | path <- made, Just sp <- [SP.parseStorePath SP.defaultStoreDir path]])
 
 -- | Carry a realisation's plan out: in a read-write session add what
@@ -1187,7 +1206,7 @@ addMade ops = do
   objects <- EvalIO . liftIO $ do
     added <- readIORef (esAdded st)
     let notAdded = (`Set.notMember` added)
-    (EvalObjects . Map.filter notAdded <$> readIORef (esSourcePathCache st))
+    (EvalObjects . Map.filterWithKey (const . notAdded . canonicalStorePathText) . sourceCopies <$> readIORef (esSourcePathCache st))
       <*> (Map.filterWithKey (const . notAdded) <$> readIORef (esStoreWriteCache st))
       <*> (Map.filterWithKey (const . notAdded) <$> readIORef (esDrvClosure st))
   if nothingToAdd objects then pure (Right ()) else addAll st objects
@@ -1199,7 +1218,7 @@ addMade ops = do
       Left (failure :: IOException) -> pure (Left (RealisationFailed (T.pack (ioFailureText failure))))
       Right (Left reason) -> pure (Left (RealisationFailed reason))
       Right (Right ()) -> do
-        let paths = Map.elems (eoSources objects) <> Map.keys (eoStoreWrites objects) <> Map.keys (eoDerivations objects)
+        let paths = map canonicalStorePathText (Map.keys (eoSources objects)) <> Map.keys (eoStoreWrites objects) <> Map.keys (eoDerivations objects)
         Right () <$ EvalIO (liftIO (modifyIORef' (esAdded st) (<> Set.fromList paths)))
     ioFailureText failure
       | isUserError failure = ioeGetErrorString failure

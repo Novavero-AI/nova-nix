@@ -1111,17 +1111,18 @@ sinkNarStream sink source = go Hash.hashInit 0 Stream.narStream `onException` ab
 -- Eval source materialization
 -- ---------------------------------------------------------------------------
 
--- | Restore eval-coerced source paths into the store and register them.
--- The evaluator's source-path cache maps the text of each path value it
--- coerced to the fixed-output store path of its copy (text only - eval
--- performs no store writes).  Each entry not already valid is restored
--- from a dump of its source ('restoreSource'), its metadata made canonical
+-- | Restore the copies of eval-coerced paths into the store and register
+-- them.  Each entry is a copy's fixed-output store path with the
+-- path-value text of the tree evaluation hashed for it, the path with its
+-- symlinks resolved (text only - eval performs no store writes).  Each
+-- entry not already valid is restored from a dump of that tree
+-- ('restoreSource'), its metadata made canonical
 -- ('canonicalizeMetadata'), and registered.  A source carries no
 -- references.  A store upstream Nix's database may also manage is
 -- refused before any entry is looked at, by an
 -- 'IOException' carrying the reason ("Nix.Store.Upstream"): a tree on
 -- disk with no row here is cleared unless it reproduces its address.
-materializeEvalSources :: Store -> Map Text Text -> IO ()
+materializeEvalSources :: Store -> Map StorePath Text -> IO ()
 materializeEvalSources store sourceCache = do
   refusal <- upstreamManagedRefusal ReplacesUpstreamPaths (stDir store)
   maybe (mapM_ adopt (Map.toList sourceCache)) (throwIO . userError . T.unpack) refusal
@@ -1142,22 +1143,20 @@ materializeEvalSources store sourceCache = do
     -- materializing the same source raced isValid, and the loser's
     -- removePathForcibly deleted the tree the winner had just
     -- registered.  Same protocol as the builder's withOutputLocks.
-    adopt (rawPath, spText) =
-      case parseStorePath defaultStoreDir spText of
-        Nothing -> pure ()
-        Just sp -> withPathLock (stDir store) sp $ \_ -> do
-          valid <- isValid store sp
-          unless valid $ do
-            let dest = storePathToFilePath (stDir store) sp
-            onDisk <- doesPathExist dest
-            adoptable <- if onDisk then adoptedTreeMatches (stCaseSensitivity store) dest sp else pure False
-            reg <-
-              if adoptable
-                then canonicalizeMetadata dest >> registrationFor store sp Nothing []
-                else do
-                  when onDisk (Dir.removePathForcibly dest)
-                  restoreSource store rawPath sp >>= either (refuse spText) pure
-            registerPath (stDB store) reg
+    adopt (sp, srcText) =
+      withPathLock (stDir store) sp $ \_ -> do
+        valid <- isValid store sp
+        unless valid $ do
+          let dest = storePathToFilePath (stDir store) sp
+          onDisk <- doesPathExist dest
+          adoptable <- if onDisk then adoptedTreeMatches (stCaseSensitivity store) dest sp else pure False
+          reg <-
+            if adoptable
+              then canonicalizeMetadata dest >> registrationFor store sp Nothing []
+              else do
+                when onDisk (Dir.removePathForcibly dest)
+                restoreSource store srcText sp >>= either (refuse (storePathToText defaultStoreDir sp)) pure
+          registerPath (stDB store) reg
     refuse spText reason =
       throwIO (userError (T.unpack ("refusing to register " <> spText <> ": " <> reason)))
 
@@ -1168,10 +1167,10 @@ materializeEvalSources store sourceCache = do
 -- the walk, through the hash and into an unpack sink in one pass, so a
 -- sibling pair the store's volume folds takes the case-hack on the way
 -- in, and no file's contents are ever held whole.  The source is read
--- where its text names it, store text in this store's directory
--- ('storeTextToFilePath'), under the case-hack its text calls for
--- ('pathCaseHack'); the restored tree is read as a store path, under its
--- volume's.
+-- as evaluation read it to name the path: the tree its resolved text
+-- names, store text in this store's directory ('storeTextToFilePath'),
+-- under the case-hack that text calls for ('pathCaseHack'); the restored
+-- tree is read as a store path, under its volume's.
 --
 -- Evaluation hashed the source earlier, so the dump is held to that
 -- address before any link is created: a source that changed in between

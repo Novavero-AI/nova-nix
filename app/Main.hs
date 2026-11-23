@@ -52,7 +52,7 @@ import Nix.Eval.CRoots (crootsAddThunk)
 import Nix.Eval.CStats (CRoot (..), countSites, renderCensus, takeCensus, valueRoots)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
-import Nix.Eval.IO (EvalIO, EvalState (..), SessionSettings (..), SessionStore (..), allowEvalPath, evalBaseEnv, evalSearchPath, nixPathValue, readImportTarget, renderEvalFailure, resolveImportTarget, runEvalIOTraced, withEvalSession)
+import Nix.Eval.IO (EvalIO, EvalState (..), SessionSettings (..), SessionStore (..), allowEvalPath, evalBaseEnv, evalSearchPath, nixPathValue, readImportTarget, renderEvalFailure, resolveImportTarget, runEvalIOTraced, sourceCopies, withEvalSession)
 import Nix.Eval.Policy (ImportFromDerivation (..))
 import Nix.Eval.Print (printAmbiguous)
 import Nix.Eval.Symbol (symbolIntern)
@@ -504,12 +504,13 @@ withEvalSessionStore config opts storeDir action
       withLocalStore buildConfig (action . ReadWriteSession)
   | otherwise = withReadOnlySession config opts storeDir action
 
--- | What a session's evaluation made: the sources it coerced, the trees it
--- wrote and the derivations it recorded, as the store adds them
--- ('soAddEvalObjects').
+-- | What a session's evaluation made: the copies of the paths it coerced,
+-- the trees it wrote and the derivations it recorded, as the store adds
+-- them ('soAddEvalObjects').
 sessionObjects :: EvalState -> IO EvalObjects
 sessionObjects st =
   EvalObjects
+    . sourceCopies
     <$> readIORef (esSourcePathCache st)
     <*> readIORef (esStoreWriteCache st)
     <*> readIORef (esDrvClosure st)

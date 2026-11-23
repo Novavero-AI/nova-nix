@@ -76,7 +76,8 @@ processCaseHack = NAR.defaultCaseHack
 -- volume, read back as the store reads its own paths
 -- ('volumeCaseHack'); any other path is a source ('processCaseHack').
 -- Evaluation hashes a path and the build driver restores its copy under
--- this one rule.
+-- this one rule, each from the same resolved text, so the copy
+-- reproduces the address evaluation gave it.
 pathCaseHack :: CaseSensitivity -> Text -> NAR.CaseHack
 pathCaseHack storeVolume path
   | isCanonicalStoreText path = volumeCaseHack storeVolume

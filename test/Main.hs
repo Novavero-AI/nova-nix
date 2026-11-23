@@ -103,7 +103,7 @@ import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), 
 import Nix.Eval.Context (contextRequest)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), FormalDefault (..), LambdaName (..))
-import Nix.Eval.IO (EvalFailure (..), EvalState (..), SessionSettings (..), SessionStore (..), allowEvalPath, evalBaseEnv, newEvalStateWith, nixPathSearchPath, renderEvalFailure, runEvalIO, runEvalIOTraced, withEvalSession)
+import Nix.Eval.IO (EvalFailure (..), EvalState (..), SessionSettings (..), SessionStore (..), allowEvalPath, evalBaseEnv, newEvalStateWith, nixPathSearchPath, renderEvalFailure, runEvalIO, runEvalIOTraced, sourceCopies, withEvalSession)
 import Nix.Eval.Operator (evalUpdate)
 import Nix.Eval.Policy (ImportFromDerivation (..), LinkTarget (..), PathRules (..), SymlinkResolution (..), WalkStop (..), allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, storeRootPrefix, uriAccess, walkPath, windowsLinkTargetJoins)
 import qualified Nix.Eval.Policy as Policy
@@ -15730,7 +15730,7 @@ evalObjectsOf :: StoreDir -> FilePath -> Text -> IO (Either Text EvalObjects)
 evalObjectsOf storeDir baseDir source = do
   st <- testEvalState storeDir baseDir
   evaluatedTo <- evalNixIOIn st baseDir source
-  recorded <- EvalObjects <$> readIORef (esSourcePathCache st) <*> readIORef (esStoreWriteCache st) <*> readIORef (esDrvClosure st)
+  recorded <- EvalObjects . sourceCopies <$> readIORef (esSourcePathCache st) <*> readIORef (esStoreWriteCache st) <*> readIORef (esDrvClosure st)
   pure (recorded <$ evaluatedTo)
 
 -- | The store paths a database registered, in the order their rows
@@ -15812,7 +15812,7 @@ testStoreOpsIO = do
               root
               "(let src = ./src; note = builtins.toFile \"note\" \"see ${src}\"; in derivation { name = \"ops\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; inherit src note; }).drvPath"
           let named = mapMaybe (parseStorePath defaultStoreDir)
-          case (named . Map.elems . eoSources <$> recorded, named . Map.keys . eoStoreWrites <$> recorded, named . Map.keys . eoDerivations <$> recorded, recorded) of
+          case (Map.keys . eoSources <$> recorded, named . Map.keys . eoStoreWrites <$> recorded, named . Map.keys . eoDerivations <$> recorded, recorded) of
             (Right [src], Right [note], Right [drv], Right objects) -> do
               added <- withLocalStore config (`soAddEvalObjects` objects)
               (valid, references) <-
@@ -23481,10 +23481,9 @@ testStoreDelete = do
           case makeFixedOutputPath "mat-locked" "sha256" NarIngestion (sha256Digest (NAR.serialise entry)) of
             Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
             Right guarded -> do
-              let spText = storePathToText defaultStoreDir guarded
               holder <- acquirePathLock sd guarded
               done <- newEmptyMVar
-              _ <- forkIO (materializeEvalSources store (Map.singleton (T.pack srcDir) spText) >>= putMVar done)
+              _ <- forkIO (materializeEvalSources store (Map.singleton guarded (T.pack srcDir)) >>= putMVar done)
               early <- timeout deleteLockProbeMicros (takeMVar done)
               releasePathLock holder
               outcome <- timeout raceWatchdogMicros (takeMVar done)
@@ -24336,13 +24335,12 @@ testStoreOps = do
           case makeFixedOutputPath "nova-nix-test-adopt-src" "sha256" NarIngestion (sha256Digest (NAR.serialise entry)) of
             Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
             Right sp -> do
-              let spText = storePathToText defaultStoreDir sp
-                  dest = storePathToFilePath (stDir store) sp
+              let dest = storePathToFilePath (stDir store) sp
               -- Fake an interrupted earlier copy: wrong partial content.
               removeIfExists dest
               createDirectoryIfMissing True dest
               TIO.writeFile (dest </> "data.txt") "partial garbage"
-              materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)])
+              materializeEvalSources store (Map.fromList [(sp, T.pack srcDir)])
               adopted <- TIO.readFile (dest </> "data.txt")
               registered <- isValid store sp
               removeIfExists srcDir
@@ -24363,12 +24361,11 @@ testStoreOps = do
           case makeFixedOutputPath "nova-nix-test-adopt-canonical" "sha256" NarIngestion (sha256Digest (NAR.serialise entry)) of
             Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
             Right sp -> do
-              let spText = storePathToText defaultStoreDir sp
-                  dest = storePathToFilePath (stDir store) sp
+              let dest = storePathToFilePath (stDir store) sp
               forceRemoveIfExists dest
               createDirectoryIfMissing True dest
               TIO.writeFile (dest </> "data.txt") "adopted content"
-              materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)])
+              materializeEvalSources store (Map.fromList [(sp, T.pack srcDir)])
               registered <- isValid store sp
               results <- traverse (uncurry canonicalAs) [(executablePermissions, dest), (readOnlyPermissions, dest </> "data.txt")]
               Dir.removePathForcibly srcDir
@@ -24388,11 +24385,10 @@ testStoreOps = do
           case makeFixedOutputPath "nova-nix-test-changed-src" "sha256" NarIngestion (sha256Digest (NAR.serialise entry)) of
             Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
             Right sp -> do
-              let spText = storePathToText defaultStoreDir sp
-                  dest = storePathToFilePath (stDir store) sp
+              let dest = storePathToFilePath (stDir store) sp
               forceRemoveIfExists dest
               TIO.writeFile (srcDir </> "data.txt") "edited after evaluation"
-              outcome <- try (materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)]))
+              outcome <- try (materializeEvalSources store (Map.fromList [(sp, T.pack srcDir)]))
               registered <- isValid store sp
               leftBehind <- Dir.doesPathExist dest
               removeIfExists srcDir
@@ -24451,13 +24447,12 @@ testStoreOps = do
           case makeFixedOutputPath "nova-nix-test-adopt-ok" "sha256" NarIngestion (sha256Digest (NAR.serialise entry)) of
             Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
             Right sp -> do
-              let spText = storePathToText defaultStoreDir sp
-                  dest = storePathToFilePath (stDir store) sp
+              let dest = storePathToFilePath (stDir store) sp
               removeIfExists dest
               createDirectoryIfMissing True dest
               TIO.writeFile (dest </> "data.txt") "same bytes"
               removeIfExists srcDir
-              materializeEvalSources store (Map.fromList [(T.pack srcDir, spText)])
+              materializeEvalSources store (Map.fromList [(sp, T.pack srcDir)])
               registered <- isValid store sp
               pure (if registered then Pass else Fail "matching tree was not adopted and registered"),
         -- scanReferences finds the canonical /nix/store text eval injects
@@ -26242,7 +26237,7 @@ evalAndBuild storeDir source = do
           -- harness unable to see a whole class of driver bug.
           sourceCache <- readIORef (esSourcePathCache st)
           storeWrites <- readIORef (esStoreWriteCache st)
-          materializeEvalSources store sourceCache
+          materializeEvalSources store (sourceCopies sourceCache)
           materializeEvalStoreWrites store storeWrites
           result <- buildDerivation config store drv testDrvPath
           pure (Right (result, store))
@@ -26783,7 +26778,7 @@ fakeRealiseStore holds stop = do
   let record call = modifyIORef' calls (call :)
       held path = (holds path ||) . Set.member path <$> readIORef added
       objectPaths objects =
-        Set.fromList (mapMaybe (parseStorePath defaultStoreDir) (Map.elems (eoSources objects) <> Map.keys (eoStoreWrites objects) <> Map.keys (eoDerivations objects)))
+        Set.fromList (Map.keys (eoSources objects) <> mapMaybe (parseStorePath defaultStoreDir) (Map.keys (eoStoreWrites objects) <> Map.keys (eoDerivations objects)))
       ops =
         StoreOps
           { soQueries =
@@ -31598,6 +31593,7 @@ testInStoreCopyIO = do
   let evalStore = tmpBase </> "nova-nix-test-in-store-copy"
       linkedStore = tmpBase </> "nova-nix-test-in-store-copy-linked"
       hostLinks = tmpBase </> "nova-nix-test-in-store-copy-host"
+      linkSources = tmpBase </> "nova-nix-test-in-store-copy-link-sources"
       restoreStore = tmpBase </> "nova-nix-test-in-store-copy-restore"
       buildStore = tmpBase </> "nova-nix-test-in-store-copy-build"
       treeBase = T.replicate 32 "a" <> "-tree"
@@ -31650,10 +31646,39 @@ testInStoreCopyIO = do
         BS.writeFile (dir </> "cased" </> caseHackName) "lower"
         BS.writeFile (dir </> "use.nix") "\"${./data.txt}\"\n"
         BS.writeFile
+          (dir </> "buildlink.nix")
+          "shell: derivation { name = \"in-store-link\"; system = builtins.currentSystem; builder = shell; args = [ \"-c\" \"cp $src $out\" ]; src = ./abslink/f; }\n"
+        BS.writeFile
           (dir </> "build.nix")
           "shell: derivation { name = \"in-store-build\"; system = builtins.currentSystem; builder = shell; args = [ ./run.sh ./data.txt ]; }\n"
         BS.writeFile (storeDir </> T.unpack fileBase) smallContents
       copyOf name entry = either (fail . show) pure (makeFixedOutputPath name "sha256" NarIngestion (sha256Digest (NAR.serialise entry)))
+      -- What a build gave: its output checked when it succeeded.
+      builtFrom storeDir result check = case result of
+        Left err -> pure (Fail err)
+        Right (BuildFailure msg code, store) -> Fail ("build failed (" <> T.pack (show code) <> "): " <> msg) <$ closeStore store
+        Right (BuildSuccess out, store) -> check (storePathToFilePath (StoreDir storeDir) out) <* closeStore store
+      -- A build whose source is the named source expression over a tree
+      -- outside the store, which holds a directory, a file and a link to
+      -- each.
+      buildsFromLink srcOf builderScript check = do
+        forceRemoveIfExists linkSources
+        forceRemoveIfExists buildStore
+        createDirectoryIfMissing True (linkSources </> "real")
+        BS.writeFile (linkSources </> "real" </> "f") "in a directory\n"
+        BS.writeFile (linkSources </> "file.txt") "a file\n"
+        Dir.createDirectoryLink "real" (linkSources </> "dirlink")
+        Dir.createFileLink "file.txt" (linkSources </> "filelink")
+        result <-
+          evalAndBuild (StoreDir buildStore) $
+            T.concat
+              [ "derivation { name = \"link-source\"; system = builtins.currentSystem; builder = \"" <> nixEscape shell <> "\"; ",
+                "args = [ \"-c\" \"" <> builderScript <> "\" ]; src = " <> srcOf (canonPathValue (T.pack linkSources)) <> "; }"
+              ]
+        outcome <- builtFrom buildStore result check
+        forceRemoveIfExists linkSources
+        forceRemoveIfExists buildStore
+        pure outcome
       inEval label source expected = runTestM label $ do
         result <- evalNixIOStore (StoreDir evalStore) tmpBase source
         pure (assertRight label result (assertEqual label expected))
@@ -31738,7 +31763,36 @@ testInStoreCopyIO = do
               inEval
                 "a flat builtins.path follows a host link into the store to a file in another store path"
                 ("builtins.path { path = " <> onHost "absf" <> "; recursive = false; }")
-                (storePathStringValue absfFlatCopy)
+                (storePathStringValue absfFlatCopy),
+              -- The copy records the tree evaluation hashed for it, the
+              -- path with the links among its ancestors resolved, and is
+              -- restored from there: through an absolute link that is
+              -- another store path in the store nova-nix was given.
+              runTestM "a copy records the tree it was hashed from" $ do
+                st <- testEvalState (StoreDir evalStore) tmpBase
+                result <- evalNixIOIn st tmpBase ("\"${" <> inTree "abslink/f" <> "}\"")
+                recorded <- sourceCopies <$> readIORef (esSourcePathCache st)
+                let expected = Map.singleton otherCopy (defaultStoreDirText <> "/" <> otherBase <> "/f")
+                pure (assertRight "recorded-copy" result (const (assertEqual "recorded-copy" expected recorded))),
+              runTestM "e2e a build naming a path below an absolute link inside a store path restores it from the store" $ do
+                placeTree buildStore
+                result <- evalAndBuild (StoreDir buildStore) ("import " <> inTree "buildlink.nix" <> " \"" <> nixEscape shell <> "\"")
+                outcome <- builtFrom buildStore result $ fmap (assertEqual "output" otherContents) . BS.readFile
+                forceRemoveIfExists buildStore
+                pure outcome,
+              -- A source that is a link is copied as the link and builds:
+              -- the builder sees a link where its source was.
+              runTestM "e2e a source that is a link to a directory builds"
+                $ buildsFromLink (<> "/dirlink") "if [ -L $src ]; then echo link > $out; fi"
+                $ fmap (assertEqual "output" "link\n") . BS.readFile,
+              runTestM "e2e a source that is a link to a file builds"
+                $ buildsFromLink (<> "/filelink") "if [ -L $src ]; then echo link > $out; fi"
+                $ fmap (assertEqual "output" "link\n") . BS.readFile,
+              -- builtins.path copies what the link points to, a copy
+              -- evaluation writes itself.
+              runTestM "e2e a source builtins.path copies through a link builds from what it points to" $
+                buildsFromLink (\dir -> "builtins.path { path = " <> dir <> "/dirlink; }") "cp -r $src $out" $
+                  \out -> assertEqual "output" "in a directory\n" <$> BS.readFile (out </> "f")
             ]
         | otherwise = [True <$ putStrLn "  SKIP  links inside a store path: this platform makes no symlinks here"]
   results <-
@@ -31785,7 +31839,7 @@ testInStoreCopyIO = do
                placeTree restoreStore
                store <- openStore (StoreDir restoreStore)
                outcome <-
-                 try (materializeEvalSources store (Map.fromList [(inTree "cased", storePathToText defaultStoreDir casedCopy), (small, storePathToText defaultStoreDir smallCopy)]))
+                 try (materializeEvalSources store (Map.fromList [(casedCopy, inTree "cased"), (smallCopy, small)]))
                valid <- mapM (isValid store) [casedCopy, smallCopy]
                restored <- BS.readFile (storePathToFilePath (StoreDir restoreStore) smallCopy)
                closeStore store
