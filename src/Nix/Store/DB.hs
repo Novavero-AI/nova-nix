@@ -30,6 +30,8 @@ module Nix.Store.DB
 
     -- * Lifecycle
     openStoreDB,
+    openStoreDBReadOnly,
+    storeTablesExist,
     closeStoreDB,
     createStoreDirectories,
 
@@ -55,12 +57,13 @@ module Nix.Store.DB
 where
 
 import Control.Exception (bracketOnError, throwIO)
+import Data.IORef (newIORef)
 import Data.List (sortOn)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Database.SQLite.Simple
-  ( Connection,
+  ( Connection (..),
     Only (..),
     Query (..),
     close,
@@ -69,8 +72,10 @@ import Database.SQLite.Simple
     execute_,
     open,
     query,
+    query_,
     withTransaction,
   )
+import qualified Database.SQLite3 as SQLite3
 import Nix.Store.Access (createStateDirectory)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, storePathToFilePath, storePathToText)
 import System.FilePath ((</>))
@@ -134,6 +139,11 @@ createValidPathsSQL =
   \  narSize          INTEGER NOT NULL\
   \)"
 
+-- | The tables a store's database holds, as 'createValidPathsSQL' and
+-- 'createRefsSQL' make them.
+storeTables :: Set.Set Text
+storeTables = Set.fromList ["ValidPaths", "Refs"]
+
 -- | Create the Refs table.
 createRefsSQL :: String
 createRefsSQL =
@@ -174,12 +184,7 @@ createStoreDirectories dir = createStateDirectory (unStoreDir dir </> metaDirNam
 configureDB :: StoreDir -> Connection -> IO StoreDB
 configureDB dir conn = do
   execute_ conn "PRAGMA journal_mode=WAL"
-  -- SQLite's default busy timeout is zero, so a second process hitting
-  -- a peer's write transaction died on an uncaught ErrorBusy SQLError
-  -- instead of waiting its turn.  Upstream waits an hour
-  -- (sqlite3_busy_timeout(db, 60 * 60 * 1000), sqlite.cc:78 at
-  -- 2.28.7); the pragma reaches the same API.
-  execute_ conn "PRAGMA busy_timeout=3600000"
+  waitWhileBusy conn
   -- SQLite leaves foreign keys OFF per connection; without this the Refs
   -- REFERENCES clauses are inert, and deleting a ValidPaths row (path
   -- deletion, garbage collection) would leave dangling Refs edges that
@@ -190,6 +195,41 @@ configureDB dir conn = do
   pure StoreDB {sdbDir = dir, sdbConn = conn}
   where
     fromString = Query . T.pack
+
+-- | Have a connection wait up to an hour for a peer's lock, as upstream's
+-- does (sqlite3_busy_timeout(db, 60 * 60 * 1000), sqlite.cc:78 at
+-- 2.28.7), where SQLite's default timeout of zero fails at once with
+-- ErrorBusy.  The pragma reaches the same API, and writes nothing.
+waitWhileBusy :: Connection -> IO ()
+waitWhileBusy conn = execute_ conn "PRAGMA busy_timeout=3600000"
+
+-- | Open the database of a store that has one, for reading only.  The
+-- connection is opened read-only and wrapped in sqlite-simple's
+-- t'Connection', whose two fields the cabal file's bound on sqlite-simple
+-- pins.  It runs no pragma that writes and no table statement, so the
+-- database file is never written and nothing is created around it but
+-- what SQLite itself needs.  For a database in WAL
+-- mode, which a store's is, that is a wal-index: SQLite creates the
+-- @-wal@ and @-shm@ files beside one that has none, and leaves them when
+-- the connection closes, since a read-only connection cannot checkpoint;
+-- the next connection that writes removes them as it closes.  Only an
+-- immutable open creates neither, and it reads with no locks, so a
+-- concurrent writer can give it wrong answers or corruption errors;
+-- upstream opens immutably only a store it is told is read-only
+-- (local-store.cc:499 at 2.34.9).
+openStoreDBReadOnly :: StoreDir -> IO StoreDB
+openStoreDBReadOnly dir = bracketOnError opened close (\conn -> StoreDB dir conn <$ waitWhileBusy conn)
+  where
+    dbPath = unStoreDir dir </> metaDirName </> dbFileName
+    opened = Connection <$> SQLite3.open2 (T.pack dbPath) [SQLite3.SQLOpenReadOnly] SQLite3.SQLVFSDefault <*> newIORef 0
+
+-- | Whether a database holds the store's tables ('storeTables').  One
+-- whose first open was cut short, or that another process is opening for
+-- the first time, holds none of them yet.
+storeTablesExist :: StoreDB -> IO Bool
+storeTablesExist db = do
+  rows <- query_ (sdbConn db) "SELECT name FROM sqlite_master WHERE type = 'table'"
+  pure (storeTables `Set.isSubsetOf` Set.fromList (map fromOnly rows))
 
 -- | Close the store database.
 closeStoreDB :: StoreDB -> IO ()

@@ -43,6 +43,7 @@ module Nix.Realise
     Undelivered (..),
     ClosureOutcome (..),
     substituteClosure,
+    noWriteAccessMessage,
 
     -- * Whether a derivation may be substituted
     DerivationAttrs (..),
@@ -75,6 +76,7 @@ import Control.Monad (filterM, void)
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
+import Data.List (sortOn)
 import Data.List.NonEmpty (NonEmpty)
 import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
@@ -88,7 +90,7 @@ import Nix.DependencyGraph (DepGraph (..), DepNode (..))
 import Nix.Derivation (Derivation (..), DerivationOutput (..))
 import Nix.Derivation.StructuredAttrs (structuredAttrsKey)
 import Nix.Json (Json (..), parseJson)
-import Nix.Store.Path (StoreDir, StorePath, defaultStoreDir, storePathBasename, storePathToFilePath, storePathToText)
+import Nix.Store.Path (StoreDir, StorePath (spName), defaultStoreDir, storePathBasename, storePathToFilePath, storePathToText)
 
 -- ---------------------------------------------------------------------------
 -- Substituting a closure
@@ -191,7 +193,8 @@ substituteClosure effects paths =
 -- | 'substituteClosure', threading the paths already visited.  A cache's
 -- declared references are not trusted to be acyclic: a cycle ends here at the
 -- visited set, and the registration it reaches refuses the unregistered
--- referent.
+-- referent.  A batch is asked about in 'substitutionOrder', so the first
+-- cache that fails, or the first refusal, is the one upstream reports.
 closureOf ::
   (Monad m) =>
   SubstEffects s m ->
@@ -199,7 +202,7 @@ closureOf ::
   [StorePath] ->
   m (ClosureOutcome, Set StorePath)
 closureOf effects visited paths = do
-  missing <- filterM (fmap not . seValid effects) paths
+  missing <- filterM (fmap not . seValid effects) (sortOn substitutionOrder paths)
   case NE.nonEmpty missing of
     Nothing -> pure (ClosureComplete, visited)
     Just batch -> do
@@ -363,6 +366,23 @@ referencesFirst effects visited (reference : rest)
         ClosureIncomplete -> pure (ClosureIncomplete, deeper)
         ClosureFailed -> pure (ClosureFailed, deeper)
         ClosureQueryFailed failure -> pure (ClosureQueryFailed failure, deeper)
+
+-- | The order upstream's worker runs the substitution goals of a batch in:
+-- by key, @a$@ then the path's name, @$@ and the path
+-- (@PathSubstitutionGoal::key@, substitution-goal.hh:59-62 at 2.24.9 and
+-- :52-55 at 2.34.9; @Worker::run@, worker.cc:318-333).  A @$@ sorts before
+-- every character a store path name may hold, so the keys sort as the
+-- names do and then as the paths do.
+substitutionOrder :: StorePath -> (Text, StorePath)
+substitutionOrder path = (spName path, path)
+
+-- | Upstream's refusal to substitute a path where nothing may be written,
+-- which its substitution goal throws in a read-only evaluation before it
+-- asks any cache (substitution-goal.cc:53-54 at 2.24.9, :40-42 at
+-- 2.34.9).  The path is named under the logical store directory, as
+-- upstream's @printStorePath@ names it.
+noWriteAccessMessage :: StorePath -> Text
+noWriteAccessMessage path = "cannot substitute path '" <> storePathToText defaultStoreDir path <> "' - no write access to the Nix store"
 
 -- ---------------------------------------------------------------------------
 -- Whether a derivation may be substituted
@@ -931,10 +951,10 @@ failureReach failure = case failure of
 -- is not valid and an @allowSubstitutes@ that cannot be read stops the
 -- call before any substitute or build has finished
 -- (@DerivationGoal::haveDerivation@, derivation-goal.cc:193-272).
--- The rest are realised one after another in the order of their
--- derivations' paths, the order a derivation's inputs are realised in,
--- where upstream's worker takes its goals in the order of their
--- derivations' names (@DerivationGoal::key@, derivation-goal.cc:97-104).
+-- Both passes take the requests in the order upstream's worker takes
+-- their goals, by the derivation's name and then its path
+-- (@DerivationGoal::key@, derivation-goal.cc:97-104), so a failure two
+-- requests could report is the one upstream's reports.
 --
 -- The first failure stops the call, as a failed goal ends every other
 -- unless @keep-going@ is set (@Worker::removeGoal@, worker.cc:162-168),
@@ -961,7 +981,7 @@ realiseRequests ::
   [(StorePath, Set Text)] ->
   m (Either RequestsFailure ())
 realiseRequests settings effects graph requests = do
-  firstPass <- runExceptT (traverse assessRequest (Map.toList (Map.fromListWith Set.union requests)))
+  firstPass <- runExceptT (traverse assessRequest (sortOn goalOrder (Map.toList (Map.fromListWith Set.union requests))))
   case firstPass of
     Left failure -> pure (Left (FailedWith failure))
     Right assessments -> do
@@ -971,6 +991,7 @@ realiseRequests settings effects graph requests = do
         [(request, outputs) | (request, OutputsWanted _ outputs _) <- assessments]
   where
     assessRequest request = (,) request <$> ExceptT (assess settings effects graph Map.empty request)
+    goalOrder (drvPath, _) = (spName drvPath, drvPath)
     inTurn _ [] = pure (Right ())
     inTurn realised ((request, _) : rest) =
       realiseNode settings effects graph realised request >>= either (fmap Left . stoppedAt request rest) (`inTurn` rest)

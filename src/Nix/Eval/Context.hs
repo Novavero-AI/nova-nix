@@ -14,6 +14,7 @@ module Nix.Eval.Context
     -- * Queries
     contextIsEmpty,
     firstContextEncoded,
+    contextRequest,
 
     -- * Extraction (for derivation building)
     extractInputSrcs,
@@ -27,6 +28,7 @@ module Nix.Eval.Context
 where
 
 import Data.Foldable (minimumBy)
+import Data.List (sortOn)
 import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -34,6 +36,7 @@ import Data.Ord (comparing)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
+import Nix.Eval.RealiseContext (ContextRequest (..))
 import Nix.Eval.Types (StringContext (..), StringContextElement (..))
 import Nix.Store.Path (StorePath (spHash, spName))
 
@@ -71,15 +74,36 @@ firstContextEncoded :: StringContext -> Maybe Text
 firstContextEncoded (StringContext elems) =
   encoded . minimumBy (comparing upstreamOrder) <$> NE.nonEmpty (Set.toList elems)
   where
-    upstreamOrder element = case element of
-      SCPlain sp -> (0 :: Int, sp, T.empty)
-      SCAllOutputs sp -> (1, sp, T.empty)
-      SCDrvOutput sp output -> (2, sp, output)
     encoded element = case element of
       SCPlain sp -> baseName sp
       SCAllOutputs sp -> "=" <> baseName sp
       SCDrvOutput sp output -> "!" <> output <> "!" <> baseName sp
     baseName sp = spHash sp <> "-" <> spName sp
+
+-- | What realising a context asks of the store, in upstream's order of
+-- its elements ('upstreamOrder'): every path that must be valid, the
+-- derivation of each output among them, and each output named.
+contextRequest :: StringContext -> ContextRequest
+contextRequest (StringContext elems) =
+  ContextRequest
+    { crPaths = map elementPath ordered,
+      crOutputs = [(drv, output) | SCDrvOutput drv output <- ordered]
+    }
+  where
+    ordered = sortOn upstreamOrder (Set.toList elems)
+    elementPath element = case element of
+      SCPlain sp -> sp
+      SCAllOutputs sp -> sp
+      SCDrvOutput sp _ -> sp
+
+-- | The position of a context element in upstream's @std::set@ of a
+-- variant ordered plain, all outputs, one output, each by its fields,
+-- which is not this type's constructor order.
+upstreamOrder :: StringContextElement -> (Int, StorePath, Text)
+upstreamOrder element = case element of
+  SCPlain sp -> (0, sp, T.empty)
+  SCAllOutputs sp -> (1, sp, T.empty)
+  SCDrvOutput sp output -> (2, sp, output)
 
 -- ---------------------------------------------------------------------------
 -- Extraction

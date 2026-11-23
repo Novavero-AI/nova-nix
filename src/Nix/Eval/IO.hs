@@ -7,11 +7,13 @@
 -- Provides t'EvalIO', a concrete 'MonadEval' instance that performs
 -- real file-system access.  The @import@ builtin reads, parses, and
 -- evaluates @.nix@ files with a per-session import cache.  Source parsed
--- by 'Nix.Parser.parseNix' evaluates in a session ('withEvalSession'):
+-- by 'Nix.Parser.parseNix' evaluates in a session ('withEvalSession'),
+-- here a read-only one, as @nova-nix eval@ runs:
 --
 -- @
--- withEvalSession (SessionSettings unrestrictedPolicy nixPathSearchPath storeDir "/path/to/project" RegionsCollect) $ \\st ->
---   runEvalIO st (evalParsed (pure (evalBaseEnv st)) parsed)
+-- withLocalStore (defaultBuildConfig storeDir) {bcSubstitution = RefuseSubstitution} $ \\ops ->
+--   withEvalSession (SessionSettings unrestrictedPolicy nixPathSearchPath storeDir "/path/to/project" RegionsCollect (ReadOnlySession (localQueries storeDir) (soBuild ops))) $ \\st ->
+--     runEvalIO st (evalParsed (pure (evalBaseEnv st)) parsed)
 -- @
 module Nix.Eval.IO
   ( -- * Evaluator
@@ -21,6 +23,7 @@ module Nix.Eval.IO
 
     -- * Sessions
     SessionSettings (..),
+    SessionStore (..),
     withEvalSession,
     nixPathSearchPath,
 
@@ -53,16 +56,20 @@ where
 
 import Control.Exception (Exception, IOException, SomeAsyncException, SomeException, bracket, bracket_, catch, catchJust, displayException, fromException, onException, throwIO, try)
 import Control.Monad (unless, void, when)
+import Control.Monad.Except (ExceptT (..), runExceptT)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
 import Crypto.Random (getRandomBytes)
+import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import Data.Either (fromRight, isRight)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
+import Data.List (find)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (catMaybes, isJust)
+import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -74,7 +81,7 @@ import Foreign.Ptr (castPtr)
 import GHC.Exts (oneShot)
 import GHC.IO.Exception (ioe_errno)
 import Nix.Builtins (builtinEnv, builtinEnvWithScope, parseNixPath, rootScopeNames)
-import Nix.Derivation (fromATerm)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Eval (deepForce, eval, evalBytecode, evalParsed, findInSearchPath)
 import Nix.Eval.Arena (arenaDestroy, arenaInit)
@@ -88,7 +95,9 @@ import Nix.Eval.CStatus (arenaLive, cInvariantViolated)
 import Nix.Eval.CThunk (CThunkPtr, cthunkMarkBlackhole, cthunkMarkPending, cthunkSetComputedAttrs, cthunkSetComputedBool, cthunkSetComputedCtxStr, cthunkSetComputedFloat, cthunkSetComputedInt, cthunkSetComputedLambda, cthunkSetComputedList, cthunkSetComputedNull, cthunkSetComputedPath, cthunkSetComputedPrimop, cthunkSetComputedPrimopApp, cthunkSetComputedStr, cthunkState)
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
+import Nix.Eval.Context (contextRequest)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, uriAccess)
+import Nix.Eval.RealiseContext (ContextRefusal (..), ContextRequest (..), PendingOrigin (..), Plan (..), SessionMode (..), firstInvalidPath, planRealisation, referenceClosure)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetKeys, bytesToTextLossy, evaluated, marshalLambda, pathCell, primopCell, readComputed, readPending, storePathOrThrow, stringCell, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
 import Nix.Expr.Resolve (undefinedVariableMessage)
@@ -98,12 +107,14 @@ import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWi
 import Nix.Store (UpstreamHazard (..), canonicalizeMetadata, unpackNarEntry, upstreamManagedRefusal)
 import Nix.Store.CaseSensitive (probeCaseSensitivity, processCaseHack, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
+import Nix.Store.Ops (BuildStop (..), EvalObjects (..), StoreOps (..), StoreQueries (..))
 import qualified Nix.Store.Path as SP
 import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
 import System.Exit (ExitCode (..))
 import System.FilePath (isAbsolute, isPathSeparator, isRelative, takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
+import System.IO.Error (ioeGetErrorString, isUserError)
 import qualified System.Process as Proc
 
 -- ---------------------------------------------------------------------------
@@ -208,6 +219,10 @@ data EvalState = EvalState
     -- @builtins.toFile@: an unrecorded write reaches @drvInputSrcs@ as
     -- an unregistered path and fails the build that names it.
     esStoreWriteCache :: !(IORef (Map Text ([SP.StorePath], SP.StoreWriteMode))),
+    -- | The store paths of the writes a fetcher made, which upstream's
+    -- fetchers add to the store in any mode, so a read-only session
+    -- reads them where it refuses what evaluation computed.
+    esFetched :: !(IORef (Set Text)),
     esBaseDir :: !FilePath,
     -- | Where store objects live on this machine, so eval's own reads and
     -- writes honor @--store@ the same way the builder does.
@@ -235,7 +250,13 @@ data EvalState = EvalState
     -- @allowPath@ after each such step), plus the fetchers' scratch
     -- directories.  Mutable because it grows as evaluation proceeds, like
     -- the import cache.
-    esAllowedPaths :: !(IORef AllowedPaths)
+    esAllowedPaths :: !(IORef AllowedPaths),
+    -- | The store contexts are realised against.
+    esStore :: !SessionStore,
+    -- | The store paths of what evaluation made that a read-write session
+    -- has added to its store, so a later realisation adds only what came
+    -- after.
+    esAdded :: !(IORef (Set Text))
   }
 
 -- | What an evaluation session starts with: upstream's settings and
@@ -254,8 +275,25 @@ data SessionSettings = SessionSettings
     -- | What to run regions for ("Nix.Eval.CRegion"): the collector, a
     -- census, or nothing.  Only a session that sets up the arena starts
     -- them; a nested session runs whatever the arena's run.
-    sessionRegions :: !Regions
+    sessionRegions :: !Regions,
+    -- | The store a path reader's context is realised against.
+    sessionStore :: !SessionStore
   }
+
+-- | The store a session realises contexts against
+-- ("Nix.Eval.RealiseContext").
+data SessionStore
+  = -- | One the session asks what it holds through queries that write
+    -- no row, as @nova-nix eval@ asks it ('Nix.Store.Ops.localQueries'),
+    -- adding nothing evaluation made, and the build an output it names is
+    -- realised by.  That build refuses every substitution and builds an
+    -- output that may not be substituted, as upstream's read-only
+    -- evaluation realises one: a build under
+    -- 'Nix.Builder.RefuseSubstitution'.
+    ReadOnlySession !(StoreQueries IO) !([(SP.StorePath, Set Text)] -> IO (Either BuildStop ()))
+  | -- | One the session also adds what evaluation made to, and builds what
+    -- a context names in, as @nova-nix build@ does.
+    ReadWriteSession !(StoreOps IO)
 
 -- | Run an action in an evaluation session: the C data layer's arena is
 -- set up when no session holds it already, the session's state is made
@@ -270,7 +308,7 @@ withEvalSession settings action = withArena (bracket crootsMark crootsRelease (c
   where
     session = do
       searchPaths <- sessionSearchPath settings
-      newEvalStateWith (sessionPolicy settings) searchPaths (sessionStoreDir settings) (sessionBaseDir settings) >>= action
+      newEvalStateWith (sessionPolicy settings) searchPaths (sessionStore settings) (sessionStoreDir settings) (sessionBaseDir settings) >>= action
     withArena body = do
       live <- arenaLive
       if live then body else withRegions (sessionRegions settings) (bracket_ arenaInit arenaDestroy body)
@@ -312,14 +350,16 @@ nixPathValue =
 -- data layer, so this runs in a session ('withEvalSession'), whose roots
 -- the base environment joins, and the search path with it, through
 -- @builtins.nixPath@.
-newEvalStateWith :: EvalPolicy -> [Thunk] -> SP.StoreDir -> FilePath -> IO EvalState
-newEvalStateWith policy searchPaths storeDir baseDir = do
+newEvalStateWith :: EvalPolicy -> [Thunk] -> SessionStore -> SP.StoreDir -> FilePath -> IO EvalState
+newEvalStateWith policy searchPaths store storeDir baseDir = do
   cache <- newIORef Map.empty
   drvCache <- newIORef Map.empty
   drvClosure <- newIORef Map.empty
   srcCache <- newIORef Map.empty
   storeWriteCache <- newIORef Map.empty
+  fetched <- newIORef Set.empty
   allowedPaths <- newIORef noAllowedPaths
+  added <- newIORef Set.empty
   now <- floor <$> getPOSIXTime :: IO Int64
   baseEnv@(Env baseEnvPtr) <- builtinEnv policy now searchPaths
   crootsAddEnv baseEnvPtr
@@ -332,6 +372,7 @@ newEvalStateWith policy searchPaths storeDir baseDir = do
         esDrvClosure = drvClosure,
         esSourcePathCache = srcCache,
         esStoreWriteCache = storeWriteCache,
+        esFetched = fetched,
         esBaseDir = baseDir,
         esStoreDir = storeDir,
         esTimestamp = now,
@@ -339,7 +380,9 @@ newEvalStateWith policy searchPaths storeDir baseDir = do
         esCallDepth = topLevelCallDepth defaultMaxCallDepth,
         esPolicy = policy,
         esRegions = regions,
-        esAllowedPaths = allowedPaths
+        esAllowedPaths = allowedPaths,
+        esStore = store,
+        esAdded = added
       }
 
 -- | Grant access to a path prefix (upstream @EvalState::allowPath@): the
@@ -594,6 +637,31 @@ instance MonadEval EvalIO where
     writes <- liftIO (readIORef ref)
     pure (fst <$> Map.lookup (canonicalStorePathText sp) writes)
 
+  -- The store is asked about each path the session cannot answer itself:
+  -- what evaluation fetched, or made in a read-write session, needs no
+  -- answer.  A path that is not valid is refused before any derivation is
+  -- read; each output's path is then read from its derivation, the one
+  -- this session recorded or the store's, and the plan carried out
+  -- ("Nix.Eval.RealiseContext").
+  realiseContext ctx = do
+    st <- EvalIO ask
+    pending <- pendingPaths
+    let request = contextRequest ctx
+        (mode, queries) = sessionQueries (esStore st)
+        asked = Set.fromList [path | path <- crPaths request, maybe True (\origin -> mode == ReadOnly && origin == Computed) (Map.lookup path pending)]
+    valid <- validAmong queries asked
+    case firstInvalidPath mode pending valid request of
+      Just path -> pure (Left (PathNotValid path))
+      Nothing -> do
+        outputPaths <- Map.fromList . catMaybes <$> traverse outputPathOf (crOutputs request)
+        validOutputs <- validAmong queries (Set.fromList (Map.elems outputPaths))
+        either (pure . Left) (realisePlan (esStore st) queries) (planRealisation mode pending (valid <> validOutputs) outputPaths request)
+    where
+      outputPathOf named@(drv, output) = do
+        recorded <- lookupSessionDrv (canonicalStorePathText drv)
+        derivation <- maybe (readStoreDerivation drv) (pure . Just) recorded
+        pure ((,) named . doPath <$> (derivation >>= find ((== output) . doName) . drvOutputs))
+
   storeSourcePath rawPath = do
     ref <- EvalIO (asks esSourcePathCache)
     cached <- EvalIO (liftIO (Map.lookup rawPath <$> readIORef ref))
@@ -658,7 +726,7 @@ instance MonadEval EvalIO where
       -- addToStoreFromDump gives what it adds (local-store.cc:1342 at
       -- 2.24.9), which builtins.toFile calls (primops.cc:2317).
       canonicalizeMetadata filePath
-    recordStoreWrite storePath refs SP.WriteText
+    recordStoreWrite Computed storePath refs SP.WriteText
     -- Upstream's toFile returns the path through allowAndSetStorePathString.
     allowPath storePath
     pure storePath
@@ -734,7 +802,7 @@ instance MonadEval EvalIO where
 
   removeScratchDir dir = wrapIO (Dir.removePathForcibly (T.unpack dir))
 
-  copyPathToStore srcPath name pin = do
+  copyPathToStore origin srcPath name pin = do
     -- Content-addressed like upstream addToStore: recursive NAR sha256
     -- under the caller's name.  Same content means same path, so the
     -- existence check in 'unpackToStoreVerified' is sound: changed source
@@ -759,7 +827,7 @@ instance MonadEval EvalIO where
     -- the store's volume may fold a pair the source's keeps apart, and
     -- the tree that lands is exactly the one the address names.
     wrapIO (unpackToStoreVerified destFilePath entry narDigest) >>= either throwEvalError pure
-    recordStoreWrite destPath [] SP.WriteRecursive
+    recordStoreWrite origin destPath [] SP.WriteRecursive
     allowPath destPath
     pure destPath
 
@@ -800,7 +868,7 @@ instance MonadEval EvalIO where
       -- writes, so the remembered tree is made canonical as the uncached
       -- fetch's copyPathToStore makes the tree it writes.
       wrapIO (canonicalizeMetadata resolved)
-      recordStoreWrite path [] SP.WriteRecursive
+      recordStoreWrite Fetched path [] SP.WriteRecursive
       -- A fetch result, whether fetched now or remembered: upstream
       -- allows the store path every fetcher returns.
       allowPath path
@@ -845,11 +913,11 @@ instance MonadEval EvalIO where
         -- Raised here rather than inside 'wrapIO', which would render
         -- the refusal through an exception's own text ("user error (...)").
         wrapIO (unpackToStoreVerified destFilePath entry (sha256Digest narBytes)) >>= either throwEvalError pure
-        recordStoreWrite destPath [] SP.WriteRecursive
+        recordStoreWrite Computed destPath [] SP.WriteRecursive
         allowPath destPath
         pure destPath
 
-  addFixedOutputFile name bytes = do
+  addFixedOutputFile origin name bytes = do
     -- Canonical fixed-output path: a sha256-pinned fetch must land at the same
     -- store path C++ Nix computes, so it stays reproducible and cache-compatible.
     sp <- storePathOrThrow (makeFixedOutputPath name "sha256" FlatIngestion (sha256Digest bytes))
@@ -867,7 +935,7 @@ instance MonadEval EvalIO where
       -- The metadata upstream gives a downloaded file it adds
       -- (LocalStore::addToStore, local-store.cc:1190 at 2.24.9).
       canonicalizeMetadata filePath
-    recordStoreWrite storePath [] SP.WriteFlat
+    recordStoreWrite origin storePath [] SP.WriteFlat
     allowPath storePath
     pure storePath
 
@@ -1030,6 +1098,92 @@ allowPath :: Text -> EvalIO ()
 allowPath path = do
   st <- EvalIO ask
   EvalIO (liftIO (allowEvalPath st path))
+
+-- | What a session's store says about what it holds, and whether the
+-- session may add to it.
+sessionQueries :: SessionStore -> (SessionMode, StoreQueries IO)
+sessionQueries (ReadOnlySession queries _) = (ReadOnly, queries)
+sessionQueries (ReadWriteSession ops) = (ReadWrite, soQueries ops)
+
+-- | Which of the paths the store holds, asking it nothing when there are
+-- none: a read-write session's store opens with its first question.
+validAmong :: StoreQueries IO -> Set SP.StorePath -> EvalIO (Set SP.StorePath)
+validAmong queries paths
+  | Set.null paths = pure Set.empty
+  | otherwise = wrapIO (sqValidPaths queries paths)
+
+-- | The store paths of what evaluation has made and the session has not
+-- added to its store, each with how it came to be: the sources it named,
+-- the trees it wrote, a fetcher's among them, and the derivations it
+-- recorded.  What has been added the store answers for.
+pendingPaths :: EvalIO (Map SP.StorePath PendingOrigin)
+pendingPaths = do
+  st <- EvalIO ask
+  EvalIO . liftIO $ do
+    sources <- readIORef (esSourcePathCache st)
+    writes <- readIORef (esStoreWriteCache st)
+    drvs <- readIORef (esDrvClosure st)
+    fetched <- readIORef (esFetched st)
+    added <- readIORef (esAdded st)
+    let originOf path = if path `Set.member` fetched then Fetched else Computed
+        made = filter (`Set.notMember` added) (Map.elems sources <> Map.keys writes <> Map.keys drvs)
+    pure (Map.fromList [(sp, originOf path) | path <- made, Just sp <- [SP.parseStorePath SP.defaultStoreDir path]])
+
+-- | Carry a realisation's plan out: in a read-write session add what
+-- evaluation made, then in either session realise the outputs through
+-- its build, then make their closures readable.
+realisePlan :: SessionStore -> StoreQueries IO -> Plan -> EvalIO (Either ContextRefusal ())
+realisePlan store queries plan = runExceptT $ do
+  case store of
+    ReadOnlySession _ build -> realiseThrough build
+    ReadWriteSession ops -> do
+      when (planAdd plan) (ExceptT (addMade ops))
+      realiseThrough (soBuild ops)
+  ExceptT (allowClosures queries (planOutputs plan))
+  where
+    realiseThrough build =
+      unless (null (planBuilds plan)) $
+        ExceptT (first stopped <$> wrapIO (build (planBuilds plan)))
+    stopped (BuildStop message _) = RealisationFailed message
+
+-- | Add to a read-write session's store what evaluation has made and not
+-- yet added there, references first ('soAddEvalObjects').  A store that
+-- refuses the add, or a write that fails, is a failed realisation, worded
+-- as the build command reports it.
+addMade :: StoreOps IO -> EvalIO (Either ContextRefusal ())
+addMade ops = do
+  st <- EvalIO ask
+  objects <- EvalIO . liftIO $ do
+    added <- readIORef (esAdded st)
+    let notAdded = (`Set.notMember` added)
+    (EvalObjects . Map.filter notAdded <$> readIORef (esSourcePathCache st))
+      <*> (Map.filterWithKey (const . notAdded) <$> readIORef (esStoreWriteCache st))
+      <*> (Map.filterWithKey (const . notAdded) <$> readIORef (esDrvClosure st))
+  outcome <- wrapIO (try (soAddEvalObjects ops objects))
+  case outcome of
+    Left (failure :: IOException) -> pure (Left (RealisationFailed (T.pack (ioFailureText failure))))
+    Right (Left reason) -> pure (Left (RealisationFailed reason))
+    Right (Right ()) -> do
+      let paths = Map.elems (eoSources objects) <> Map.keys (eoStoreWrites objects) <> Map.keys (eoDerivations objects)
+      Right () <$ EvalIO (liftIO (modifyIORef' (esAdded st) (<> Set.fromList paths)))
+  where
+    ioFailureText failure
+      | isUserError failure = ioeGetErrorString failure
+      | otherwise = displayException failure
+
+-- | Under a restricting policy, make readable every path in the closures
+-- of a realisation's outputs, as upstream's @allowClosure@ does
+-- (eval.cc:378-387 at 2.34.9).  A no-op otherwise, and nothing is asked.
+allowClosures :: StoreQueries IO -> [SP.StorePath] -> EvalIO (Either ContextRefusal ())
+allowClosures queries outputs = do
+  st <- EvalIO ask
+  if not (pathsRestricted (esPolicy st)) || null outputs
+    then pure (Right ())
+    else do
+      closure <- wrapIO (referenceClosure (sqReferences queries) outputs)
+      case closure of
+        Left failure -> pure (Left (RealisationFailed failure))
+        Right paths -> Right () <$ mapM_ (allowPath . canonicalStorePathText) (Set.toList paths)
 
 -- | Refuse a read unless the whole path, symlinks resolved, lies in the
 -- allowed prefixes.  Upstream's accessor checks every prefix as its
@@ -1211,11 +1365,15 @@ storeFilePath = SP.storePathToFilePath
 -- @drvInputSrcs@ with no registration row and fails the build with
 -- \"path \'...\' is not valid\".  The mode names the scheme that
 -- constructed the path, so materialization can verify the on-disk
--- content reproduces it before registering.
-recordStoreWrite :: Text -> [SP.StorePath] -> SP.StoreWriteMode -> EvalIO ()
-recordStoreWrite storePath refs mode = do
-  cacheRef <- EvalIO (asks esStoreWriteCache)
-  EvalIO (liftIO (modifyIORef' cacheRef (Map.insert storePath (refs, mode))))
+-- content reproduces it before registering.  A fetcher's write is
+-- remembered as one ('esFetched'), and stays one when a computation
+-- writes the same path again.
+recordStoreWrite :: PendingOrigin -> Text -> [SP.StorePath] -> SP.StoreWriteMode -> EvalIO ()
+recordStoreWrite origin storePath refs mode = do
+  st <- EvalIO ask
+  EvalIO . liftIO $ do
+    modifyIORef' (esStoreWriteCache st) (Map.insert storePath (refs, mode))
+    when (origin == Fetched) (modifyIORef' (esFetched st) (Set.insert storePath))
 
 -- | The file's bytes, 'Nothing' when nothing readable is there: absent,
 -- or something unreadable squatting on the name; either way the writer

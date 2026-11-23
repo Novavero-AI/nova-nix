@@ -31,7 +31,7 @@ import Data.Word (Word32)
 import Foreign.C.Error (Errno (..), ePIPE)
 import GHC.IO.Exception (IOException (..))
 import GHC.Profiling (requestHeapCensus)
-import Nix.Builder (BuildConfig (..), BuildResult (..), BuildStop (..), buildWithDeps, defaultBuildConfig, execWrapperConfig, substituteFromCaches)
+import Nix.Builder (BuildConfig (..), BuildResult (..), BuildStop (..), SubstitutionAccess (..), buildWithDeps, defaultBuildConfig, execWrapperConfig, substituteFromCaches)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builtins (isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
 import Nix.Cli.Args (AutoArg (..), CliOpts (..), Command (..), OutLink, PushArgs (..), Target (..), outLinkFor, parseArgs)
@@ -49,7 +49,7 @@ import Nix.Eval.CRoots (crootsAddThunk)
 import Nix.Eval.CStats (CRoot (..), countSites, renderCensus, takeCensus, valueRoots)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
-import Nix.Eval.IO (EvalIO, EvalState (..), SessionSettings (..), allowEvalPath, evalBaseEnv, evalSearchPath, nixPathValue, readImportTarget, renderEvalFailure, resolveImportTarget, runEvalIOTraced, withEvalSession)
+import Nix.Eval.IO (EvalIO, EvalState (..), SessionSettings (..), SessionStore (..), allowEvalPath, evalBaseEnv, evalSearchPath, nixPathValue, readImportTarget, renderEvalFailure, resolveImportTarget, runEvalIOTraced, withEvalSession)
 import Nix.Eval.Print (printAmbiguous)
 import Nix.Eval.Symbol (symbolIntern)
 import Nix.Eval.Types (mkStrBytes, mkThunkBc)
@@ -61,7 +61,7 @@ import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), defaul
 import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), loadSecretKeyFile, pushTarget, pushToDirectory)
 import Nix.Realise (BuildMode (..), ClosureOutcome (..), Fallback (..), SubstitutesSetting (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, isValid, openStore, queryAllValidPaths, resolveDeleteTarget, storeEntryNameText, upstreamManagedRefusal)
-import Nix.Store.Ops (EvalObjects (..), StoreOps (..), withLocalStore)
+import Nix.Store.Ops (EvalObjects (..), StoreOps (..), localQueries, withLocalStore)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
 import Nix.Trust (ContentFacts, fetchedByBuiltin, fixedOutputInputs, renderTrustReport, trustReport)
@@ -329,8 +329,8 @@ evalPolicyFor opts config =
 -- the resolved spelling; upstream allows only the given one and refuses
 -- the read, which is a mismatch between its own allow list and walk, not
 -- a rule worth keeping.
-withCliSession :: CliOpts -> NixConfig -> StoreDir -> FilePath -> FilePath -> Regions -> (EvalState -> IO a) -> IO a
-withCliSession opts config storeDir dataDir baseDir regions action = do
+withCliSession :: CliOpts -> NixConfig -> StoreDir -> SessionStore -> FilePath -> FilePath -> Regions -> (EvalState -> IO a) -> IO a
+withCliSession opts config storeDir store dataDir baseDir regions action = do
   let policy = evalPolicyFor opts config
   -- Read whatever the policy, so a NIX_PATH with no UTF-8 form is refused
   -- under pure-eval too, but parsed only where it is used.
@@ -338,7 +338,7 @@ withCliSession opts config storeDir dataDir baseDir regions action = do
   let searchPath
         | epPureEval policy = parseNixPath (TE.encodeUtf8 (T.pack dataDir))
         | otherwise = mergeSearchPaths (optNixPaths opts) dataDir nixPath
-  withEvalSession (SessionSettings policy searchPath storeDir baseDir regions) $ \st0 -> do
+  withEvalSession (SessionSettings policy searchPath storeDir baseDir regions store) $ \st0 -> do
     let st = st0 {esCallDepth = topLevelCallDepth (ncMaxCallDepth config)}
     allowSearchPathRoots st
     action st
@@ -376,10 +376,10 @@ parseForEval opts config = parseNixWithScope (rootScopeNames (evalPolicyFor opts
 -- found, read and parsed.  The action runs with the target's directory
 -- as the session's base, and gets the cells and the parsed target.  A
 -- failure to find, read or parse is reported and exits.
-withTarget :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Regions -> Target -> (EvalState -> AutoArgs -> ParsedSource -> IO a) -> IO a
-withTarget config opts storeDir dataDir regions target action = do
+withTarget :: NixConfig -> CliOpts -> StoreDir -> SessionStore -> FilePath -> Regions -> Target -> (EvalState -> AutoArgs -> ParsedSource -> IO a) -> IO a
+withTarget config opts storeDir store dataDir regions target action = do
   cwd <- getCurrentDirectory
-  withCliSession opts config storeDir dataDir cwd regions $ \st -> do
+  withCliSession opts config storeDir store dataDir cwd regions $ \st -> do
     autoArgs <- sessionAutoArgs opts config cwd st
     (baseDir, origin, source) <- targetSource cwd st target
     case parseForEval opts config baseDir origin source of
@@ -457,11 +457,12 @@ evalOrExit st action =
 
 -- | Evaluate a target and print its value.  A function is called first
 -- when an argument is given, as @nix-instantiate --eval@ calls it only
--- then (nix-instantiate.cc:47-52 at 2.24.9).
+-- then (nix-instantiate.cc:47-52 at 2.24.9).  The session is read-only,
+-- as @nix-instantiate --eval@'s is ('withReadOnlySession').
 evalCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> IO ()
 evalCommand config opts storeDir dataDir target = do
   regions <- regionsWanted
-  withTarget config opts storeDir dataDir regions target $ \st autoArgs parsed -> do
+  withReadOnlySession config opts storeDir $ \session -> withTarget config opts storeDir session dataDir regions target $ \st autoArgs parsed -> do
     let call
           | Map.null autoArgs = pure
           | otherwise = autoCallFunction autoArgs
@@ -550,10 +551,14 @@ writeRegionCensus = do
 -- contents), for diffing nova-nix's serialization against upstream Nix.
 -- A function is called first, whether or not an argument is given, as
 -- @nix-instantiate@ calls one before it writes a derivation
--- (get-drvs.cc:360 at 2.24.9).
+-- (get-drvs.cc:360 at 2.24.9).  The session is read-write, as plain
+-- @nix-instantiate@'s is, which runs read-only only under @--eval@
+-- (nix-instantiate.cc:154-155): what an import from derivation names is
+-- added and built.
 evalAterm :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> IO ()
-evalAterm config opts storeDir dataDir target =
-  withTarget config opts storeDir dataDir RegionsCollect target $ \st autoArgs parsed -> do
+evalAterm config opts storeDir dataDir target = do
+  buildConfig <- buildConfigFor config opts storeDir
+  withLocalStore buildConfig $ \ops -> withTarget config opts storeDir (ReadWriteSession ops) dataDir RegionsCollect target $ \st autoArgs parsed -> do
     val <- evalOrExit st $ do
       val <- evalParsed (pure (evalBaseEnv st)) parsed >>= autoCallFunction autoArgs
       val <$ forceDerivationAttrs val
@@ -592,9 +597,9 @@ derivationAttrKeys = ["type", "drvPath", "outputName"]
 -- (attr-path.cc:58 and get-drvs.cc:360 at 2.24.9).  The action reads what
 -- the command needs out of them: the session's end frees the value.  A
 -- failure is reported and exits.
-evalTarget :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> (EvalState -> NixValue -> IO a) -> IO a
-evalTarget config opts storeDir dataDir target attrPath action =
-  withTarget config opts storeDir dataDir RegionsCollect target $ \st autoArgs parsed -> do
+evalTarget :: NixConfig -> CliOpts -> StoreDir -> SessionStore -> FilePath -> Target -> Maybe T.Text -> (EvalState -> NixValue -> IO a) -> IO a
+evalTarget config opts storeDir store dataDir target attrPath action =
+  withTarget config opts storeDir store dataDir RegionsCollect target $ \st autoArgs parsed -> do
     let call = autoCallFunction autoArgs
     selected <- evalOrExit st $ do
       root <- evalParsed (pure (evalBaseEnv st)) parsed
@@ -618,56 +623,52 @@ evalTarget config opts storeDir dataDir target attrPath action =
 buildCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> OutLink -> IO ()
 buildCommand config opts storeDir dataDir target attrPath outLink = do
   upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("build: " <>))
-  let caches = resolveCaches config (optSubstituter opts) (optTrustedKey opts)
-  wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
-  -- The session ends before the build starts, freeing the evaluation's
-  -- memory: the build needs only what is read out of it here.  The full
-  -- .drv closure (root + every transitive input) recorded during
-  -- evaluation is written to the store before building, and the root's
-  -- own recipe is read from the same map, so what is built is what its
-  -- path hashes.
-  (drvSP, outputName, drvClosure, sourceCache, storeWrites) <-
-    evalTarget config opts storeDir dataDir target attrPath $ \st val -> do
-      drvSP <- derivationPath val
-      outputName <- defaultOutputName drvSP val
-      (,,,,) drvSP outputName
-        <$> readIORef (esDrvClosure st)
-        <*> readIORef (esSourcePathCache st)
-        <*> readIORef (esStoreWriteCache st)
-  drv <- recordedDerivation drvClosure drvSP
-  -- Resolved before the build, as nix-build resolves the output it
-  -- realizes before building anything.
-  outputPath <- namedOutputPath drv outputName
-  cores <- buildCoresFor config
-  let buildConfig =
-        (defaultBuildConfig storeDir)
-          { bcCaches = caches,
-            bcFallback = fallbackFor opts config,
-            bcSubstitutes = substitutesFor config,
-            bcCores = cores,
-            bcExecWrappers = wrappers
-          }
-      -- Evaluation computes the paths of the sources it coerced and of
-      -- the .drv files it recorded, and writes trees such as
-      -- builtins.toFile's, but registers none of them, so a build adds
-      -- them first.  The whole recorded .drv closure goes in, the root's
-      -- own recipe among it, since the build reads each one back.
-      evalObjects = EvalObjects {eoSources = sourceCache, eoStoreWrites = storeWrites, eoDerivations = drvClosure}
-      -- With --check the derivation is checked, every output of it,
-      -- and otherwise realised for every output.
-      build ops = case buildModeFor opts of
-        BuildNormal -> soBuild ops [(drvSP, Set.fromList (map doName (drvOutputs drv)))]
-        BuildCheck -> soCheck ops drvSP
-  -- The store opens with the add, after the session has ended.  The
-  -- root is registered before the store closes: its lease is what
-  -- keeps a concurrent collection from running between the build's
-  -- end and the link's creation.  The path prints after the store has
-  -- closed and the link exists, as nix-build prints it, so a failed
-  -- link prints nothing a script would take for success.
-  outcome <- withLocalStore buildConfig $ \ops -> runExceptT $ do
-    ExceptT (first AddRefused <$> soAddEvalObjects ops evalObjects)
-    ExceptT (first BuildStopped <$> build ops)
-    traverse (\link -> ExceptT (first LinkRefused <$> soAddOutLinkRoot ops link outputPath)) (outLinkFor outLink outputName)
+  buildConfig <- buildConfigFor config opts storeDir
+  -- One handle serves the evaluation, which adds and builds what an
+  -- import from derivation names, and the build after it, and opens with
+  -- whichever first asks for the store.  The root is registered before
+  -- the store closes: its lease is what keeps a concurrent collection
+  -- from running between the build's end and the link's creation.  The
+  -- path prints after the store has closed and the link exists, as
+  -- nix-build prints it, so a failed link prints nothing a script would
+  -- take for success.
+  (outcome, outputPath) <- withLocalStore buildConfig $ \ops -> do
+    -- The session ends before the build starts, freeing the evaluation's
+    -- memory: the build needs only what is read out of it here.  The
+    -- full .drv closure (root + every transitive input) recorded during
+    -- evaluation is written to the store before building, and the root's
+    -- own recipe is read from the same map, so what is built is what its
+    -- path hashes.
+    (drvSP, outputName, drvClosure, sourceCache, storeWrites) <-
+      evalTarget config opts storeDir (ReadWriteSession ops) dataDir target attrPath $ \st val -> do
+        drvSP <- derivationPath val
+        outputName <- defaultOutputName drvSP val
+        (,,,,) drvSP outputName
+          <$> readIORef (esDrvClosure st)
+          <*> readIORef (esSourcePathCache st)
+          <*> readIORef (esStoreWriteCache st)
+    drv <- recordedDerivation drvClosure drvSP
+    -- Resolved before the build, as nix-build resolves the output it
+    -- realizes before building anything.
+    outputPath <- namedOutputPath drv outputName
+    let -- Evaluation computes the paths of the sources it coerced and of
+        -- the .drv files it recorded, and writes trees such as
+        -- builtins.toFile's.  An import from derivation adds all of it
+        -- made by then, so a build adds the rest first; the add passes
+        -- over what is valid.  The whole recorded .drv closure goes in,
+        -- the root's own recipe among it, since the build reads each one
+        -- back.
+        evalObjects = EvalObjects {eoSources = sourceCache, eoStoreWrites = storeWrites, eoDerivations = drvClosure}
+        -- With --check the derivation is checked, every output of it,
+        -- and otherwise realised for every output.
+        build = case buildModeFor opts of
+          BuildNormal -> soBuild ops [(drvSP, Set.fromList (map doName (drvOutputs drv)))]
+          BuildCheck -> soCheck ops drvSP
+    outcome <- runExceptT $ do
+      ExceptT (first AddRefused <$> soAddEvalObjects ops evalObjects)
+      ExceptT (first BuildStopped <$> build)
+      traverse (\link -> ExceptT (first LinkRefused <$> soAddOutLinkRoot ops link outputPath)) (outLinkFor outLink outputName)
+    pure (outcome, outputPath)
   case outcome of
     -- Reported as a refusal an add throws is ('reportIOFailure').
     Left (AddRefused reason) -> do
@@ -680,6 +681,36 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
       exitWith (ExitFailure code)
     Left (LinkRefused err) -> failWith ("build: " <> err)
     Right _ -> toStdout (TIO.putStrLn (T.pack (storePathToFilePath storeDir outputPath)))
+
+-- | The configuration a command's builds run under: the caches, fallback,
+-- substitution setting, cores and launchers its options and nix.conf
+-- give.
+buildConfigFor :: NixConfig -> CliOpts -> StoreDir -> IO BuildConfig
+buildConfigFor config opts storeDir = do
+  wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
+  cores <- buildCoresFor config
+  pure
+    (defaultBuildConfig storeDir)
+      { bcCaches = resolveCaches config (optSubstituter opts) (optTrustedKey opts),
+        bcFallback = fallbackFor opts config,
+        bcSubstitutes = substitutesFor config,
+        bcCores = cores,
+        bcExecWrappers = wrappers
+      }
+
+-- | Run an action with a read-only session's store for the store in a
+-- directory, as @nix-instantiate --eval@ runs read-only
+-- (nix-instantiate.cc:154-155 at 2.24.9).  Its queries make no store and
+-- write no row ('localQueries', beside whose database SQLite can make its
+-- wal-index files), and an output a context names is realised by a build
+-- that refuses every substitution ('RefuseSubstitution'), which opens the
+-- store only when it runs, and in a store upstream Nix manages opens
+-- nothing.
+withReadOnlySession :: NixConfig -> CliOpts -> StoreDir -> (SessionStore -> IO a) -> IO a
+withReadOnlySession config opts storeDir action = do
+  buildConfig <- buildConfigFor config opts storeDir
+  withLocalStore buildConfig {bcSubstitution = RefuseSubstitution} $ \ops ->
+    action (ReadOnlySession (localQueries storeDir) (soBuild ops))
 
 -- | Why a build command stopped once evaluation was done.
 data BuildCommandStop
@@ -702,7 +733,7 @@ data BuildCommandStop
 -- refuses one ("Nix.Store.Upstream").
 trustCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> IO ()
 trustCommand config opts storeDir dataDir target attrPath = do
-  (drvSP, drvClosure) <- evalTarget config opts storeDir dataDir target attrPath $ \st val ->
+  (drvSP, drvClosure) <- withReadOnlySession config opts storeDir $ \session -> evalTarget config opts storeDir session dataDir target attrPath $ \st val ->
     (,) <$> derivationPath val <*> readIORef (esDrvClosure st)
   drv <- recordedDerivation drvClosure drvSP
   graph <- either (failWith . ("error: " <>)) pure (runIdentity (buildDepGraph (Identity . recordedRecipe drvClosure) drv drvSP))

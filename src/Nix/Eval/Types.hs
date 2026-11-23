@@ -175,6 +175,7 @@ import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.Compile (BcCaptureInfo (..), BcCapturedSlots (..), compileExpr, compileFormalsToEval, compileParsed, foldBcCapturedSlots, formalDefaultFromWords, formalDefaultWords)
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), lambdaNameFromSymbol, lambdaNameSymbol)
 import Nix.Eval.Policy (EvalPolicy (..), unrestrictedPolicy)
+import Nix.Eval.RealiseContext (ContextRefusal, PendingOrigin)
 import Nix.Eval.SourcePos (PosIdx, noPos)
 import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolIntern, symbolText)
 import Nix.Expr.Types (CaptureInfo (..), Expr (..), NixAtom (..))
@@ -1550,12 +1551,13 @@ class (MonadCData m) => MonadEval m where
 
   -- | Copy a path (file or directory) to the store, returning the store
   -- path.  Content-addressed like upstream addToStore: recursive NAR
-  -- sha256 under the given name.  Arguments: source path, store name,
-  -- and an optional sha256 pin as (expected digest, refusal): a copy
-  -- whose digest is another fails before anything is written, with the
-  -- refusal of the digest it has.  @builtins.path@ and
-  -- @builtins.fetchTarball@ share this pin.
-  copyPathToStore :: Text -> Text -> Maybe (ByteString, ByteString -> Text) -> m Text
+  -- sha256 under the given name.  Arguments: how the copy came to be (a
+  -- fetcher's, or @builtins.path@'s), source path, store name, and an
+  -- optional sha256 pin as (expected digest, refusal): a copy whose
+  -- digest is another fails before anything is written, with the refusal
+  -- of the digest it has.  @builtins.path@ and @builtins.fetchTarball@
+  -- share this pin.
+  copyPathToStore :: PendingOrigin -> Text -> Text -> Maybe (ByteString, ByteString -> Text) -> m Text
 
   -- | Recursive NAR sha256 digest of a path, without copying it anywhere.
   -- Used by @builtins.fetchGit@ to report @narHash@.
@@ -1597,8 +1599,9 @@ class (MonadCData m) => MonadEval m where
   -- | Write raw bytes to the store at a canonical flat fixed-output path
   -- (@makeFixedOutputPath name "sha256" FlatIngestion@), so a hash-pinned
   -- fetch lands at the same store path C++ Nix computes - reproducible and
-  -- cacheable.
-  addFixedOutputFile :: Text -> ByteString -> m Text
+  -- cacheable.  The origin says whether a fetcher or @builtins.path@
+  -- wrote them.
+  addFixedOutputFile :: PendingOrigin -> Text -> ByteString -> m Text
 
   -- | Print a trace/warning message.
   -- IO evaluators write to stderr; pure evaluators silently discard.
@@ -1652,6 +1655,13 @@ class (MonadCData m) => MonadEval m where
   -- @drvPath@'s closure follows them as upstream's @computeFSClosure@
   -- follows its database's.  Pure evaluators write nothing.
   lookupSessionReferences :: StorePath -> m (Maybe [StorePath])
+
+  -- | Realise a string's context before a path reader reads the path it
+  -- spells, as upstream's @EvalState::realiseContext@ does: every path it
+  -- names found valid or made so, and every output it names built or
+  -- substituted, or why that cannot be ("Nix.Eval.RealiseContext").  Pure
+  -- evaluators have no store and realise nothing.
+  realiseContext :: StringContext -> m (Either ContextRefusal ())
 
   -- | Compute the store path a source file/directory gets when copied into
   -- the store (recursive NAR sha256 to a @source@ fixed-output path), WITHOUT
@@ -1790,7 +1800,7 @@ instance MonadEval PureEval where
   runProcess _ _ _ = throwEvalError "runProcess: not available in pure evaluation"
   createScratchDir _ = throwEvalError "createScratchDir: not available in pure evaluation"
   removeScratchDir _ = pure ()
-  copyPathToStore _ _ _ = throwEvalError "builtins.path: not available in pure evaluation"
+  copyPathToStore _ _ _ _ = throwEvalError "builtins.path: not available in pure evaluation"
   narHashOfPath _ = throwEvalError "builtins.fetchGit: not available in pure evaluation"
   isExecutableFile _ = throwEvalError "builtins.path: not available in pure evaluation"
   setExecutableFile _ = throwEvalError "builtins.fetchGit: not available in pure evaluation"
@@ -1799,7 +1809,7 @@ instance MonadEval PureEval where
   writeFetchCache _ _ = pure ()
   readSymlinkTarget _ = throwEvalError "builtins.path: not available in pure evaluation"
   addSourceNar _ _ = throwEvalError "builtins.path: not available in pure evaluation"
-  addFixedOutputFile _ _ = throwEvalError "builtins.fetchurl: not available in pure evaluation"
+  addFixedOutputFile _ _ _ = throwEvalError "builtins.fetchurl: not available in pure evaluation"
   traceMessage _ = pure ()
   lookupDrvHash _ = pure Nothing
   cacheDrvHash _ _ = pure ()
@@ -1814,6 +1824,7 @@ instance MonadEval PureEval where
   -- output names are never recoverable here either.
   lookupSessionDrv _ = pure Nothing
   lookupSessionReferences _ = pure Nothing
+  realiseContext _ = pure (Right ())
 
   -- Pure eval cannot read files: a path coerces to itself (no store copy);
   -- the real copy-to-store happens only under 'EvalIO'.

@@ -51,12 +51,14 @@ module Nix.Builder
     checkDerivation,
     buildWithDeps,
     buildRequests,
+    realiseWithoutWriting,
     checkStored,
     substitutePaths,
     substituteFromCaches,
 
     -- * Build configuration
     BuildConfig (..),
+    SubstitutionAccess (..),
     defaultBuildConfig,
 
     -- * Pure pieces (exported for tests)
@@ -120,7 +122,7 @@ import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, r
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Push (narHashMatches)
-import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, Fallback (..), FetchOutcome (..), RealiseEffects (..), RealiseSettings (..), Realised (..), Registration (..), SubstEffects (..), SubstitutesSetting (..), Undelivered (..), realise, realiseFailureMessage, realiseFailureStatus, realiseRequests, requestsFailureMessage, requestsFailureStatus, substituteClosure)
+import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, Fallback (..), FetchOutcome (..), Offer (QueryFailed), RealiseEffects (..), RealiseSettings (..), Realised (..), Registration (..), SubstEffects (..), SubstitutesSetting (..), Undelivered (..), noWriteAccessMessage, realise, realiseFailureMessage, realiseFailureStatus, realiseRequests, requestsFailureMessage, requestsFailureStatus, substituteClosure)
 import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (isPlainFile)
@@ -290,6 +292,8 @@ data BuildConfig = BuildConfig
     -- | Whether a derivation's @allowSubstitutes@ attribute is heeded:
     -- upstream's @always-allow-substitutes@.
     bcSubstitutes :: !SubstitutesSetting,
+    -- | Whether a substitute may be fetched and written to the store.
+    bcSubstitution :: !SubstitutionAccess,
     -- | What 'buildWithDeps' does with the derivation it is given:
     -- upstream's build mode, which @nix-build --check@ sets.  Nothing
     -- else reads it, and 'buildDerivation' always builds.
@@ -323,6 +327,20 @@ data BuildConfig = BuildConfig
   }
   deriving (Eq, Show)
 
+-- | Whether a build may substitute what it needs.
+data SubstitutionAccess
+  = -- | It fetches a substitute from 'bcCaches' and registers what
+    -- arrives.
+    SubstituteFromCaches
+  | -- | It refuses each substitution before any cache is asked, as
+    -- upstream's substitution goal refuses one in a read-only evaluation
+    -- ('Nix.Realise.noWriteAccessMessage').  An output that may not be
+    -- substituted is still built, as upstream builds one there: nothing
+    -- on its build path checks for read-only mode
+    -- (derivation-goal.cc:249 at 2.24.9, :103 at 2.34.9).
+    RefuseSubstitution
+  deriving (Eq, Show)
+
 -- | Default build configuration.  A builder is told of one core
 -- ('baselineCores'), where upstream's default is the machine's count,
 -- which takes IO to find ("Nix.Builder.Cores").
@@ -333,6 +351,7 @@ defaultBuildConfig dir =
       bcCaches = [],
       bcFallback = NoFallback,
       bcSubstitutes = HeedAllowSubstitutes,
+      bcSubstitution = SubstituteFromCaches,
       bcMode = BuildNormal,
       bcCores = baselineCores,
       bcExecWrappers = Map.empty,
@@ -2137,13 +2156,44 @@ buildWithDeps config store rootDrv rootDrvPath = do
 buildRequests :: BuildConfig -> Store -> [(StorePath, Set Text)] -> IO (Either BuildStop ())
 buildRequests config store requests = do
   refusal <- upstreamManagedRefusal ReplacesUpstreamPaths (bcStoreDir config)
-  maybe realiseGraph (\reason -> pure (Left (BuildStop reason 1))) refusal
+  maybe (realiseRequestsWith config (realiseEffects config store) requests) (\reason -> pure (Left (BuildStop reason 1))) refusal
+
+-- | Realise requests as 'buildRequests' does where nothing may be written:
+-- in a store upstream Nix's database also manages, for an evaluation that
+-- runs read-only.  A path is valid as the answer given says, every
+-- substitution is refused before a cache is asked, as upstream's
+-- read-only evaluation refuses it ('Nix.Realise.noWriteAccessMessage'),
+-- and an output that has to be built is refused for the reason given.
+-- Nothing is opened or written, so a refusal of a substitution comes
+-- before the refusal of the store.
+realiseWithoutWriting :: BuildConfig -> (StorePath -> IO Bool) -> Text -> [(StorePath, Set Text)] -> IO (Either BuildStop ())
+realiseWithoutWriting config valid reason = realiseRequestsWith config effects
   where
-    realiseGraph = do
-      graph <- acyclicGraph <$> buildDepGraphFrom (readDrvFromStore config) (map fst requests)
-      either (pure . Left) realiseIn graph
+    refused = pure . QueryFailed . noWriteAccessMessage
+    effects =
+      RealiseEffects
+        { reSubst =
+            SubstEffects
+              { seValid = liftIO . valid,
+                seReferences = refused,
+                seNextOffer = const . refused,
+                seFetch = \_ batch -> pure (NotFetched (fmap (\(path, _) -> (path, DeliveryFailed)) batch))
+              },
+          reBuild = \_ _ _ -> pure (Left reason),
+          reCheck = \_ _ -> pure (Left reason),
+          reReport = \status drv -> liftIO (logRealised status drv)
+        }
+
+-- | Read each requested @.drv@ and every input it reaches from the store,
+-- refuse a cycle among them, and realise the requests over the effects
+-- given, with the message and status a build that stops reports.
+realiseRequestsWith :: BuildConfig -> RealiseEffects Substitute Realising -> [(StorePath, Set Text)] -> IO (Either BuildStop ())
+realiseRequestsWith config effects requests = do
+  graph <- acyclicGraph <$> buildDepGraphFrom (readDrvFromStore config) (map fst requests)
+  either (pure . Left) realiseIn graph
+  where
     realiseIn depGraph = do
-      result <- evalStateT (realiseRequests (realiseSettings config) (realiseEffects config store) depGraph requests) emptyNarInfoMemo
+      result <- evalStateT (realiseRequests (realiseSettings config) effects depGraph requests) emptyNarInfoMemo
       pure (first (\failure -> BuildStop (requestsFailureMessage (bcStoreDir config) failure) (requestsFailureStatus failure)) result)
 
 -- | Check one derivation the store holds, every output of it, as
@@ -2206,13 +2256,18 @@ realiseEffects config store =
 
 -- | The store and caches a substitution uses: 'bcCaches' asked under
 -- 'bcFallback' and 'bcFetchRetry', and what arrives registered in the
--- store ('substitutePaths').  A t'Substitute' names the path it was offered
+-- store ('substitutePaths').  Under 'RefuseSubstitution' the first path
+-- asked about is refused instead, a failed query, which ends the call
+-- whatever 'bcFallback' says, as upstream's refusal is thrown before
+-- @fallback@ is read.  A t'Substitute' names the path it was offered
 -- for, which is the path "Nix.Realise" pairs it with.
 substEffects :: BuildConfig -> Store -> SubstEffects Substitute Realising
 substEffects config store =
   SubstEffects
     { seValid = liftIO . isValid store,
-      seReferences = queryReferencesWith (bcFetchRetry config) ioRetryEffects (bcFallback config) (bcCaches config),
+      seReferences = case bcSubstitution config of
+        SubstituteFromCaches -> queryReferencesWith (bcFetchRetry config) ioRetryEffects (bcFallback config) (bcCaches config)
+        RefuseSubstitution -> pure . QueryFailed . noWriteAccessMessage,
       seNextOffer = const (queryNextOfferWith (bcFetchRetry config) ioRetryEffects (bcFallback config)),
       seFetch = \registration -> liftIO . substitutePaths config store registration . fmap snd
     }
