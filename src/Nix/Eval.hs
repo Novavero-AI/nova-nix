@@ -142,7 +142,7 @@ import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), BcCaptureInfo (..), BcInheritedName (..), BcShares (..), decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, foldBcBindings, foldBcInheritedNames, foldBcShares, reassembleDouble, reassembleInt64)
 import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, plainContext)
 import Nix.Eval.EvalFormals (FormalDefault (..), LambdaName, hasDefault, lambdaNameText)
-import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdate, expectInt, expectedFailure, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
+import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdateChain, expectInt, expectedFailure, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
 import Nix.Eval.Policy (fileUrlPrefix, isAbsolutePath)
 import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printSymbol, printValue)
 import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, printPos)
@@ -441,13 +441,28 @@ evalBcBinary env bcIdx0 = do
             OpImpl -> evalShortCircuitImpl env leftIdx rightIdx
             OpAdd -> evalAddition (evalBytecode env leftIdx) (evalBytecode env rightIdx)
             -- Not through 'operate', which forces both operands before either
-            -- is looked at: the left must be checked before the right is
-            -- evaluated.
-            OpUpdate -> evalUpdate (evalBytecode env leftIdx) (evalBytecode env rightIdx)
+            -- is looked at: each operand of a chain is checked before the
+            -- next is evaluated.
+            OpUpdate -> do
+              operands <- (<>) <$> updateOperands leftIdx <*> updateOperands rightIdx
+              evalUpdateChain (evalBytecode env <$> operands)
             _
               | desugaredToCall op -> withCallFrame operate
               | otherwise -> operate
     Nothing -> corruptBytecode "binary operator tag" flags_
+
+-- | The operands of the chain of @//@ an operand starts, first to last:
+-- the operand itself, or, for an update, its two operands' own, as
+-- upstream's @evalForUpdate@ queues a chain, descending into an operand
+-- only when it is an @ExprOpUpdate@ (eval.cc:2007-2025 at 2.34.9).
+-- Parentheses make no node, so a chain however they group it is one.
+updateOperands :: (MonadCData m) => Word32 -> m (NonEmpty Word32)
+updateOperands bcIdx = do
+  opcode <- cbcOpcode bcIdx
+  flags_ <- cbcFlags bcIdx
+  case (opcode, decodeBinaryOp flags_) of
+    (OpBinary, Just OpUpdate) -> (<>) <$> (cbcArg1 bcIdx >>= updateOperands) <*> (cbcArg2 bcIdx >>= updateOperands)
+    _ -> pure (bcIdx :| [])
 
 -- | @+@, as upstream's @ExprConcatStrings::eval@ runs it over two operands
 -- (eval.cc at 2.24.9, the same in 2.33.2).  The left operand is evaluated
