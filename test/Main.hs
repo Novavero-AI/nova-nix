@@ -90,7 +90,7 @@ import Nix.Eval.CRoots (crootsAddThunk)
 import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
 import Nix.Eval.CStatus (CStatusError (..), arenaLive)
 import Nix.Eval.CStr (cstrNew)
-import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetBool, cthunkGetInt, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkPrimop, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
+import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetBool, cthunkGetInt, cthunkMarkBlackhole, cthunkNewBc, cthunkNewComputedAttrs, cthunkNewComputedInt, cthunkNewComputedList, cthunkNull, cthunkPayload, cthunkPrimop, cthunkSetComputedInt, cthunkSetComputedNull, cthunkState, cthunkValueTag)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), BcCaptureInfo (..), BcInheritedName (..), BcInheritedNames, BcShares (..), SiblingVar (..), compileExpr, compileFormalsToEval, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, foldBcBindings, foldBcCapturedSlots, foldBcInheritedNames, foldBcShares, reassembleInt64, siblingShares)
@@ -105,7 +105,7 @@ import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecor
 import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolCount, symbolIntern, symbolLen, symbolText)
-import Nix.Eval.Types (AttrEntry (..), AttrSet (..), Env (..), Pending (..), attrSetAllPairs, attrSetFindName, attrSetFoldM, attrSetFromEntries, attrSetFromSymbolEntriesSizedFor, attrSetKeys, attrSetLookupSymbolEntry, attrSetMemberSymbol, attrSetRemoveKeys, attrSetToMap, buildCaptureEnv, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkApply2Thunk, mkApplyThunk, mkThunkBc, newEnv, newScopeEnv, pushLazyWithScope, readComputed, readPending, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
+import Nix.Eval.Types (AttrEntry (..), AttrSet (..), Env (..), Pending (..), attrSetAllPairs, attrSetFindName, attrSetFoldM, attrSetFromEntries, attrSetFromSymbolEntriesSizedFor, attrSetKeys, attrSetLookupSymbolEntry, attrSetMapWithKey, attrSetMemberSymbol, attrSetRemoveKeys, attrSetToMap, buildCaptureEnv, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkApply2Thunk, mkApplyThunk, mkThunkBc, newEnv, newScopeEnv, pushLazyWithScope, readComputed, readPending, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed, pattern ValueBool, pattern ValueNull)
 import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -1824,6 +1824,49 @@ testCensus = do
                 (censusReached census, censusUnplaced census, censusVisitedObjects census, censusVisitedBytes census)
                   QC.=== let reach = censusTreeReach tree
                           in (reach, 0, sum (fmap (fromMaybe 0 . figuresCount) reach) + lists reach, sum (fmap figuresBytes reach)),
+      -- Layers share a base or sit one on another, and a list holds every
+      -- layer: the census reaches each set once, sizes a layer by the
+      -- entries its own arrays hold, and reaches each value once.
+      runTestM "a census counts a base its layers share once, and a layer by its own entries" $ do
+        pool <- mapM (\i -> symbolIntern ("census_layer_" <> T.pack (show (i :: Int)))) [1 .. 30]
+        let setOf names = do
+              set <- cattrsetNew SetLiteral (length names)
+              forM_ names $ \name -> cthunkNewComputedInt 0 >>= cattrsetInsert set name noPos
+              cattrsetFreeze set
+              pure set
+            -- A right operand's names start halfway into the base's, so
+            -- some of them shadow it, and 16 of them are left in the pool.
+            rightNames baseSize size = take size (drop (min (baseSize `div` 2) (length pool - setLayerRhsMax)) pool)
+            gen = (,) <$> QC.chooseInt (1, length pool) <*> (QC.chooseInt (1, setMaxLayers - 2) >>= \n -> QC.vectorOf n ((,) <$> QC.chooseInt (1, setLayerRhsMax) <*> QC.arbitrary))
+        quickCheckPasses $
+          QC.forAll gen $ \(baseSize, shapes) -> QC.ioProperty $ do
+            base <- setOf (take baseSize pool)
+            (_, layers) <-
+              foldM
+                ( \(below, made) (size, onBelow) -> do
+                    right <- setOf (rightNames baseSize size)
+                    layer <- cattrsetUpdate SetUpdate (if onBelow then below else base) right
+                    pure (layer, layer : made)
+                )
+                (base, [])
+                shapes
+            cells <- mapM (cthunkNewComputedAttrs . castPtr) layers
+            list <- thunkListToCList cells
+            root <- cthunkNewComputedList (castPtr list)
+            taken <- censusOf [RootThunk (Thunk root)]
+            let sizes = map fst shapes
+                setCount = 1 + length layers
+                cellCount = 1 + length layers + baseSize + sum sizes
+            pure $ case taken of
+              Left failure -> QC.counterexample (T.unpack failure) False
+              Right census ->
+                let reached = censusReached census
+                 in (kindAttrSets reached, kindThunks reached, kindLists reached, censusSetSizes census)
+                      QC.=== ( Figures (Just (fromIntegral setCount)) (setBytes baseSize + sum (map setBytes sizes)),
+                               Figures (Just (fromIntegral cellCount)) (fromIntegral cellCount * censusCellBytes),
+                               Figures (Just 1) (censusHeaderBytes + fromIntegral (length layers) * censusPointerBytes),
+                               Map.fromListWith (+) [(fromIntegral n, 1) | n <- baseSize : sizes]
+                             ),
       runTestM "a census taken twice over the same roots counts the same, so the mark leaves the data layer as it found it" $
         quickCheckPasses $
           QC.forAll genCensusTree $ \tree -> QC.ioProperty $ do
@@ -2106,6 +2149,36 @@ setHeaderSize, setEntrySize :: Word64
 setHeaderSize = 40
 setEntrySize = 16
 
+-- | Bytes of a set with room for this many entries.
+setBytes :: Int -> Word64
+setBytes room = setHeaderSize + fromIntegral room * setEntrySize
+
+-- | The most entries a right operand of @//@ has for the result to be a
+-- layer, and the most sets a chain of layers holds:
+-- @NN_ATTRSET_LAYER_RHS_MAX@ on a 64-bit target and
+-- @NN_ATTRSET_MAX_LAYERS@ (cbits/nn_attrset.h).
+setLayerRhsMax, setMaxLayers :: Int
+setLayerRhsMax = 16
+setMaxLayers = 8
+
+-- | The room @nn_attrset_new@ gives a set asked for none
+-- (cbits/nn_attrset.c).
+setDefaultRoom :: Int
+setDefaultRoom = 8
+
+-- | A source that forces a chain of updates, each on the one before it:
+-- the left operand, then each right operand in turn.
+updateSource :: Text -> [Text] -> Text
+updateSource left rights = "builtins.deepSeq (" <> foldl' (\chain right -> "(" <> chain <> " // " <> right <> ")") left rights <> ") null"
+
+-- | A set literal binding @b1@ to @bN@.
+rightOf :: Int -> Text
+rightOf n = "{ " <> T.concat ["b" <> T.pack (show i) <> " = 1; " | i <- [1 .. n]] <> "}"
+
+-- | Sets of one attribute each, every one binding a name of its own.
+singleRights :: Int -> [Text]
+singleRights n = ["{ c" <> T.pack (show i) <> " = 1; }" | i <- [1 .. n]]
+
 -- | The figures of each site and size that counting by site adds while
 -- an action runs; a site or size that gains nothing is left out.
 sitesAdded :: IO () -> IO (Either Text SiteCounts)
@@ -2164,6 +2237,10 @@ testRegionCollector = do
   putStrLn "eval/region-collector"
   sequence
     [ leavesNoMore "the collector frees the sets a force made once nothing reaches them, so forcing more of them leaves no more behind" id,
+      -- Each force makes a set of a thousand names and a layer on it,
+      -- whose own force ends with the layer alone holding the set, and
+      -- reads the set's names through the layer.
+      leavesNoMoreOf "the collector frees a set and the layer on it once nothing reaches them, so forcing more of them leaves no more behind" layeredDropped (\n -> n * (n - 1) + 1001 * n),
       -- One force around them all: the forces inside it close inside a
       -- region, tenuring what they mark, and it marks its region whole as
       -- they pass the budget.
@@ -2175,14 +2252,15 @@ testRegionCollector = do
       holdsFewerSpans "under one force around them all, the span table drops the spans that hold no line, so it holds fewer at once than the forces begin"
     ]
   where
-    leavesNoMore name wrap =
+    leavesNoMore name wrap = leavesNoMoreOf name (wrap . dropped) (* 1000)
+    leavesNoMoreOf name sourceOf answerOf =
       runTestM name $ do
         tmpBase <- getTemporaryDirectory
-        few <- setsOfEval tmpBase (wrap (dropped 20))
-        many <- setsOfEval tmpBase (wrap (dropped 200))
+        few <- setsOfEval tmpBase (sourceOf 20)
+        many <- setsOfEval tmpBase (sourceOf 200)
         pure $ case (few, many) of
           (Right (VInt answerFew, madeFew, leftFew), Right (VInt answerMany, madeMany, leftMany)) ->
-            assertEqual "each force counted its thousand names" (20000, 200000) (answerFew, answerMany)
+            assertEqual "each force read its thousand names" (answerOf 20, answerOf 200) (answerFew, answerMany)
               `andThen` assertEqual "the forces made a thousand sets each" True (madeMany - madeFew >= 180 * 1000)
               `andThen` assertEqual "as many left after 200 forces as after 20" leftFew leftMany
           _ -> Fail ("no census or no count: " <> T.pack (show (fmap third few, fmap third many)))
@@ -2251,7 +2329,15 @@ testRegionCollector = do
     siblingCells = 1025
     -- Each element of the map is a force that makes a set of a thousand
     -- names, each from a set of its own, and returns only a count.
-    dropped :: Int -> Text
+    layeredDropped :: Int64 -> Text
+    layeredDropped n =
+      "let mk = i: let layered = (let base = builtins.listToAttrs "
+        <> "(builtins.genList (j: { name = \"a${toString j}\"; value = i; }) 1000); in base // { extra = i; }); "
+        <> "in layered.a7 + layered.extra + builtins.length (builtins.attrNames layered); "
+        <> "in builtins.foldl' (a: b: a + b) 0 (map mk (builtins.genList (i: i) "
+        <> T.pack (show n)
+        <> "))"
+    dropped :: Int64 -> Text
     dropped n =
       "let mk = i: builtins.length (builtins.attrNames (builtins.listToAttrs "
         <> "(builtins.genList (j: { name = \"a${toString j}\"; value = i; }) 1000))); "
@@ -2596,9 +2682,14 @@ testAllocSites = do
           sitesAdded $
             mapM_ (\(AttrSet left, AttrSet right) -> void (cattrsetUnion SetUpdate left right)) [(one, none), (none, one), (one, one)]
         pure (assertEqual "update" (Right (Map.singleton SetUpdate (SetSiteFigures 3 2 (3 * setHeaderSize + 4 * setEntrySize)))) (fmap sitesSets added)),
-      -- Upstream adds the size of the set an update merges to
-      -- nrOpUpdateValuesCopied (eval.cc:1934 at 2.24.9, :1988 at 2.34.9).
-      runTestM "an update counts the entries of the set it makes as copied, and a union counts none" $ do
+      -- Upstream layers a right operand of at most 16 attributes on a left
+      -- whose chain is not full, adding the right's size to
+      -- nrOpUpdateValuesCopied, and else merges, adding the result's
+      -- (eval.cc:1932-1988 at 2.34.9).  A set built here is flat, so its
+      -- chain is not full.  An empty operand, which the evaluator never
+      -- passes, makes a union, which counts as shareable, and two make one
+      -- with the default room.
+      runTestM "an update layers a right operand of at most 16 entries and counts its entries as copied, else merges and counts the result's, and a union counts none" $ do
         pool <- mapM (\i -> symbolIntern ("copied_" <> T.pack (show (i :: Int)))) [1 .. 30]
         let build keys = do
               set <- cattrsetNew SetLiteral (length keys)
@@ -2613,10 +2704,16 @@ testAllocSites = do
             updated <- sitesAdded (cattrsetUpdate SetUpdate leftSet rightSet >>= cattrsetSize >>= writeIORef made)
             size <- readIORef made
             merged <- sitesAdded (void (cattrsetUnion SetUpdate leftSet rightSet))
-            let expected = Set.size (Set.fromList (left ++ right))
+            let union = Set.size (Set.fromList (left ++ right))
+                layered = not (null left) && not (null right) && length right <= setLayerRhsMax
+                (copied, room)
+                  | layered = (length right, length right)
+                  | null left && null right = (union, setDefaultRoom)
+                  | otherwise = (union, length left + length right)
+                shareable = if null left || null right then 1 else 0
             pure $
-              (fromIntegral size, fmap sitesUpdateCopied updated, fmap sitesUpdateCopied merged)
-                QC.=== (expected, Right (fromIntegral expected), Right 0),
+              (fromIntegral size, fmap sitesUpdateCopied updated, fmap (Map.lookup SetUpdate . sitesSets) updated, fmap sitesUpdateCopied merged)
+                QC.=== (union, Right (fromIntegral copied), Right (Just (SetSiteFigures 1 shareable (setBytes room))), Right 0),
       -- Each source's figures are worked out by hand from the evaluator:
       -- an env is an 8-byte word with 8 bytes a slot, which holds the
       -- parent of an env of one to seven slots and no scopes and is
@@ -2669,25 +2766,50 @@ testAllocSites = do
         []
         [(SetLiteral, SetSiteFigures 2 0 112)],
       sitesTest
-        "an update of two sets with attributes makes one"
+        "an update of two sets with attributes makes a layer, with room for the right operand's alone"
         "builtins.deepSeq ({ a = 1; } // { b = 2; }) null"
         []
-        [(SetLiteral, SetSiteFigures 2 0 112), (SetUpdate, SetSiteFigures 1 0 72)],
+        [(SetLiteral, SetSiteFigures 2 0 112), (SetUpdate, SetSiteFigures 1 0 56)],
+      sitesTest
+        "an update layers a right operand of 16 attributes"
+        (updateSource "{ a = 1; }" [rightOf setLayerRhsMax])
+        []
+        [(SetLiteral, SetSiteFigures 2 0 (setBytes 1 + setBytes setLayerRhsMax)), (SetUpdate, SetSiteFigures 1 0 (setBytes setLayerRhsMax))],
+      sitesTest
+        "an update merges a right operand of 17 attributes, into a set with room for both"
+        (updateSource "{ a = 1; }" [rightOf (setLayerRhsMax + 1)])
+        []
+        [(SetLiteral, SetSiteFigures 2 0 (setBytes 1 + setBytes (setLayerRhsMax + 1))), (SetUpdate, SetSiteFigures 1 0 (setBytes (setLayerRhsMax + 2)))],
+      -- Seven updates layer, the chain growing to eight sets, and the
+      -- eighth merges the chain's eight names with its own.
+      sitesTest
+        "an update on a chain of eight sets merges"
+        (updateSource "{ a = 1; }" (singleRights setMaxLayers))
+        []
+        [(SetLiteral, SetSiteFigures 9 0 (9 * setBytes 1)), (SetUpdate, SetSiteFigures 8 0 (7 * setBytes 1 + setBytes 9))],
       copiesTest
         "an update with an empty operand copies nothing"
         "builtins.deepSeq [ ({ } // { a = 1; }) ({ b = 2; } // { }) ] null"
         0,
       copiesTest
-        "an update copies every entry of the set it makes, a name both operands hold once"
+        "an update that layers copies the right operand's entries alone"
         "builtins.deepSeq ({ a = 1; b = 2; } // { b = 3; c = 4; }) null"
-        3,
-      -- `a // b // c` parses as `a // (b // c)`, and each update merges,
-      -- as upstream 2.24.9's does: the right one makes a set of two, then
-      -- the left one a set of four.
+        2,
       copiesTest
-        "a chain of updates copies the set each update makes"
+        "an update that merges copies every entry of the set it makes, a name both operands hold once"
+        (updateSource "{ a = 1; b1 = 2; }" [rightOf (setLayerRhsMax + 1)])
+        (fromIntegral setLayerRhsMax + 2),
+      copiesTest
+        "an update on a chain of eight sets copies every entry of the set it merges"
+        (updateSource "{ a = 1; }" (singleRights setMaxLayers))
+        (fromIntegral setMaxLayers - 1 + 9),
+      -- `a // b // c` parses as `a // (b // c)`: the right update layers
+      -- { d } on { c }, copying one entry, and the left layers that set of
+      -- two on { a, b }, copying its two.
+      copiesTest
+        "a chain of updates copies what each update layers"
         "builtins.deepSeq ({ a = 1; b = 2; } // { c = 3; } // { d = 4; }) null"
-        6,
+        3,
       sitesTest
         "removeAttrs of every attribute makes an empty set of its own, and of an empty set none"
         "builtins.deepSeq [ (builtins.removeAttrs { a = 1; } [ \"a\" ]) (builtins.removeAttrs { } [ \"a\" ]) ] null"
@@ -27524,6 +27646,63 @@ testCAttrSet = do
             pure $
               (walked, folded, keys, asMap, found, entries, members, setMembers, firstWanted)
                 QC.=== (model, model, map symbolText modelNames, Map.fromList [(symbolText name, Thunk value) | (name, _, value) <- model], modelFound, modelFound, modelMembers, modelMembers, find (`elem` wanted) modelNames),
+      -- A chain of updates beside a flattened copy, made by unions, and a
+      -- map of it: each update layers while the left's chain holds fewer
+      -- than eight sets and the right at most 16 entries, as the copies it
+      -- counts show, and every read of the chain, and of each set made
+      -- from it, answers as the map's does.  The right operands cross 16
+      -- entries, and the chains eight sets.
+      runTestM "a chain of updates reads as its flattened copy and a map of it, and layers as upstream's does" $ do
+        pool <- mapM (\i -> symbolIntern ("chain_" <> T.pack (show (i :: Int)))) [1 .. 40]
+        absent <- symbolIntern "chain_absent"
+        cells <- mapM textCell ["one", "two", "three"]
+        let names = absent : pool
+            sized n = QC.resize n (genValuedInserts pool cells)
+            gen = (,,,) <$> sized 60 <*> (QC.chooseInt (1, 12) >>= \n -> QC.vectorOf n (sized 20)) <*> QC.sublistOf pool <*> sized 20
+            modelOf inserts = Map.fromList [(name, (pos, value)) | (name, pos, value) <- insertsModel inserts]
+            asWalk model = [(name, pos, value) | (name, (pos, value)) <- Map.toAscList model]
+            step (set, copy, model, layers, steps) (right, rightModel) = do
+              made <- newIORef set
+              added <- sitesAdded (cattrsetUpdate SetUpdate set right >>= writeIORef made)
+              updated <- readIORef made
+              copied <- cattrsetUnion SetUpdate copy right
+              let merged = Map.union rightModel model
+                  layered = not (Map.null model) && not (Map.null rightModel) && layers < setMaxLayers && Map.size rightModel <= setLayerRhsMax
+                  expected = if layered then Map.size rightModel else Map.size merged
+                  chained = if layered then layers + 1 else 1
+              pure (updated, copied, merged, chained, (fmap sitesUpdateCopied added, Right (fromIntegral expected)) : steps)
+        quickCheckPasses $
+          QC.forAll gen $ \(baseInserts, rightsInserts, removed, otherInserts) -> QC.ioProperty $ do
+            base <- buildValued baseInserts
+            rights <- mapM buildValued rightsInserts
+            other <- buildValued otherInserts
+            let otherModel = modelOf otherInserts
+            (chain, copy, model, _, steps) <- foldM step (base, base, modelOf baseInserts, 1 :: Int, []) (zip rights (map modelOf rightsInserts))
+            walked <- walkedEntries chain
+            copyWalked <- walkedEntries copy
+            size <- cattrsetSize chain
+            found <- mapM (cattrsetFind chain) names
+            looked <- mapM (cattrsetLookup chain) names
+            members <- mapM (cattrsetMember chain) names
+            keys <- attrSetKeys (AttrSet chain)
+            asMap <- attrSetToMap (AttrSet chain)
+            kept <- cattrsetRemoveKeys SetRemoveAttrs chain removed >>= walkedEntries
+            unions <- mapM (>>= walkedEntries) [cattrsetUnion SetUpdate chain other, cattrsetUnion SetUpdate other chain]
+            updates <- mapM (>>= walkedEntries) [cattrsetUpdate SetUpdate chain other, cattrsetUpdate SetUpdate other chain]
+            mapped <- attrSetMapWithKey SetMapAttrs (const pure) (AttrSet chain) >>= walkedEntries . unAttrSet
+            let counted = reverse (map fst steps)
+                expectedCounts = reverse (map snd steps)
+                both = [asWalk (Map.union otherModel model), asWalk (Map.union model otherModel)]
+            pure $
+              QC.conjoin
+                [ QC.counterexample "the copies" (counted QC.=== expectedCounts),
+                  QC.counterexample "the walk and the size" ((walked, copyWalked, fromIntegral size) QC.=== (asWalk model, asWalk model, Map.size model)),
+                  QC.counterexample "the reads by name" ((found, looked, members) QC.=== (map (`Map.lookup` model) names, map (fmap snd . (`Map.lookup` model)) names, map (`Map.member` model) names)),
+                  QC.counterexample "the keys and the map" ((keys, asMap) QC.=== (map symbolText (Map.keys model), Map.fromList [(symbolText name, Thunk value) | (name, (_, value)) <- Map.toList model])),
+                  QC.counterexample "the removal" (kept QC.=== asWalk (Map.withoutKeys model (Set.fromList removed))),
+                  QC.counterexample "the unions and the updates" ((unions, updates) QC.=== (both, both)),
+                  QC.counterexample "mapAttrs" (mapped QC.=== [(name, noPos, value) | (name, (_, value)) <- Map.toAscList model])
+                ],
       -- The action answers False the nth time it is asked, so a walk in
       -- lockstep asks of the first n pairs and no more, or of every pair
       -- when the sets end first.

@@ -1824,7 +1824,7 @@ builtinAddErrorContext message value = addErrorTrace contextLine (argValue value
 
 builtinAttrNames :: (MonadEval m) => NixValue -> m NixValue
 builtinAttrNames (VAttrs attrs) =
-  -- Nix returns attribute names lexicographically sorted; the C array is in
+  -- Nix returns attribute names lexicographically sorted; a set walks in
   -- interned-symbol order, so sort here (consistent with builtins.attrValues,
   -- which sorts via attrSetElems).
   attrSetKeys attrs >>= valuesList . map mkStr . sort

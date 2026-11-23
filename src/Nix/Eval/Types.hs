@@ -447,7 +447,8 @@ data BuiltinArg
 
 -- | An attribute set: a C set (@cbits/nn_attrset.h@) whose entries are
 -- sorted by symbol id, each an interned name, the position it was
--- defined at and its value's cell, so a lookup is a binary search.
+-- defined at and its value's cell, so a lookup is a binary search of
+-- each of its layers, top first.
 --
 -- Two sets are equal when they are one C set, and 'show' gives its
 -- address.  Neither reads the set; 'attrSetToMap' reads its entries.
@@ -462,7 +463,7 @@ data AttrEntry = AttrEntry
   }
 
 -- | The value a set binds to an interned name, found by a binary search
--- of the C array, which is sorted by symbol.
+-- of each of its layers, top first, each sorted by symbol.
 attrSetLookupSymbol :: (MonadCData m) => Symbol -> AttrSet -> m (Maybe Thunk)
 attrSetLookupSymbol sym (AttrSet cset) = fmap Thunk <$> cattrsetLookup cset sym
 
@@ -488,16 +489,17 @@ attrSetLookupEntry key attrs = do
   sym <- symbolIntern key
   attrSetLookupSymbolEntry sym attrs
 
--- | All keys, as symbol text from C, in the C array's order: by interned
+-- | All keys, as symbol text from C, in the set's order: by interned
 -- symbol, not by name ('attrSetFoldM').
 attrSetKeys :: (MonadCData m) => AttrSet -> m [Text]
 attrSetKeys attrs = reverse <$> attrSetFoldM (\names name _ -> pure (symbolText name : names)) [] attrs
 
 -- | Fold an action over a set's attributes, each its name and its entry,
--- first to last in the C array's order, by interned symbol, as upstream
--- walks the @Attr@s of a set's @Bindings@, which are sorted by @Symbol@
--- (attr-set.hh:30-33 and :91-95 at 2.24.9).  It reads one entry at a
--- time ('cattrsetWalk') and forces the accumulator at each.
+-- first to last by interned symbol, as upstream walks the @Attr@s of a
+-- set's @Bindings@, which are sorted by @Symbol@ (attr-set.hh:30-33 and
+-- :91-95 at 2.24.9), merging its layers' at 2.34.9.  It reads a flat set
+-- one entry at a time, and a layered one from the entries 'cattrsetWalk'
+-- copies out of its layers first, and forces the accumulator at each.
 {-# INLINE attrSetFoldM #-}
 attrSetFoldM :: (MonadCData m) => (a -> Symbol -> AttrEntry -> m a) -> a -> AttrSet -> m a
 attrSetFoldM step initial (AttrSet cset) = cattrsetWalk cset >>= go initial
@@ -556,7 +558,7 @@ attrSetSize :: (MonadCData m) => AttrSet -> m Int
 attrSetSize (AttrSet cset) = fromIntegral <$> cattrsetSize cset
 
 -- | Full materialization: build a 'Map Text Thunk' from all entries.
--- Walks the C array ('attrSetFoldM') and builds a Haskell Map.  Expensive
+-- Walks the set ('attrSetFoldM') and builds a Haskell Map.  Expensive
 -- on large sets - avoid on the hot path.
 attrSetToMap :: (MonadCData m) => AttrSet -> m (Map Text Thunk)
 attrSetToMap = attrSetFoldM (\acc name entry -> pure (Map.insert (symbolText name) (entryThunk entry) acc)) Map.empty

@@ -34,6 +34,8 @@ printf './data.txt\n' >"$fixture/sub/inner.nix"
 printf '{ p = ./data.txt; }\n' >"$fixture/sub/attrs.nix"
 printf 'p: p\n' >"$fixture/sub/id.nix"
 printf 'builtins.readFile q\n' >"$fixture/sub/readq.nix"
+# A position names a file: an expression given on the command line has none.
+printf 'let s = { a = 1; }; in s // { b = 2; }\n' >"$fixture/layered.nix"
 # Indented strings whose whitespace upstream strips.  Tabs and
 # newlines are printf escapes so each fixture's exact bytes are visible.
 printf "''\n\n        ''\n" >"$fixture/ind-blank-then-spaces.nix"
@@ -205,6 +207,24 @@ echo
 
 echo "== which sets print as repeated =="
 check "an update with an empty operand is the other operand" 'let a = { x = 1; }; l = [ a (a // { }) ({ } // a) ]; in builtins.deepSeq l l'
+check "a layered set printed twice and beside the set under it" 'let b = { x = 1; y = 2; }; l = b // { z = 3; }; v = [ l l b ]; in builtins.deepSeq v v'
+echo
+
+# 2.34 layers a right operand of at most 16 attributes on the left, eight
+# sets to a chain, and 2.24 copies both: a read of the result answers the
+# same either way.  Eight updates on one set layer seven times, then merge.
+echo "== what // makes of a small right operand =="
+chain='let s = { a = 0; b = 0; c = 0; }; l = ((((((((s // { a = 1; }) // { d = 1; }) // { b = 2; }) // { e = 1; }) // { a = 3; }) // { f = 1; }) // { c = 4; g = 1; }) // { d = 5; }); in'
+check "a chain of eight updates prints as one set" "$chain builtins.deepSeq l l"
+check "a chain of eight updates names its attributes" "$chain builtins.attrNames l"
+check "a chain of eight updates lists its values" "$chain builtins.attrValues l"
+check "an attribute keeps its position, from the set under a layer and from the layer" 'let l = import ./layered.nix; p = n: let q = builtins.unsafeGetAttrPos n l; in [ q.line q.column ]; v = [ (p "a") (p "b") ]; in builtins.deepSeq v v'
+check "a layered set equals the set it reads as" 'let s = { a = 1; b = 2; }; v = [ (s // { c = 3; } == { a = 1; b = 2; c = 3; }) (s // { b = 3; } == { a = 1; b = 3; }) (s // { b = 3; } == s) ]; in builtins.deepSeq v v'
+check "builtins that read a layered set" 'let l = { a = 1; b = 2; } // { b = 3; c = 4; }; v = [ (builtins.removeAttrs l [ "b" ]) (builtins.intersectAttrs l { a = 0; c = 0; z = 0; }) (builtins.intersectAttrs { b = 0; } l) (builtins.mapAttrs (n: x: x * 10) l) (builtins.listToAttrs (builtins.attrValues (builtins.mapAttrs (name: value: { inherit name value; }) l))) ]; in builtins.deepSeq v v'
+check "with a layered set" 'let a = { x = 1; y = 2; }; v = with (a // { y = 3; }); [ x y ]; in builtins.deepSeq v v'
+refusedAtPosition "an unexpected argument a layered set holds" '({ a }: a) ({ a = 1; } // { zz = 2; })' "from call site"
+refused "deepSeq forces the set under a layer by its names" 'let b = { za = throw "base"; }; l = b // { zb = throw "layer"; }; in builtins.deepSeq l null'
+refused "deepSeq forces a layer by its names" 'let early = { zg = 0; }; b = { zh = throw "base"; }; l = b // { zg = throw "layer"; }; in builtins.deepSeq l null'
 echo
 
 echo "== what a string and an attribute name print as =="
