@@ -25,6 +25,7 @@ module Nix.Store.Ops
     StoreQueries (..),
     StoreOps (..),
     EvalObjects (..),
+    nothingToAdd,
     BuildStop (..),
 
     -- * The local store
@@ -41,6 +42,7 @@ import Control.Exception (bracket)
 import Control.Monad (filterM)
 import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -77,7 +79,8 @@ data StoreOps m = StoreOps
     -- valid, then every derivation it recorded, written unless its file
     -- already holds those bytes and registered again whether or not it
     -- was valid.  A store that refuses the add says why before anything
-    -- is written.
+    -- is written; an add of nothing asks nothing of the store and so
+    -- refuses nothing.
     soAddEvalObjects :: !(EvalObjects -> m (Either Text ())),
     -- | Realise each derivation for the outputs a request names, with the
     -- message and status of a build that stops.
@@ -134,7 +137,10 @@ withLocalStore config action = withOpenedOnFirstUse (openStore dir) closeStore (
     localOps useStore =
       StoreOps
         { soQueries = queriesOf dir (\_ _ query -> useStore >>= query . stDB),
-          soAddEvalObjects = \objects -> refusing >>= maybe (Right <$> (useStore >>= (`addEvalObjects` objects))) (pure . Left),
+          soAddEvalObjects = \objects ->
+            if nothingToAdd objects
+              then pure (Right ())
+              else refusing >>= maybe (Right <$> (useStore >>= (`addEvalObjects` objects))) (pure . Left),
           soBuild = \requests ->
             refusing >>= \case
               Nothing -> useStore >>= \store -> buildRequests config store requests
@@ -191,6 +197,11 @@ queriesOf rawDir withDatabase =
       query dir upstreamManaged
     onDisk dir path = (/= WalkAbsent) <$> classifyWalkNode (storePathToFilePath dir path)
     named dir text = maybe (Left ("unparseable reference in store DB: " <> text)) Right (parseStorePath dir text)
+
+-- | Whether an evaluation made nothing to add: no source, tree or
+-- derivation.
+nothingToAdd :: EvalObjects -> Bool
+nothingToAdd objects = Map.null (eoSources objects) && Map.null (eoStoreWrites objects) && Map.null (eoDerivations objects)
 
 -- | Add an evaluation's objects to an open store, references first.
 addEvalObjects :: Store -> EvalObjects -> IO ()

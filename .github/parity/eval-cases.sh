@@ -279,6 +279,16 @@ check "an outPath left of + is its own text, not a store copy" 'let s = { outPat
 echo
 
 echo "== what builtins.path copies =="
+# nix-instantiate --eval runs read-only (nix-instantiate.cc:154-155 at
+# 2.24.9), so it computes a copy's path without writing it (FetchMode::DryRun,
+# primops.cc:2473) and a toFile result's without adding the text (:2310);
+# nova-nix's eval computes them the same way, writing nothing to the store,
+# which upstream manages here.
+check "a file, by its NAR" 'builtins.path { path = ./data.txt; }'
+check "a file, flat" 'builtins.path { path = ./data.txt; recursive = false; }'
+check "a directory, by its NAR" 'builtins.path { path = ./sub; }'
+check "a directory, filtered" 'builtins.path { path = ./sub; filter = p: t: baseNameOf p != "useq.nix"; }'
+check "a toFile result" 'builtins.toFile "parity-text" "some text\n"'
 # 2.34.0 refuses a directory through another read, in other words.
 if ! upstreamAtLeast 2.34.0; then
   refused "a directory, flat" 'builtins.path { path = ./sub; recursive = false; }'
@@ -463,6 +473,20 @@ echo "== a path reader realises its argument's context =="
 if ! upstreamAtLeast 2.34.0 || upstreamAtLeast 2.35.0; then
   refused "an import from a derivation in a read-only evaluation" 'import (derivation { name = "parity-ifd-read-only"; system = "x86_64-linux"; builder = "/bin/sh"; })'
 fi
+echo
+
+echo "== a pinned fetch the store holds already =="
+# A pinned fetch whose path is valid returns it without downloading or
+# writing anything (fetchTree.cc:484-497 at 2.24.9).  2.34.9 ensures the path
+# instead (fetchTree.cc:456-478 at 2.34.9), which for a valid one returns at
+# once without asking a substituter (build/entry-points.cc:103).  nix-store --add-fixed makes the path valid with nothing fetched,
+# and the URL names no file, so a download would fail.  The result is read as
+# a string, since upstream's fetchurl gives one where nova-nix gives a path.
+pinnedFile="$fixture/parity-pinned"
+printf 'pinned\n' >"$pinnedFile"
+pinnedHash=$(nix-hash --type sha256 --flat "$pinnedFile")
+nix-store --add-fixed sha256 "$pinnedFile" >/dev/null
+check "a pinned fetchurl whose path is valid" "\"\${builtins.fetchurl { url = \"file://$fixture/absent/parity-pinned\"; sha256 = \"$pinnedHash\"; }}\""
 echo
 
 echo "== what allow-import-from-derivation and trace-import-from-derivation say =="

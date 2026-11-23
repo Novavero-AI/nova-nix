@@ -470,16 +470,45 @@ evalOrExit st action =
 -- | Evaluate a target and print its value.  A function is called first
 -- when an argument is given, as @nix-instantiate --eval@ calls it only
 -- then (nix-instantiate.cc:47-52 at 2.24.9).  The session is read-only,
--- as @nix-instantiate --eval@'s is ('withReadOnlySession').
+-- as @nix-instantiate --eval@'s is ('withReadOnlySession'), unless
+-- @--read-write-mode@ asks for a read-write one, as it asks
+-- @nix-instantiate@'s (nix-instantiate.cc:154-155): then what evaluation
+-- made is added to the store once evaluation succeeds, where upstream
+-- adds each object as it makes it.  An evaluation that made nothing adds
+-- nothing, so it asks nothing of a store upstream Nix manages.
 evalCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> IO ()
 evalCommand config opts storeDir dataDir target = do
   regions <- regionsWanted
-  withReadOnlySession config opts storeDir $ \session -> withTarget config opts storeDir session dataDir regions target $ \st autoArgs parsed -> do
+  withEvalSessionStore config opts storeDir $ \session -> withTarget config opts storeDir session dataDir regions target $ \st autoArgs parsed -> do
     let call
           | Map.null autoArgs = pure
           | otherwise = autoCallFunction autoArgs
     (env, forced) <- evalOrExit st (evalRooted (optStrict opts) (evalBaseEnv st) call parsed)
+    case session of
+      ReadOnlySession _ _ -> pure ()
+      ReadWriteSession ops -> sessionObjects st >>= soAddEvalObjects ops >>= either (failWith . ("error: " <>)) pure
     printResult forced >> writeCensus env forced >> writeRegionCensus
+
+-- | The store an @eval@ session realises contexts against: read-only by
+-- default ('withReadOnlySession'), and under @--read-write-mode@ the
+-- local store a build uses, under the build's configuration, so the
+-- cache, key, fallback and launcher flags reach what it builds.
+withEvalSessionStore :: NixConfig -> CliOpts -> StoreDir -> (SessionStore -> IO a) -> IO a
+withEvalSessionStore config opts storeDir action
+  | optReadWriteMode opts = do
+      buildConfig <- buildConfigFor config opts storeDir
+      withLocalStore buildConfig (action . ReadWriteSession)
+  | otherwise = withReadOnlySession config opts storeDir action
+
+-- | What a session's evaluation made: the sources it coerced, the trees it
+-- wrote and the derivations it recorded, as the store adds them
+-- ('soAddEvalObjects').
+sessionObjects :: EvalState -> IO EvalObjects
+sessionObjects st =
+  EvalObjects
+    <$> readIORef (esSourcePathCache st)
+    <*> readIORef (esStoreWriteCache st)
+    <*> readIORef (esDrvClosure st)
 
 -- | Evaluate the source in the root environment, pass the value through
 -- @call@, and give the result 'finalize' gives, with that environment,
@@ -651,15 +680,12 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
     -- evaluation is written to the store before building, and the root's
     -- own recipe is read from the same map, so what is built is what its
     -- path hashes.
-    (drvSP, outputName, drvClosure, sourceCache, storeWrites) <-
+    (drvSP, outputName, evalObjects) <-
       evalTarget config opts storeDir (ReadWriteSession ops) dataDir target attrPath $ \st val -> do
         drvSP <- derivationPath val
         outputName <- defaultOutputName drvSP val
-        (,,,,) drvSP outputName
-          <$> readIORef (esDrvClosure st)
-          <*> readIORef (esSourcePathCache st)
-          <*> readIORef (esStoreWriteCache st)
-    drv <- recordedDerivation drvClosure drvSP
+        (,,) drvSP outputName <$> sessionObjects st
+    drv <- recordedDerivation (eoDerivations evalObjects) drvSP
     -- Resolved before the build, as nix-build resolves the output it
     -- realizes before building anything.
     outputPath <- namedOutputPath drv outputName
@@ -670,7 +696,6 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
         -- over what is valid.  The whole recorded .drv closure goes in,
         -- the root's own recipe among it, since the build reads each one
         -- back.
-        evalObjects = EvalObjects {eoSources = sourceCache, eoStoreWrites = storeWrites, eoDerivations = drvClosure}
         -- With --check the derivation is checked, every output of it,
         -- and otherwise realised for every output.
         build = case buildModeFor opts of
@@ -714,15 +739,16 @@ buildConfigFor config opts storeDir = do
 -- directory, as @nix-instantiate --eval@ runs read-only
 -- (nix-instantiate.cc:154-155 at 2.24.9).  Its queries make no store and
 -- write no row ('localQueries', beside whose database SQLite can make its
--- wal-index files), and an output a context names is realised by a build
--- that refuses every substitution ('RefuseSubstitution'), which opens the
--- store only when it runs, and in a store upstream Nix manages opens
--- nothing.
+-- wal-index files).  The store's operations open it only to add what a
+-- fetcher fetched, as upstream's fetchers add theirs in any mode, or to
+-- build: an output a context names is realised by a build that refuses
+-- every substitution ('RefuseSubstitution'), which in a store upstream
+-- Nix manages opens nothing.
 withReadOnlySession :: NixConfig -> CliOpts -> StoreDir -> (SessionStore -> IO a) -> IO a
 withReadOnlySession config opts storeDir action = do
   buildConfig <- buildConfigFor config opts storeDir
   withLocalStore buildConfig {bcSubstitution = RefuseSubstitution} $ \ops ->
-    action (ReadOnlySession (localQueries storeDir) (soBuild ops))
+    action (ReadOnlySession (localQueries storeDir) ops)
 
 -- | Why a build command stopped once evaluation was done.
 data BuildCommandStop
@@ -737,12 +763,13 @@ data BuildCommandStop
 -- derivation's closure, fetch each one nova-nix's builtins fetch alone,
 -- substitute the others from the configured caches, scan the outputs the
 -- store holds, and print what the closure relies on ("Nix.Trust").  The
--- graph is read from the recipes evaluation recorded, so beyond what
--- evaluation itself writes, as @builtins.toFile@ does, only the fetches
--- and substitutions write to the store, and a closure with no
--- fixed-output input does not open it.  A store directory upstream Nix's
--- database also manages is refused before it is opened, as a build
--- refuses one ("Nix.Store.Upstream").
+-- graph is read from the recipes evaluation recorded.  The evaluation is
+-- read-only ('withReadOnlySession'), so it writes only what a fetcher
+-- fetches, and otherwise only the fetches and substitutions of
+-- fixed-output inputs write to the store: a closure with no fixed-output
+-- input does not open it.  A store directory upstream Nix's database
+-- also manages is refused before those are made, as a build refuses one
+-- ("Nix.Store.Upstream").
 trustCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> IO ()
 trustCommand config opts storeDir dataDir target attrPath = do
   (drvSP, drvClosure) <- withReadOnlySession config opts storeDir $ \session -> evalTarget config opts storeDir session dataDir target attrPath $ \st val ->

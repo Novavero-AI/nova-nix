@@ -34,6 +34,7 @@ module Nix.Eval.RealiseContext
     ContextRequest (..),
 
     -- * Planning
+    readableIn,
     firstInvalidPath,
     Plan (..),
     planRealisation,

@@ -12,7 +12,7 @@
 --
 -- @
 -- withLocalStore (defaultBuildConfig storeDir) {bcSubstitution = RefuseSubstitution} $ \\ops ->
---   withEvalSession (SessionSettings unrestrictedPolicy nixPathSearchPath storeDir "/path/to/project" RegionsCollect (ReadOnlySession (localQueries storeDir) (soBuild ops))) $ \\st ->
+--   withEvalSession (SessionSettings unrestrictedPolicy nixPathSearchPath storeDir "/path/to/project" RegionsCollect (ReadOnlySession (localQueries storeDir) ops)) $ \\st ->
 --     runEvalIO st (evalParsed (pure (evalBaseEnv st)) parsed)
 -- @
 module Nix.Eval.IO
@@ -97,7 +97,7 @@ import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLe
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Context (contextRequest)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, uriAccess)
-import Nix.Eval.RealiseContext (ContextRefusal (..), ContextRequest (..), PendingOrigin (..), Plan (..), SessionMode (..), firstInvalidPath, planRealisation, referenceClosure)
+import Nix.Eval.RealiseContext (ContextRefusal (..), ContextRequest (..), PendingOrigin (..), Plan (..), SessionMode (..), firstInvalidPath, planRealisation, readableIn, referenceClosure)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetKeys, bytesToTextLossy, evaluated, marshalLambda, pathCell, primopCell, readComputed, readPending, storePathOrThrow, stringCell, warnMessage, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
 import Nix.Expr.Resolve (undefinedVariableMessage)
@@ -107,7 +107,7 @@ import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWi
 import Nix.Store (UpstreamHazard (..), canonicalizeMetadata, unpackNarEntry, upstreamManagedRefusal)
 import Nix.Store.CaseSensitive (probeCaseSensitivity, processCaseHack, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Ops (BuildStop (..), EvalObjects (..), StoreOps (..), StoreQueries (..))
+import Nix.Store.Ops (BuildStop (..), EvalObjects (..), StoreOps (..), StoreQueries (..), nothingToAdd)
 import qualified Nix.Store.Path as SP
 import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
@@ -213,11 +213,11 @@ data EvalState = EvalState
     -- | Cache of source path to its store path (recursive NAR hash), so a path
     -- literal used across many derivations is hashed only once.
     esSourcePathCache :: !(IORef (Map Text Text)),
-    -- | Every store object evaluation wrote (store path to its
-    -- references), for the build driver to register before building -
-    -- eval has no store DB handle.  All of them, not only
-    -- @builtins.toFile@: an unrecorded write reaches @drvInputSrcs@ as
-    -- an unregistered path and fails the build that names it.
+    -- | Every store object evaluation made (store path to its
+    -- references), written or, in a read-only session, only named, for
+    -- the build driver to register before building.  All of them, not
+    -- only @builtins.toFile@: an unrecorded write reaches @drvInputSrcs@
+    -- as an unregistered path and fails the build that names it.
     esStoreWriteCache :: !(IORef (Map Text ([SP.StorePath], SP.StoreWriteMode))),
     -- | The store paths of the writes a fetcher made, which upstream's
     -- fetchers add to the store in any mode, so a read-only session
@@ -285,12 +285,14 @@ data SessionSettings = SessionSettings
 data SessionStore
   = -- | One the session asks what it holds through queries that write
     -- no row, as @nova-nix eval@ asks it ('Nix.Store.Ops.localQueries'),
-    -- adding nothing evaluation made, and the build an output it names is
-    -- realised by.  That build refuses every substitution and builds an
-    -- output that may not be substituted, as upstream's read-only
-    -- evaluation realises one: a build under
-    -- 'Nix.Builder.RefuseSubstitution'.
-    ReadOnlySession !(StoreQueries IO) !([(SP.StorePath, Set Text)] -> IO (Either BuildStop ()))
+    -- and whose operations write and add what a fetcher fetched, as
+    -- upstream's fetchers add theirs in any mode, and realise an output a
+    -- context names.  What evaluation computed is named and never
+    -- written.  The operations' build refuses every substitution and
+    -- builds an output that may not be substituted, as upstream's
+    -- read-only evaluation realises one: a 'Nix.Store.Ops.withLocalStore'
+    -- under 'Nix.Builder.RefuseSubstitution'.
+    ReadOnlySession !(StoreQueries IO) !(StoreOps IO)
   | -- | One the session also adds what evaluation made to, and builds what
     -- a context names in, as @nova-nix build@ does.
     ReadWriteSession !(StoreOps IO)
@@ -714,23 +716,24 @@ instance MonadEval EvalIO where
     -- (which would CRLF-translate on Windows and store bytes that no
     -- longer match the hash that named the path).
     sp <- storePathOrThrow (makeTextPath name (sha256Digest contents) refs)
-    filePath <- evalFilePath sp
     let storePath = canonicalStorePathText sp
-    wrapIO $ do
-      Dir.createDirectoryIfMissing True (takeDirectory filePath)
-      -- Adopt an existing file only when its bytes are these bytes: an
-      -- interrupted earlier run can leave a truncated file here, and
-      -- skipping on bare existence adopted it under this path's hash.
-      -- 'Dir.removePathForcibly' clears read-only marks and accepts a
-      -- missing path, so a sealed or squatting leftover rewrites too.
-      existing <- readBytesIfPresent filePath
-      unless (existing == Just contents) $ do
-        Dir.removePathForcibly filePath
-        BS.writeFile filePath contents
-      -- Adopted or written, the file takes the metadata upstream's
-      -- addToStoreFromDump gives what it adds (local-store.cc:1342 at
-      -- 2.24.9), which builtins.toFile calls (primops.cc:2317).
-      canonicalizeMetadata filePath
+    writtenFor Computed $ do
+      filePath <- evalFilePath sp
+      wrapIO $ do
+        Dir.createDirectoryIfMissing True (takeDirectory filePath)
+        -- Adopt an existing file only when its bytes are these bytes: an
+        -- interrupted earlier run can leave a truncated file here, and
+        -- skipping on bare existence adopted it under this path's hash.
+        -- 'Dir.removePathForcibly' clears read-only marks and accepts a
+        -- missing path, so a sealed or squatting leftover rewrites too.
+        existing <- readBytesIfPresent filePath
+        unless (existing == Just contents) $ do
+          Dir.removePathForcibly filePath
+          BS.writeFile filePath contents
+        -- Adopted or written, the file takes the metadata upstream's
+        -- addToStoreFromDump gives what it adds (local-store.cc:1342 at
+        -- 2.24.9), which builtins.toFile calls (primops.cc:2317).
+        canonicalizeMetadata filePath
     recordStoreWrite Computed storePath refs SP.WriteText
     -- Upstream's toFile returns the path through allowAndSetStorePathString.
     allowPath storePath
@@ -826,12 +829,13 @@ instance MonadEval EvalIO where
     -- The name is refused only once the tree is hashed, as upstream's is:
     -- the refusal names the path the copy would have had.
     sp <- storePathOrThrow (makeFixedOutputPath name "sha256" NarIngestion narDigest)
-    destFilePath <- evalFilePath sp
     let destPath = canonicalStorePathText sp
     -- Restored from the entry just hashed, not copied from the source:
     -- the store's volume may fold a pair the source's keeps apart, and
     -- the tree that lands is exactly the one the address names.
-    wrapIO (unpackToStoreVerified destFilePath entry narDigest) >>= either throwEvalError pure
+    writtenFor origin $ do
+      destFilePath <- evalFilePath sp
+      wrapIO (unpackToStoreVerified destFilePath entry narDigest) >>= either throwEvalError pure
     recordStoreWrite origin destPath [] SP.WriteRecursive
     allowPath destPath
     pure destPath
@@ -879,6 +883,14 @@ instance MonadEval EvalIO where
       allowPath path
     pure there
 
+  pinnedFetchHeld sp = do
+    st <- EvalIO ask
+    pending <- pendingPaths
+    let (mode, queries) = sessionQueries (esStore st)
+    valid <- validAmong queries (Set.singleton sp)
+    let held = readableIn mode pending valid sp
+    held <$ when held (allowPath (canonicalStorePathText sp))
+
   writeFetchCache key value = wrapIO $ do
     file <- fetchCacheFile key
     -- The cache is an optimisation: a machine that cannot write one still
@@ -913,11 +925,12 @@ instance MonadEval EvalIO where
       Left err -> throwEvalError ("builtins.path: internal NAR round-trip error: " <> T.pack err)
       Right entry -> do
         sp <- storePathOrThrow (makeFixedOutputPath name "sha256" NarIngestion (sha256Digest narBytes))
-        destFilePath <- evalFilePath sp
         let destPath = canonicalStorePathText sp
         -- Raised here rather than inside 'wrapIO', which would render
         -- the refusal through an exception's own text ("user error (...)").
-        wrapIO (unpackToStoreVerified destFilePath entry (sha256Digest narBytes)) >>= either throwEvalError pure
+        writtenFor Computed $ do
+          destFilePath <- evalFilePath sp
+          wrapIO (unpackToStoreVerified destFilePath entry (sha256Digest narBytes)) >>= either throwEvalError pure
         recordStoreWrite Computed destPath [] SP.WriteRecursive
         allowPath destPath
         pure destPath
@@ -926,20 +939,21 @@ instance MonadEval EvalIO where
     -- Canonical fixed-output path: a sha256-pinned fetch must land at the same
     -- store path C++ Nix computes, so it stays reproducible and cache-compatible.
     sp <- storePathOrThrow (makeFixedOutputPath name "sha256" FlatIngestion (sha256Digest bytes))
-    filePath <- evalFilePath sp
     let storePath = canonicalStorePathText sp
-    wrapIO $ do
-      Dir.createDirectoryIfMissing True (takeDirectory filePath)
-      -- Same verified adoption as the other writers: an unconditional
-      -- write would crash on a sealed leftover (the write hits
-      -- read-only).
-      existing <- readBytesIfPresent filePath
-      unless (existing == Just bytes) $ do
-        Dir.removePathForcibly filePath
-        BS.writeFile filePath bytes
-      -- The metadata upstream gives a downloaded file it adds
-      -- (LocalStore::addToStore, local-store.cc:1190 at 2.24.9).
-      canonicalizeMetadata filePath
+    writtenFor origin $ do
+      filePath <- evalFilePath sp
+      wrapIO $ do
+        Dir.createDirectoryIfMissing True (takeDirectory filePath)
+        -- Same verified adoption as the other writers: an unconditional
+        -- write would crash on a sealed leftover (the write hits
+        -- read-only).
+        existing <- readBytesIfPresent filePath
+        unless (existing == Just bytes) $ do
+          Dir.removePathForcibly filePath
+          BS.writeFile filePath bytes
+        -- The metadata upstream gives a downloaded file it adds
+        -- (LocalStore::addToStore, local-store.cc:1190 at 2.24.9).
+        canonicalizeMetadata filePath
     recordStoreWrite origin storePath [] SP.WriteFlat
     allowPath storePath
     pure storePath
@@ -1120,7 +1134,9 @@ validAmong queries paths
 -- | The store paths of what evaluation has made and the session has not
 -- added to its store, each with how it came to be: the sources it named,
 -- the trees it wrote, a fetcher's among them, and the derivations it
--- recorded.  What has been added the store answers for.
+-- recorded.  What has been added the store answers for, except what a
+-- fetcher fetched, which is readable whether or not it has been added
+-- and so needs no answer.
 pendingPaths :: EvalIO (Map SP.StorePath PendingOrigin)
 pendingPaths = do
   st <- EvalIO ask
@@ -1131,7 +1147,7 @@ pendingPaths = do
     fetched <- readIORef (esFetched st)
     added <- readIORef (esAdded st)
     let originOf path = if path `Set.member` fetched then Fetched else Computed
-        made = filter (`Set.notMember` added) (Map.elems sources <> Map.keys writes <> Map.keys drvs)
+        made = filter (\path -> path `Set.notMember` added || path `Set.member` fetched) (Map.elems sources <> Map.keys writes <> Map.keys drvs)
     pure (Map.fromList [(sp, originOf path) | path <- made, Just sp <- [SP.parseStorePath SP.defaultStoreDir path]])
 
 -- | Carry a realisation's plan out: in a read-write session add what
@@ -1140,7 +1156,7 @@ pendingPaths = do
 realisePlan :: SessionStore -> StoreQueries IO -> Plan -> EvalIO (Either ContextRefusal ())
 realisePlan store queries plan = runExceptT $ do
   case store of
-    ReadOnlySession _ build -> realiseThrough build
+    ReadOnlySession _ ops -> realiseThrough (soBuild ops)
     ReadWriteSession ops -> do
       when (planAdd plan) (ExceptT (addMade ops))
       realiseThrough (soBuild ops)
@@ -1164,14 +1180,17 @@ addMade ops = do
     (EvalObjects . Map.filter notAdded <$> readIORef (esSourcePathCache st))
       <*> (Map.filterWithKey (const . notAdded) <$> readIORef (esStoreWriteCache st))
       <*> (Map.filterWithKey (const . notAdded) <$> readIORef (esDrvClosure st))
-  outcome <- wrapIO (try (soAddEvalObjects ops objects))
-  case outcome of
-    Left (failure :: IOException) -> pure (Left (RealisationFailed (T.pack (ioFailureText failure))))
-    Right (Left reason) -> pure (Left (RealisationFailed reason))
-    Right (Right ()) -> do
-      let paths = Map.elems (eoSources objects) <> Map.keys (eoStoreWrites objects) <> Map.keys (eoDerivations objects)
-      Right () <$ EvalIO (liftIO (modifyIORef' (esAdded st) (<> Set.fromList paths)))
+  if nothingToAdd objects then pure (Right ()) else addAll st objects
   where
+    addAll st objects = do
+      outcome <- wrapIO (try (soAddEvalObjects ops objects))
+      recordAdded st objects outcome
+    recordAdded st objects outcome = case outcome of
+      Left (failure :: IOException) -> pure (Left (RealisationFailed (T.pack (ioFailureText failure))))
+      Right (Left reason) -> pure (Left (RealisationFailed reason))
+      Right (Right ()) -> do
+        let paths = Map.elems (eoSources objects) <> Map.keys (eoStoreWrites objects) <> Map.keys (eoDerivations objects)
+        Right () <$ EvalIO (liftIO (modifyIORef' (esAdded st) (<> Set.fromList paths)))
     ioFailureText failure
       | isUserError failure = ioeGetErrorString failure
       | otherwise = displayException failure
@@ -1364,21 +1383,47 @@ fetchCacheFile key = do
 storeFilePath :: SP.StoreDir -> SP.StorePath -> FilePath
 storeFilePath = SP.storePathToFilePath
 
--- | Record a store object evaluation just wrote, so the build driver
--- registers it before a derivation naming it is built.  Every eval-time
--- writer goes through this: a write that skips it lands in
--- @drvInputSrcs@ with no registration row and fails the build with
--- \"path \'...\' is not valid\".  The mode names the scheme that
--- constructed the path, so materialization can verify the on-disk
+-- | Run a write of an object evaluation made unless the session only
+-- names it: a read-only session writes what a fetcher fetched, as
+-- upstream's fetchers add their results in any mode (fetchTree.cc:504-509
+-- at 2.24.9), and computes the path of everything else without writing
+-- it, as upstream's read-only evaluation does (primops.cc:2310 and :2473,
+-- eval.cc:2394).  A read-write session writes everything.  An evaluation
+-- that writes nothing never makes the store.
+writtenFor :: PendingOrigin -> EvalIO () -> EvalIO ()
+writtenFor origin write = do
+  st <- EvalIO ask
+  case (esStore st, origin) of
+    (ReadOnlySession _ _, Computed) -> pure ()
+    _ -> write
+
+-- | Record a store object evaluation just made, written or only named,
+-- so the build driver registers it before a derivation naming it is
+-- built.  Every eval-time writer goes through this: a write that skips
+-- it lands in @drvInputSrcs@ with no registration row and fails the
+-- build with \"path \'...\' is not valid\".  The mode names the scheme
+-- that constructed the path, so materialization can verify the on-disk
 -- content reproduces it before registering.  A fetcher's write is
 -- remembered as one ('esFetched'), and stays one when a computation
--- writes the same path again.
+-- makes the same path again.
+--
+-- A read-only session adds what a fetcher fetched to its store at once,
+-- as upstream's local store adds a fetch the moment it lands, whatever
+-- the mode (@addToStore@, tarball.cc:86 at 2.24.9), making its database
+-- if it has none: a later read in this evaluation or a later evaluation
+-- finds it valid, even if this one fails.  A read-write session adds
+-- everything it made before a realisation and once evaluation is done.
 recordStoreWrite :: PendingOrigin -> Text -> [SP.StorePath] -> SP.StoreWriteMode -> EvalIO ()
 recordStoreWrite origin storePath refs mode = do
   st <- EvalIO ask
   EvalIO . liftIO $ do
     modifyIORef' (esStoreWriteCache st) (Map.insert storePath (refs, mode))
     when (origin == Fetched) (modifyIORef' (esFetched st) (Set.insert storePath))
+  case (esStore st, origin) of
+    (ReadOnlySession _ ops, Fetched) -> do
+      wrapIO (soAddEvalObjects ops (EvalObjects Map.empty (Map.singleton storePath (refs, mode)) Map.empty)) >>= either throwEvalError pure
+      EvalIO (liftIO (modifyIORef' (esAdded st) (Set.insert storePath)))
+    _ -> pure ()
 
 -- | The file's bytes, 'Nothing' when nothing readable is there: absent,
 -- or something unreadable squatting on the name; either way the writer
