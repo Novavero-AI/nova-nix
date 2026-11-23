@@ -1,14 +1,17 @@
 name: Windows sandbox probe
 
 # A throwaway probe of what a Windows build sandbox would rest on, run
-# before nova-nix-sandbox's Windows backend is written: a restricted token
-# whose restricting SIDs are S-1-5-12 and a SID of the build's own, the
-# store DACL the design proposes, and nested job objects.  It builds
+# before nova-nix-sandbox's Windows backend is written: build accounts,
+# the design, and restricted and write-restricted tokens, the candidates
+# for a tier without the service the accounts need, with the store DACL
+# the design proposes and nested job objects.  It builds
 # probe/windows-sandbox.c with GHC's own C compiler, the one that builds
-# the shipped helper, and prints one PASS or FAIL line per check.  The job
-# fails when a check the design depends on fails.  Every file the probe
-# makes is under the runner's temporary directory, and the trace step
-# turns failure auditing on for its own steps alone.
+# the shipped helper, uploads it for running on a desktop too, and prints
+# one PASS or FAIL line per check.  The job fails when a check the design
+# depends on fails.  The probe's layout is under the runner's temporary
+# directory; the probe also makes, and removes, two local accounts and a
+# file in the user's profile for each pass, and the trace step turns
+# failure auditing on for its own steps alone.
 
 on:
   push:
@@ -51,9 +54,10 @@ jobs:
           }
           $global:LASTEXITCODE = 0
 
-      # The probe and the tools it runs under the restricted token sit in a
-      # directory granting S-1-5-12 read and execute, which what is put
-      # there inherits.  The runner's user is granted the same by name, so
+      # The probe and the tools it runs under each token sit in a directory
+      # granting S-1-5-12 read and execute, which what is put there
+      # inherits.  Users is granted the same, for the build accounts the
+      # probe makes, which are in Users; and the runner's user by name, so
       # the probe's stand-in for a standard user, which holds the
       # Administrators group deny-only, can start the probe from there too.
       # The probe makes the rest of its layout itself.
@@ -63,7 +67,7 @@ jobs:
           $tools = Join-Path $root 'tools'
           $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
           New-Item -ItemType Directory -Path (Join-Path $tools 'bin') | Out-Null
-          icacls $tools /grant '*S-1-5-12:(OI)(CI)RX' "*${user}:(OI)(CI)RX"
+          icacls $tools /grant '*S-1-5-12:(OI)(CI)RX' '*S-1-5-32-545:(OI)(CI)RX' "*${user}:(OI)(CI)RX"
           if ($LASTEXITCODE -ne 0) { throw "icacls failed with $LASTEXITCODE" }
           icacls $tools
           "PROBE_ROOT=$root" >> $env:GITHUB_ENV
@@ -117,6 +121,13 @@ jobs:
             "no objdump at C:\mingw64\bin to list the probe's imports"
           }
 
+      - name: Upload the probe
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-sandbox-probe
+          path: ${{ env.PROBE_ROOT }}/tools/bin/probe.exe
+          if-no-files-found: error
+
       # The runner keeps MSYS2 at C:\msys64, off PATH, and a UCRT MinGW-w64
       # gcc at C:\mingw64.  They are copied under the probe's root, so the
       # restricted token is granted only what the probe owns.
@@ -156,10 +167,12 @@ jobs:
       # refused, and the process refused it: event 4656 with a
       # RestrictedSidCount above 0.  Other kernel objects (tokens,
       # processes, object directories) are not covered.  The control step
-      # is a file refusal the probe already knows of, so an empty trace of
-      # another step means no file was refused rather than nothing was
-      # recorded; no step controls for keys.  The trace informs: it never
-      # fails the job, and the auditing it turns on is turned off after it.
+      # is a file refusal the probe already knows of; each step's counts,
+      # of every failure event, of those under a restricted token and of
+      # those the runner's user's, say whether a silent step recorded
+      # nothing or had what it recorded filtered out.  No step controls for
+      # keys.  The trace informs: it never fails the job, and the auditing
+      # it turns on is turned off after it.
       - name: Trace what a restricted build is refused
         continue-on-error: true
         run: |
@@ -190,14 +203,19 @@ jobs:
             # Audit Failure, the keyword a refused request is logged with.
             $failure = 0x10000000000000
             $filter = @{ LogName = 'Security'; Id = 4656; Keywords = $failure; StartTime = $starts[0].Start }
-            $events = @()
-            try {
-              $events = @(Get-WinEvent -FilterHashtable $filter -ErrorAction Stop)
-            } catch {
-              if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {
-                "::warning::the Security log could not be read: $_"
+            function Get-Events([hashtable] $filter) {
+              try {
+                @(Get-WinEvent -FilterHashtable $filter -ErrorAction Stop)
+              } catch {
+                if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {
+                  "::warning::the Security log could not be read: $_" | Out-Host
+                }
+                @()
               }
             }
+            $events = @(Get-Events $filter)
+            $unkeyed = @(Get-Events @{ LogName = 'Security'; Id = 4656; StartTime = $starts[0].Start })
+            "4656 events since the trace began: $($unkeyed.Count), $($events.Count) with the Audit Failure keyword"
             # The build tokens carry the runner's user; restricted service
             # tokens on the machine carry their service accounts.
             $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -206,22 +224,54 @@ jobs:
             for ($i = 0; $i -lt $starts.Count; $i++) {
               $from = $starts[$i].Start
               $until = if ($i + 1 -lt $starts.Count) { $starts[$i + 1].Start } else { [datetime]::MaxValue }
-              "refused under the build's token during $($starts[$i].Step):"
-              $during = $events | Where-Object { $_.TimeCreated -ge $from -and $_.TimeCreated -lt $until }
-              $refused = @($during | ForEach-Object {
+              $during = @($events | Where-Object { $_.TimeCreated -ge $from -and $_.TimeCreated -lt $until })
+              $fields = @($during | ForEach-Object {
                 $data = @{}
                 foreach ($field in ([xml]$_.ToXml()).Event.EventData.Data) { $data[$field.Name] = $field.'#text' }
-                if ([int]$data['RestrictedSidCount'] -gt 0 -and $data['SubjectUserSid'] -eq $user) {
-                  $process = [System.IO.Path]::GetFileName([string]$data['ProcessName'])
-                  '  {0}: {1} {2}, access {3}' -f $process, $data['ObjectType'], $data['ObjectName'], $data['AccessMask']
+                [pscustomobject]$data
+              })
+              $restricted = @($fields | Where-Object { [int]$_.RestrictedSidCount -gt 0 })
+              $mine = @($restricted | Where-Object { $_.SubjectUserSid -eq $user })
+              ("refused during $($starts[$i].Step): $($during.Count) failure events, $($restricted.Count) under a " +
+                "restricted token, $($mine.Count) of them the runner's user's")
+              $mine | ForEach-Object {
+                $process = [System.IO.Path]::GetFileName([string]$_.ProcessName)
+                '  {0}: {1} {2}, access {3}' -f $process, $_.ObjectType, $_.ObjectName, $_.AccessMask
+              } | Select-Object -Unique
+              if ($mine.Count -eq 0) {
+                # What was recorded but filtered out, so the filter can be checked.
+                $fields | Select-Object -First 3 | ForEach-Object {
+                  '  unmatched: {0} {1} {2}, restricted SIDs {3}, subject {4}' -f
+                    [System.IO.Path]::GetFileName([string]$_.ProcessName), $_.ObjectType, $_.ObjectName,
+                    $_.RestrictedSidCount, $_.SubjectUserSid
                 }
-              } | Select-Object -Unique)
-              if ($refused.Count -eq 0) { '  nothing recorded' } else { $refused }
+              }
             }
           }
           $global:LASTEXITCODE = 0
 
+      # The build accounts are started through the Secondary Logon service,
+      # which starts on demand; starting it here says so when it cannot.
+      # write-profile lets the probe make a file in the runner user's
+      # profile, which it removes, for a build to try to delete.
       - name: Run the probe
         run: |
-          & (Join-Path $env:PROBE_ROOT 'tools\bin\probe.exe') run $env:PROBE_ROOT $env:PROBE_BASH $env:PROBE_GCC
+          try { Start-Service seclogon } catch { "::warning::the Secondary Logon service did not start: $_" }
+          & (Join-Path $env:PROBE_ROOT 'tools\bin\probe.exe') run $env:PROBE_ROOT $env:PROBE_BASH $env:PROBE_GCC write-profile
           exit $LASTEXITCODE
+
+      # The probe removes the build accounts it makes, and their batch
+      # logon right; this removes any account a run that ended early left,
+      # by the name prefix the probe gives them, and leaves such an
+      # account's right on its SID, which the discarded runner takes with
+      # it.
+      # Windows PowerShell carries the LocalAccounts module itself, where
+      # PowerShell 7 loads it through a compatibility session.
+      - name: Remove leftover build accounts
+        if: always()
+        shell: powershell
+        run: |
+          Get-LocalUser | Where-Object Name -like 'nnprobe*' | ForEach-Object {
+            "removing the leftover account $($_.Name)"
+            Remove-LocalUser -SID $_.SID
+          }
