@@ -1,20 +1,21 @@
 name: Seed
 
-# CI on main once a day, its ladder building every rung of the seed ladder
+# CI and the seed ladder on main once a day, the ladder building every rung
 # from the seed on both Windows legs, x64 and ARM64, naming no substituter
 # but the handoff each stage leaves the next, which holds the sources and
-# what the run itself built (Ladder (mode) in ci.yml).  A pull request and
-# a push to main take the rungs the public cache holds from it on the x64
-# leg alone, so this is the run that fails when the chain no longer builds
-# from the seed, under a builder change or a newer runner image, and the
-# one that runs the ladder on ARM64.  GitHub sends a scheduled run's
-# notifications to whoever last changed its cron line.  A from-seed run on
-# demand is ci.yml dispatched, on any branch.
+# what the run itself built (Ladder (mode) in seed-ladder.yml).  A pull
+# request and a push to main take the rungs the public cache holds from it
+# on the x64 leg alone, so this is the run that fails when the chain no
+# longer builds from the seed, under a builder change or a newer runner
+# image, and the one that runs the ladder on ARM64.  GitHub sends a
+# scheduled run's notifications to whoever last changed its cron line.  A
+# from-seed run on demand is seed-ladder.yml dispatched, on any branch.
 #
-# Its own workflow rather than a schedule in ci.yml: GitHub disables a
-# public repository's scheduled workflows after 60 days with no activity in
-# the repository, a disabled workflow is triggered by nothing, and ci.yml
-# carries every required check.
+# Its own workflow rather than a schedule in ci.yml or seed-ladder.yml:
+# GitHub disables a public repository's scheduled workflows after 60 days
+# with no activity in the repository, a disabled workflow is triggered by
+# nothing, ci.yml carries every required check but Parity, and
+# seed-ladder.yml publishes main's rungs.
 on:
   schedule:
     # Off the hour: GitHub delays scheduled runs at the start of every
@@ -29,3 +30,7 @@ jobs:
   ci:
     name: CI
     uses: ./.github/workflows/ci.yml
+
+  ladder:
+    name: Seed ladder
+    uses: ./.github/workflows/seed-ladder.yml

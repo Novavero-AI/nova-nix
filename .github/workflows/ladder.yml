@@ -5,17 +5,18 @@ name: Ladder
 # pkgs/windows/rungs.nix lists, Mes, TinyCC, GCC 4.6.4, GCC 4.6.4 C++,
 # GCC 10, GCC 16, x86_64, GCC 16 x86_64, Native x86_64 and Stage-2
 # stdenv.  A stage's job builds its rungs, runs its checks, and starts
-# from the store paths the job before it built.  ci.yml calls this
-# workflow once for each leg Ladder (mode) names, so each leg's chain runs
-# on its own: a stage that fails stops the stages after it on its own leg
-# alone.
+# from the store paths the job before it built.  seed-ladder.yml calls
+# this workflow once for each leg Ladder (mode) names, so each leg's
+# chain runs on its own: a stage that fails stops the stages after it on
+# its own leg alone.
 #
 # The rungs are i686 programs but Native x86_64's, which are x86_64 ones,
 # as is what the Stage-2 stdenv stage builds with them.
 # The x64 leg runs i686 programs through WoW64 and the ARM64 leg through
 # ARM64 Windows' x86 emulator; the x64 leg runs x86_64 programs natively
 # and the ARM64 leg through its x64 emulator, as it runs the x64 nova-nix
-# that Stage0 (nova-nix) builds, since the ARM64 image has no GHC.
+# that Ladder (nova-nix and handoff server) builds, since the ARM64 image
+# has no GHC.
 #
 # In seed mode every rung builds from the seed, and the stages name no
 # substituter but the handoff.  In substitute mode each stage takes the
@@ -37,9 +38,9 @@ name: Ladder
 # With publish set, each stage publishes what it holds to the public cache
 # once its checks pass, with that token.  GitHub refuses a job that
 # references the environment from any other ref, so a job names it only
-# with publish set, and ci.yml sets publish for the x64 leg of a push to
-# main alone.  A called workflow's environment secret is empty unless its
-# caller passes it by name, as ci.yml does.
+# with publish set, and seed-ladder.yml sets publish for the x64 leg of a
+# push to main alone.  A called workflow's environment secret is empty
+# unless its caller passes it by name, as seed-ladder.yml does.
 on:
   workflow_call:
     inputs:
@@ -72,9 +73,9 @@ on:
 permissions:
   contents: read
 
-# The public cache's address and key, which ci.yml spells once and passes
-# in: every stage takes its sources from the cache, substitute mode its
-# rungs, and publish pushes to it.
+# The public cache's address and key, which seed-ladder.yml passes in:
+# every stage takes its sources from the cache, substitute mode its rungs,
+# and publish pushes to it.
 env:
   CACHE_URL: ${{ inputs.cache-url }}
   CACHE_PUBLIC_KEY: ${{ inputs.cache-public-key }}
@@ -108,7 +109,7 @@ jobs:
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: stage0-nova-nix
+          name: ladder-nova-nix
           path: ${{ runner.temp }}
 
       - name: Download the handoff server
@@ -340,7 +341,7 @@ jobs:
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: stage0-nova-nix
+          name: ladder-nova-nix
           path: ${{ runner.temp }}
 
       - name: Download the handoff server
@@ -1007,7 +1008,7 @@ jobs:
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: stage0-nova-nix
+          name: ladder-nova-nix
           path: ${{ runner.temp }}
 
       - name: Download the handoff server
@@ -1273,7 +1274,7 @@ jobs:
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: stage0-nova-nix
+          name: ladder-nova-nix
           path: ${{ runner.temp }}
 
       - name: Download the handoff server
@@ -1457,7 +1458,7 @@ jobs:
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: stage0-nova-nix
+          name: ladder-nova-nix
           path: ${{ runner.temp }}
 
       - name: Download the handoff server
@@ -1691,7 +1692,7 @@ jobs:
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: stage0-nova-nix
+          name: ladder-nova-nix
           path: ${{ runner.temp }}
 
       - name: Download the handoff server
@@ -1890,7 +1891,7 @@ jobs:
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: stage0-nova-nix
+          name: ladder-nova-nix
           path: ${{ runner.temp }}
 
       - name: Download the handoff server
@@ -2148,7 +2149,7 @@ jobs:
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: stage0-nova-nix
+          name: ladder-nova-nix
           path: ${{ runner.temp }}
 
       - name: Download the handoff server
@@ -2322,7 +2323,7 @@ jobs:
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: stage0-nova-nix
+          name: ladder-nova-nix
           path: ${{ runner.temp }}
 
       - name: Download the handoff server
@@ -2543,7 +2544,7 @@ jobs:
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: stage0-nova-nix
+          name: ladder-nova-nix
           path: ${{ runner.temp }}
 
       - name: Download the handoff server

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Decide how a CI run's ladder jobs come by the seed ladder, from the event
-# that started the run, its ref, and for a pull request the files it
+# Decide how a Seed ladder run's jobs come by the seed ladder, from the
+# event that started the run, its ref, and for a pull request the files it
 # changes.  The merge queue runs no ladder job, Ladder (mode) among them, so
 # this is not asked about it.
 #

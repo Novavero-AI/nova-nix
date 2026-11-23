@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The mode ladder-mode.sh prints for each event and ref, and for a pull
-# request's lists of changed files, one case per rule and per edge.  CI runs
-# these before it lets the script decide a run's mode, since a wrong skip is
-# a run that tests nothing and stays green.
+# request's lists of changed files, one case per rule and per edge.  Ladder
+# (mode) runs these before it lets the script decide a run's mode, since a
+# wrong skip is a run that tests nothing and stays green.
 #
 # Portable to bash 3.2, which is what macOS ships.
 #

@@ -21,6 +21,12 @@ jobs:
     name: CI
     uses: ./.github/workflows/ci.yml
 
+  # Every rung from the seed on both legs, as in the daily run: a release's
+  # tag is a ref .github/cache/ladder-mode.sh builds from the seed.
+  ladder:
+    name: Seed ladder
+    uses: ./.github/workflows/seed-ladder.yml
+
   parity:
     name: Parity
     uses: ./.github/workflows/parity.yml
@@ -57,7 +63,7 @@ jobs:
   # build rather than only evaluate.
   package:
     name: Package (${{ matrix.name }})
-    needs: [check-tag, ci, parity]
+    needs: [check-tag, ci, ladder, parity]
     strategy:
       fail-fast: true
       matrix:

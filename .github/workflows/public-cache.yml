@@ -1,0 +1,227 @@
+name: Public cache
+
+# Refreshes the public cache from each push to main and checks it from a
+# fresh store.  The seed ladder's x64 leg publishes the rungs
+# (seed-ladder.yml); this publishes the closure pkgs/windows/hello.nix
+# builds and every source pkgs/windows fetches.  No job here is a required
+# check, and pull requests and the merge queue run none.
+#
+# The write token is a secret of the `cache` environment, whose deployment
+# branch rule admits main alone, and GitHub refuses a job that references
+# the environment from any other ref.  That rule is the gate: a repository
+# setting only an admin changes, where the trigger below lives in a file
+# any push can edit.
+on:
+  push:
+    branches: [main]
+
+# Drop the default GITHUB_TOKEN to read-only; nothing here writes via it.
+permissions:
+  contents: read
+
+# A run is not cancelled once it starts: a cancelled publish leaves the
+# cache one run behind until the next push's run completes.  One still
+# waiting when a newer push arrives is cancelled, as GitHub cancels a
+# group's pending run, and the newer run publishes the closure of a tree
+# that holds its changes.
+concurrency:
+  group: public-cache-${{ github.ref }}
+  cancel-in-progress: false
+
+# The public cache's address and signing key, as ci.yml and
+# seed-ladder.yml spell them (test/Main.hs holds the three to one of
+# each): Publish (public cache) pushes to it and E2E (public cache)
+# substitutes from it.
+env:
+  CACHE_URL: https://cache.novavero.ai
+  CACHE_PUBLIC_KEY: cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Publish (public cache): refresh the public cache with the closure main
+  # builds, so it serves the current one rather than whatever was pushed by
+  # hand last.
+  #
+  # The closure is built again here, with the public cache as a substituter:
+  # after the first publish, everything a push left alone substitutes and
+  # only the delta builds, and --all then finds the rest already cached.  A
+  # toolchain bump is the cold case, a second full build.  The bytes pushed
+  # are this job's, so this job runs its own Hello first and one that does
+  # not print is never published.  That check is what holds a closure back:
+  # a job cannot need one of another workflow, so this one does not wait
+  # for ci.yml's E2E (Windows) on the same commit.  On a push by the merge
+  # queue, the merge group's run passed it there; on a push by anyone else,
+  # ci.yml runs it beside this job.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish (public cache)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    environment:
+      name: cache
+      url: ${{ env.CACHE_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
+        id: setup
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      # The store's key names this plan (.github/actions/cabal-store).
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
+
+      - name: Install nova-nix
+        run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
+
+      - name: Provision the store root
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # Every source pkgs/windows fetches, for --all below to publish: one
+      # the cache holds comes from it, and one it lacks is fetched from its
+      # upstream host here, the once.
+      - name: Take the sources from the public cache
+        shell: bash
+        run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+      # build prints the out path as its last stdout line; the [subst] and
+      # [build] lines go to stderr and stay in the job log.  LC_ALL pinned
+      # as E2E (public cache) pins it: the greeting is compared literally,
+      # and hello configures NLS in when it finds libintl, which the seed
+      # ships.  The build never sees it: the builder scrubs the ambient
+      # environment down to SystemRoot, SystemDrive and windir.
+      - name: Build hello.nix, substituting what the cache already has, and run it
+        shell: bash
+        env:
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/hello.nix \
+            --substituter "$CACHE_URL" \
+            --trusted-key "$CACHE_PUBLIC_KEY" | tail -n 1)
+          echo "out path: $out"
+          got=$("$(cygpath -u "$out")/bin/hello.exe")
+          echo "output: $got"
+          [ "$got" = "Hello, world!" ] || { echo "unexpected hello output: $got" >&2; exit 1; }
+
+      # --all is every valid path but the derivations in a store this job
+      # filled from empty: the closure, and every source pkgs/windows
+      # fetches, each fixed-output and so the same bytes wherever it was
+      # fetched.  push skips what the cache already serves and prints both
+      # counts itself.  An absent secret arrives as an empty key file, which
+      # push refuses.
+      - name: Publish the closure to the public cache
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: |
+          set -euo pipefail
+          keyfile="$RUNNER_TEMP/cache-key"
+          trap 'rm -f "$keyfile"' EXIT
+          (umask 077; printf '%s' "$NOVA_CACHE_API_KEY" > "$keyfile")
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$CACHE_URL" --key-file "$keyfile" \
+            --compression zstd --all
+
+  # ---------------------------------------------------------------------------
+  # End-to-end (public cache): the loop the Linux job proves against a
+  # throwaway server, run on Windows against the cache users are given.
+  # A fresh store, the public cache as the only substituter, and the build
+  # must come entirely from it: a single [build] line means the cache is
+  # missing part of the current closure and the job turns red, instead of
+  # a silent local rebuild hiding the gap.  Once the publish job above has
+  # refreshed the cache from this same tree.
+  # ---------------------------------------------------------------------------
+  e2e-public-cache:
+    name: E2E (public cache)
+    needs: [publish]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
+        id: setup
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      # The store's key names this plan (.github/actions/cabal-store).
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
+
+      - name: Install nova-nix
+        run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
+
+      # The store root wants pre-creating on the runner, as the Windows job
+      # found; cygpath keeps the separators Windows-native so the store dir
+      # the binary renders paths through has one spelling.
+      - name: Substitute the whole closure from the public cache
+        shell: bash
+        env:
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          store=$(cygpath -w "$RUNNER_TEMP/public-store")
+          mkdir -p "$RUNNER_TEMP/public-store"
+          log="$RUNNER_TEMP/substitute.log"
+          out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/hello.nix \
+            --store "$store" \
+            --substituter "$CACHE_URL" \
+            --trusted-key "$CACHE_PUBLIC_KEY" \
+            2> "$log" | tail -n 1)
+          echo "out path: $out"
+          grep -F '[subst]' "$log" || { echo "nothing was substituted from the public cache" >&2; cat "$log" >&2; exit 1; }
+          if grep -F '[build]' "$log"; then
+            echo "the public cache is missing part of the current closure: the lines above were built locally" >&2
+            exit 1
+          fi
+          got=$("$(cygpath -u "$out")/bin/hello.exe")
+          echo "output: $got"
+          [ "$got" = "Hello, world!" ] || { echo "unexpected hello output: $got" >&2; exit 1; }
+
+      # The publish job above pushed every source pkgs/windows fetches, so
+      # each has to come from the cache here.  A [build] line is a source
+      # the cache lacks, which every other job then fetches from its
+      # upstream host on every run.
+      - name: Every source comes from the public cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          store=$(cygpath -w "$RUNNER_TEMP/public-store")
+          log="$RUNNER_TEMP/sources.log"
+          if ! bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe" --store "$store" 2> "$log"; then
+            cat "$log" >&2
+            exit 1
+          fi
+          if grep -F '[build]' "$log"; then
+            echo "the public cache is missing the sources above: each was fetched from its upstream host" >&2
+            exit 1
+          fi
+          echo "$(grep -c -F '[subst]' "$log") sources came from the public cache"
+
+      - name: Dump the substitution log on failure
+        if: failure()
+        shell: bash
+        run: cat "$RUNNER_TEMP/substitute.log" || true

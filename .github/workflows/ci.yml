@@ -1,5 +1,9 @@
 name: CI
 
+# The checks a change needs before it merges, run on each pull request, in
+# the merge queue and on main.  The seed ladder and the publishing to the
+# public cache are workflows of their own (seed-ladder.yml,
+# public-cache.yml), each with the triggers it needs.
 on:
   push:
     branches: [main]
@@ -26,28 +30,23 @@ permissions:
   contents: read
 
 # A newer push to a pull request supersedes the run in flight, so that one
-# is cancelled.  A run on main is not cancelled once it starts: it
-# publishes what it built to the public cache, and a cancelled publish
-# leaves the cache one run behind until the next push's run completes.
-# One still waiting when a newer push arrives is cancelled, as GitHub
-# cancels a group's pending run.  The newer run tests a tree that holds its
-# changes and, taking from the cache what it holds, builds and publishes
-# the rungs the cancelled run would have.  Merge-group runs are the queue's
-# own evidence and are left alone for the same reason as main's.  The event
-# is in the group so that a run seed.yml calls on main neither waits behind
-# nor cancels a push's.  pr-closed.yml spells a pull request's group out to
+# is cancelled.  A run on main is the verdict on a commit in main's history
+# and a merge group's run is the queue's evidence for its merge, so neither
+# is cancelled once it starts; one still waiting when a newer run joins the
+# group is, as GitHub cancels a group's pending run.  The event is in the
+# group so that a run seed.yml calls on main neither waits behind nor
+# cancels a push's.  pr-closed.yml spells a pull request's group out to
 # cancel its run once it closes, so a change to the group changes it too.
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# The public cache's address and signing key, spelled once: the publish job
-# and the ladder's x64 leg on main push to it, E2E (public cache)
-# substitutes from it, every job that builds from pkgs/windows takes its
-# sources from it, the ladder's later stages through the first one's
-# handoff, the ladder takes the seed ladder's rungs from it in substitute
-# mode, and all must agree.  Ladder (mode) passes both to ladder.yml, which
-# does not see this env.  A cache move or a key rotation is one edit here.
+# The public cache's address and signing key: E2E (Windows) and the Stage0
+# legs take every source pkgs/windows fetches from it.  seed-ladder.yml and
+# public-cache.yml spell the same two, and test/Main.hs holds the three to
+# one of each.  publish.yml's installer check spells them inline, as
+# install-nova-nix's own check does, so a cache move or a key rotation
+# edits all four.
 env:
   CACHE_URL: https://cache.novavero.ai
   CACHE_PUBLIC_KEY: cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
@@ -60,14 +59,12 @@ jobs:
   # A push to main by the merge queue carries the commit its merge group's
   # run tested, since the queue moves main to that commit, so its run skips
   # the builds, tests and Stage0 legs that run ran there.  The textual
-  # checks through Cabal Check still run, about two minutes: Stage0
-  # (nova-nix), whose build the ladder runs, needs Cabal Check, and a job
-  # whose chain of needs holds a skipped job is skipped unless its own
-  # condition says otherwise.  What a merge group's run does not run still
-  # runs: the ladder, after Cabal Check as on any push, and the jobs that
-  # publish to the public cache, which on such a push wait for no textual
-  # check.  A push by anyone else reaches main untested and runs every job.
-  # github.actor stays the queue when such a run is re-run.
+  # checks through Cabal Check and Stage0 (nova-nix) still run.  A push by
+  # anyone else reaches main untested and runs every job.  github.actor
+  # stays the queue when such a run is re-run.  What a merge group's run
+  # does not run, the ladder and the publishing to the public cache, are
+  # workflows of their own (seed-ladder.yml, public-cache.yml) and run on
+  # every push to main.
   ascii:
     name: ASCII source
     runs-on: ubuntu-latest
@@ -1237,393 +1234,6 @@ jobs:
           grep -Fqx 'ABORTING HARD' "$log" || fail "kaem did not abort"
           if grep -Fq ' +> mkdir' "$log"; then fail "kaem ran the mkdir after cp failed"; fi
           exit "$status"
-
-  # ---------------------------------------------------------------------------
-  # Ladder (mode): whether and how this run builds the seed ladder, the
-  # rungs pkgs/windows builds from its 1,623-byte seed.  Decided once a run
-  # by .github/cache/ladder-mode.sh, which has the rules, from the event, the
-  # ref and, for a pull request, the files it changes:
-  #
-  #   skip         a pull request that changes documentation alone.  No
-  #                ladder job runs.  None is a required check, and the
-  #                Stage0 legs, which are, still build their chain from the
-  #                seed.
-  #   substitute   any other pull request, and every push to main.  The
-  #                x64 leg takes each rung the public cache holds from it
-  #                and builds the ones it lacks: the ones the change alters,
-  #                and on main any that a push whose run was cancelled while
-  #                it waited never published.
-  #   seed         the daily run seed.yml calls, a dispatched run and a
-  #                release.  Both legs build every rung from the seed.
-  #
-  # A push to main publishes what its x64 leg holds, the rungs it built and
-  # the ones it took from the cache: a rung's store path, and so what the
-  # cache holds for it, is the same however it was built.  The ARM64 leg
-  # runs in seed mode alone; on every change, Stage0 (Windows ARM64) runs
-  # the seed chain under the x86 emulator.
-  #
-  # The merge queue runs no ladder job.  None is a required check, so the
-  # queue merges without waiting for them, and the push to main that
-  # follows runs the ladder on the commit the queue tested.  Ladder (mode)
-  # does not run there, and the jobs that need it skip with it.
-  #
-  # A pull request's changed files come from git, which needs no token and
-  # has no page limit.  A pull_request run checks out the merge commit
-  # GitHub makes of the pull request and its base, and that commit's first
-  # parent is the base, so the diff from it to the checkout is what the
-  # change does to the tree the jobs build.
-  # ---------------------------------------------------------------------------
-  ladder-mode:
-    name: Ladder (mode)
-    if: github.event_name != 'merge_group'
-    runs-on: ubuntu-latest
-    outputs:
-      mode: ${{ steps.decide.outputs.mode }}
-      legs: ${{ steps.decide.outputs.legs }}
-      cache-url: ${{ steps.decide.outputs.cache-url }}
-      cache-public-key: ${{ steps.decide.outputs.cache-public-key }}
-    steps:
-      # Two commits deep: a pull request's merge commit and its parents.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 2
-
-      # A wrong skip is a run that tests nothing and stays green, so the
-      # rules are checked against their cases before they decide anything.
-      - name: The rules decide their cases
-        run: bash .github/cache/ladder-mode-cases.sh
-
-      # --no-renames lists a renamed file under both of its names.  Git's
-      # default lists the new one alone, and a source file renamed to a
-      # document would pass for documentation.  A pull request's checkout
-      # that is no merge commit is refused: its first parent is the commit
-      # before it, not the base, and the diff would be of the last commit
-      # alone.
-      #
-      # The legs are the Ladder job's matrix: the x64 leg, which publishes
-      # on a push to main, alone in substitute mode, and the ARM64 leg with
-      # it in seed mode.  The public cache's address and key go out with
-      # them, since ladder.yml takes them as inputs: a called workflow does
-      # not see its caller's env.
-      - name: Decide the mode
-        id: decide
-        env:
-          X64_LEG: '{"os":"windows-latest","name":"Windows","publish":true}'
-          ARM64_LEG: '{"os":"windows-11-arm","name":"Windows ARM64","publish":false}'
-        run: |
-          set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            if ! git rev-parse --verify --quiet HEAD^2 > /dev/null; then
-              echo "::error::the checkout is not a pull request's merge commit, so its first parent is not the base"
-              exit 1
-            fi
-            mode=$(git diff --name-only --no-renames -z HEAD^1 HEAD | bash .github/cache/ladder-mode.sh "$GITHUB_EVENT_NAME" "$GITHUB_REF")
-          else
-            mode=$(bash .github/cache/ladder-mode.sh "$GITHUB_EVENT_NAME" "$GITHUB_REF" < /dev/null)
-          fi
-          case $mode in
-            seed) legs="[$X64_LEG,$ARM64_LEG]" ;;
-            substitute) legs="[$X64_LEG]" ;;
-            skip) legs='[]' ;;
-            *)
-              echo "::error::ladder-mode.sh printed $mode, which is no mode"
-              exit 1
-              ;;
-          esac
-          {
-            echo "mode=$mode"
-            echo "legs=$legs"
-            echo "cache-url=$CACHE_URL"
-            echo "cache-public-key=$CACHE_PUBLIC_KEY"
-          } | tee -a "$GITHUB_OUTPUT"
-
-  # ---------------------------------------------------------------------------
-  # Ladder (handoff server): nova-cache-server, which serves each stage's
-  # handoff (ladder.yml).  Built on x64 Windows, since the ARM64 image has no
-  # GHC; ARM64 Windows runs it through its x64 emulator, as it runs nova-nix.
-  # cabal resolves it under this project's index-state, as nova-nix's own
-  # build resolves the nova-cache library its push is built with.
-  # ---------------------------------------------------------------------------
-  ladder-server:
-    name: Ladder (handoff server)
-    needs: [ladder-mode]
-    if: needs.ladder-mode.outputs.mode != 'skip'
-    runs-on: windows-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
-        id: setup
-        with:
-          ghc-version: "9.14.1"
-          cabal-version: "latest"
-
-      # The Windows store, which caches.yml fills with the packages the
-      # server builds with as well as nova-nix's: warp and wai-extra, which
-      # nova-nix does not need.  The store's key names nova-nix's plan
-      # (.github/actions/cabal-store).
-      - name: Plan the build
-        run: cabal build --enable-tests --dry-run
-
-      - name: Restore the Cabal store
-        uses: ./.github/actions/cabal-store
-        with:
-          path: ${{ steps.setup.outputs.cabal-store }}
-          prefix: cabal-${{ runner.os }}
-          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
-          ghc-version: ${{ steps.setup.outputs.ghc-version }}
-          cabal-version: ${{ steps.setup.outputs.cabal-version }}
-
-      - name: Build nova-cache-server
-        run: cabal install nova-cache -f server --install-method=copy --installdir=staged/bin --overwrite-policy=always
-
-      # Kept for the 30 days a run can be re-run in, as nova-nix is.
-      - name: Upload nova-cache-server
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: ladder-handoff-server
-          path: staged/
-          if-no-files-found: error
-          overwrite: true
-          retention-days: 30
-
-  # ---------------------------------------------------------------------------
-  # Ladder (Windows) and Ladder (Windows ARM64): the seed ladder on each leg
-  # Ladder (mode) names, each leg a call of ladder.yml, which builds it as a
-  # chain of jobs, one for each stage.  Each leg is a call of its own so that
-  # its chain runs on its own: a job that needs a matrix job waits for both
-  # of its legs, so stage jobs with a leg each would leave the x64 leg's
-  # later stages unrun, and unpublished, when a stage failed on ARM64.
-  # fail-fast is off for the same reason.
-  #
-  # The x64 leg of a push to main publishes each stage to the public cache
-  # once its checks pass.  One leg publishes: a cache holding some store
-  # paths from each leg would not hold the bytes either leg's checks ran on.
-  # The token is a secret of the `cache` environment, which the caller of a
-  # reusable workflow cannot name, so it is passed by name to ladder.yml,
-  # whose jobs name the environment.
-  # ---------------------------------------------------------------------------
-  ladder:
-    name: Ladder (${{ matrix.name }})
-    needs: [stage0-nova-nix, ladder-mode, ladder-server]
-    if: needs.ladder-mode.outputs.mode != 'skip'
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(needs.ladder-mode.outputs.legs) }}
-    uses: ./.github/workflows/ladder.yml
-    with:
-      os: ${{ matrix.os }}
-      mode: ${{ needs.ladder-mode.outputs.mode }}
-      publish: ${{ matrix.publish && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      cache-url: ${{ needs.ladder-mode.outputs.cache-url }}
-      cache-public-key: ${{ needs.ladder-mode.outputs.cache-public-key }}
-    secrets:
-      NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
-
-  # ---------------------------------------------------------------------------
-  # Publish (public cache): refresh the public cache with the closure main
-  # builds, so it serves the current one rather than whatever was pushed by
-  # hand last.  A job of its own rather than a step of e2e-windows: the
-  # token is a secret of the `cache` environment, whose deployment branch
-  # rule admits main alone, and GitHub refuses a job that references the
-  # environment from any other ref.  On e2e-windows that refusal would hit
-  # E2E (Windows), a required check on every pull request.  The gate is a
-  # repository setting only an admin changes, where an `if:` lives in the
-  # file any push can edit; the `if:` kept here makes other refs skip the
-  # job instead of failing it.
-  #
-  # The closure is built again here, with the public cache as a substituter:
-  # after the first publish, everything a push left alone substitutes and
-  # only the delta builds, and --all then finds the rest already cached.  A
-  # toolchain bump is the cold case, a second full build.  What e2e-windows
-  # ran stays on its own runner; the bytes pushed are this job's, so this
-  # job runs its own Hello first and one that does not print is never
-  # published.
-  # ---------------------------------------------------------------------------
-  publish:
-    name: Publish (public cache)
-    needs: [e2e-windows]
-    # On main, once E2E (Windows) passes, or on a push by the merge queue,
-    # where it is skipped, its merge group's run having passed it on this
-    # commit.  A skipped need skips a job whose condition reads no status,
-    # so this one reads them.
-    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && (needs.e2e-windows.result == 'success' || github.actor == 'github-merge-queue[bot]') }}
-    runs-on: windows-latest
-    timeout-minutes: 45
-    environment:
-      name: cache
-      url: ${{ env.CACHE_URL }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
-        id: setup
-        with:
-          ghc-version: "9.14.1"
-          cabal-version: "latest"
-
-      # The store's key names this plan (.github/actions/cabal-store).
-      - name: Plan the build
-        run: cabal build --enable-tests --dry-run
-
-      - name: Restore the Cabal store
-        uses: ./.github/actions/cabal-store
-        with:
-          path: ${{ steps.setup.outputs.cabal-store }}
-          prefix: cabal-${{ runner.os }}
-          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
-          ghc-version: ${{ steps.setup.outputs.ghc-version }}
-          cabal-version: ${{ steps.setup.outputs.cabal-version }}
-
-      - name: Install nova-nix
-        run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
-
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
-
-      # Every source pkgs/windows fetches, for --all below to publish: one
-      # the cache holds comes from it, and one it lacks is fetched from its
-      # upstream host here, the once.
-      - name: Take the sources from the public cache
-        shell: bash
-        run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
-
-      # build prints the out path as its last stdout line; the [subst] and
-      # [build] lines go to stderr and stay in the job log.  LC_ALL pinned
-      # as E2E (public cache) pins it: the greeting is compared literally,
-      # and hello configures NLS in when it finds libintl, which the seed
-      # ships.  The build never sees it: the builder scrubs the ambient
-      # environment down to SystemRoot, SystemDrive and windir.
-      - name: Build hello.nix, substituting what the cache already has, and run it
-        shell: bash
-        env:
-          LC_ALL: C
-        run: |
-          set -euo pipefail
-          out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/hello.nix \
-            --substituter "$CACHE_URL" \
-            --trusted-key "$CACHE_PUBLIC_KEY" | tail -n 1)
-          echo "out path: $out"
-          got=$("$(cygpath -u "$out")/bin/hello.exe")
-          echo "output: $got"
-          [ "$got" = "Hello, world!" ] || { echo "unexpected hello output: $got" >&2; exit 1; }
-
-      # --all is every valid path but the derivations in a store this job
-      # filled from empty: the closure, and every source pkgs/windows
-      # fetches, each fixed-output and so the same bytes wherever it was
-      # fetched.  push skips what the cache already serves and prints both
-      # counts itself.  An absent secret arrives as an empty key file, which
-      # push refuses.
-      - name: Publish the closure to the public cache
-        shell: bash
-        env:
-          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
-        run: |
-          set -euo pipefail
-          keyfile="$RUNNER_TEMP/cache-key"
-          trap 'rm -f "$keyfile"' EXIT
-          (umask 077; printf '%s' "$NOVA_CACHE_API_KEY" > "$keyfile")
-          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
-            --cache "$CACHE_URL" --key-file "$keyfile" \
-            --compression zstd --all
-
-  # ---------------------------------------------------------------------------
-  # End-to-end (public cache): the loop the Linux job proves against a
-  # throwaway server, run on Windows against the cache users are given.
-  # A fresh store, the public cache as the only substituter, and the build
-  # must come entirely from it: a single [build] line means the cache is
-  # missing part of the current closure and the job turns red, instead of
-  # a silent local rebuild hiding the gap.  Main pushes only, after
-  # the publish job above has refreshed the cache from this same tree.
-  # ---------------------------------------------------------------------------
-  e2e-public-cache:
-    name: E2E (public cache)
-    needs: [publish]
-    # Once Publish (public cache) passes.  On a push by the merge queue, E2E
-    # (Windows), which Publish needs, is skipped, and a skip applies to every
-    # job after it in the chain whose condition reads no status.
-    if: ${{ !cancelled() && needs.publish.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    runs-on: windows-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
-        id: setup
-        with:
-          ghc-version: "9.14.1"
-          cabal-version: "latest"
-
-      # The store's key names this plan (.github/actions/cabal-store).
-      - name: Plan the build
-        run: cabal build --enable-tests --dry-run
-
-      - name: Restore the Cabal store
-        uses: ./.github/actions/cabal-store
-        with:
-          path: ${{ steps.setup.outputs.cabal-store }}
-          prefix: cabal-${{ runner.os }}
-          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
-          ghc-version: ${{ steps.setup.outputs.ghc-version }}
-          cabal-version: ${{ steps.setup.outputs.cabal-version }}
-
-      - name: Install nova-nix
-        run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
-
-      # The store root wants pre-creating on the runner, as the Windows job
-      # found; cygpath keeps the separators Windows-native so the store dir
-      # the binary renders paths through has one spelling.
-      - name: Substitute the whole closure from the public cache
-        shell: bash
-        env:
-          LC_ALL: C
-        run: |
-          set -euo pipefail
-          store=$(cygpath -w "$RUNNER_TEMP/public-store")
-          mkdir -p "$RUNNER_TEMP/public-store"
-          log="$RUNNER_TEMP/substitute.log"
-          out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/hello.nix \
-            --store "$store" \
-            --substituter "$CACHE_URL" \
-            --trusted-key "$CACHE_PUBLIC_KEY" \
-            2> "$log" | tail -n 1)
-          echo "out path: $out"
-          grep -F '[subst]' "$log" || { echo "nothing was substituted from the public cache" >&2; cat "$log" >&2; exit 1; }
-          if grep -F '[build]' "$log"; then
-            echo "the public cache is missing part of the current closure: the lines above were built locally" >&2
-            exit 1
-          fi
-          got=$("$(cygpath -u "$out")/bin/hello.exe")
-          echo "output: $got"
-          [ "$got" = "Hello, world!" ] || { echo "unexpected hello output: $got" >&2; exit 1; }
-
-      # The publish job above pushed every source pkgs/windows fetches, so
-      # each has to come from the cache here.  A [build] line is a source
-      # the cache lacks, which every other job then fetches from its
-      # upstream host on every run.
-      - name: Every source comes from the public cache
-        shell: bash
-        run: |
-          set -euo pipefail
-          store=$(cygpath -w "$RUNNER_TEMP/public-store")
-          log="$RUNNER_TEMP/sources.log"
-          if ! bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe" --store "$store" 2> "$log"; then
-            cat "$log" >&2
-            exit 1
-          fi
-          if grep -F '[build]' "$log"; then
-            echo "the public cache is missing the sources above: each was fetched from its upstream host" >&2
-            exit 1
-          fi
-          echo "$(grep -c -F '[subst]' "$log") sources came from the public cache"
-
-      - name: Dump the substitution log on failure
-        if: failure()
-        shell: bash
-        run: cat "$RUNNER_TEMP/substitute.log" || true
 
   # ---------------------------------------------------------------------------
   # End-to-end (Linux): the full binary-cache loop against a real

@@ -22423,16 +22423,21 @@ ormoluVersions line =
   where
     ormoluPrefix = "ormolu-"
 
--- | The versions of the tools that workflows spell in more than one place:
--- GHC in every haskell-actions/setup step, and ormolu in CI's Ormolu job
--- and in caches.yml.  caches.yml saves the caches the other workflows
--- restore under keys that name these versions, so a bump that missed it
--- would leave every one of them unsaved.  Each tool has one version, and
--- the workflows known to name it are among those found naming it, so a
+-- | The values that workflows spell in more than one place, and that have
+-- to agree.  GHC's version is in every haskell-actions/setup step, and
+-- ormolu's in CI's Ormolu job and in caches.yml: caches.yml saves the
+-- caches the other workflows restore under keys that name these versions,
+-- so a bump that missed it would leave every one of them unsaved.  The
+-- public cache's address and signing key are the CACHE_URL and
+-- CACHE_PUBLIC_KEY of CI, Seed ladder and Public cache, whose jobs take
+-- from the cache or publish to it, and a cache move or a key rotation
+-- that missed one would leave that workflow's jobs asking the old address
+-- or trusting the old key.  Each value has one spelling, and the
+-- workflows known to name it are among those found naming it, so a
 -- reading that finds nothing fails.
-testWorkflowVersions :: IO [Bool]
-testWorkflowVersions = do
-  putStrLn "ci/versions"
+testWorkflowSpellings :: IO [Bool]
+testWorkflowSpellings = do
+  putStrLn "ci/spellings"
   outcome <- try $ do
     names <- Dir.listDirectory workflowsDir
     let workflows = sort [name | name <- names, ".yml" `T.isSuffixOf` T.pack name]
@@ -22445,18 +22450,26 @@ testWorkflowVersions = do
           ormolu =
             [(name, version) | (name, line) <- code, version <- ormoluVersions line]
               ++ [(name, version) | (name, line) <- code, version <- literalValues "ORMOLU_VERSION" [line]]
+          cacheUrl = [(name, url) | (name, line) <- code, url <- literalValues "CACHE_URL" [line]]
+          cacheKey = [(name, key) | (name, line) <- code, key <- literalValues "CACHE_PUBLIC_KEY" [line]]
        in sequence
             [ runTest "every workflow names one GHC version, ci.yml and caches.yml among them" $
-                oneVersion "GHC" ["caches.yml", "ci.yml"] ghc,
+                oneSpelling "GHC's version" ["caches.yml", "ci.yml"] ghc,
               runTest "every workflow names one ormolu version, ci.yml and caches.yml among them" $
-                oneVersion "ormolu" ["caches.yml", "ci.yml"] ormolu
+                oneSpelling "ormolu's version" ["caches.yml", "ci.yml"] ormolu,
+              runTest "every workflow names one public cache address, ci.yml, public-cache.yml and seed-ladder.yml among them" $
+                oneSpelling "the public cache's address" cacheWorkflows cacheUrl,
+              runTest "every workflow names one public cache key, ci.yml, public-cache.yml and seed-ladder.yml among them" $
+                oneSpelling "the public cache's key" cacheWorkflows cacheKey
             ]
   where
-    oneVersion :: Text -> [FilePath] -> [(FilePath, Text)] -> TestResult
-    oneVersion tool known found = case ([name | name <- known, name `notElem` map fst found], nub (map snd found)) of
+    cacheWorkflows :: [FilePath]
+    cacheWorkflows = ["ci.yml", "public-cache.yml", "seed-ladder.yml"]
+    oneSpelling :: Text -> [FilePath] -> [(FilePath, Text)] -> TestResult
+    oneSpelling value known found = case ([name | name <- known, name `notElem` map fst found], nub (map snd found)) of
       ([], [_]) -> Pass
-      ([], _) -> Fail (tool <> " is spelled as more than one version: " <> T.pack (show found))
-      (missing, _) -> Fail (tool <> " is named in none of " <> T.pack (show missing))
+      ([], _) -> Fail (value <> " is spelled more than one way: " <> T.pack (show found))
+      (missing, _) -> Fail (value <> " is named in none of " <> T.pack (show missing))
 
 testFetchGitTransport :: IO [Bool]
 testFetchGitTransport = do
@@ -34150,7 +34163,7 @@ runSuite = do
           testChecksForbidSubstitutes,
           testWindowsSources,
           testWindowsRungs,
-          testWorkflowVersions,
+          testWorkflowSpellings,
           testNarKnownAnswer,
           testFetchGitTransport,
           testFetchGitShallow,
