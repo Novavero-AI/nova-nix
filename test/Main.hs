@@ -82,6 +82,7 @@ import qualified Nix.Daemon.Wire as Wire
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), DrvFile, Platform (..), currentPlatform, drvFileATerm, drvFileDerivation, drvFilePath, extraPlatforms, fromATerm, inputAddressed, platformToText, textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
+import Nix.Develop.Environment (AttrsFiles (..), BuildEnvironment (..), EnvironmentScript (..), Prompt (..), ScriptDirectories (..), ScriptFile (..), Shell (..), ShellMode (..), Variable (..), buildEnvironmentJson, environmentScript, escapeShellArgAlways, ignoreVars, parseBuildEnvironment, renderRcfile)
 import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, checkGitRef, checkGitRev, checkGitUrl, currentSystemStr, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evalParsed, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, listedBuiltins, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
@@ -26728,6 +26729,212 @@ strictCaseAgrees storeDir (StrictCase name source) = case parseNix testBaseDir t
       lookupDrvHash inputText >>= maybe (throwEvalError ("no modulo hash was cached for " <> inputText)) (\hash -> pure (hash, outputs))
 
 -- ---------------------------------------------------------------------------
+-- Tests: develop's captured environment and rcfile
+-- ---------------------------------------------------------------------------
+
+-- | The captured environment and the scripts made from it.  Three of the
+-- fixtures in test/data/develop are what upstream's get-env.sh (2.35.4)
+-- writes when bash 5.3 runs it over a stand-in stdenv setup: one output,
+-- three, and structured attributes with two.  Two more are small
+-- documents for the rewriting rules.  Each golden is what upstream's own
+-- code makes of a fixture: develop.cc's BuildEnvironment, makeRcScript and
+-- the rcfile lines of CmdDevelop::run, with util.cc's escapeShellArgAlways
+-- and rewriteStrings, built against nlohmann_json 3.11.3 with the store
+-- taken out.
+testDevelopEnvironment :: IO [Bool]
+testDevelopEnvironment = do
+  putStrLn "develop/environment"
+  tmpBase <- getTemporaryDirectory
+  sequence $
+    map dumpGolden developFixtures
+      <> [rcfileGolden fixture mode | fixture <- developFixtures, mode <- developModes]
+      <> map (rcfileGolden "one-output") promptModes
+      <> [ scriptGolden "rewrites" (ScriptDirectories "/w" "/t") [],
+           scriptGolden "paths" (ScriptDirectories "/" "/t/") [ScriptFile "/t/.attrs.sh" "declare x=1", ScriptFile "/t/.attrs.json" "{\"x\":1}"],
+           runTestM "the structured attributes' files are written to the temporary directory" $
+             withDevelopFixture "structured" $ \env ->
+               pure . assertRight "script" (environmentScript goldenDirectories env) $ \script ->
+                 assertEqual
+                   "files"
+                   [ScriptFile (goldenTemporary <> "/.attrs.sh") (attrsFileBytes attrsSh env), ScriptFile (goldenTemporary <> "/.attrs.json") (attrsFileBytes attrsJson env)]
+                   (scriptFiles script),
+           runTestM "a script without structured attributes names no files" $
+             withDevelopFixture "several-outputs" $ \env ->
+               pure (assertRight "script" (environmentScript goldenDirectories env) (assertEqual "files" [] . scriptFiles)),
+           runTestM "a variable of a kind get-env.sh writes as unknown is dropped" $
+             withDevelopFixture "one-output" $ \env ->
+               pure (assertEqual "dropped" [Nothing, Nothing, Just "impure"] [kept <$> Map.lookup name (beVariables env) | name <- ["BASHOPTS", "NIX_FIXTURE_COUNT", "IN_NIX_SHELL"]]),
+           runTest "a variable of any kind but the four is dropped" $
+             assertEqual
+               "dropped"
+               (Right (BuildEnvironment Map.empty Map.empty Nothing))
+               (parseBuildEnvironment "{\"bashFunctions\":{},\"variables\":{\"i\":{\"type\":\"integer\",\"value\":3},\"r\":{\"type\":\"unknown\"}}}"),
+           runTest "a document of another shape is refused" $
+             assertEqual "accepted" [] [document | document <- malformedEnvironments, isRight (parseBuildEnvironment document)],
+           runTest "ignoreVars is upstream's" $
+             assertEqual "ignoreVars" (Set.fromList upstreamIgnoreVars) ignoreVars,
+           runTest "a variable in ignoreVars is left as the shell has it"
+             $ assertRight "script" (developScript (("KEPT", ExportedString "k") : ("outputs", ShellString "") : [(name, ExportedString "x") | name <- upstreamIgnoreVars]))
+             $ assertEqual "assigned" ["KEPT", "outputs"] . assignedNames,
+           runTest "an outputs string splits on carriage returns too"
+             $ assertRight "script" (developScript [("a", ShellString "/s/a"), ("b", ShellString "/s/b"), ("outputs", ShellString "a\rb"), ("v", ShellString "/s/a /s/b")])
+             $ assertEqual "v" True . BS.isInfixOf "\nv='/w/outputs/a /w/outputs/b'\n" . scriptText,
+           runTest "an outputs array names the outputs, the first of two with one path taking it"
+             $ assertRight "script" (developScript [("a", ShellString "/s/same"), ("b", ShellString "/s/same"), ("outputs", IndexedArray ["b", "a"]), ("v", ShellString "/s/same")])
+             $ assertEqual "v" True . BS.isInfixOf "\nv='/w/outputs/b'\n" . scriptText,
+           runTest "an outputs associative array names the outputs by its keys"
+             $ assertRight "script" (developScript [("a", ShellString "/s/a"), ("b", ShellString "/s/b"), ("outputs", AssociativeArray (Map.fromList [("a", "/s/x"), ("b", "/s/y")])), ("v", ShellString "/s/a /s/b /s/x")])
+             $ assertEqual "v" True . BS.isInfixOf "\nv='/w/outputs/a /w/outputs/b /s/x'\n" . scriptText,
+           runTest "an environment with no outputs is refused in upstream's words" $
+             assertEqual "refused" (Left "derivation does not have an 'outputs' attribute") (scriptText <$> developScript [("out", ShellString "/s/o")]),
+           runTest "an output's variable that is not a string is refused in upstream's words" $
+             assertEqual "refused" (Left "bash variable is not a string") (scriptText <$> developScript [("outputs", ShellString "out"), ("out", IndexedArray ["/s/o"])]),
+           runTest "structured attributes' outputs that are not an associative array are refused in upstream's words" $
+             assertEqual "refused" (Left "bash variable is not an associative array") (scriptText <$> structuredScript [("outputs", ShellString "out"), ("out", ShellString "/s/o")]),
+           runTest "an output with no variable is refused" $
+             assertEqual "refused" (Left "the build environment has no variable 'out'") (scriptText <$> developScript [("outputs", ShellString "out")]),
+           runTest "structured attributes with no file variable are refused" $
+             assertEqual "refused" (Left "the build environment has no variable 'NIX_ATTRS_SH_FILE'") (scriptText <$> structuredScript [("outputs", AssociativeArray (Map.singleton "out" "/s/o"))]),
+           runTest "a file variable that is not a string is refused in upstream's words" $
+             assertEqual "refused" (Left "bash variable is not a string") (scriptText <$> structuredScript [("NIX_ATTRS_SH_FILE", IndexedArray []), ("outputs", AssociativeArray (Map.singleton "out" "/s/o"))]),
+           runTest "a replacement holding what it replaces is refused where upstream's replacing never ends" $
+             assertEqual "accepted" [] [path | path <- ["/w", "", "/w/outputs"], isRight (developScript [("outputs", ShellString "out"), ("out", ShellString path)])],
+           runTest "a replacement holding what it replaces is harmless where the script does not hold it" $
+             assertEqual "refused" [] [path | path <- ["/w", "/w/", "/w/outputs"], isLeft (developScript [("outputs", ShellString "HOME"), ("HOME", ShellString path)])],
+           runTest "a path that is its own replacement is left as it is"
+             $ assertRight "script" (developScript [("outputs", ShellString "out"), ("out", ShellString "/w/outputs/out")])
+             $ assertEqual "out" True . BS.isInfixOf "\nout='/w/outputs/out'\n" . scriptText,
+           runTestM "reading what is written gives the environment back" $
+             quickCheckPasses (QC.forAll genBuildEnvironment (\env -> parseBuildEnvironment (renderJson (buildEnvironmentJson env)) QC.=== Right env)),
+           shellWordLaw (tmpBase </> "nova-nix-test-shell-word")
+         ]
+  where
+    dumpGolden fixture =
+      runTestM (fixture <> ": written back as upstream's toJSON writes it") $
+        withDevelopFixture fixture $ \env -> do
+          expected <- BS.readFile (developData (fixture <> ".dump.json"))
+          pure (assertEqual "dump" expected (renderJson (buildEnvironmentJson env)))
+    rcfileGolden fixture (modeName, mode) =
+      runTestM (fixture <> ": the " <> modeName <> " rcfile is upstream's") $
+        withDevelopFixture fixture $ \env -> do
+          expected <- BS.readFile (developData (fixture <> "." <> modeName <> ".rcfile"))
+          pure . assertRight "script" (environmentScript goldenDirectories env) $
+            assertEqual "rcfile" expected . renderRcfile (Shell "/tmp/nix-shell.Xc9Tq2" mode "bash")
+    scriptGolden fixture directories files =
+      runTestM (fixture <> ": the script is upstream's") $
+        withDevelopFixture fixture $ \env -> do
+          expected <- BS.readFile (developData (fixture <> ".script"))
+          pure . assertRight "script" (environmentScript directories env) $ \script ->
+            assertEqual "script" expected (scriptText script) `andThen` assertEqual "files" files (scriptFiles script)
+    goldenDirectories = ScriptDirectories "/home/user/project" goldenTemporary
+    goldenTemporary = "/tmp/nix-develop-4242-0"
+    developModes =
+      [ ("interactive", Interactive (Prompt "" "" "")),
+        ("prompts", Interactive goldenPrompt),
+        ("command", RunCommand ("make" :| ["CFLAGS=-O2 -g", "it's"])),
+        ("phase", RunPhase "build")
+      ]
+    promptModes =
+      [ ("prompt", Interactive (Prompt (bashPrompt goldenPrompt) "" "")),
+        ("prompt-prefix", Interactive (Prompt "" (bashPromptPrefix goldenPrompt) "")),
+        ("prompt-suffix", Interactive (Prompt "" "" (bashPromptSuffix goldenPrompt)))
+      ]
+    goldenPrompt = Prompt "\\[\\e[1;32m\\]dev\\$ " "(nix) " " it's"
+    attrsFileBytes field env = maybe "" (TE.encodeUtf8 . field) (beAttrsFiles env)
+    kept variable = case variable of
+      ExportedString s -> s
+      ShellString s -> s
+      _ -> ""
+    developScript variables = environmentScript (ScriptDirectories "/w" "/t") (BuildEnvironment (Map.fromList variables) Map.empty Nothing)
+    structuredScript variables = environmentScript (ScriptDirectories "/w" "/t") (BuildEnvironment (Map.fromList variables) Map.empty (Just (AttrsFiles "" "")))
+    -- The names a script assigns a quoted string to.
+    assignedNames script = [name | line <- BS8.lines (scriptText script), (name, rest) <- [BS8.break (== '=') line], "='" `BS.isPrefixOf` rest]
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+
+-- | The fixtures get-env.sh wrote, each with goldens in every mode.
+developFixtures :: [Text]
+developFixtures = ["one-output", "several-outputs", "structured"]
+
+-- | A file of test/data/develop.
+developData :: Text -> FilePath
+developData name = "test" </> "data" </> "develop" </> T.unpack name
+
+-- | Run a check over a fixture's environment as 'parseBuildEnvironment'
+-- reads it.
+withDevelopFixture :: Text -> (BuildEnvironment -> IO TestResult) -> IO TestResult
+withDevelopFixture fixture check = do
+  document <- BS.readFile (developData (fixture <> ".json"))
+  either (pure . Fail . ("fixture: " <>)) check (parseBuildEnvironment document)
+
+-- | Upstream's ignoreVars (develop.cc:315-332 at 2.35.4).
+upstreamIgnoreVars :: [Text]
+upstreamIgnoreVars = ["BASHOPTS", "HOME", "NIX_BUILD_TOP", "NIX_ENFORCE_PURITY", "NIX_LOG_FD", "NIX_REMOTE", "PPID", "SHELLOPTS", "SSL_CERT_FILE", "TEMP", "TEMPDIR", "TERM", "TMP", "TMPDIR", "TZ", "UID"]
+
+-- | Documents upstream's reader has no defined answer for, each refused.
+malformedEnvironments :: [BS.ByteString]
+malformedEnvironments =
+  [ "{\"bashFunctions\":{},\"variables\":{\"v\":{\"type\":\"var\",\"value\":\"\xff\"}}}",
+    "[]",
+    "{\"bashFunctions\":{}}",
+    "{\"variables\":{}}",
+    "{\"bashFunctions\":[],\"variables\":{}}",
+    "{\"bashFunctions\":{\"f\":1},\"variables\":{}}",
+    "{\"bashFunctions\":{},\"variables\":{\"v\":\"x\"}}",
+    "{\"bashFunctions\":{},\"variables\":{\"v\":{\"value\":\"x\"}}}",
+    "{\"bashFunctions\":{},\"variables\":{\"v\":{\"type\":1,\"value\":\"x\"}}}",
+    "{\"bashFunctions\":{},\"variables\":{\"v\":{\"type\":\"exported\"}}}",
+    "{\"bashFunctions\":{},\"variables\":{\"v\":{\"type\":\"var\",\"value\":1}}}",
+    "{\"bashFunctions\":{},\"variables\":{\"v\":{\"type\":\"array\",\"value\":[\"a\",1]}}}",
+    "{\"bashFunctions\":{},\"variables\":{\"v\":{\"type\":\"array\",\"value\":{}}}}",
+    "{\"bashFunctions\":{},\"variables\":{\"v\":{\"type\":\"associative\",\"value\":[]}}}",
+    "{\"bashFunctions\":{},\"variables\":{\"v\":{\"type\":\"associative\",\"value\":{\"k\":null}}}}",
+    "{\"bashFunctions\":{},\"variables\":{},\"structuredAttrs\":null}",
+    "{\"bashFunctions\":{},\"variables\":{},\"structuredAttrs\":{\".attrs.sh\":\"\"}}",
+    "{\"bashFunctions\":{},\"variables\":{},\"structuredAttrs\":{\".attrs.sh\":\"\",\".attrs.json\":{}}}"
+  ]
+
+-- | Environments of every shape: any text, control characters and quotes
+-- among it, in names, values, function bodies and the files.
+genBuildEnvironment :: QC.Gen BuildEnvironment
+genBuildEnvironment =
+  BuildEnvironment
+    <$> genEntries genVariable
+    <*> genEntries genAnyText
+    <*> QC.oneof [pure Nothing, Just <$> (AttrsFiles <$> genAnyText <*> genAnyText)]
+  where
+    genEntries genValue = Map.fromList <$> QC.resize 6 (QC.listOf ((,) <$> genAnyText <*> genValue))
+    genVariable =
+      QC.oneof
+        [ ShellString <$> genAnyText,
+          ExportedString <$> genAnyText,
+          IndexedArray <$> QC.resize 4 (QC.listOf genAnyText),
+          AssociativeArray <$> genEntries genAnyText
+        ]
+    genAnyText = T.pack <$> QC.resize 12 (QC.listOf (QC.frequency [(4, QC.arbitrary), (1, QC.elements "'\"\\\n\t\0{}[]")]))
+
+-- | A POSIX sh reads a word 'escapeShellArgAlways' quotes back as the same
+-- bytes, whatever they are but NUL, which no shell word holds.
+shellWordLaw :: FilePath -> IO Bool
+shellWordLaw scriptPath
+  | SI.os == "mingw32" = True <$ putStrLn "  SKIP  a POSIX sh reads an escapeShellArgAlways word back: POSIX only"
+  | otherwise =
+      runTestM "a POSIX sh reads an escapeShellArgAlways word back as the same bytes" $ do
+        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} (QC.forAll genWord (QC.ioProperty . readBack))
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+  where
+    genWord = BS.pack <$> QC.resize 16 (QC.listOf (QC.frequency [(1, pure 0x27), (1, QC.elements [0x5c, 0x22, 0x24, 0x60, 0x0a]), (4, QC.choose (1, 255))]))
+    readBack word = do
+      BS.writeFile scriptPath ("printf '%s' " <> escapeShellArgAlways word)
+      printed <-
+        Proc.withCreateProcess (Proc.proc "/bin/sh" [scriptPath]) {Proc.std_out = Proc.CreatePipe, Proc.env = Just [("LC_ALL", "C")]} $ \_ out _ process -> do
+          bytes <- maybe (pure BS.empty) BS.hGetContents out
+          code <- Proc.waitForProcess process
+          pure (code, bytes)
+      pure (printed QC.=== (ExitSuccess, word))
+
+-- ---------------------------------------------------------------------------
 -- Tests: Builder (Phase 2, Batch 4)
 -- ---------------------------------------------------------------------------
 
@@ -36328,6 +36535,7 @@ runSuite = do
           testLinkOrdering,
           testFromATerm,
           testInputAddressed,
+          testDevelopEnvironment,
           testBuilder,
           testFlatOutputFormIO,
           testE2E,

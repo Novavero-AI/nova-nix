@@ -11,3 +11,8 @@ insert_final_newline = true
 
 [*.sh]
 end_of_line = lf
+
+# A program's output, byte for byte: nlohmann's dump() and get-env.sh end
+# without a newline.
+[test/data/develop/*]
+insert_final_newline = unset

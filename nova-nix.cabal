@@ -115,6 +115,7 @@ library
     Nix.DependencyGraph
     Nix.Derivation
     Nix.Derivation.StructuredAttrs
+    Nix.Develop.Environment
     Nix.Builder
     Nix.Builder.BuildDir
     Nix.Builder.Buildenv

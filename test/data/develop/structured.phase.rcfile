@@ -1,0 +1,108 @@
+unset shellHook
+PATH=${PATH:-}
+nix_saved_PATH="$PATH"
+XDG_DATA_DIRS=${XDG_DATA_DIRS:-}
+nix_saved_XDG_DATA_DIRS="$XDG_DATA_DIRS"
+BASH='/nix/store/3fyf1d1h6cdg8gc7pjpnh1hxkm5a4mmv-bash-5.3p3/bin/bash'
+HOSTTYPE='aarch64'
+IFS=' 	
+'
+IN_NIX_SHELL='impure'
+export IN_NIX_SHELL
+LINENO='78'
+MACHTYPE='aarch64-apple-darwin25.4.0'
+NIX_ATTRS_JSON_FILE='/tmp/nix-develop-4242-0/.attrs.json'
+export NIX_ATTRS_JSON_FILE
+NIX_ATTRS_SH_FILE='/tmp/nix-develop-4242-0/.attrs.sh'
+export NIX_ATTRS_SH_FILE
+NIX_BUILD_CORES='4'
+export NIX_BUILD_CORES
+NIX_CFLAGS_COMPILE='-I/home/user/project/outputs/out/include -DGREETING="hello world" -I/home/user/project/outputs/dev/include'
+export NIX_CFLAGS_COMPILE
+NIX_STORE='/nix/store'
+export NIX_STORE
+OLDPWD=''
+export OLDPWD
+OPTERR='1'
+OSTYPE='darwin25.4.0'
+PATH='/nix/store/4zd8mb1c7r0x5jsg2dqhlf9wnv6pyk3a-hello-dep-1.0/bin:/nix/store/3fyf1d1h6cdg8gc7pjpnh1hxkm5a4mmv-bash-5.3p3/bin'
+export PATH
+PS4='+ '
+SHELL='/noshell'
+export SHELL
+declare -a buildInputs=('/nix/store/4zd8mb1c7r0x5jsg2dqhlf9wnv6pyk3a-hello-dep-1.0' )
+builder='/nix/store/3fyf1d1h6cdg8gc7pjpnh1hxkm5a4mmv-bash-5.3p3/bin/bash'
+dev='/home/user/project/outputs/dev'
+dontAddDisableDepTrack='1'
+export dontAddDisableDepTrack
+declare -a envHostHostHooks=()
+declare -A fixtureFlags=(['newline']='a
+b' ['plain']='tab	here' ['with space']='it'\''s' )
+name='structured-env'
+out='/home/user/project/outputs/out'
+declare -A outputs=(['dev']='/home/user/project/outputs/dev' ['out']='/home/user/project/outputs/out' )
+declare -a preBuildHooks=('echo "before build"' 'echo it'\''s' )
+prefix='/home/user/project/outputs/out'
+shellHook='echo "structured hook"'
+stdenv='/nix/store/2wn1qbk9i4ydbvqgmrbx3hx3k1l0vjfh-stdenv'
+system='x86_64-linux'
+buildPhase ()
+{
+ 
+    runHook preBuild;
+    echo "building into $out with $NIX_CFLAGS_COMPILE";
+    make -j"$NIX_BUILD_CORES" PREFIX="$out";
+    runHook postBuild
+}
+genericBuild ()
+{
+ 
+    for curPhase in ${phases:-buildPhase};
+    do
+        runPhase "$curPhase";
+    done
+}
+runHook ()
+{
+ 
+    local hookName="$1";
+    shift;
+    local hooksSlice="${hookName%Hook}Hooks[@]";
+    local hook;
+    for hook in ${!hooksSlice+"${!hooksSlice}"};
+    do
+        eval "$hook" "$@";
+    done;
+    if declare -F "$hookName" > /dev/null; then
+        "$hookName" "$@";
+    else
+        if [ -n "${!hookName:-}" ]; then
+            eval "${!hookName}";
+        fi;
+    fi;
+    return 0
+}
+runPhase ()
+{
+ 
+    local curPhase="$*";
+    echo "Running phase: $curPhase";
+    runHook "pre${curPhase^}";
+    eval "${!curPhase:-$curPhase}"
+}
+PATH="$PATH${nix_saved_PATH:+:$nix_saved_PATH}"
+XDG_DATA_DIRS="$XDG_DATA_DIRS${nix_saved_XDG_DATA_DIRS:+:$nix_saved_XDG_DATA_DIRS}"
+export NIX_BUILD_TOP="$(mktemp -d -t nix-shell.XXXXXX)"
+export TMP="$NIX_BUILD_TOP"
+export TMPDIR="$NIX_BUILD_TOP"
+export TEMP="$NIX_BUILD_TOP"
+export TEMPDIR="$NIX_BUILD_TOP"
+eval "${shellHook:-}"
+command rm -f '/tmp/nix-shell.Xc9Tq2'
+foundMakefile=1
+if declare -f runPhase >/dev/null; then
+  runPhase buildPhase
+else
+  runHook buildPhase
+fi
+SHELL="bash"

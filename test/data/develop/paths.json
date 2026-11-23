@@ -1,0 +1,10 @@
+{
+  "bashFunctions": {},
+  "variables": {
+    "NIX_ATTRS_JSON_FILE": {"type": "exported", "value": "/b/.attrs.json"},
+    "NIX_ATTRS_SH_FILE": {"type": "exported", "value": "/b/.attrs.sh"},
+    "outputs": {"type": "associative", "value": {"": "/s/q", "/abs": "/s/p", "x": "/s/r"}},
+    "v": {"type": "var", "value": "/s/p /s/q /s/r /b/.attrs.sh /b/.attrs.json"}
+  },
+  "structuredAttrs": {".attrs.sh": "declare x=1", ".attrs.json": "{\"x\":1}"}
+}

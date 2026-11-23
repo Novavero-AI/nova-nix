@@ -1,0 +1,19 @@
+unset shellHook
+PATH=${PATH:-}
+nix_saved_PATH="$PATH"
+XDG_DATA_DIRS=${XDG_DATA_DIRS:-}
+nix_saved_XDG_DATA_DIRS="$XDG_DATA_DIRS"
+NIX_ATTRS_JSON_FILE='/t/.attrs.json'
+export NIX_ATTRS_JSON_FILE
+NIX_ATTRS_SH_FILE='/t/.attrs.sh'
+export NIX_ATTRS_SH_FILE
+declare -A outputs=(['']='/outputs/' ['/abs']='/abs' ['x']='/outputs/x' )
+v='/abs /outputs/ /outputs/x /t/.attrs.sh /t/.attrs.json'
+PATH="$PATH${nix_saved_PATH:+:$nix_saved_PATH}"
+XDG_DATA_DIRS="$XDG_DATA_DIRS${nix_saved_XDG_DATA_DIRS:+:$nix_saved_XDG_DATA_DIRS}"
+export NIX_BUILD_TOP="$(mktemp -d -t nix-shell.XXXXXX)"
+export TMP="$NIX_BUILD_TOP"
+export TMPDIR="$NIX_BUILD_TOP"
+export TEMP="$NIX_BUILD_TOP"
+export TEMPDIR="$NIX_BUILD_TOP"
+eval "${shellHook:-}"

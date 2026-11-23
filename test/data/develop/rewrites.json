@@ -1,0 +1,12 @@
+{
+  "bashFunctions": {},
+  "variables": {
+    "a": {"type": "var", "value": "/s/x"},
+    "b": {"type": "var", "value": "/s/x-dev"},
+    "c": {"type": "var", "value": "/s/same"},
+    "d": {"type": "var", "value": "/s/same"},
+    "o": {"type": "var", "value": "o-p"},
+    "outputs": {"type": "var", "value": " a\tb\no  d c "},
+    "v": {"type": "exported", "value": "/s/x-dev o-p-p /s/same"}
+  }
+}
