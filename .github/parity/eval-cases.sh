@@ -24,8 +24,12 @@ fi
 # A tree, because path literals are only interesting relative to something.
 # Both evaluators run with this as the working directory, so an absolute
 # path in one output is the same absolute path in the other.
+# nova-nix's store under it holds read-only trees, so the cleanup makes it
+# writable before removing it.  What checkValue's evaluators print on
+# stderr is kept apart, outside the tree.
 fixture=$(mktemp -d)
-trap 'rm -rf "$fixture"' EXIT
+streams=$(mktemp -d)
+trap 'chmod -R u+w "$fixture" 2>/dev/null; rm -rf "$fixture" "$streams"' EXIT
 mkdir -p "$fixture/sub"
 printf 'outer\n' >"$fixture/data.txt"
 printf 'inner\n' >"$fixture/sub/data.txt"
@@ -57,14 +61,11 @@ cp "$repoRoot/.github/parity/fetchurl-cases.nix" "$fixture/fetchurl-cases.nix"
 checked=0
 failures=0
 
-check() {
-  label=$1
-  expr=$2
+# Count a row and print its verdict: ok when both evaluators succeeded and
+# printed the same, the expression and each side's exit and output when
+# not, returning 1.
+verdict() {
   checked=$((checked + 1))
-  upstream=$(cd "$fixture" && nix-instantiate --eval -I "nix=$repoRoot/data/nix" -E "$expr" 2>&1)
-  upstreamStatus=$?
-  nova=$(cd "$fixture" && "$novaBin" eval --nix-path "nix=$repoRoot/data/nix" --expr "$expr" 2>&1)
-  novaStatus=$?
   if [ "$upstreamStatus" -eq 0 ] && [ "$novaStatus" -eq 0 ] && [ "$upstream" = "$nova" ]; then
     printf '  ok    %s\n' "$label"
   else
@@ -73,7 +74,37 @@ check() {
     printf '          expression  %s\n' "$expr"
     printf '          upstream    (exit %s) %s\n' "$upstreamStatus" "$upstream"
     printf '          nova-nix    (exit %s) %s\n' "$novaStatus" "$nova"
+    return 1
   fi
+}
+
+# An expression both evaluators must print the same for, stderr included.
+check() {
+  label=$1
+  expr=$2
+  upstream=$(cd "$fixture" && nix-instantiate --eval -I "nix=$repoRoot/data/nix" -E "$expr" 2>&1)
+  upstreamStatus=$?
+  nova=$(cd "$fixture" && "$novaBin" eval ${novaStore:+--store "$novaStore"} --nix-path "nix=$repoRoot/data/nix" --expr "$expr" 2>&1)
+  novaStatus=$?
+  verdict
+}
+
+# An expression both evaluators must give the same value for, compared on
+# stdout alone, for a row about the value where upstream also reports its
+# own progress on stderr: a fetch that unpacks into its Git cache says so,
+# and nova-nix has no such cache.  What each printed on stderr is shown
+# when the row differs.
+checkValue() {
+  label=$1
+  expr=$2
+  upstream=$(cd "$fixture" && nix-instantiate --eval -I "nix=$repoRoot/data/nix" -E "$expr" 2>"$streams/upstream")
+  upstreamStatus=$?
+  nova=$(cd "$fixture" && "$novaBin" eval ${novaStore:+--store "$novaStore"} --nix-path "nix=$repoRoot/data/nix" --expr "$expr" 2>"$streams/nova")
+  novaStatus=$?
+  verdict || {
+    printf '          upstream stderr  %s\n' "$(cat "$streams/upstream")"
+    printf '          nova-nix stderr  %s\n' "$(cat "$streams/nova")"
+  }
 }
 
 # The lines of the input that end in the text given.
@@ -475,18 +506,52 @@ if ! upstreamAtLeast 2.34.0 || upstreamAtLeast 2.35.0; then
 fi
 echo
 
+echo "== what a fetcher returns =="
+# A fetched store path is a string carrying itself as context
+# (allowAndSetStorePathString, fetchTree.cc:526 at 2.24.9 and :508 at
+# 2.34.9), and so is fetchGit's outPath (mkStorePathString, :30 and :33): it
+# prints quoted, and a coercion names the store path rather than copying it
+# again as it would a path.  A fetcher writes in any mode, and nova-nix
+# refuses to write into a store upstream's database manages, so it fetches
+# into a store of its own; both print the logical /nix/store path.  Each row
+# compares the value alone: upstream's first fetch of the tarball prints
+# "unpacking '<url>' into the Git cache..." on stderr at 2.24.9, 2.34.9 and
+# 2.35.4.
+printf 'fetched\n' >"$fixture/parity-fetched"
+mkdir -p "$fixture/tarball/tree"
+printf 'in a tarball\n' >"$fixture/tarball/tree/f"
+tar -C "$fixture/tarball" -czf "$fixture/parity.tar.gz" tree
+git init --quiet "$fixture/repo"
+printf 'in a repository\n' >"$fixture/repo/f"
+git -C "$fixture/repo" add f
+git -C "$fixture/repo" -c user.name=parity -c user.email=parity@localhost commit --quiet -m f
+# nova-nix's store for one call.
+withNovaStore() {
+  local novaStore="$fixture/nova-store"
+  "$@"
+}
+fetchedFile="builtins.fetchurl \"file://$fixture/parity-fetched\""
+fetchedTarball="builtins.fetchTarball \"file://$fixture/parity.tar.gz\""
+fetchedRepo="(builtins.fetchGit { url = \"$fixture/repo\"; }).outPath"
+withNovaStore checkValue "what fetchurl returns" "$fetchedFile"
+withNovaStore checkValue "the type of what fetchurl returns" "builtins.typeOf ($fetchedFile)"
+withNovaStore checkValue "what fetchTarball returns" "$fetchedTarball"
+withNovaStore checkValue "the type of what fetchTarball returns" "builtins.typeOf ($fetchedTarball)"
+withNovaStore checkValue "fetchGit's outPath" "$fetchedRepo"
+withNovaStore checkValue "the type of fetchGit's outPath" "builtins.typeOf $fetchedRepo"
+echo
+
 echo "== a pinned fetch the store holds already =="
 # A pinned fetch whose path is valid returns it without downloading or
 # writing anything (fetchTree.cc:484-497 at 2.24.9).  2.34.9 ensures the path
 # instead (fetchTree.cc:456-478 at 2.34.9), which for a valid one returns at
 # once without asking a substituter (build/entry-points.cc:103).  nix-store --add-fixed makes the path valid with nothing fetched,
-# and the URL names no file, so a download would fail.  The result is read as
-# a string, since upstream's fetchurl gives one where nova-nix gives a path.
+# and the URL names no file, so a download would fail.
 pinnedFile="$fixture/parity-pinned"
 printf 'pinned\n' >"$pinnedFile"
 pinnedHash=$(nix-hash --type sha256 --flat "$pinnedFile")
 nix-store --add-fixed sha256 "$pinnedFile" >/dev/null
-check "a pinned fetchurl whose path is valid" "\"\${builtins.fetchurl { url = \"file://$fixture/absent/parity-pinned\"; sha256 = \"$pinnedHash\"; }}\""
+check "a pinned fetchurl whose path is valid" "builtins.fetchurl { url = \"file://$fixture/absent/parity-pinned\"; sha256 = \"$pinnedHash\"; }"
 echo
 
 echo "== what allow-import-from-derivation and trace-import-from-derivation say =="
