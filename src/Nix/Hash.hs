@@ -1,4 +1,6 @@
 {-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TupleSections #-}
 
 -- | Cryptographic hashing for the Nix store.
 --
@@ -28,8 +30,9 @@
 --   network transfer integrity.
 --
 -- nova-cache already handles output hashes and file hashes.  This module
--- provides the shared hashing utilities and the @makeStorePath@ family that
--- constructs content-addressed store paths exactly as C++ Nix does.
+-- provides the shared hashing utilities, the @makeStorePath@ family that
+-- constructs content-addressed store paths exactly as C++ Nix does, and
+-- the reading of a hash from each spelling upstream accepts.
 module Nix.Hash
   ( -- * Shared hashing utilities
     sha256Hex,
@@ -47,6 +50,13 @@ module Nix.Hash
     hexHashLen,
     nix32HashLen,
     base64HashLen,
+
+    -- * Hash spellings
+    unknownHashAlgo,
+    parseHashAlgo,
+    parseAnyHash,
+    digestByLength,
+    sriDigest,
 
     -- * Store path construction (Nix @makeStorePath@ family)
     makeStorePath,
@@ -78,7 +88,7 @@ import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word8)
 import Nix.Store.Path (BadStorePath (BadStorePath), StoreDir (..), StorePath, checkStorePathName, defaultStoreDir, storePathToText)
 import Nix.Store.Path.Internal (StorePath (StorePath))
-import NovaCache.Base32 (encode)
+import qualified NovaCache.Base32 as Nix32
 import NovaCache.Hash (formatNixHash, hashBytes, parseNixHash)
 
 -- | SHA-256 hex digest of a ByteString.
@@ -95,14 +105,14 @@ sha256Hex bs =
 truncatedBase32 :: BS.ByteString -> Text
 truncatedBase32 bs =
   let digest = CH.hash bs :: CH.Digest CH.SHA256
-   in encode (compressHash 20 (BA.convert digest))
+   in Nix32.encode (compressHash 20 (BA.convert digest))
 
 -- | Nix's output placeholder for @builtins.placeholder@: @\/@ followed by the
 -- full SHA-256 of @"nix-output:" <> name@ in Nix base-32 (no truncation, no
 -- store-dir prefix).  Matches C++ Nix @hashPlaceholder@.
 hashPlaceholder :: Text -> Text
 hashPlaceholder name =
-  "/" <> encode (sha256Digest (encodeUtf8 ("nix-output:" <> name)))
+  "/" <> Nix32.encode (sha256Digest (encodeUtf8 ("nix-output:" <> name)))
 
 -- | XOR-fold a hash to @targetLen@ bytes, matching C++ Nix @compressHash@
 -- (hash.cc): byte @i@ is XOR'd into position @i mod targetLen@, which is
@@ -256,6 +266,108 @@ nix32HashLen n = (8 * n - 1) `div` 5 + 1
 base64HashLen :: Int -> Int
 base64HashLen n = 4 * ((n + 2) `div` 3)
 
+-- ---------------------------------------------------------------------------
+-- Hash spellings
+--
+-- A hash read from text, in each spelling upstream accepts.
+-- ---------------------------------------------------------------------------
+
+-- | Upstream's refusal of an algorithm name it does not know
+-- (@parseHashAlgo@, hash.cc:435-442 at 2.24.9).
+unknownHashAlgo :: Text -> Text
+unknownHashAlgo algo = "unknown hash algorithm '" <> algo <> "', expect 'md5', 'sha1', 'sha256', or 'sha512'"
+
+-- | The digest size in bytes of an algorithm upstream knows, or upstream's
+-- refusal of the name (@parseHashAlgo@, hash.cc:435-442 at 2.24.9).
+parseHashAlgo :: Text -> Either Text Int
+parseHashAlgo algo = maybe (Left (unknownHashAlgo algo)) Right (hashAlgoBytes algo)
+
+-- | Parse a hash as upstream's @Hash::parseAny@ does (hash.cc:184-198 at
+-- 2.24.9).  The algorithm is the one the hash's own tag names, else
+-- @expected@; when both are given they must be the same.  @expected@ is a
+-- name 'parseHashAlgo' accepts.
+parseAnyHash :: Maybe Text -> Text -> Either Text (Text, BS.ByteString)
+parseAnyHash expected original =
+  hashSpelling original >>= \case
+    SriHash algo digest -> agreeing algo (sriDigest algo digest)
+    PrefixedHash algo digest -> agreeing algo (digestByLength algo digest)
+    UntaggedHash -> case expected of
+      Just algo -> (algo,) <$> digestByLength algo original
+      Nothing -> Left ("hash '" <> original <> "' does not include a type, nor is the type otherwise known from context")
+  where
+    agreeing algo decoded = case expected of
+      Just want | want /= algo -> Left ("hash '" <> original <> "' should have type '" <> want <> "'")
+      _ -> (algo,) <$> decoded
+
+-- | Decode a digest that is not SRI, keyed by its length as upstream's
+-- @Hash@ constructor keys it (hash.cc:205-262 at 2.24.9): an algorithm's
+-- base16, nix32, and base64 spellings have pairwise distinct lengths, so
+-- the input length selects the decoder and every other length is an
+-- error.  Trying decoders in sequence instead mis-reads edge inputs - an
+-- all-hex-digit string of nix32 length is a nix32 hash, and a truncated
+-- hash must be rejected, not decoded by whichever shorter format happens
+-- to accept it.  The length is counted in bytes, as upstream counts it,
+-- not in characters: base64 decoding ignores what follows the padding,
+-- and a character there that UTF-8 spells in more than one byte must
+-- still make the length wrong.
+digestByLength :: Text -> Text -> Either Text BS.ByteString
+digestByLength algo s = parseHashAlgo algo >>= byLength
+  where
+    len = BS.length (encodeUtf8 s)
+    byLength size
+      | len == hexHashLen size = sizedDigest "base-16" size s (hexToBytes s)
+      | len == nix32HashLen size = sizedDigest "base-32" size s (either (const Nothing) Just (Nix32.decode s))
+      | len == base64HashLen size = sizedDigest "base-64" size s (base64ToBytes s)
+      | otherwise = Left ("hash '" <> s <> "' has wrong length for hash algorithm '" <> algo <> "'")
+
+-- | Decode an SRI digest, base64 of whatever length, as the @isSRI@ branch
+-- of upstream's @Hash@ constructor does (hash.cc:247-258 at 2.24.9).
+sriDigest :: Text -> Text -> Either Text BS.ByteString
+sriDigest algo b64 = do
+  size <- parseHashAlgo algo
+  sizedDigest "SRI" size b64 (base64ToBytes b64)
+
+-- | A decoded digest of the algorithm's size, or upstream's refusal of
+-- the spelling it was decoded from: @invalid base-16 hash@ and
+-- @invalid base-32 hash@ for a character outside the alphabet or nix32
+-- bits past the digest's end (hash.cc:214, :232, :242 at 2.24.9), and
+-- @invalid SRI hash@ or @invalid base-64 hash@ for base64 that is refused
+-- or decodes to the wrong length (hash.cc:247-258).  A refused base64
+-- character is the same error as a wrong length there: the constructor
+-- catches @base64Decode@'s exception without rethrowing it, so the length
+-- check fails on the empty result.
+sizedDigest :: Text -> Int -> Text -> Maybe BS.ByteString -> Either Text BS.ByteString
+sizedDigest spelling size encoded decoded = case decoded of
+  Just bytes | BS.length bytes == size -> Right bytes
+  _ -> Left ("invalid " <> spelling <> " hash '" <> encoded <> "'")
+
+-- | A hash string, its algorithm tag split off.
+data HashSpelling
+  = -- | @algo:digest@, the digest in base16, nix32 or base64 by its length.
+    PrefixedHash !Text !Text
+  | -- | @algo-digest@ (SRI), the digest in base64.
+    SriHash !Text !Text
+  | -- | No tag: the algorithm comes from context.
+    UntaggedHash
+
+-- | Split a hash string's algorithm tag off as upstream's
+-- @getParsedTypeAndSRI@ does (hash.cc:150-169 at 2.24.9): at the first
+-- @:@, else at the first @-@, which marks SRI.  The tag is everything
+-- before the separator, and one that names no known algorithm is an
+-- error.  Base64 decoding ignores what follows the padding, so this split
+-- is what refuses a separator there: @sha256-...=:x@ names the algorithm
+-- @sha256-...=@.
+hashSpelling :: Text -> Either Text HashSpelling
+hashSpelling s
+  | Just (tag, digest) <- splitTag ":" = tagged PrefixedHash tag digest
+  | Just (tag, digest) <- splitTag "-" = tagged SriHash tag digest
+  | otherwise = Right UntaggedHash
+  where
+    splitTag sep = case T.breakOn sep s of
+      (tag, rest) | not (T.null rest) -> Just (tag, T.drop 1 rest)
+      _ -> Nothing
+    tagged spelling tag digest = spelling tag digest <$ parseHashAlgo tag
+
 -- | The core store-path construction primitive.  Given a @type@ string, the
 -- inner content digest (raw SHA-256 bytes), and a name, produce the store
 -- path.  Mirrors C++ Nix @makeStorePath@:
@@ -288,7 +400,7 @@ makeStorePath (StoreDir dir) typ innerDigest name =
           <> T.pack dir
           <> ":"
           <> name
-      hashPart = encode (compressHash storePathHashBytes (sha256Digest (encodeUtf8 preimage)))
+      hashPart = Nix32.encode (compressHash storePathHashBytes (sha256Digest (encodeUtf8 preimage)))
    in case checkStorePathName name of
         Left err -> Left (BadStorePath hashPart err)
         Right () -> Right (StorePath hashPart name)

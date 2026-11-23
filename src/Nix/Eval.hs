@@ -233,7 +233,7 @@ import Nix.Expr.Types
     Expr (..),
     UnaryOp (..),
   )
-import Nix.Hash (FileIngestionMethod (..), base64HashLen, base64ToBytes, bytesToHexText, fileIngestionPrefix, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, nix32HashLen, sha256Digest)
+import Nix.Hash (FileIngestionMethod (..), base64ToBytes, bytesToHexText, fileIngestionPrefix, hashAlgoBytes, hashPlaceholder, makeFixedOutputPath, parseAnyHash, parseHashAlgo, sha256Digest, sriDigest, unknownHashAlgo)
 import Nix.Json (IntegerRange (..), Json (..), JsonBuilder (..), parseJsonInto, renderJson)
 import Nix.Parser (ParsedSource)
 import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, isInStoreText, parseStorePath, parseStorePathBaseName, storePathBaseNameError, storePathNameErrorText, storePathNameReasonText, storePathNameUpstreamText, storePathToText)
@@ -5203,33 +5203,6 @@ builtinConvertHash (VAttrs attrs) = do
 builtinConvertHash other =
   throwEvalError ("builtins.convertHash: expected a set, got " <> typeName other)
 
--- | Upstream's refusal of an algorithm name it does not know
--- (@parseHashAlgo@, hash.cc:435-442 at 2.24.9).
-unknownHashAlgo :: Text -> Text
-unknownHashAlgo algo = "unknown hash algorithm '" <> algo <> "', expect 'md5', 'sha1', 'sha256', or 'sha512'"
-
--- | The digest size in bytes of an algorithm upstream knows, or upstream's
--- refusal of the name (@parseHashAlgo@, hash.cc:435-442 at 2.24.9).
-parseHashAlgo :: Text -> Either Text Int
-parseHashAlgo algo = maybe (Left (unknownHashAlgo algo)) Right (hashAlgoBytes algo)
-
--- | Parse a hash as upstream's @Hash::parseAny@ does (hash.cc:184-198 at
--- 2.24.9).  The algorithm is the one the hash's own tag names, else
--- @expected@; when both are given they must be the same.  @expected@ is a
--- name 'parseHashAlgo' accepts.
-parseAnyHash :: Maybe Text -> Text -> Either Text (Text, BS.ByteString)
-parseAnyHash expected original =
-  hashSpelling original >>= \case
-    SriHash algo digest -> agreeing algo (sriDigest algo digest)
-    PrefixedHash algo digest -> agreeing algo (digestByLength algo digest)
-    UntaggedHash -> case expected of
-      Just algo -> (algo,) <$> digestByLength algo original
-      Nothing -> Left ("hash '" <> original <> "' does not include a type, nor is the type otherwise known from context")
-  where
-    agreeing algo decoded = case expected of
-      Just want | want /= algo -> Left ("hash '" <> original <> "' should have type '" <> want <> "'")
-      _ -> (algo,) <$> decoded
-
 -- | Read a hash as upstream's @newHashAllowEmpty@ does (hash.cc:271-281 at
 -- 2.24.9): an empty one is the digest of @expected@ whose every byte is
 -- zero, which upstream warns of, naming it in SRI, and is refused with no
@@ -5265,75 +5238,6 @@ parseNarHash declared
         _ -> Left "narHash must use SHA-256"
   where
     sha256DigestSize = 32
-
--- | Decode a digest that is not SRI, keyed by its length as upstream's
--- @Hash@ constructor keys it (hash.cc:205-262 at 2.24.9): an algorithm's
--- base16, nix32, and base64 spellings have pairwise distinct lengths, so
--- the input length selects the decoder and every other length is an
--- error.  Trying decoders in sequence instead mis-reads edge inputs - an
--- all-hex-digit string of nix32 length is a nix32 hash, and a truncated
--- hash must be rejected, not decoded by whichever shorter format happens
--- to accept it.  The length is counted in bytes, as upstream counts it,
--- not in characters: base64 decoding ignores what follows the padding,
--- and a character there that UTF-8 spells in more than one byte must
--- still make the length wrong.
-digestByLength :: Text -> Text -> Either Text BS.ByteString
-digestByLength algo s = parseHashAlgo algo >>= byLength
-  where
-    len = BS.length (TE.encodeUtf8 s)
-    byLength size
-      | len == hexHashLen size = sizedDigest "base-16" size s (hexToBytes s)
-      | len == nix32HashLen size = sizedDigest "base-32" size s (either (const Nothing) Just (Nix32.decode s))
-      | len == base64HashLen size = sizedDigest "base-64" size s (base64ToBytes s)
-      | otherwise = Left ("hash '" <> s <> "' has wrong length for hash algorithm '" <> algo <> "'")
-
--- | Decode an SRI digest, base64 of whatever length, as the @isSRI@ branch
--- of upstream's @Hash@ constructor does (hash.cc:247-258 at 2.24.9).
-sriDigest :: Text -> Text -> Either Text BS.ByteString
-sriDigest algo b64 = do
-  size <- parseHashAlgo algo
-  sizedDigest "SRI" size b64 (base64ToBytes b64)
-
--- | A decoded digest of the algorithm's size, or upstream's refusal of
--- the spelling it was decoded from: @invalid base-16 hash@ and
--- @invalid base-32 hash@ for a character outside the alphabet or nix32
--- bits past the digest's end (hash.cc:214, :232, :242 at 2.24.9), and
--- @invalid SRI hash@ or @invalid base-64 hash@ for base64 that is refused
--- or decodes to the wrong length (hash.cc:247-258).  A refused base64
--- character is the same error as a wrong length there: the constructor
--- catches @base64Decode@'s exception without rethrowing it, so the length
--- check fails on the empty result.
-sizedDigest :: Text -> Int -> Text -> Maybe BS.ByteString -> Either Text BS.ByteString
-sizedDigest spelling size encoded decoded = case decoded of
-  Just bytes | BS.length bytes == size -> Right bytes
-  _ -> Left ("invalid " <> spelling <> " hash '" <> encoded <> "'")
-
--- | A hash string, its algorithm tag split off.
-data HashSpelling
-  = -- | @algo:digest@, the digest in base16, nix32 or base64 by its length.
-    PrefixedHash !Text !Text
-  | -- | @algo-digest@ (SRI), the digest in base64.
-    SriHash !Text !Text
-  | -- | No tag: the algorithm comes from context.
-    UntaggedHash
-
--- | Split a hash string's algorithm tag off as upstream's
--- @getParsedTypeAndSRI@ does (hash.cc:150-169 at 2.24.9): at the first
--- @:@, else at the first @-@, which marks SRI.  The tag is everything
--- before the separator, and one that names no known algorithm is an
--- error.  Base64 decoding ignores what follows the padding, so this split
--- is what refuses a separator there: @sha256-...=:x@ names the algorithm
--- @sha256-...=@.
-hashSpelling :: Text -> Either Text HashSpelling
-hashSpelling s
-  | Just (tag, digest) <- splitTag ":" = tagged PrefixedHash tag digest
-  | Just (tag, digest) <- splitTag "-" = tagged SriHash tag digest
-  | otherwise = Right UntaggedHash
-  where
-    splitTag sep = case T.breakOn sep s of
-      (tag, rest) | not (T.null rest) -> Just (tag, T.drop 1 rest)
-      _ -> Nothing
-    tagged spelling tag digest = spelling tag digest <$ parseHashAlgo tag
 
 -- | Require a string attribute from an attrset.
 requireStrAttr :: (MonadEval m) => Text -> Text -> AttrSet -> m Text
