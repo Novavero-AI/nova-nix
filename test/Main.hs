@@ -96,12 +96,14 @@ import Nix.Eval.CThunk (CThunkPtr, cthunkBool, cthunkGetBool, cthunkGetInt, cthu
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), BcCaptureInfo (..), BcInheritedName (..), BcInheritedNames, BcShares (..), SiblingVar (..), compileExpr, compileFormalsToEval, compileParsed, decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, encodeBinaryOp, encodeUnaryOp, foldBcBindings, foldBcCapturedSlots, foldBcInheritedNames, foldBcShares, reassembleInt64, siblingShares)
+import Nix.Eval.Context (contextRequest)
 import qualified Nix.Eval.Context as Context
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), FormalDefault (..), LambdaName (..))
-import Nix.Eval.IO (EvalFailure (..), EvalState (..), SessionSettings (..), allowEvalPath, evalBaseEnv, newEvalStateWith, nixPathSearchPath, renderEvalFailure, runEvalIO, runEvalIOTraced, withEvalSession)
+import Nix.Eval.IO (EvalFailure (..), EvalState (..), SessionSettings (..), SessionStore (..), allowEvalPath, evalBaseEnv, newEvalStateWith, nixPathSearchPath, renderEvalFailure, runEvalIO, runEvalIOTraced, withEvalSession)
 import Nix.Eval.Operator (evalUpdate)
 import Nix.Eval.Policy (allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printSymbol, printValue)
+import Nix.Eval.RealiseContext (ContextRefusal (..), ContextRequest (..), PendingOrigin (..), Plan (..), SessionMode (..), contextRefusalMessage, findFileRefusalMessage, planRealisation, referenceClosure)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, newPosRecorder, noPos, printPos, recordPos)
 import Nix.Eval.StartupSymbols (startupSymbols)
@@ -127,8 +129,8 @@ import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileN
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (MetadataChange (..), NodeKind (..), NodeMetadata (..), Ownership (..), canonicalPermissions, executablePermissions, metadataChanges, readOnlyPermissions, storeModificationTime)
-import Nix.Store.Ops (EvalObjects (..), StoreOps (..), withLocalStore, withOpenedOnFirstUse)
-import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, qualifyPathText, storePathHashLen, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
+import Nix.Store.Ops (EvalObjects (..), StoreOps (..), StoreQueries (..), localQueries, withLocalStore, withOpenedOnFirstUse)
+import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, isInStoreText, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, qualifyPathText, storePathHashLen, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import Nix.Store.Path.Internal (StorePath (..))
 import Nix.Store.Upstream (UpstreamHazard (..), upstreamManagedRefusal)
 import qualified Nix.Substituter as Subst
@@ -5463,14 +5465,38 @@ evalNixIO baseDir source = do
 -- interned in would otherwise depend on the machine; a test of
 -- @NIX_PATH@ itself uses 'evalNixIOWithNixPath'.
 testEvalState :: StoreDir -> FilePath -> IO EvalState
-testEvalState = newEvalStateWith unrestrictedPolicy []
+testEvalState storeDir = newEvalStateWith unrestrictedPolicy [] (testSessionStore storeDir) storeDir
+
+-- | The store a test's evaluation realises contexts against: the local
+-- store in the directory, read-write as a build's session is, so what
+-- evaluation writes reads back.  Each operation opens the store for
+-- itself and closes it ('eachOpening'), since a test's state is made
+-- outside any bracket.
+testSessionStore :: StoreDir -> SessionStore
+testSessionStore storeDir = ReadWriteSession (eachOpening (defaultBuildConfig storeDir))
+
+-- | The local store's operations, each opening the store for itself and
+-- closing it once it is done.
+eachOpening :: BuildConfig -> StoreOps IO
+eachOpening config =
+  StoreOps
+    { soQueries =
+        StoreQueries
+          { sqValidPaths = \paths -> withLocalStore config (\ops -> sqValidPaths (soQueries ops) paths),
+            sqReferences = \path -> withLocalStore config (\ops -> sqReferences (soQueries ops) path)
+          },
+      soAddEvalObjects = \objects -> withLocalStore config (`soAddEvalObjects` objects),
+      soBuild = \requests -> withLocalStore config (`soBuild` requests),
+      soCheck = \drvPath -> withLocalStore config (`soCheck` drvPath),
+      soAddOutLinkRoot = \link path -> withLocalStore config (\ops -> soAddOutLinkRoot ops link path)
+    }
 
 -- | 'evalNixIO' with the search path @NIX_PATH@ gives ('nixPathSearchPath').
 evalNixIOWithNixPath :: FilePath -> Text -> IO (Either Text NixValue)
 evalNixIOWithNixPath baseDir source = do
   storeDir <- evalNixIOStoreDir
   searchPaths <- nixPathSearchPath
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir baseDir
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir baseDir
   evalNixIOIn st baseDir source
 
 -- | 'evalNixIO' keeping a failure whole, its lines of context included.
@@ -7059,7 +7085,7 @@ unpairedSurrogateNixPath dir
       runTestM "NIX_PATH holding an unpaired surrogate is refused" $
         withEnvVar (T.unpack nixPathVarName) "a=\xD800" $ do
           storeDir <- evalNixIOStoreDir
-          outcome <- try (nixPathSearchPath >>= \searchPaths -> newEvalStateWith unrestrictedPolicy searchPaths storeDir dir)
+          outcome <- try (nixPathSearchPath >>= \searchPaths -> newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir dir)
           pure $ case outcome of
             Left (err :: IOException)
               | unpairedSurrogateWords `T.isInfixOf` T.pack (displayException err) -> Pass
@@ -9397,6 +9423,31 @@ testRealise = do
                 "message"
                 (Left ("derivation '/nix/store/" <> T.replicate 32 "b" <> "-b.drv' does not have wanted outputs 'b-man'"))
                 (either (Left . Realise.requestsFailureMessage defaultStoreDir) Right result),
+      -- Upstream's worker takes its goals by key, the derivation's name
+      -- and then its path (DerivationGoal::key, derivation-goal.cc:97-104
+      -- at 2.24.9): here the name and the path disagree.
+      runTest "of two requests for outputs their derivations lack, the call reports the one named first, not the one whose path sorts first" $
+        let first = StorePath (T.replicate 32 "z") "a.drv"
+            second = StorePath (T.replicate 32 "b") "b.drv"
+            at path (_, node) = (path, node)
+            graph = DepGraph.DepGraph (Map.fromList [at first (fakeNode "a" ["a-out"] []), at second (fakeNode "b" ["b-out"] [])])
+            settings = Realise.RealiseSettings Realise.NoFallback Realise.HeedAllowSubstitutes
+            (result, _) = runState (Realise.realiseRequests settings (fakeRealiseEffects Set.empty) graph [(second, Set.singleton "b-man"), (first, Set.fromList ["a-man", "a-zed"])]) (fakeWorld [] [])
+         in assertEqual "requests" (Left (Realise.FailedWith (Realise.MissingOutputs first ("a-man" :| ["a-zed"])))) result,
+      -- A derivation's outputs are kept by output name, dev before out,
+      -- where upstream's worker runs their substitution goals by key, the
+      -- path's name and then the path (substitution-goal.hh:59-62 at
+      -- 2.24.9).  An out path's name is the derivation's own, so it comes
+      -- first, though its path sorts after dev's here.
+      runTest "a derivation's missing outputs are asked of the caches in the order upstream's worker asks, by path name and then path" $
+        let out = StorePath (T.replicate 32 "z") "two"
+            dev = StorePath (T.replicate 32 "a") "two-dev"
+            (drvPath, node) = fakeNode "two" [] []
+            twoOutputs = node {DepGraph.dnDerivation = (DepGraph.dnDerivation node) {drvOutputs = [DerivationOutput "dev" dev "" "", DerivationOutput "out" out "" ""]}}
+            settings = Realise.RealiseSettings Realise.NoFallback Realise.HeedAllowSubstitutes
+            world = (fakeWorld [] []) {fwUnreachable = Set.fromList [out, dev]}
+            (result, _) = runState (Realise.realiseRequests settings (fakeRealiseEffects Set.empty) (DepGraph.DepGraph (Map.singleton drvPath twoOutputs)) [(drvPath, Set.fromList ["dev", "out"])]) world
+         in assertEqual "requests" (Left (Realise.FailedWith (Realise.CacheQueryFailed (fakeQueryFailure out)))) result,
       runTest "a call exits with its one failure's status, however it is reported" $
         let differs = Realise.NotDeterministic helloDrv helloOut
          in assertEqual
@@ -17480,7 +17531,7 @@ testStage0Pe32Chain = do
   -- which resolves against the checkout's data directory as the installed
   -- binary resolves it against its own.
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let chain = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ").stage0-pe32"
       runCommandTests = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "run-command.nix")
       quoted name = "\"" <> name <> "\""
@@ -17793,7 +17844,7 @@ testMesWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "mes.nix")
       quoted name = "\"" <> name <> "\""
@@ -17944,7 +17995,7 @@ testTinyccWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "tinycc.nix")
       quoted name = "\"" <> name <> "\""
@@ -18216,7 +18267,7 @@ testGnumakeWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gnumake.nix")
       source =
@@ -18318,7 +18369,7 @@ testBusyboxWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "busybox.nix")
       source =
@@ -18441,7 +18492,7 @@ testChecksForbidSubstitutes = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let fileOf name = nixQuotedPath (cwd </> "test" </> "data" </> T.unpack name)
       source =
         T.concat
@@ -18483,7 +18534,7 @@ testSeedStdenvWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "seed-stdenv.nix")
       source =
@@ -18607,7 +18658,7 @@ testBinutilsWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "binutils.nix")
       source =
@@ -18723,7 +18774,7 @@ testGccCoreWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-core.nix")
       source =
@@ -18889,7 +18940,7 @@ testGcc46Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc46.nix")
       source =
@@ -19029,7 +19080,7 @@ testGcc46CxxWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc46-cxx.nix")
       source =
@@ -19207,7 +19258,7 @@ testGcc10Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc10.nix")
       source =
@@ -19397,7 +19448,7 @@ testMingwW64LatestWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "mingw-w64-latest.nix")
       source =
@@ -19542,7 +19593,7 @@ testGccLatestWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-latest.nix")
       source =
@@ -19733,7 +19784,7 @@ testBinutilsX8664Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "binutils-x86_64.nix")
       source =
@@ -19873,7 +19924,7 @@ testGccCoreX8664Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-core-x86_64.nix")
       source =
@@ -20051,7 +20102,7 @@ testMingwW64CrtX8664Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "mingw-w64-x86_64.nix")
       source =
@@ -20178,7 +20229,7 @@ testGccX8664Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-x86_64.nix")
       source =
@@ -20362,7 +20413,7 @@ testBinutilsNativeX8664Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "binutils-native-x86_64.nix")
       source =
@@ -20510,7 +20561,7 @@ testGccNativeX8664Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-native-x86_64.nix")
       source =
@@ -20758,7 +20809,7 @@ testStage2StdenvWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checksOf name = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> name)
       source =
@@ -20920,7 +20971,7 @@ testWindowsSources = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = cwd </> "pkgs" </> "windows"
       source =
         T.concat
@@ -21055,7 +21106,7 @@ testWindowsRungs = do
   storeDir <- evalNixIOStoreDir
   workflow <- try (BS.readFile ladderWorkflowPath)
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = cwd </> "pkgs" </> "windows"
       source =
         T.concat
@@ -25202,6 +25253,604 @@ testClosedStdoutCLI = do
           pure (assertEqual "status, stderr and what is left" (ExitSuccess, ["finding garbage collector roots..."], []) (code, err, left))
       ]
 
+-- ---------------------------------------------------------------------------
+-- Tests: realising a string's context
+-- ---------------------------------------------------------------------------
+
+-- | What a fake store is asked, in order.
+data FakeCall
+  = FakeQueried !(Set.Set StorePath)
+  | FakeAdded
+  | FakeBuilt ![(StorePath, Set.Set Text)]
+  deriving (Eq, Show)
+
+-- | A store holding the paths the predicate admits and what is added to
+-- it, answering every add and build as done and the build's with the stop
+-- given, and recording each call.
+fakeRealiseStore :: (StorePath -> Bool) -> Maybe BuildStop -> IO (StoreOps IO, IO [FakeCall])
+fakeRealiseStore holds stop = do
+  calls <- newIORef []
+  added <- newIORef Set.empty
+  let record call = modifyIORef' calls (call :)
+      held path = (holds path ||) . Set.member path <$> readIORef added
+      objectPaths objects =
+        Set.fromList (mapMaybe (parseStorePath defaultStoreDir) (Map.elems (eoSources objects) <> Map.keys (eoStoreWrites objects) <> Map.keys (eoDerivations objects)))
+      ops =
+        StoreOps
+          { soQueries =
+              StoreQueries
+                { sqValidPaths = \paths -> record (FakeQueried paths) >> Set.fromList <$> filterM held (Set.toList paths),
+                  sqReferences = \_ -> pure (Right Set.empty)
+                },
+            soAddEvalObjects = \objects -> Right () <$ (record FakeAdded >> modifyIORef' added (<> objectPaths objects)),
+            soBuild = \requests -> maybe (Right ()) Left stop <$ record (FakeBuilt requests),
+            soCheck = \_ -> pure (Right ()),
+            soAddOutLinkRoot = \link _ -> pure (Right link)
+          }
+  pure (ops, reverse <$> readIORef calls)
+
+-- | A read-only session over a fake store's queries and build.
+readOnlyOver :: StoreOps IO -> SessionStore
+readOnlyOver ops = ReadOnlySession (soQueries ops) (soBuild ops)
+
+-- | The build of a read-only session that should realise no output: a
+-- request is a failure the test sees.
+unexpectedBuild :: [(StorePath, Set.Set Text)] -> IO (Either BuildStop ())
+unexpectedBuild requests = pure (Left (BuildStop ("a build no test asked for: " <> T.pack (show requests)) 1))
+
+-- | Evaluate source in a state, keeping the whole failure, its lines of
+-- context included.
+evalTracedIn :: EvalState -> FilePath -> Text -> IO (Either EvalFailure NixValue)
+evalTracedIn st baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 source) of
+  Left err -> pure (Left (EvalFailure [] (T.pack (show err))))
+  Right parsed -> runEvalIOTraced st (evalParsed (pure (evalBaseEnv st)) parsed)
+
+-- | The planning of a context's realisation, which a session's store
+-- answers for: what is asked in which order, what each session refuses,
+-- and what a read-write one adds and builds.
+testRealiseContext :: IO [Bool]
+testRealiseContext = do
+  putStrLn "eval/realise-context"
+  let named name = StorePath (T.replicate 32 (T.take 1 name)) name
+      drv = named "drv.drv"
+      whole = named "other.drv"
+      src = named "src"
+      out = named "drv-out"
+      dev = named "drv-dev"
+      context = StringContext . Set.fromList
+      request = contextRequest (context [SCDrvOutput drv "out", SCDrvOutput drv "dev", SCPlain src])
+      outputPaths = Map.fromList [((drv, "out"), out), ((drv, "dev"), dev)]
+      computed paths = Map.fromList [(path, Computed) | path <- paths]
+      planned mode pending valid = planRealisation mode (computed pending) (Set.fromList valid) outputPaths request
+      plainRequest path = contextRequest (context [SCPlain path])
+      logical = storePathToText defaultStoreDir
+      origins = QC.elements [Fetched, Computed]
+  sequence
+    [ -- NixStringContext is a std::set of a variant ordered plain, whole
+      -- derivation, output (value/context.hh at 2.24.9).
+      runTest "a context is asked in upstream's order: plain paths, derivations named whole, then outputs, each by path" $
+        assertEqual
+          "request"
+          (ContextRequest [src, whole, drv, drv] [(drv, "dev"), (drv, "out")])
+          (contextRequest (context [SCDrvOutput drv "out", SCAllOutputs whole, SCDrvOutput drv "dev", SCPlain src])),
+      runTest "the first path that is not valid is refused, in the request's order" $
+        assertEqual "plan" (Left (PathNotValid src)) (planned ReadWrite [] []),
+      runTest "a read-only session refuses a derivation evaluation computed, as upstream's read-only evaluation never writes one" $
+        assertEqual "plan" (Left (PathNotValid drv)) (planned ReadOnly [drv] [src]),
+      runTest "a read-only session reads what a fetcher fetched, as upstream's fetchers add it in any mode, and adds nothing" $
+        assertEqual "plan" (Right (Plan False [] [])) (planRealisation ReadOnly (Map.singleton src Fetched) Set.empty Map.empty (plainRequest src)),
+      runTest "a read-only session reads outputs the store holds, and adds and builds nothing" $
+        assertEqual "plan" (Right (Plan False [] [dev, out])) (planned ReadOnly [] [drv, src, out, dev]),
+      runTest "a read-only session realises a derivation the store holds for its missing outputs, and adds nothing" $
+        assertEqual "plan" (Right (Plan False [(drv, Set.fromList ["dev", "out"])] [dev, out])) (planned ReadOnly [] [drv, src]),
+      runTest "an output name whose path is not known is left to the realisation, which refuses one a derivation does not have" $
+        assertEqual
+          "plan"
+          (Right (Plan False [(drv, Set.singleton "dev")] [out]))
+          (planRealisation ReadOnly Map.empty (Set.fromList [drv, src, out]) (Map.delete (drv, "dev") outputPaths) request),
+      runTest "a read-write session counts what evaluation made as valid, adds it, and builds each derivation once for its missing outputs" $
+        assertEqual "plan" (Right (Plan True [(drv, Set.fromList ["dev", "out"])] [dev, out])) (planned ReadWrite [drv] [src]),
+      runTest "a read-write session with every path valid adds and builds nothing" $
+        assertEqual "plan" (Right (Plan False [] [dev, out])) (planned ReadWrite [] [drv, src, out, dev]),
+      runTest "a read-write session adds what evaluation made before a read of it, and builds nothing" $
+        assertEqual "plan" (Right (Plan True [] [])) (planRealisation ReadWrite (computed [src]) Set.empty Map.empty (plainRequest src)),
+      -- Carried out, a plan leaves nothing pending: what it adds and builds
+      -- the store then holds.
+      runTestM "a plan carried out leaves nothing to add or build" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll ((,) <$> QC.sublistOf [drv, src] <*> QC.sublistOf [drv, src, out, dev]) $ \(pending, valid) ->
+              case planned ReadWrite pending valid of
+                Left _ -> QC.property True
+                Right plan ->
+                  planRealisation ReadWrite Map.empty (Set.fromList (pending <> valid <> planOutputs plan)) outputPaths request
+                    QC.=== Right (Plan False [] (planOutputs plan))
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      -- A read-write session adds whatever a read-only one reads, so it
+      -- refuses nothing the read-only one would read.
+      runTestM "whatever a read-only session can read, a read-write session can" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll ((,) . Map.fromList <$> QC.listOf ((,) <$> QC.elements [drv, src] <*> origins) <*> QC.sublistOf [drv, src, out, dev]) $ \(pending, valid) ->
+              case planRealisation ReadOnly pending (Set.fromList valid) outputPaths request of
+                Left _ -> QC.property True
+                Right _ -> QC.property (either (const False) (const True) (planRealisation ReadWrite pending (Set.fromList valid) outputPaths request))
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      runTest "a refusal reads as upstream's" $
+        assertEqual
+          "messages"
+          [ "path '" <> logical drv <> "' is not valid",
+            "cannot find '/somewhere', since path '" <> T.replicate 32 "d" <> "-drv.drv' is not valid",
+            "the build's own words"
+          ]
+          [ contextRefusalMessage (PathNotValid drv),
+            findFileRefusalMessage "/somewhere" (PathNotValid drv),
+            findFileRefusalMessage "/somewhere" (RealisationFailed "the build's own words")
+          ],
+      runTest "a read-only substitution is refused in upstream's words" $
+        assertEqual "message" ("cannot substitute path '" <> logical dev <> "' - no write access to the Nix store") (Realise.noWriteAccessMessage dev),
+      -- isInDir (file-system.cc:151-157 at 2.24.9) needs a character
+      -- after the separator.
+      runTest "a path is in the store only below the store directory, as upstream's isInStore asks" $
+        assertEqual
+          "in store"
+          [False, False, False, True, True]
+          (map isInStoreText ["/nix/store", "/nix/store/", "/nix/storefront/x", "/nix/store/x", logical dev]),
+      runTest "an output's closure takes each path it references once, through a cycle" $
+        let referencing = Map.fromList [(out, Set.singleton src), (src, Set.singleton dev), (dev, Set.singleton out)]
+         in assertEqual
+              "closure"
+              (Right (Set.fromList [out, src, dev]))
+              (runIdentity (referenceClosure (\path -> Identity (Right (Map.findWithDefault Set.empty path referencing))) [out]))
+    ]
+
+-- | The evaluator's realisation of a context over a fake store and over
+-- the local store's read-only queries: what each session asks, adds and
+-- builds, which builtins realise and in which order, what a read-only
+-- session reads of what evaluation fetched, what is refused and in whose
+-- words, and what a read-only session leaves of a store.
+testRealiseContextIO :: IO [Bool]
+testRealiseContextIO = do
+  putStrLn "eval/realise-context-io"
+  tmpBase <- getTemporaryDirectory
+  environment <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-realise-context"
+      storeDir = StoreDir (root </> "store")
+      twoOutputs = "(derivation { name = \"two\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [ \"out\" \"dev\" ]; })"
+      outOfTwo = "\"${" <> twoOutputs <> "}\""
+      fileUrl path = "file://" <> canonPathValue (T.pack path)
+      nixString text = "\"" <> T.replace "\"" "\\\"" (T.replace "\\" "\\\\" text) <> "\""
+      evalWith store source = do
+        st <- newEvalStateWith unrestrictedPolicy [] store storeDir root
+        evalTracedIn st root source
+      notValidDerivation failure =
+        T.isPrefixOf "path '/nix/store/" (failureMessage failure) && T.isSuffixOf "-two.drv' is not valid" (failureMessage failure)
+      readOnlyAnswer source = do
+        (ops, _) <- fakeRealiseStore (const False) Nothing
+        evalWith (readOnlyOver ops) source
+      refusedRead source =
+        readOnlyAnswer source <&> \case
+          Left failure | notValidDerivation failure -> Pass
+          other -> Fail ("expected the derivation refused before the read, got: " <> T.pack (show other))
+      failsWith expected source =
+        readOnlyAnswer source <&> \case
+          Left failure | expected (failureMessage failure) -> Pass
+          other -> Fail ("expected another failure, got: " <> T.pack (show other))
+      tracedWith expected source =
+        readOnlyAnswer source <&> \case
+          Left failure | any expected (failureTrace failure) -> Pass
+          other -> Fail ("expected another line of context, got: " <> T.pack (show other))
+      readsAs expected source =
+        readOnlyAnswer source <&> \case
+          Right value | value == mkStr expected -> Pass
+          other -> Fail ("expected " <> expected <> ", got: " <> T.pack (show other))
+      addingTwo line = "while adding path '/nix/store/" `T.isPrefixOf` line && "-two'" `T.isSuffixOf` line
+      readers =
+        [ ("import", "import " <> outOfTwo),
+          ("builtins.scopedImport", "builtins.scopedImport { } " <> outOfTwo),
+          ("builtins.readFile", "builtins.readFile " <> outOfTwo),
+          ("builtins.pathExists", "builtins.pathExists " <> outOfTwo),
+          ("builtins.readDir", "builtins.readDir " <> outOfTwo),
+          ("builtins.readFileType", "builtins.readFileType " <> outOfTwo),
+          ("builtins.hashFile", "builtins.hashFile \"sha256\" " <> outOfTwo),
+          ("builtins.path", "builtins.path { path = " <> outOfTwo <> "; }"),
+          ("builtins.filterSource", "builtins.filterSource (p: t: true) " <> outOfTwo)
+        ]
+      emptyDatabaseStore = StoreDir (root </> "empty-database-store")
+      stage = root </> "stage"
+      tarball = root </> "fetched.tar.gz"
+      fetchedFile = root </> "fetched.txt"
+      repo = root </> "repo"
+      gitFetch rev = "builtins.fetchGit { url = " <> nixString (T.pack repo) <> ";" <> maybe "" (\pinned -> " rev = \"" <> pinned <> "\";") rev <> " }"
+      tarProcess =
+        (Proc.proc "tar" ["-czf", tarball, "-C", stage, "top"])
+          { Proc.env = Just (("COPYFILE_DISABLE", "1") : environment)
+          }
+  forceRemoveIfExists root
+  createDirectoryIfMissing True (stage </> "top")
+  createDirectoryIfMissing True (root </> "filtered")
+  BS.writeFile (root </> "filtered" </> "child") "child\n"
+  BS.writeFile (stage </> "top" </> "default.nix") "{ v = \"from a tarball\"; }\n"
+  BS.writeFile fetchedFile "fetched bytes\n"
+  createDirectoryIfMissing True (unStoreDir emptyDatabaseStore </> metaDirName)
+  BS.writeFile (unStoreDir emptyDatabaseStore </> metaDirName </> dbFileName) ""
+  revs <- makeGitFixture repo [("VERSION", "1.2.3\n")]
+  readerResults <- traverse (\(reader, source) -> runTestM (reader <> " realises its argument's context before it reads") (refusedRead source)) readers
+  results <-
+    withEnvVar "XDG_CACHE_HOME" (root </> "cache") $
+      sequence
+        [ runTestM "a path value has no context, and the store is asked nothing" $ do
+            (ops, calls) <- fakeRealiseStore (const False) Nothing
+            answer <- evalWith (ReadWriteSession ops) "builtins.pathExists ./absent"
+            asked <- calls
+            pure (assertEqual "answer and calls" (Right (VBool False), []) (answer, asked)),
+          runTestM "a plain path evaluation wrote is added before it is read, and nothing is built" $ do
+            (ops, calls) <- fakeRealiseStore (const False) Nothing
+            answer <- evalWith (ReadWriteSession ops) "builtins.readFile (builtins.toFile \"plain\" \"text\")"
+            asked <- calls
+            pure (assertEqual "answer and calls" (Right (mkStr "text"), [FakeAdded]) (answer, asked)),
+          -- Once added, a write is the store's to answer for, so a second
+          -- read asks the store instead of adding it again.
+          runTestM "a write already added is asked of the store and not added again" $ do
+            (ops, calls) <- fakeRealiseStore (const False) Nothing
+            answer <- evalWith (ReadWriteSession ops) "let f = builtins.toFile \"twice\" \"text\"; in builtins.readFile f + builtins.readFile f"
+            asked <- calls
+            pure $ case (answer, asked) of
+              (Right value, [FakeAdded, FakeQueried _]) | value == mkStr "texttext" -> Pass
+              other -> Fail ("expected one add and then a question, got: " <> T.pack (show other)),
+          runTestM "two outputs of one derivation are built in one request, after what evaluation made is added" $ do
+            (ops, calls) <- fakeRealiseStore (const False) Nothing
+            answer <- evalWith (ReadWriteSession ops) ("let d = " <> twoOutputs <> "; in builtins.pathExists \"${d.out}${d.dev}\"")
+            asked <- calls
+            pure $ case (answer, asked) of
+              (Right (VBool False), [FakeQueried outputs, FakeAdded, FakeBuilt [(_, wanted)]])
+                | Set.size outputs == 2, wanted == Set.fromList ["dev", "out"] -> Pass
+              other -> Fail ("expected the outputs asked about, an add and one build, got: " <> T.pack (show other)),
+          runTestM "a read-only session refuses a derivation evaluation computed in upstream's words, under its line of context, and adds and builds nothing" $ do
+            (ops, calls) <- fakeRealiseStore (const False) Nothing
+            answer <- evalWith (readOnlyOver ops) ("import " <> twoOutputs)
+            asked <- calls
+            pure $ case (answer, asked) of
+              (Left failure, [FakeQueried _])
+                | notValidDerivation failure,
+                  any (T.isPrefixOf "while realising the context of path '/nix/store/") (failureTrace failure) ->
+                    Pass
+              other -> Fail ("expected the refusal under its line of context, got: " <> T.pack (show other)),
+          runTestM "a read-only session reads an output the store holds, and adds and builds nothing" $ do
+            (ops, calls) <- fakeRealiseStore (const True) Nothing
+            answer <- evalWith (readOnlyOver ops) ("builtins.pathExists \"${" <> twoOutputs <> ".out}\"")
+            asked <- calls
+            pure $ case (answer, asked) of
+              (Right (VBool False), [FakeQueried _, FakeQueried _]) -> Pass
+              other -> Fail ("expected two questions and no add or build, got: " <> T.pack (show other)),
+          runTestM "a read-only session realises a missing output of a derivation the store holds through its build, and adds nothing" $ do
+            (ops, calls) <- fakeRealiseStore ((== "two.drv") . spName) Nothing
+            answer <- evalWith (readOnlyOver ops) ("builtins.pathExists " <> outOfTwo)
+            asked <- calls
+            pure $ case (answer, asked) of
+              (Right (VBool False), [FakeQueried _, FakeQueried _, FakeBuilt [(_, wanted)]]) | wanted == Set.singleton "out" -> Pass
+              other -> Fail ("expected the output built and nothing added, got: " <> T.pack (show other)),
+          -- tryEval catches only an assertion (primops.cc:914 at 2.24.9).
+          runTestM "builtins.tryEval does not catch a refusal" $
+            refusedRead ("builtins.tryEval (import " <> twoOutputs <> ")"),
+          -- prim_pathExists catches only a RestrictedPathError
+          -- (primops.cc:1663-1665 at 2.24.9).
+          runTestM "builtins.pathExists answers a failed build with the failure, not false" $ do
+            (ops, _) <- fakeRealiseStore (const False) (Just (BuildStop "building two failed: exit 3: builder failed" 1))
+            answer <- evalWith (ReadWriteSession ops) ("builtins.pathExists " <> outOfTwo)
+            pure $ case answer of
+              Left failure | failureMessage failure == "building two failed: exit 3: builder failed" -> Pass
+              other -> Fail ("expected the build's failure, got: " <> T.pack (show other)),
+          runTestM "builtins.findFile names the entry and the path's base name when the entry's context names a path that is not valid" $
+            failsWith
+              ( \message ->
+                  "cannot find '/nix/store/" `T.isPrefixOf` message
+                    && "-two', since path '" `T.isInfixOf` message
+                    && "-two.drv' is not valid" `T.isSuffixOf` message
+                    && not ("since path '/nix/store/" `T.isInfixOf` message)
+              )
+              ("let d = " <> twoOutputs <> "; in builtins.findFile [ { prefix = \"x\"; path = \"${d}\"; } ] \"x\""),
+          -- Upstream's checks that come before realisePath or addPath
+          -- (primops.cc:1977-1982, 2497-2498 and 2569-2592 at 2.24.9).
+          runTestM "builtins.hashFile refuses an unknown algorithm before it realises its path" $
+            failsWith ("unknown hash algorithm 'bogus'" `T.isPrefixOf`) ("builtins.hashFile \"bogus\" " <> outOfTwo),
+          runTestM "builtins.filterSource forces its filter before it realises its path" $
+            failsWith ("expected a function" `T.isPrefixOf`) ("builtins.filterSource 1 " <> outOfTwo),
+          runTestM "builtins.path reads every argument before it realises its path" $
+            failsWith (== "unsupported argument 'zzz' to 'addPath'") ("builtins.path { path = " <> outOfTwo <> "; zzz = 1; }"),
+          -- prim_path forces the filter as a function and the name as a
+          -- string with no context at their turns (primops.cc:2573-2576 at
+          -- 2.24.9), and an empty name is the base name (:2593-2594).
+          runTestM "builtins.path refuses a filter that is not a function at its turn, before it realises its path" $
+            failsWith ("expected a function" `T.isPrefixOf`) ("builtins.path { path = " <> outOfTwo <> "; filter = 1; }"),
+          runTestM "builtins.path refuses a filter that is not a function for a flat copy too, under upstream's line of context" $
+            tracedWith (== "while evaluating the `filter` parameter passed to builtins.path") "builtins.path { path = ./filtered/child; filter = 1; recursive = false; }",
+          runTestM "builtins.path refuses a name that is not a string, under upstream's line of context" $
+            tracedWith (== "while evaluating the `name` attribute passed to builtins.path") "builtins.path { path = ./filtered/child; name = 1; }",
+          runTestM "builtins.path refuses a name with context" $
+            failsWith ("the string '" `T.isPrefixOf`) "builtins.path { path = ./filtered/child; name = builtins.toFile \"n\" \"x\"; }",
+          runTestM "builtins.path names a copy whose name is empty by the path's base name" $
+            readOnlyAnswer "builtins.path { path = ./filtered/child; name = \"\"; }" <&> \case
+              Right (VStr bytes _) | "-child" `BS.isSuffixOf` bytes -> Pass
+              other -> Fail ("expected a copy named child, got: " <> T.pack (show other)),
+          -- addPath's try block (primops.cc:2487 at 2.24.9).
+          runTestM "builtins.path gives a refusal of its path's context upstream's line of context" $
+            tracedWith addingTwo ("builtins.path { path = " <> outOfTwo <> "; }"),
+          runTestM "builtins.filterSource gives a refusal of its path's context upstream's line of context" $
+            tracedWith addingTwo ("builtins.filterSource (p: t: true) " <> outOfTwo),
+          runTestM "builtins.path gives a copy that fails upstream's line of context" $
+            tracedWith (== ("while adding path '" <> canonPathValue (T.pack (root </> "absent")) <> "'")) "builtins.path { path = ./absent; }",
+          runTestM "builtins.filterSource gives a failure in its filter upstream's line of context" $
+            tracedWith (== ("while adding path '" <> canonPathValue (T.pack (root </> "filtered")) <> "'")) "builtins.filterSource (p: t: throw \"no\") ./filtered",
+          -- Upstream's fetchers add what they fetch in any mode
+          -- (fetchTree.cc:504-509, tarball.cc:86, fetchers.cc:195 at
+          -- 2.24.9), so a read-only evaluation reads it through its context.
+          if SI.os == "mingw32"
+            then runTest "a read-only session imports a fetchTarball result through its context (skipped: fetchTarball extracts through sh, which nova-nix does not assume on Windows)" Pass
+            else runTestM "a read-only session imports a fetchTarball result through its context" $ do
+              (tarCode, _, tarErr) <- Proc.readCreateProcessWithExitCode tarProcess ""
+              case tarCode of
+                ExitFailure n -> pure (Fail ("tar exited " <> T.pack (show n) <> ": " <> T.pack tarErr))
+                ExitSuccess -> readsAs "from a tarball" ("(import \"${builtins.fetchTarball " <> nixString (fileUrl tarball) <> "}/default.nix\").v"),
+          runTestM "a read-only session reads a fetchurl result through its context" $
+            readsAs "fetched bytes\n" ("builtins.readFile \"${builtins.fetchurl " <> nixString (fileUrl fetchedFile) <> "}\""),
+          runTestM "a read-only session reads a fetchGit result through its context" $
+            readsAs "1.2.3\n" ("builtins.readFile \"${" <> gitFetch Nothing <> "}/VERSION\""),
+          -- The first session records the pinned fetch, and the second
+          -- adopts the tree the record names: the repository is gone by
+          -- then, so nothing is fetched again.
+          runTestM "a read-only session reads a fetchGit result adopted from the fetch cache" $ do
+            let pinned = gitFetch (listToMaybe revs)
+                readVersion = "builtins.readFile \"${" <> pinned <> "}/VERSION\""
+            fetched <- readsAs "1.2.3\n" readVersion
+            Dir.renameDirectory repo (repo <> "-moved")
+            adopted <- readsAs "1.2.3\n" readVersion
+            pure (fetched `andThen` adopted),
+          -- What a fetcher fetched is readable whatever the store says, so a
+          -- read-only session does not ask.
+          runTestM "a read-only session asks the store nothing about what a fetcher fetched" $ do
+            (ops, calls) <- fakeRealiseStore (const False) Nothing
+            answer <- evalWith (readOnlyOver ops) ("builtins.readFile \"${builtins.fetchurl " <> nixString (fileUrl fetchedFile) <> "}\"")
+            asked <- calls
+            pure (assertEqual "answer and calls" (Right (mkStr "fetched bytes\n"), []) (answer, asked)),
+          runTestM "a read-only session over a store that does not exist refuses, and makes no directory, metadata, database or lock" $ do
+            let absent = StoreDir (root </> "absent-store")
+            st <- newEvalStateWith unrestrictedPolicy [] (ReadOnlySession (localQueries absent) unexpectedBuild) absent root
+            answer <- evalTracedIn st root ("import " <> twoOutputs)
+            made <- Dir.doesPathExist (unStoreDir absent)
+            pure $ case answer of
+              Left failure | notValidDerivation failure, not made -> Pass
+              other -> Fail ("expected the refusal and no store, got: " <> T.pack (show (other, made))),
+          -- A read-only connection writes no page of the database; SQLite
+          -- makes only the wal-index a WAL database needs beside it.
+          runTestM "a read-only query answers from the store's database, leaves it as it was, and creates nothing beside it but SQLite's wal-index" $ do
+            let held = StorePath (T.replicate 32 "h") "held"
+                unheld = StorePath (T.replicate 32 "u") "unheld"
+                dir = StoreDir (root </> "queried-store")
+                metadata = unStoreDir dir </> metaDirName
+                walIndex = Set.fromList [dbFileName <> "-wal", dbFileName <> "-shm"]
+            bracket (openStore dir) closeStore $ \store -> do
+              createDirectoryIfMissing True (storePathToFilePath (stDir store) held)
+              registrationFor store held Nothing [] >>= registerPath (stDB store)
+            before <- Set.fromList <$> Dir.listDirectory metadata
+            database <- BS.readFile (metadata </> dbFileName)
+            valid <- sqValidPaths (localQueries dir) (Set.fromList [held, unheld])
+            references <- sqReferences (localQueries dir) held
+            after <- Set.fromList <$> Dir.listDirectory metadata
+            databaseAfter <- BS.readFile (metadata </> dbFileName)
+            pure
+              ( assertEqual "answers" (Set.singleton held, Right Set.empty) (valid, references)
+                  `andThen` assertEqual "database" database databaseAfter
+                  `andThen` assertEqual "beside it" Set.empty ((after `Set.difference` before) `Set.difference` walIndex)
+              ),
+          -- An empty database, as a store whose first open was cut short
+          -- leaves, holds none of the store's tables: a connection that
+          -- made them would fill it, and one that asked them would fail.
+          runTestM "a read-only query of a database without the store's tables answers that it holds nothing, and writes nothing to it" $ do
+            let held = StorePath (T.replicate 32 "h") "held"
+            outcome <- try ((,) <$> sqValidPaths (localQueries emptyDatabaseStore) (Set.singleton held) <*> sqReferences (localQueries emptyDatabaseStore) held)
+            bytes <- BS.readFile (unStoreDir emptyDatabaseStore </> metaDirName </> dbFileName)
+            pure $ case (outcome :: Either SQL.SQLError (Set.Set StorePath, Either Text (Set.Set StorePath)), bytes) of
+              (Right (valid, Right references), "") | Set.null valid, Set.null references -> Pass
+              other -> Fail ("expected nothing held and the database still empty, got: " <> T.pack (show other)),
+          runTestM "a read-only session over a database without the store's tables refuses a derivation in upstream's words" $ do
+            st <- newEvalStateWith unrestrictedPolicy [] (ReadOnlySession (localQueries emptyDatabaseStore) unexpectedBuild) emptyDatabaseStore root
+            outcome <- try (evalTracedIn st root ("import " <> twoOutputs))
+            pure $ case outcome :: Either SQL.SQLError (Either EvalFailure NixValue) of
+              Right (Left failure) | notValidDerivation failure -> Pass
+              other -> Fail ("expected the refusal, got: " <> T.pack (show other)),
+          -- nova-nix holds no rows in a store upstream manages, so a tree
+          -- there counts as valid (the design's Decided list).
+          runTestM "a read-only query of a store upstream's database manages counts a tree that exists as valid, and opens no database there" $ do
+            let upstreamRoot = root </> "upstream"
+                planted = StoreDir (upstreamRoot </> "nix" </> "store")
+                tree = StorePath (T.replicate 32 "t") "tree"
+                missing = StorePath (T.replicate 32 "m") "missing"
+                upstreamDb = upstreamRoot </> "nix" </> "var" </> "nix" </> "db" </> "db.sqlite"
+            createDirectoryIfMissing True (takeDirectory upstreamDb)
+            BS.writeFile upstreamDb ""
+            createDirectoryIfMissing True (storePathToFilePath planted tree)
+            valid <- sqValidPaths (localQueries planted) (Set.fromList [tree, missing])
+            opened <- Dir.doesPathExist (unStoreDir planted </> metaDirName)
+            pure (assertEqual "valid and opened" (Set.singleton tree, False) (valid, opened))
+        ]
+  forceRemoveIfExists root
+  pure (readerResults <> results)
+
+-- | Import from derivation through the real CLI: a build imports and reads
+-- an output it builds and one it substitutes, a value forced before the
+-- build reads the same after it, the outputs and what they reference are
+-- readable under restrict-eval and pure-eval, @eval --aterm@ builds as
+-- @build@ does, @eval@ refuses a derivation it computed in upstream's
+-- words, builds an output that may not be substituted and refuses one
+-- that may, and reads what a fetcher fetched.
+testImportFromDerivationCLI :: IO [Bool]
+testImportFromDerivationCLI = do
+  putStrLn "cli/import-from-derivation"
+  shell <- findTestShell
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-ifd"
+      isolatedEnv =
+        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
+          : ("XDG_CONFIG_HOME", root </> "config")
+          : ("XDG_CACHE_HOME", root </> "cache")
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"]) ambient
+      runCLI args =
+        Proc.readCreateProcessWithExitCode
+          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
+          ""
+      nixString text = "\"" <> T.replace "${" "\\${" (T.replace "\"" "\\\"" (T.replace "\\" "\\\\" text)) <> "\""
+      system = nixString (platformToText currentPlatform)
+      derivationOf name script extra =
+        "derivation { name = " <> nixString name <> "; system = " <> system <> "; builder = " <> nixString shell <> "; args = [ \"-c\" " <> nixString script <> " ]; " <> extra <> " }"
+      -- A build of its own makes the file the expression imports and the
+      -- one it reads; what the top derivation writes is what it read.
+      ifd = derivationOf "ifd-made" "mkdir $out && printf '{ v = \"built\"; }' > $out/default.nix && printf data > $out/data" ""
+      topWriting value = derivationOf "ifd-top" "printf %s \"$value\" > $out" ("value = " <> value <> ";")
+      -- A value forced before the build and read after it.
+      built = T.unpack ("let made = " <> ifd <> "; before = { kept = \"kept\"; }; read = builtins.seq before.kept ((import made).v + builtins.readFile \"${made}/data\"); in " <> topWriting "before.kept + read")
+      substitutedBytes = "{ v = \"substituted\"; }" :: BS.ByteString
+      fixedAttrs = "outputHashMode = \"flat\"; outputHashAlgo = \"sha256\"; outputHash = \"" <> Hash.bytesToHexText (sha256Digest substitutedBytes) <> "\";"
+      substituted = T.unpack ("let fetched = " <> derivationOf "ifd-fetched.nix" "exit 1" fixedAttrs <> "; in " <> topWriting "(import fetched).v")
+      readOnly = "import (derivation { name = \"ifd-read-only\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; })"
+      -- The file read is in a dependency of the output imported, which the
+      -- output's references name: readable only through its closure.  The
+      -- output names it by its logical path, which a build in a store kept
+      -- elsewhere would rewrite to where it is kept, so the path is put
+      -- together from the dependency's base name, which keeps its context.
+      dependency = derivationOf "ifd-dependency" "mkdir $out && printf depvalue > $out/value" ""
+      reading = derivationOf "ifd-reading" "mkdir $out && printf 'builtins.readFile \"/nix/%s/%s/value\"' store \"$dependencyName\" > $out/default.nix" ("dependencyName = builtins.baseNameOf \"${" <> dependency <> "}\";")
+      throughDependency = T.unpack (topWriting ("import (" <> reading <> ")"))
+      -- A build of something else adds both derivations, as every
+      -- derivation evaluation recorded goes in, and builds neither.
+      unsubstitutable = derivationOf "ifd-unsubstitutable" "mkdir $out && printf built-read-only > $out/data" "allowSubstitutes = false;"
+      substitutable = derivationOf "ifd-substitutable" "mkdir $out && printf never > $out/data" ""
+      holder = T.unpack ("builtins.seq (" <> unsubstitutable <> ").drvPath (builtins.seq (" <> substitutable <> ").drvPath (" <> derivationOf "ifd-holder" "printf held > $out" "" <> "))")
+      readData derivation = T.unpack ("builtins.readFile \"${" <> derivation <> "}/data\"")
+      stage = root </> "stage"
+      tarball = root </> "fetched.tar.gz"
+      repo = root </> "repo"
+      fileUrl path = "file://" <> canonPathValue (T.pack path)
+      tarProcess =
+        (Proc.proc "tar" ["-czf", tarball, "-C", stage, "top"])
+          { Proc.env = Just (("COPYFILE_DISABLE", "1") : ambient)
+          }
+      evalAt store source = runCLI ["eval", "--expr", source, "--store", root </> store]
+      lastLineOf err = listToMaybe (reverse (filter (not . T.null) (map T.strip (T.lines (T.pack err)))))
+      -- A store upstream Nix's database manages, holding the derivation
+      -- of substitutable and not its output.
+      upstreamRoot = root </> "upstream"
+      upstreamStore = upstreamRoot </> "nix" </> "store"
+      upstreamDb = upstreamRoot </> "nix" </> "var" </> "nix" </> "db" </> "db.sqlite"
+      substitutableDrvPath = T.unpack ("(" <> substitutable <> ").drvPath")
+      build store source flags = runCLI (["build", "--expr", source, "--store", root </> store, "--no-out-link"] ++ flags)
+      printed out = listToMaybe (reverse (filter (not . null) (lines (filter (/= '\r') out))))
+      contentsOf out = maybe (pure Nothing) (fmap Just . BS.readFile) (printed out)
+      outcome (code, out, err) = "exit " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err
+      narInfoTarget out = "/" <> TE.encodeUtf8 (spHash out) <> ".narinfo"
+      substitutedNar = NAR.serialise (NAR.NarRegular False substitutedBytes)
+  fetchedOut <- either (fail . show) pure (makeFixedOutputPath "ifd-fetched.nix" "sha256" FlatIngestion (sha256Digest substitutedBytes))
+  (trustedKey, fetchedNarInfo) <- either fail pure (signedTestNarInfo fetchedOut [] "nar/fetched.nar" substitutedNar)
+  let route target _
+        | target == narInfoTarget fetchedOut = Send (httpResponse "200 OK" (TE.encodeUtf8 fetchedNarInfo))
+        | target == "/nar/fetched.nar" = Send (httpResponse "200 OK" substitutedNar)
+        | otherwise = Send (httpResponse "404 Not Found" "missing")
+  bracket_
+    (forceRemoveIfExists root >> createDirectoryIfMissing True root)
+    (forceRemoveIfExists root)
+    ( do
+        madeRun@(_, madeOut, _) <- build "built" built []
+        made <- contentsOf madeOut
+        restrictedRun@(_, restrictedOut, _) <- build "restricted" throughDependency ["--restrict-eval"]
+        restricted <- contentsOf restrictedOut
+        pureRun@(_, pureOut, _) <- build "pure" throughDependency ["--pure-eval"]
+        pureRead <- contentsOf pureOut
+        atermRun@(atermCode, atermOut, _) <- runCLI ["eval", "--aterm", "--expr", built, "--store", root </> "aterm"]
+        holderRun@(holderCode, _, _) <- build "read-only-build" holder []
+        unsubstitutableRun@(_, unsubstitutableOut, _) <- evalAt "read-only-build" (readData unsubstitutable)
+        substitutableRun@(substitutableCode, _, substitutableErr) <- evalAt "read-only-build" (readData substitutable)
+        (_, drvPathOut, _) <- evalAt "upstream-source" substitutableDrvPath
+        (_, atermOfSubstitutable, _) <- runCLI ["eval", "--aterm", "--expr", T.unpack substitutable, "--store", root </> "upstream-source"]
+        createDirectoryIfMissing True upstreamStore
+        createDirectoryIfMissing True (takeDirectory upstreamDb)
+        BS.writeFile upstreamDb ""
+        forM_ (printed drvPathOut) $ \quoted ->
+          BS.writeFile (upstreamStore </> takeFileName (filter (/= '"') quoted)) (BS8.pack (filter (`notElem` ("\r\n" :: String)) atermOfSubstitutable))
+        upstreamRun@(upstreamCode, _, upstreamErr) <- runCLI ["eval", "--expr", readData substitutable, "--store", upstreamStore]
+        createDirectoryIfMissing True (stage </> "top")
+        BS.writeFile (stage </> "top" </> "default.nix") "{ v = \"from a tarball\"; }\n"
+        tarballRun <-
+          if SI.os == "mingw32"
+            then pure Nothing
+            else do
+              (tarCode, _, tarErr) <- Proc.readCreateProcessWithExitCode tarProcess ""
+              case tarCode of
+                ExitFailure _ -> pure (Just (tarCode, "", tarErr))
+                ExitSuccess -> Just <$> evalAt "fetching" (T.unpack ("(import \"${builtins.fetchTarball " <> nixString (fileUrl tarball) <> "}/default.nix\").v"))
+        _ <- makeGitFixture repo [("VERSION", "1.2.3\n")]
+        gitRun@(_, gitOut, _) <- evalAt "fetching" (T.unpack ("builtins.readFile \"${builtins.fetchGit { url = " <> nixString (T.pack repo) <> "; }}/VERSION\""))
+        substitutedRun@(_, substitutedOut, _) <-
+          withHttpServer route $ \base _ _ ->
+            build "substituted" substituted ["--substituter", T.unpack base, "--trusted-key", T.unpack trustedKey]
+        fetched <- contentsOf substitutedOut
+        refusedRun@(refusedCode, _, refusedErr) <- runCLI ["eval", "--expr", readOnly, "--store", root </> "read-only"]
+        readOnlyStoreMade <- Dir.doesPathExist (root </> "read-only")
+        let lastLine = lastLineOf refusedErr
+        sequence
+          [ runTest "build imports and reads an output it builds, and a value forced before the build reads the same after it" $
+              if made == Just "keptbuiltdata" then Pass else Fail (outcome madeRun),
+            runTest "build imports an output a cache holds, and runs no builder for it" $
+              if fetched == Just "substituted" then Pass else Fail (outcome substitutedRun),
+            runTest "an output built during evaluation, and a file in what it references, are readable under restrict-eval" $
+              if restricted == Just "depvalue" then Pass else Fail (outcome restrictedRun),
+            runTest "an output built during evaluation, and a file in what it references, are readable under pure-eval" $
+              if pureRead == Just "depvalue" then Pass else Fail (outcome pureRun),
+            runTest "eval --aterm adds and builds what an import from derivation names, as plain nix-instantiate does" $
+              if atermCode == ExitSuccess && "keptbuiltdata" `T.isInfixOf` T.pack atermOut then Pass else Fail (outcome atermRun),
+            -- Upstream's read-only evaluation refuses a substitution and
+            -- builds an output that may not be substituted
+            -- (substitution-goal.cc:53-54, derivation-goal.cc:249 at 2.24.9).
+            runTest "eval builds an output of a derivation the store holds that may not be substituted, and reads it" $
+              if holderCode == ExitSuccess && printed unsubstitutableOut == Just "\"built-read-only\"" then Pass else Fail (outcome holderRun <> "; " <> outcome unsubstitutableRun),
+            runTest "eval refuses to substitute an output of a derivation the store holds, in upstream's words" $
+              case lastLineOf substitutableErr of
+                Just line
+                  | substitutableCode == ExitFailure 1,
+                    "error: cannot substitute path '/nix/store/" `T.isPrefixOf` line,
+                    "-ifd-substitutable' - no write access to the Nix store" `T.isSuffixOf` line ->
+                      Pass
+                _ -> Fail (outcome substitutableRun),
+            -- Upstream's substitution goal refuses before anything is built
+            -- or written (substitution-goal.cc:53-54 at 2.24.9), so the
+            -- store's own refusal is never reached.
+            runTest "eval refuses to substitute an output in a store upstream Nix manages in upstream's words, before refusing the store" $
+              case lastLineOf upstreamErr of
+                Just line
+                  | upstreamCode == ExitFailure 1,
+                    "error: cannot substitute path '/nix/store/" `T.isPrefixOf` line,
+                    "-ifd-substitutable' - no write access to the Nix store" `T.isSuffixOf` line ->
+                      Pass
+                _ -> Fail (outcome upstreamRun),
+            runTest "eval imports a fetchTarball result through its context" $
+              case tarballRun of
+                Nothing -> Pass
+                Just run@(_, tarballOut, _) -> if printed tarballOut == Just "\"from a tarball\"" then Pass else Fail (outcome run),
+            runTest "eval reads a fetchGit result through its context" $
+              if printed gitOut == Just "\"1.2.3\\n\"" then Pass else Fail (outcome gitRun),
+            runTest "eval refuses an import from a derivation in upstream's words, under its line of context, and makes no store" $
+              case lastLine of
+                Just line
+                  | refusedCode == ExitFailure 1,
+                    "error: path '/nix/store/" `T.isPrefixOf` line,
+                    "-ifd-read-only.drv' is not valid" `T.isSuffixOf` line,
+                    "while realising the context of path '/nix/store/" `T.isInfixOf` T.pack refusedErr,
+                    not readOnlyStoreMade ->
+                      Pass
+                _ -> Fail (outcome refusedRun)
+          ]
+    )
+
 -- | @build --check@ through the real CLI, which the tests of the build
 -- itself cannot show: that the flag reaches the build, that a check which
 -- passes prints the path a build prints, and that one which finds a
@@ -26344,7 +26993,7 @@ testTrustWindowsGraphs = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths storeDir cwd
+  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       source = "builtins.concatStringsSep \" \" [ " <> windows <> ".stage0-pe32.kaem-unwrapped.drvPath " <> windows <> ".hello.drvPath ]"
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
@@ -26840,7 +27489,7 @@ testPhase4IO = do
         -- Search path with --nix-path equivalent (populated nixPath)
         runTestM "search path with populated nixPath" $ do
           nixPaths <- parseNixPath (TE.encodeUtf8 ("mypkg=" <> T.pack subDir))
-          st <- newEvalStateWith unrestrictedPolicy nixPaths platformStoreDir testDir
+          st <- newEvalStateWith unrestrictedPolicy nixPaths (ReadOnlySession (localQueries platformStoreDir) unexpectedBuild) platformStoreDir testDir
           result <- runEvalIO st (eval (evalBaseEnv st) (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "mypkg"])))
           pure $ case result of
             Right (VPath _) -> Pass
@@ -27119,7 +27768,7 @@ namesOnlyChildFlag = "--names-only-child"
 inTestSession :: IO a -> IO a
 inTestSession action = do
   storeDir <- evalNixIOStoreDir
-  withEvalSession (SessionSettings unrestrictedPolicy (pure []) storeDir testBaseDir RegionsCollect) (const action)
+  withEvalSession (SessionSettings unrestrictedPolicy (pure []) storeDir testBaseDir RegionsCollect (ReadOnlySession (localQueries storeDir) unexpectedBuild)) (const action)
 
 -- | The flag that runs 'arenaCycleChild'.
 arenaCycleChildFlag :: String
@@ -28898,7 +29547,7 @@ instance MonadEval StubStoreEval where
   runProcess _ _ _ = throwEvalError "runProcess: not available in the stub evaluator"
   createScratchDir _ = throwEvalError "createScratchDir: not available in the stub evaluator"
   removeScratchDir _ = pure ()
-  copyPathToStore _ _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
+  copyPathToStore _ _ _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
   narHashOfPath _ = throwEvalError "builtins.fetchGit: not available in the stub evaluator"
   setExecutableFile _ = throwEvalError "builtins.fetchGit: not available in the stub evaluator"
   lookupFetchCache key = stubAnswer (Map.lookup key . seFetchCache)
@@ -28908,7 +29557,7 @@ instance MonadEval StubStoreEval where
   readSymlinkTarget _ = throwEvalError "builtins.path: not available in the stub evaluator"
   resolveSymlinks = pure
   addSourceNar _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
-  addFixedOutputFile _ _ = throwEvalError "builtins.fetchurl: not available in the stub evaluator"
+  addFixedOutputFile _ _ _ = throwEvalError "builtins.fetchurl: not available in the stub evaluator"
   traceMessage _ = pure ()
   lookupDrvHash _ = pure Nothing
   cacheDrvHash _ _ = pure ()
@@ -28916,6 +29565,7 @@ instance MonadEval StubStoreEval where
   readStoreDerivation sp = stubAnswer (Map.lookup (storePathToText defaultStoreDir sp) . seDrvs)
   lookupSessionDrv _ = pure Nothing
   lookupSessionReferences _ = pure Nothing
+  realiseContext _ = pure (Right ())
   storeSourcePath = pure
   evalPolicy = pure unrestrictedPolicy
   checkUri _ = pure ()
@@ -31797,6 +32447,8 @@ runSuite = do
           testTrust,
           testTrustScanIO,
           testRealise,
+          testRealiseContext,
+          testRealiseContextIO,
           testSubstituter,
           testCaseSensitiveVolumeIO,
           testFoldingVolumeIO,
@@ -31830,6 +32482,7 @@ runSuite = do
           testE2E,
           testExecWrapperCLI,
           testCheckCLI,
+          testImportFromDerivationCLI,
           testBuildCoresCLI,
           testOutLinkCLI,
           testTargetArgs,
@@ -32108,7 +32761,7 @@ evalPolicyIO policy roots searchPaths baseDir source = do
   case parseNixWithScope (rootScopeNames policy) baseDir testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> do
-      st <- newEvalStateWith policy searchPaths storeDir baseDir
+      st <- newEvalStateWith policy searchPaths (testSessionStore storeDir) storeDir baseDir
       mapM_ (allowEvalPath st) roots
       runEvalIO st (evalParsed (pure (evalBaseEnv st)) parsed)
 

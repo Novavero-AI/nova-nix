@@ -44,6 +44,7 @@ module Nix.Store.Path
     storePathToText,
     storePathBasename,
     isCanonicalStoreText,
+    isInStoreText,
     storeTextToFilePath,
     qualifyPathText,
     parseStorePath,
@@ -132,6 +133,15 @@ isCanonicalStoreText txt = case T.stripPrefix defaultStoreDirText txt of
   Just rest -> case T.uncons rest of
     Nothing -> True
     Just (c, _) -> c == '/' || c == '\\'
+  Nothing -> False
+
+-- | Whether path text names something in the canonical store dir, as
+-- upstream's @isInStore@ asks: the store dir followed by a separator and
+-- at least one more character, so not the store dir itself
+-- (@isInDir@, file-system.cc:151-157 at 2.24.9).
+isInStoreText :: Text -> Bool
+isInStoreText txt = case T.stripPrefix defaultStoreDirText txt >>= T.uncons of
+  Just (separator, rest) -> (separator == '/' || separator == '\\') && not (T.null rest)
   Nothing -> False
 
 -- | Resolve path-value text to the filesystem location it names: text

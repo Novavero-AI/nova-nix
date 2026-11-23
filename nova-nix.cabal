@@ -68,6 +68,7 @@ library
     Nix.Eval.Types
     Nix.Eval.IO
     Nix.Eval.Policy
+    Nix.Eval.RealiseContext
     Nix.Eval.Operator
     Nix.Eval.Print
     Nix.Eval.SourceError
@@ -157,7 +158,13 @@ library
     , process             >= 1.6 && < 1.7
     , random              >= 1.2 && < 1.4
     , regex-tdfa          >= 1.3 && < 1.4
-    , sqlite-simple       >= 0.4 && < 0.5
+    -- Nix.Store.DB wraps a read-only direct-sqlite handle in Connection,
+    -- whose two fields 0.4.19 introduced (0.4.18 has one) in a minor
+    -- release, so the bound holds to the release whose shape is known.
+    , sqlite-simple       >= 0.4.19 && < 0.4.20
+    -- 2.3.28 is the first whose open2 opens a database read-only, which a
+    -- store's queries for a read-only evaluation do.
+    , direct-sqlite       >= 2.3.28 && < 2.4
     , tar                 >= 0.7.1 && < 0.8
     , text                >= 2.0 && < 2.2
     , time                >= 1.9 && < 1.17

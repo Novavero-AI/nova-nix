@@ -97,7 +97,7 @@ module Nix.Eval
   )
 where
 
-import Control.Monad (foldM, foldM_, forM_, unless, void, when, (>=>))
+import Control.Monad (foldM, foldM_, forM_, mfilter, unless, void, when, (>=>))
 import qualified Crypto.Hash as CH
 import qualified Data.Array as Array
 import Data.Bits (xor, (.&.), (.|.))
@@ -145,6 +145,7 @@ import Nix.Eval.EvalFormals (FormalDefault (..), LambdaName, hasDefault, lambdaN
 import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdateChain, expectInt, expectedFailure, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
 import Nix.Eval.Policy (fileUrlPrefix, isAbsolutePath)
 import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printSymbol, printValue)
+import Nix.Eval.RealiseContext (PendingOrigin (..), contextRefusalMessage, findFileRefusalMessage)
 import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, printPos)
 import Nix.Eval.StringInterp (StringChunk (..), coerceToString, concatChunks, formatNixFloat, stripIndentedChunks)
 import Nix.Eval.Symbol (Symbol (..), symbolIntern, symbolText)
@@ -234,7 +235,7 @@ import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), base64HashLen, base64ToBytes, bytesToHexText, fileIngestionPrefix, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
 import Nix.Json (IntegerRange (..), Json (..), JsonBuilder (..), parseJsonInto, renderJson)
 import Nix.Parser (ParsedSource)
-import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathBaseName, storePathBaseNameError, storePathNameErrorText, storePathNameReasonText, storePathNameUpstreamText, storePathToText)
+import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, isInStoreText, parseStorePath, parseStorePathBaseName, storePathBaseNameError, storePathNameErrorText, storePathNameReasonText, storePathNameUpstreamText, storePathToText)
 import Nix.Store.Path.Internal (maskedOutputPath)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
@@ -3377,10 +3378,44 @@ coerceToStringAsPath label val = do
   path <- absolutePathString =<< decodedText label bytes
   pure (path, ctx)
 
--- | 'coerceToPathWithContext' for a builtin that reads the path and keeps
--- no string.
+-- | 'coerceToPathWithContext' for a builtin that keeps no string and
+-- realises no context: one that reads nothing at the path, or reads it
+-- only as upstream's does without realising (@builtins.storePath@
+-- resolves symlinks through it).
 coerceToPath :: (MonadEval m) => Text -> NixValue -> m Text
 coerceToPath label val = fst <$> coerceToPathWithContext label val
+
+-- | Upstream's @realisePath@ (primops.cc:126-143 at 2.24.9), which every
+-- builtin that reads a path runs its argument through: the path the
+-- argument coerces to, once the store paths its context names are
+-- realised ('realiseContext'), which adds the line of context
+-- @while realising the context of path \'...\'@ to a failure.  A refusal
+-- is an evaluation error, which @builtins.tryEval@ does not catch, as
+-- upstream's catches only an assertion (primops.cc:914).  A path value
+-- has no context and is read as it is.
+realisePath :: (MonadEval m) => Text -> NixValue -> m Text
+realisePath label val = do
+  (path, ctx) <- coerceToPathWithContext label val
+  unless (contextIsEmpty ctx) $
+    addErrorTrace (pure ("while realising the context of path '" <> path <> "'")) (realisedOrRefused ctx)
+  pure path
+
+-- | Upstream's @addPath@ around the copy @builtins.path@ and
+-- @builtins.filterSource@ make of a path, once their arguments are read
+-- (primops.cc:2436-2492 at 2.24.9): a path in the store has its context
+-- realised first, and any failure from there on, the realisation's, the
+-- filter's and the copy's, carries the line of context
+-- @while adding path \'...\'@.
+addingPath :: (MonadEval m) => Text -> StringContext -> m a -> m a
+addingPath path ctx copy =
+  addErrorTrace (pure ("while adding path '" <> path <> "'")) $ do
+    when (isInStoreText path && not (contextIsEmpty ctx)) (realisedOrRefused ctx)
+    copy
+
+-- | Realise a context, failing with the refusal's message when it cannot
+-- be.
+realisedOrRefused :: (MonadEval m) => StringContext -> m ()
+realisedOrRefused ctx = realiseContext ctx >>= either (throwEvalError . contextRefusalMessage) pure
 
 -- | Upstream @coerceToPath@'s rule for a string operand: it must spell an
 -- absolute path, which is then canonicalized like any path value
@@ -3396,11 +3431,11 @@ absolutePathString s
     canonical = canonPathValue s
 
 builtinImport :: (MonadEval m) => NixValue -> m NixValue
-builtinImport val = importFile =<< coerceToPath "import" val
+builtinImport val = importFile =<< realisePath "import" val
 
 builtinReadFile :: (MonadEval m) => NixValue -> m NixValue
 builtinReadFile val = do
-  p <- coerceToPath "builtins.readFile" val
+  p <- realisePath "builtins.readFile" val
   bytes <- readFileBytes p
   -- The value is the file's RAW BYTES, as upstream: no BOM stripping, no
   -- UTF-16 transcoding, no replacement characters (the auto-decode stays
@@ -3417,7 +3452,7 @@ builtinReadFile val = do
 -- canonicalization would otherwise erase.
 builtinPathExists :: (MonadEval m) => NixValue -> m NixValue
 builtinPathExists val = do
-  p <- coerceToPath "builtins.pathExists" val
+  p <- realisePath "builtins.pathExists" val
   VBool <$> doesPathExist (existenceQuery val) p
   where
     existenceQuery (VStr s _)
@@ -3433,7 +3468,7 @@ builtinPathExists val = do
 -- no symlink above the entry.
 builtinReadDir :: (MonadEval m) => NixValue -> m NixValue
 builtinReadDir val = do
-  p <- coerceToPath "builtins.readDir" val
+  p <- realisePath "builtins.readDir" val
   entries <- listDirectory p
   -- Resolved only when an entry needs it, so a listing that types every
   -- entry costs nothing more.
@@ -3570,11 +3605,19 @@ forceSearchEntry thunk = do
         VStr s _ -> pure s
         _ -> throwEvalError "builtins.findFile: 'prefix' must be a string"
       path <- case pathVal of
-        VStr s _ -> pure s
+        VStr s ctx -> s <$ realiseSearchEntry s ctx
         VPath s -> pure (TE.encodeUtf8 s)
         _ -> throwEvalError "builtins.findFile: 'path' must be a string or path"
       pure (prefix, path)
     _ -> throwEvalError "builtins.findFile: search path entry must be a set"
+
+-- | Realise the context of a search path entry's path before its lookup,
+-- as upstream's @builtins.findFile@ realises it, naming the entry when a
+-- path its context names is not valid (primops.cc:1819-1826 at 2.24.9).
+realiseSearchEntry :: (MonadEval m) => BS.ByteString -> StringContext -> m ()
+realiseSearchEntry path ctx =
+  unless (contextIsEmpty ctx) $
+    realiseContext ctx >>= either (throwEvalError . findFileRefusalMessage (bytesToTextLossy path)) pure
 
 -- | A lookup that matched no entry.  A CATCHABLE error (upstream raises
 -- ThrownError here): nixpkgs' impure.nix wraps @<nixpkgs-overlays>@ in
@@ -3663,7 +3706,7 @@ toFileRefs (StringContext elems) = mapM refOf (Set.toAscList elems)
 -- taken unforced.
 builtinScopedImport :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
 builtinScopedImport scopeArg pathVal = do
-  p <- coerceToPath "builtins.scopedImport" pathVal
+  p <- realisePath "builtins.scopedImport" pathVal
   scopeVal <- argValue scopeArg
   case scopeVal of
     VAttrs attrs -> scopedImportFile attrs p
@@ -3729,6 +3772,7 @@ fetchAndExtractTarball url pin name = do
     0 -> do
       storePath <-
         copyPathToStore
+          Fetched
           extractDir
           name
           (fmap (\expected -> (expected, fetchHashMismatch url expected)) pin)
@@ -4171,7 +4215,7 @@ fetchGitInClone args checkedRef checkedRev cloneDir = do
       else decodeDecimal ctx =<< git ["rev-list", "--count", "HEAD"]
   lastModifiedText <- git ["show", "-s", "--format=%ct", "HEAD"]
   removeGitMetadata ctx cloneDir
-  storePath <- copyPathToStore cloneDir name Nothing
+  storePath <- copyPathToStore Fetched cloneDir name Nothing
   narHash <- narHashOfPath cloneDir
   removeScratchDir cloneDir
   lastModified <- decodeDecimal ctx lastModifiedText
@@ -4380,7 +4424,7 @@ fetchUrlSimple url pin = do
   forM_ pin $ \expected ->
     let got = sha256Digest bytes
      in when (expected /= got) $ throwEvalError (fetchHashMismatch url expected got)
-  storePath <- addFixedOutputFile name bytes
+  storePath <- addFixedOutputFile Fetched name bytes
   pure (VPath storePath)
 
 -- | Fetch a URL into the scratch directory and hand back its bytes.
@@ -5103,27 +5147,33 @@ expectBool other = expectedFailure "a Boolean" other
 
 -- | @builtins.hashFile algo path@ - hash raw bytes of a file on disk.
 -- Returns base-16 hex string, matching @builtins.hashString@ output format.
--- The algorithm is read as upstream's @forceStringNoCtx@ reads it
--- (primops.cc:1977 at 2.24.9).
+-- The algorithm is read as upstream's @forceStringNoCtx@ reads it and
+-- refused before the path is realised or read (primops.cc:1977-1982 at
+-- 2.24.9).
 builtinHashFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinHashFile algoVal pathVal = do
   algoName <- decodedText "builtins.hashFile" =<< structuredStringValue RefuseContext algoVal
-  bytes <- readFileBytes =<< coerceToPath "builtins.hashFile" pathVal
-  hashBytesWithAlgo algoName bytes
+  digest <- maybe (throwEvalError (unknownHashAlgo algoName)) pure (hexDigestOf algoName)
+  bytes <- readFileBytes =<< realisePath "builtins.hashFile" pathVal
+  pure (mkStr (digest bytes))
 
 -- | Shared hash dispatch for raw t'Data.ByteString.ByteString' input.
 hashBytesWithAlgo :: (MonadEval m) => Text -> BS.ByteString -> m NixValue
-hashBytesWithAlgo algo bytes = case algo of
-  "sha256" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.SHA256)))
-  "sha512" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.SHA512)))
-  "sha1" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.SHA1)))
-  "md5" -> pure (mkStr (digestToHex (CH.hash bytes :: CH.Digest CH.MD5)))
-  _ -> throwEvalError (unknownHashAlgo algo)
+hashBytesWithAlgo algo bytes = maybe (throwEvalError (unknownHashAlgo algo)) (\digest -> pure (mkStr (digest bytes))) (hexDigestOf algo)
+
+-- | The base-16 digest an algorithm's name selects, if it names one.
+hexDigestOf :: Text -> Maybe (BS.ByteString -> Text)
+hexDigestOf = \case
+  "sha256" -> Just (\bytes -> digestToHex (CH.hash bytes :: CH.Digest CH.SHA256))
+  "sha512" -> Just (\bytes -> digestToHex (CH.hash bytes :: CH.Digest CH.SHA512))
+  "sha1" -> Just (\bytes -> digestToHex (CH.hash bytes :: CH.Digest CH.SHA1))
+  "md5" -> Just (\bytes -> digestToHex (CH.hash bytes :: CH.Digest CH.MD5))
+  _ -> Nothing
 
 -- | @builtins.readFileType path@ - classify a filesystem entry.
 -- Returns @"regular"@, @"directory"@, @"symlink"@, or @"unknown"@.
 builtinReadFileType :: (MonadEval m) => NixValue -> m NixValue
-builtinReadFileType val = mkStr <$> (getFileType =<< coerceToPath "builtins.readFileType" val)
+builtinReadFileType val = mkStr <$> (getFileType =<< realisePath "builtins.readFileType" val)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - convertHash
@@ -6013,32 +6063,35 @@ builtinPath (VAttrs attrs) = do
   -- prim_path reads the arguments one at a time in the set's own order,
   -- refusing one it does not take at its turn, and checks for the path
   -- once that loop is done (primops.cc:2569-2592 at 2.24.9).  The order
-  -- is by interned symbol, as upstream's attribute sets are sorted.
+  -- is by interned symbol, as upstream's attribute sets are sorted.  The
+  -- path's context is realised only after that, in addPath (:2596).
   args <- attrSetFoldM readPathArgument noPathArguments attrs
-  pathStr <- maybe (throwEvalError "missing required 'path' attribute in the first argument to builtins.path") pure (paPath args)
-  let name = fromMaybe (canonBaseName pathStr) (paName args)
+  (pathStr, pathContext) <- maybe (throwEvalError "missing required 'path' attribute in the first argument to builtins.path") pure (paPath args)
+  -- An empty name is the path's base name, as upstream's is (:2593-2594).
+  let name = fromMaybe (canonBaseName pathStr) (mfilter (not . T.null) (paName args))
       expectedDigest = paPin args
       -- Upstream compares the copy's store path with the one the pin
       -- gives (primops.cc:2478-2482 at 2.24.9); under one name and one
       -- method the two differ exactly when the digests do.
       mismatch = "store path mismatch in (possibly filtered) path added from '" <> pathStr <> "'"
-  -- A pinned copy's path follows from the pin.  Upstream's addPath builds
-  -- it once prim_path has forced every argument and before it reads the
-  -- tree (primops.cc at 2.24.9), so a name it refuses is refused under the
-  -- pinned hash, before the filter is applied.
-  forM_ expectedDigest $ \expected ->
-    storePathOrThrow (makeFixedOutputPath name "sha256" (paMethod args) expected)
-  storePathText <- case (paMethod args, paFilter args) of
-    (FlatIngestion, _) -> flatFileCopy pathStr name expectedDigest mismatch
-    (NarIngestion, Nothing) -> copyPathToStore pathStr name (fmap (,const mismatch) expectedDigest)
-    (NarIngestion, Just keep) -> do
-      narBytes <- filteredSourceNar keep pathStr
-      -- The sha256 pin applies to the FILTERED tree, as upstream.
-      case expectedDigest of
-        Just expected | expected /= sha256Digest narBytes -> throwEvalError mismatch
-        _ -> pure ()
-      addSourceNar name narBytes
-  pure (sourceResultString storePathText)
+  addingPath pathStr pathContext $ do
+    -- A pinned copy's path follows from the pin.  Upstream's addPath
+    -- builds it once the context is realised and before it reads the tree
+    -- (primops.cc:2462-2466 at 2.24.9), so a name it refuses is refused
+    -- under the pinned hash, before the filter is applied.
+    forM_ expectedDigest $ \expected ->
+      storePathOrThrow (makeFixedOutputPath name "sha256" (paMethod args) expected)
+    storePathText <- case (paMethod args, paFilter args) of
+      (FlatIngestion, _) -> flatFileCopy pathStr name expectedDigest mismatch
+      (NarIngestion, Nothing) -> copyPathToStore Computed pathStr name (fmap (,const mismatch) expectedDigest)
+      (NarIngestion, Just keep) -> do
+        narBytes <- filteredSourceNar keep pathStr
+        -- The sha256 pin applies to the FILTERED tree, as upstream.
+        case expectedDigest of
+          Just expected | expected /= sha256Digest narBytes -> throwEvalError mismatch
+          _ -> pure ()
+        addSourceNar name narBytes
+    pure (sourceResultString storePathText)
 builtinPath other =
   throwEvalError ("builtins.path: expected an attribute set, got " <> typeName other)
 
@@ -6046,7 +6099,7 @@ builtinPath other =
 -- locals hold them (primops.cc:2560-2565 at 2.24.9): a NAR copy until
 -- @recursive@ says otherwise.
 data PathArguments = PathArguments
-  { paPath :: !(Maybe Text),
+  { paPath :: !(Maybe (Text, StringContext)),
     paName :: !(Maybe Text),
     paFilter :: !(Maybe NixValue),
     paMethod :: !FileIngestionMethod,
@@ -6058,20 +6111,24 @@ noPathArguments :: PathArguments
 noPathArguments = PathArguments Nothing Nothing Nothing NarIngestion Nothing
 
 -- | One argument of @builtins.path@, read as @prim_path@ reads the one at
--- its key (primops.cc:2571-2587 at 2.24.9): @recursive@ as a Boolean
--- choosing a NAR or a flat copy, and any key it does not take refused
--- with its message.
+-- its key (primops.cc:2571-2587 at 2.24.9): @name@ as a string with no
+-- context, @filter@ as a function, each refused otherwise under
+-- upstream's line of context for it, @recursive@ as a Boolean choosing a
+-- NAR or a flat copy, and any key it does not take refused with its
+-- message.
 readPathArgument :: (MonadEval m) => PathArguments -> Symbol -> AttrEntry -> m PathArguments
 readPathArgument args name entry = case key of
-  "path" -> (\path -> args {paPath = Just path}) <$> (coerceToPath "builtins.path" =<< force thunk)
-  "name" -> (\named -> args {paName = Just named}) <$> forceAttrValueStr thunk
-  "filter" -> (\keep -> args {paFilter = Just keep}) <$> force thunk
+  "path" -> (\path -> args {paPath = Just path}) <$> (coerceToPathWithContext "builtins.path" =<< force thunk)
+  "name" -> (\named -> args {paName = Just named}) <$> (checked "`name` attribute" nameOf =<< force thunk)
+  "filter" -> (\keep -> args {paFilter = Just keep}) <$> (checked "`filter` parameter" expectFunction =<< force thunk)
   "recursive" -> (\recursive -> args {paMethod = if recursive then NarIngestion else FlatIngestion}) <$> (expectBool =<< force thunk)
   "sha256" -> (\pin -> args {paPin = Just pin}) <$> (pathPin =<< force thunk)
   _ -> throwEvalError ("unsupported argument '" <> key <> "' to 'addPath'")
   where
     key = symbolText name
     thunk = entryThunk entry
+    checked what check value = addErrorTrace (pure ("while evaluating the " <> what <> " passed to builtins.path")) (check value)
+    nameOf value = decodedText "builtins.path" =<< structuredStringValue RefuseContext value
     pathPin pinVal = case pinVal of
       VStr pin _ -> decodeSha256Pin =<< decodedText "builtins.path" pin
       other -> throwEvalError ("builtins.path: 'sha256' must be a string, got " <> typeName other)
@@ -6093,7 +6150,7 @@ flatFileCopy rawPath name pin mismatch = do
   case pin of
     Just expected | expected /= sha256Digest bytes -> throwEvalError mismatch
     _ -> pure ()
-  addFixedOutputFile name bytes
+  addFixedOutputFile Computed name bytes
 
 -- | The result value both source importers return: the store path as a
 -- string carrying itself as context.
@@ -6155,13 +6212,14 @@ filteredSourceNar filterFn rawRoot = do
 -- @(path, type)@ where type is @"regular"@, @"directory"@, @"symlink"@,
 -- or @"unknown"@.  Equivalent to @builtins.path@ with a filter and the
 -- source's basename as the store name.  @prim_filterSource@ coerces the
--- path before it forces the filter (primops.cc at 2.24.9), so the filter
+-- path before it forces the filter, and realises the path's context only
+-- after both, in addPath (primops.cc:2493-2502 at 2.24.9), so the filter
 -- is taken unforced.
 builtinFilterSource :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
 builtinFilterSource filterArg pathVal = do
-  path <- coerceToPath "builtins.filterSource" pathVal
+  (path, ctx) <- coerceToPathWithContext "builtins.filterSource" pathVal
   filterFn <- forceFunctionArg filterArg
-  filterSourceInto filterFn path
+  addingPath path ctx (filterSourceInto filterFn path)
 
 filterSourceInto :: (MonadEval m) => NixValue -> Text -> m NixValue
 filterSourceInto filterFn path = do

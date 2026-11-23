@@ -452,6 +452,19 @@ if ! upstreamAtLeast 2.33.0; then
 fi
 echo
 
+echo "== a path reader realises its argument's context =="
+# nix-instantiate --eval runs read-only (nix-instantiate.cc:154-155 at
+# 2.24.9), so derivationStrict computes a derivation's path without writing
+# it, and an import of its output finds the derivation not valid
+# (primops.cc:48-51).  The name is the case's own, so no other case has
+# made the derivation valid.  2.34.9 names the path by its base name alone
+# (eval-error.cc:9 at 2.34.9), where 2.24.9 and 2.35.4 name the whole store
+# path, as nova-nix does.
+if ! upstreamAtLeast 2.34.0 || upstreamAtLeast 2.35.0; then
+  refused "an import from a derivation in a read-only evaluation" 'import (derivation { name = "parity-ifd-read-only"; system = "x86_64-linux"; builder = "/bin/sh"; })'
+fi
+echo
+
 echo "== Nova's mirror interface preserves fixed-output identity =="
 for caseName in legacy sha256 sri order invalidUrls invalidHashes escapedUrl unicodeUrl; do
   check "fetchurl $caseName" "(import ./fetchurl-cases.nix).$caseName"
