@@ -369,6 +369,7 @@ data FlagName
   | NoOutLinkFlag
   | StrictFlag
   | AtermFlag
+  | ReadWriteModeFlag
   | NixPathFlag
   | ArgFlag
   | ArgStrFlag
@@ -455,6 +456,8 @@ flag name = case name of
     long "strict" Nothing "Deep-force all thunks before printing (warning: OOM on large results)" evalOnly
   AtermFlag ->
     long "aterm" Nothing "Print the `.drv` ATerm of the derivation the target evaluates to, in place of its value" evalOnly
+  ReadWriteModeFlag ->
+    long "read-write-mode" Nothing "Write what evaluation makes (`builtins.toFile`, `builtins.path` and the like) to the store and register it, and build or substitute what a path's context names, as `build` does; without it `eval` computes those paths and writes only what a fetcher fetches" evalOnly
   NixPathFlag ->
     long "nix-path" (Just "NAME=PATH") "Add search path (repeatable, merged with `NIX_PATH`)" evalBuildAndTrust
   ArgFlag ->
@@ -470,15 +473,15 @@ flag name = case name of
   NoAllowImportFromDerivationFlag ->
     long "no-allow-import-from-derivation" Nothing "Refuse to build or substitute what a path's context names when `import` or another builtin reads the path, even an output already valid" evalBuildAndTrust
   SubstituterFlag ->
-    long "substituter" (Just "URL") "Try this binary cache before building" buildAndTrust
+    long "substituter" (Just "URL") "Try this binary cache before building" evalBuildAndTrust
   TrustedKeyFlag ->
-    long "trusted-key" (Just "KEY") "Trust signatures by this public key (`NAME:BASE64`) from any substituter" buildAndTrust
+    long "trusted-key" (Just "KEY") "Trust signatures by this public key (`NAME:BASE64`) from any substituter" evalBuildAndTrust
   FallbackFlag ->
-    long "fallback" Nothing "Build from source if substitution fails" buildAndTrust
+    long "fallback" Nothing "Build from source if substitution fails" evalBuildAndTrust
   CheckFlag ->
     long "check" Nothing "Build the derivation again beside its valid outputs, and fail with status 104 if an output comes out different" buildOnly
   ExecWrapperFlag ->
-    long "exec-wrapper" (Just "S=PATH") "Run system `S`'s derivations through `PATH` (repeatable), e.g. `x86_64-windows=/usr/bin/wine`" buildOnly
+    long "exec-wrapper" (Just "S=PATH") "Run system `S`'s derivations through `PATH` (repeatable), e.g. `x86_64-windows=/usr/bin/wine`" evalAndBuild
   CacheFlag ->
     long "cache" (Just "URL") "The cache to push to: a nova-cache server's `http://` or `https://` URL, or a directory's `file://` URL (required)" pushOnly
   AllFlag ->
@@ -505,6 +508,7 @@ flag name = case name of
     buildOnly = CommandFlag (BuildCommand :| [])
     pushOnly = CommandFlag (PushCommand :| [])
     buildAndTrust = CommandFlag (BuildCommand :| [TrustCommand])
+    evalAndBuild = CommandFlag (EvalCommand :| [BuildCommand])
     evalBuildAndTrust = CommandFlag (EvalCommand :| [BuildCommand, TrustCommand])
 
 -- ---------------------------------------------------------------------------

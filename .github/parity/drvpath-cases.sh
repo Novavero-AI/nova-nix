@@ -31,13 +31,13 @@ if ! command -v nix-instantiate >/dev/null 2>&1; then
   exit 1
 fi
 
-# nova-nix writes what evaluation creates (toFile output, a fetched tree)
-# into the store it is given, and /nix/store belongs to the Nix daemon, so it
-# gets a store of its own; store paths keep the logical /nix/store prefix
-# either way.  Upstream writes to its own store, as any evaluation that
-# instantiates does: nix-instantiate's --eval alone implies read-only mode,
-# which cannot take the closure of a drvPath's deep context (primops.cc at
-# 2.24.9), so the oracle would fail where a user's evaluation succeeds.
+# Both evaluate with --read-write-mode, as any evaluation that instantiates
+# does: nix-instantiate's --eval alone implies read-only mode, which cannot
+# take the closure of a drvPath's deep context (primops.cc at 2.24.9), so the
+# oracle would fail where a user's evaluation succeeds.  nova-nix then writes
+# what evaluation creates (toFile output, a fetched tree) into the store it
+# is given, and /nix/store belongs to the Nix daemon, so it gets a store of
+# its own; store paths keep the logical /nix/store prefix either way.
 # Both get a fresh cache directory, so a fetch is a fetch and never a hit
 # left behind by an earlier run.
 scratch=$(mktemp -d) || exit 1
@@ -96,7 +96,7 @@ while read -r label expr <&3 || [ -n "$label" ]; do
     nix-instantiate --eval --read-write-mode -I "nixpkgs=$nixpkgs" -E "$wrapped")
   upStatus=$?
   novaSecs=$(timed "$scratch/nova.out" "$scratch/nova.err" \
-    "$novaBin" eval --store "$scratch/store" \
+    "$novaBin" eval --read-write-mode --store "$scratch/store" \
     --nix-path "nixpkgs=$nixpkgs" --nix-path "nix=$repoRoot/data/nix" \
     --expr "$wrapped")
   novaStatus=$?

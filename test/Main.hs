@@ -14554,13 +14554,16 @@ testStoreOpsIO = do
         runTestM "the local store opens at its first operation, holds its lease while open, and closes when the action ends" $ do
           fresh
           untouched <- withLocalStore config (const (Dir.doesDirectoryExist (metaDir storeDir)))
+          -- An add of nothing asks nothing of the store.
+          emptyAdd <- withLocalStore config $ \ops -> (,) <$> soAddEvalObjects ops noObjects <*> Dir.doesDirectoryExist (metaDir storeDir)
           during <- withLocalStore config $ \ops -> do
-            added <- soAddEvalObjects ops noObjects
-            (,) added <$> leaseHeld storeDir
+            asked <- sqValidPaths (soQueries ops) (Set.singleton (StorePath (T.replicate 32 "q") "queried"))
+            (,) asked <$> leaseHeld storeDir
           after <- leaseHeld storeDir
           pure $
             assertEqual "unopened" False untouched
-              `andThen` assertEqual "open" (Right (), True) during
+              `andThen` assertEqual "empty add" (Right (), False) emptyAdd
+              `andThen` assertEqual "open" (Set.empty, True) during
               `andThen` assertEqual "closed" False after,
         -- A tree evaluation wrote references the source it names, and the
         -- derivation both: each is registered after what it references.
@@ -14596,16 +14599,18 @@ testStoreOpsIO = do
           createDirectoryIfMissing True (unStoreDir planted)
           plantedDir <- canonicalStoreDir planted
           refusal <- upstreamManagedRefusal ReplacesUpstreamPaths plantedDir
-          (added, built, checked) <-
+          (nothingAdded, added, built, checked) <-
             withLocalStore (defaultBuildConfig plantedDir) $ \ops ->
-              (,,)
+              (,,,)
                 <$> soAddEvalObjects ops noObjects
+                <*> soAddEvalObjects ops (EvalObjects Map.empty (Map.singleton (storePathToText defaultStoreDir (StorePath (T.replicate 32 "t") "tree")) ([], WriteRecursive)) Map.empty)
                 <*> soBuild ops []
                 <*> soCheck ops (StorePath (T.replicate 32 "c") "checked.drv")
           opened <- Dir.doesDirectoryExist (metaDir plantedDir)
           pure $ case refusal of
             Just reason ->
-              assertEqual "add" (Left reason) added
+              assertEqual "nothing to add" (Right ()) nothingAdded
+                `andThen` assertEqual "add" (Left reason) added
                 `andThen` assertEqual "build" (Left (BuildStop reason 1)) built
                 `andThen` assertEqual "check" (Left (BuildStop reason 1)) checked
                 `andThen` assertEqual "opened" False opened
@@ -25291,12 +25296,19 @@ fakeRealiseStore holds stop = do
 
 -- | A read-only session over a fake store's queries and build.
 readOnlyOver :: StoreOps IO -> SessionStore
-readOnlyOver ops = ReadOnlySession (soQueries ops) (soBuild ops)
+readOnlyOver ops = ReadOnlySession (soQueries ops) ops
 
--- | The build of a read-only session that should realise no output: a
--- request is a failure the test sees.
-unexpectedBuild :: [(StorePath, Set.Set Text)] -> IO (Either BuildStop ())
-unexpectedBuild requests = pure (Left (BuildStop ("a build no test asked for: " <> T.pack (show requests)) 1))
+-- | The operations of a read-only session that should add and realise
+-- nothing: each is a failure the test sees.
+unexpectedOps :: StoreOps IO
+unexpectedOps =
+  StoreOps
+    { soQueries = StoreQueries {sqValidPaths = \_ -> pure Set.empty, sqReferences = \_ -> pure (Right Set.empty)},
+      soAddEvalObjects = \_ -> pure (Left "an add no test asked for"),
+      soBuild = \requests -> pure (Left (BuildStop ("a build no test asked for: " <> T.pack (show requests)) 1)),
+      soCheck = \_ -> pure (Left (BuildStop "a check no test asked for" 1)),
+      soAddOutLinkRoot = \_ _ -> pure (Left "a root no test asked for")
+    }
 
 -- | Evaluate source in a state, keeping the whole failure, its lines of
 -- context included.
@@ -25452,6 +25464,28 @@ testRealiseContextIO = do
       evalUnder policy store source = do
         st <- newEvalStateWith policy [] store storeDir root
         evalTracedIn st root source
+      evalAt dir store source = do
+        st <- newEvalStateWith unrestrictedPolicy [] store (StoreDir dir) root
+        evalTracedIn st root source
+      -- A read-only session's answer, the same as a read-write one's,
+      -- with nothing written to its store, where the read-write one has
+      -- written the object.
+      computedWithoutWriting source = do
+        let computing = root </> "computing-store"
+            writing = root </> "writing-store"
+        forceRemoveIfExists computing
+        forceRemoveIfExists writing
+        (ro, _) <- fakeRealiseStore (const False) Nothing
+        (rw, _) <- fakeRealiseStore (const False) Nothing
+        computed <- evalAt computing (readOnlyOver ro) source
+        written <- evalAt writing (ReadWriteSession rw) source
+        computingMade <- Dir.doesPathExist computing
+        writtenThere <- case written of
+          Right (VStr bytes _) | Just sp <- parseStorePath defaultStoreDir (TE.decodeUtf8 bytes) -> Dir.doesPathExist (storePathToFilePath (StoreDir writing) sp)
+          _ -> pure False
+        pure $ case (computed, written) of
+          (Right answer, Right expected) | answer == expected, not computingMade, writtenThere -> Pass
+          other -> Fail ("expected the read-write answer and no store, got: " <> T.pack (show (other, computingMade, writtenThere)))
       refusingImports = unrestrictedPolicy {epImportFromDerivation = RefuseImportFromDerivation}
       refusedImport failure =
         "cannot build '/nix/store/" `T.isPrefixOf` failureMessage failure
@@ -25653,6 +25687,61 @@ testRealiseContextIO = do
               case tarCode of
                 ExitFailure n -> pure (Fail ("tar exited " <> T.pack (show n) <> ": " <> T.pack tarErr))
                 ExitSuccess -> readsAs "from a tarball" ("(import \"${builtins.fetchTarball " <> nixString (fileUrl tarball) <> "}/default.nix\").v"),
+          -- nix-instantiate --eval computes these paths without writing
+          -- them (primops.cc:2310 and :2473 at 2.24.9).
+          runTestM "a read-only session computes the path of a toFile result and writes nothing" $
+            computedWithoutWriting "builtins.toFile \"named\" \"text\"",
+          runTestM "a read-only session computes the path of a builtins.path copy by its NAR and writes nothing" $
+            computedWithoutWriting "builtins.path { path = ./filtered; }",
+          runTestM "a read-only session computes the path of a flat builtins.path copy and writes nothing" $
+            computedWithoutWriting "builtins.path { path = ./filtered/child; recursive = false; }",
+          runTestM "a read-only session computes the path of a filtered copy and writes nothing" $
+            computedWithoutWriting "builtins.filterSource (p: t: true) ./filtered",
+          -- Upstream's fetchers add what they fetch in any mode
+          -- (fetchTree.cc:504-509 at 2.24.9).
+          runTestM "a read-only session writes what a fetcher fetches" $ do
+            let dir = root </> "fetching-store"
+            (ops, _) <- fakeRealiseStore (const False) Nothing
+            answer <- evalAt dir (readOnlyOver ops) ("builtins.fetchurl " <> nixString (fileUrl fetchedFile))
+            case answer of
+              Right (VPath path) | Just sp <- parseStorePath defaultStoreDir path -> do
+                there <- Dir.doesPathExist (storePathToFilePath (StoreDir dir) sp)
+                pure (if there then Pass else Fail ("the fetch was not written to " <> path))
+              other -> pure (Fail ("expected the fetched path, got: " <> T.pack (show other))),
+          -- fetchTree.cc:484-497 at 2.24.9: the URLs name no file, so only
+          -- the early exit answers.
+          runTestM "a pinned fetchurl the store holds returns its path without downloading" $ do
+            let pin = sha256Digest "pinned\n"
+            held <- either (fail . show) pure (makeFixedOutputPath "held-file" "sha256" FlatIngestion pin)
+            (ops, _) <- fakeRealiseStore (== held) Nothing
+            answer <- evalWith (readOnlyOver ops) ("builtins.fetchurl { url = " <> nixString (fileUrl (root </> "absent" </> "held-file")) <> "; sha256 = \"" <> Hash.bytesToHexText pin <> "\"; }")
+            pure (assertEqual "answer" (Right (VPath (storePathToText defaultStoreDir held))) (either (Left . failureMessage) Right answer)),
+          runTestM "a pinned fetchTarball the store holds returns its path without downloading" $ do
+            let pin = sha256Digest "a tree's NAR"
+            held <- either (fail . show) pure (makeFixedOutputPath "source" "sha256" NarIngestion pin)
+            (ops, _) <- fakeRealiseStore (== held) Nothing
+            answer <- evalWith (readOnlyOver ops) ("builtins.fetchTarball { url = " <> nixString (fileUrl (root </> "absent" </> "held.tar.gz")) <> "; sha256 = \"" <> Hash.bytesToHexText pin <> "\"; }")
+            pure (assertEqual "answer" (Right (VPath (storePathToText defaultStoreDir held))) (either (Left . failureMessage) Right answer)),
+          -- A flat builtins.path copy of the same bytes under the fetch's
+          -- name lands at the path the pin names, computed and unwritten
+          -- in a read-only session, so only a read-write one holds it and
+          -- the read-only one downloads from a URL that names nothing.
+          runTestM "a path evaluation computed holds a pinned fetch in a read-write session and not in a read-only one" $ do
+            let pin = sha256Digest "child\n"
+                source =
+                  "let copied = builtins.path { path = ./filtered/child; name = \"held-copy\"; recursive = false; }; in builtins.seq copied (builtins.fetchurl { url = "
+                    <> nixString (fileUrl (root </> "absent" </> "held-copy"))
+                    <> "; sha256 = \""
+                    <> Hash.bytesToHexText pin
+                    <> "\"; })"
+            expected <- either (fail . show) pure (makeFixedOutputPath "held-copy" "sha256" FlatIngestion pin)
+            (ro, _) <- fakeRealiseStore (const False) Nothing
+            (rw, _) <- fakeRealiseStore (const False) Nothing
+            readOnly <- evalWith (readOnlyOver ro) source
+            readWrite <- evalWith (ReadWriteSession rw) source
+            pure $ case (readOnly, readWrite) of
+              (Left _, Right (VPath path)) | path == storePathToText defaultStoreDir expected -> Pass
+              other -> Fail ("expected a download in the read-only session and the computed copy in the read-write one, got: " <> T.pack (show other)),
           runTestM "a read-only session reads a fetchurl result through its context" $
             readsAs "fetched bytes\n" ("builtins.readFile \"${builtins.fetchurl " <> nixString (fileUrl fetchedFile) <> "}\""),
           runTestM "a read-only session reads a fetchGit result through its context" $
@@ -25669,14 +25758,14 @@ testRealiseContextIO = do
             pure (fetched `andThen` adopted),
           -- What a fetcher fetched is readable whatever the store says, so a
           -- read-only session does not ask.
-          runTestM "a read-only session asks the store nothing about what a fetcher fetched" $ do
+          runTestM "a read-only session adds what a fetcher fetched as it lands, and asks the store nothing about it" $ do
             (ops, calls) <- fakeRealiseStore (const False) Nothing
             answer <- evalWith (readOnlyOver ops) ("builtins.readFile \"${builtins.fetchurl " <> nixString (fileUrl fetchedFile) <> "}\"")
             asked <- calls
-            pure (assertEqual "answer and calls" (Right (mkStr "fetched bytes\n"), []) (answer, asked)),
+            pure (assertEqual "answer and calls" (Right (mkStr "fetched bytes\n"), [FakeAdded]) (answer, asked)),
           runTestM "a read-only session over a store that does not exist refuses, and makes no directory, metadata, database or lock" $ do
             let absent = StoreDir (root </> "absent-store")
-            st <- newEvalStateWith unrestrictedPolicy [] (ReadOnlySession (localQueries absent) unexpectedBuild) absent root
+            st <- newEvalStateWith unrestrictedPolicy [] (ReadOnlySession (localQueries absent) unexpectedOps) absent root
             answer <- evalTracedIn st root ("import " <> twoOutputs)
             made <- Dir.doesPathExist (unStoreDir absent)
             pure $ case answer of
@@ -25715,7 +25804,7 @@ testRealiseContextIO = do
               (Right (valid, Right references), "") | Set.null valid, Set.null references -> Pass
               other -> Fail ("expected nothing held and the database still empty, got: " <> T.pack (show other)),
           runTestM "a read-only session over a database without the store's tables refuses a derivation in upstream's words" $ do
-            st <- newEvalStateWith unrestrictedPolicy [] (ReadOnlySession (localQueries emptyDatabaseStore) unexpectedBuild) emptyDatabaseStore root
+            st <- newEvalStateWith unrestrictedPolicy [] (ReadOnlySession (localQueries emptyDatabaseStore) unexpectedOps) emptyDatabaseStore root
             outcome <- try (evalTracedIn st root ("import " <> twoOutputs))
             pure $ case outcome :: Either SQL.SQLError (Either EvalFailure NixValue) of
               Right (Left failure) | notValidDerivation failure -> Pass
@@ -25849,6 +25938,32 @@ testImportFromDerivationCLI = do
         forM_ (printed drvPathOut) $ \quoted ->
           BS.writeFile (upstreamStore </> takeFileName (filter (/= '"') quoted)) (BS8.pack (filter (`notElem` ("\r\n" :: String)) atermOfSubstitutable))
         upstreamRun@(upstreamCode, _, upstreamErr) <- runCLI ["eval", "--expr", readData substitutable, "--store", upstreamStore]
+        -- What eval writes, read-only by default and under --read-write-mode.
+        BS.writeFile (root </> "eval-source.txt") "a source\n"
+        let pathExpr = T.unpack ("builtins.path { path = " <> nixString (T.pack (root </> "eval-source.txt")) <> "; }")
+            toFileExpr = "builtins.toFile \"eval-written\" \"written\""
+        computedRun@(computedCode, computedOut, _) <- evalAt "eval-read-only" toFileExpr
+        computedStoreMade <- Dir.doesPathExist (root </> "eval-read-only")
+        upstreamPathRun@(upstreamPathCode, upstreamPathOut, _) <- runCLI ["eval", "--expr", pathExpr, "--store", upstreamStore]
+        upstreamPathWritten <- maybe (pure False) (\line -> Dir.doesPathExist (upstreamStore </> takeFileName (filter (/= '"') line))) (printed upstreamPathOut)
+        -- An evaluation that made nothing adds nothing there, and one that
+        -- must write is refused.
+        nothingMadeRun@(nothingMadeCode, nothingMadeOut, _) <- runCLI ["eval", "--read-write-mode", "--expr", "1", "--store", upstreamStore]
+        neededWriteRun@(neededWriteCode, _, _) <- runCLI ["eval", "--read-write-mode", "--expr", toFileExpr, "--store", upstreamStore]
+        -- A pinned fetch, then the same fetch with its source gone.
+        createDirectoryIfMissing True (root </> "fetch-source")
+        BS.writeFile (root </> "fetch-source" </> "eval-pinned") "pinned\n"
+        let pinnedExpr = T.unpack ("builtins.fetchurl { url = " <> nixString (fileUrl (root </> "fetch-source" </> "eval-pinned")) <> "; sha256 = \"" <> Hash.bytesToHexText (sha256Digest "pinned\n") <> "\"; }")
+        firstFetchRun@(_, firstFetchOut, _) <- evalAt "eval-fetching" pinnedExpr
+        Dir.removeFile (root </> "fetch-source" </> "eval-pinned")
+        secondFetchRun@(secondFetchCode, secondFetchOut, _) <- evalAt "eval-fetching" pinnedExpr
+        writtenRun@(writtenCode, writtenOut, _) <- runCLI ["eval", "--read-write-mode", "--expr", toFileExpr, "--store", root </> "eval-read-write"]
+        readBackRun@(_, readBackOut, _) <- evalAt "eval-read-write" ("builtins.readFile (" <> toFileExpr <> ")")
+        evalBuiltRun@(_, evalBuiltOut, _) <-
+          runCLI ["eval", "--read-write-mode", "--expr", T.unpack ("let made = " <> ifd <> "; in (import made).v + builtins.readFile \"${made}/data\""), "--store", root </> "eval-built"]
+        evalSubstitutedRun@(_, evalSubstitutedOut, _) <-
+          withHttpServer route $ \base _ _ ->
+            runCLI ["eval", "--read-write-mode", "--substituter", T.unpack base, "--trusted-key", T.unpack trustedKey, "--expr", T.unpack ("(import (" <> derivationOf "ifd-fetched.nix" "exit 1" fixedAttrs <> ")).v"), "--store", root </> "eval-substituted"]
         createDirectoryIfMissing True (stage </> "top")
         BS.writeFile (stage </> "top" </> "default.nix") "{ v = \"from a tarball\"; }\n"
         tarballRun <-
@@ -25921,6 +26036,39 @@ testImportFromDerivationCLI = do
                     "-ifd-substitutable' - no write access to the Nix store" `T.isSuffixOf` line ->
                       Pass
                 _ -> Fail (outcome upstreamRun),
+            -- nix-instantiate --eval computes these paths without writing
+            -- them (primops.cc:2310 and :2473 at 2.24.9).
+            runTest "eval prints a toFile result's path and makes no store" $
+              if computedCode == ExitSuccess && printed computedOut == printed writtenOut && not computedStoreMade then Pass else Fail (outcome computedRun <> "; " <> outcome writtenRun),
+            runTest "eval prints a builtins.path copy's path in a store upstream Nix manages, writing nothing there" $
+              case printed upstreamPathOut of
+                Just line
+                  | upstreamPathCode == ExitSuccess,
+                    "\"/nix/store/" `isPrefixOf` line,
+                    "-eval-source.txt\"" `isSuffixOf` line,
+                    not upstreamPathWritten ->
+                      Pass
+                _ -> Fail (outcome upstreamPathRun),
+            runTest "eval --read-write-mode that makes nothing adds nothing, so a store upstream Nix manages refuses nothing" $
+              if nothingMadeCode == ExitSuccess && printed nothingMadeOut == Just "1" then Pass else Fail (outcome nothingMadeRun),
+            runTest "eval --read-write-mode that must write in a store upstream Nix manages is refused" $
+              if neededWriteCode == ExitFailure 1 then Pass else Fail (outcome neededWriteRun),
+            -- Upstream's local store adds a fetch as it lands, in any mode
+            -- (tarball.cc:86 at 2.24.9), so its next evaluation takes the
+            -- pinned fetch's early exit (fetchTree.cc:484-497).
+            runTest "eval registers what a pinned fetch writes, so a second eval of it needs no source" $
+              if secondFetchCode == ExitSuccess && isJust (printed firstFetchOut) && printed secondFetchOut == printed firstFetchOut
+                then Pass
+                else Fail (outcome firstFetchRun <> "; " <> outcome secondFetchRun),
+            -- Upstream's read-write evaluation adds what it makes as it goes
+            -- (primops.cc:2310-2320 at 2.24.9), so a later evaluation
+            -- finds it valid.
+            runTest "eval --read-write-mode writes and registers a toFile result, which a read-only eval then reads" $
+              if writtenCode == ExitSuccess && printed readBackOut == Just "\"written\"" then Pass else Fail (outcome writtenRun <> "; " <> outcome readBackRun),
+            runTest "eval --read-write-mode imports and reads an output it builds" $
+              if printed evalBuiltOut == Just "\"builtdata\"" then Pass else Fail (outcome evalBuiltRun),
+            runTest "eval --read-write-mode imports an output a cache holds, through --substituter and --trusted-key" $
+              if printed evalSubstitutedOut == Just "\"substituted\"" then Pass else Fail (outcome evalSubstitutedRun),
             runTest "eval imports a fetchTarball result through its context" $
               case tarballRun of
                 Nothing -> Pass
@@ -27581,7 +27729,7 @@ testPhase4IO = do
         -- Search path with --nix-path equivalent (populated nixPath)
         runTestM "search path with populated nixPath" $ do
           nixPaths <- parseNixPath (TE.encodeUtf8 ("mypkg=" <> T.pack subDir))
-          st <- newEvalStateWith unrestrictedPolicy nixPaths (ReadOnlySession (localQueries platformStoreDir) unexpectedBuild) platformStoreDir testDir
+          st <- newEvalStateWith unrestrictedPolicy nixPaths (ReadOnlySession (localQueries platformStoreDir) unexpectedOps) platformStoreDir testDir
           result <- runEvalIO st (eval (evalBaseEnv st) (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "mypkg"])))
           pure $ case result of
             Right (VPath _) -> Pass
@@ -27860,7 +28008,7 @@ namesOnlyChildFlag = "--names-only-child"
 inTestSession :: IO a -> IO a
 inTestSession action = do
   storeDir <- evalNixIOStoreDir
-  withEvalSession (SessionSettings unrestrictedPolicy (pure []) storeDir testBaseDir RegionsCollect (ReadOnlySession (localQueries storeDir) unexpectedBuild)) (const action)
+  withEvalSession (SessionSettings unrestrictedPolicy (pure []) storeDir testBaseDir RegionsCollect (ReadOnlySession (localQueries storeDir) unexpectedOps)) (const action)
 
 -- | The flag that runs 'arenaCycleChild'.
 arenaCycleChildFlag :: String
@@ -29650,6 +29798,7 @@ instance MonadEval StubStoreEval where
   resolveSymlinks = pure
   addSourceNar _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
   addFixedOutputFile _ _ _ = throwEvalError "builtins.fetchurl: not available in the stub evaluator"
+  pinnedFetchHeld _ = pure False
   traceMessage _ = pure ()
   lookupDrvHash _ = pure Nothing
   cacheDrvHash _ _ = pure ()

@@ -146,12 +146,14 @@ Give nova-nix a store of its own. It does not read upstream Nix's database or
 roots, so in a store upstream Nix also manages, `nova-nix store gc` would
 delete upstream's paths, and a build would replace the upstream paths it builds
 or downloads. `build`, `store gc` and `store delete` refuse such a store.
-`eval` refuses it once the evaluation writes to the store, as
-`builtins.toFile`, `builtins.path` and the fetchers do, and `trust` once it
-fetches a fixed-output input. Where upstream Nix is installed, give nova-nix
-another directory with `--store`. A build in a store other than `/nix/store`
-or `C:\nix\store` writes that store's directory into its output, so the output
-differs from upstream's at the same store path.
+`eval` computes the paths of `builtins.toFile` and `builtins.path` without
+writing them, as `nix-instantiate --eval` does, so it refuses such a store only
+once a fetcher writes to it, or anything does under `--read-write-mode`.
+`trust` evaluates the same way, and refuses such a store once a fetcher writes
+to it or it fetches a fixed-output input. Where upstream Nix is installed, give
+nova-nix another directory with `--store`. A build in a store other than
+`/nix/store` or `C:\nix\store` writes that store's directory into its output,
+so the output differs from upstream's at the same store path.
 
 Each `nova-nix` process opens the store itself, with no daemon, so whoever
 builds needs write access to the store directory.

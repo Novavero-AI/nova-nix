@@ -1588,6 +1588,12 @@ class (MonadCData m) => MonadEval m where
   -- derivation naming it fails with \"path \'...\' is not valid\".
   adoptStorePath :: Text -> m Bool
 
+  -- | Whether the session's store already holds the path a pinned fetch
+  -- names, admitting it as a fetch result is admitted when it does:
+  -- upstream's early exit, which then neither downloads nor writes
+  -- (fetchTree.cc:484-496 at 2.24.9).
+  pinnedFetchHeld :: StorePath -> m Bool
+
   -- | Record a fetch under that key. Failing to record is not an error -
   -- the cache is an optimisation.
   writeFetchCache :: Text -> Text -> m ()
@@ -1812,6 +1818,7 @@ instance MonadEval PureEval where
   setExecutableFile _ = throwEvalError "builtins.fetchGit: not available in pure evaluation"
   lookupFetchCache _ = pure Nothing
   adoptStorePath _ = pure False
+  pinnedFetchHeld _ = pure False
   writeFetchCache _ _ = pure ()
   readSymlinkTarget _ = throwEvalError "builtins.path: not available in pure evaluation"
   addSourceNar _ _ = throwEvalError "builtins.path: not available in pure evaluation"

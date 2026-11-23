@@ -3751,6 +3751,13 @@ fetchAndExtractTarball :: (MonadEval m) => Text -> Maybe BS.ByteString -> Text -
 fetchAndExtractTarball url pin name = do
   checkUri url
   requireFetchPin "fetchTarball" pin
+  held <- heldPinnedPath name NarIngestion pin
+  maybe (downloadAndExtractTarball url pin name) (pure . VPath) held
+
+-- | The download and copy of 'fetchAndExtractTarball', for a fetch the
+-- store does not hold already.
+downloadAndExtractTarball :: (MonadEval m) => Text -> Maybe BS.ByteString -> Text -> m NixValue
+downloadAndExtractTarball url pin name = do
   toolUrl <- localFileUrl url
   extractDir <- createScratchDir "nova-nix-tarball-"
   -- The -- separator prevents argument injection from the URL.
@@ -4410,18 +4417,39 @@ fetchUrlSimple url pin = do
     Left err -> throwEvalError ("builtins.fetchurl: " <> storePathNameErrorText err)
     Right () -> pure ()
   requireFetchPin "fetchurl" pin
-  -- Download to a file, not through the text-mode stdout pipe (which mangles
-  -- binary), read the raw bytes, verify the pin if one was given, then store at
-  -- the canonical fixed-output path.  The file lives in an exclusively
-  -- created scratch directory ('createScratchDir'), removed once read.
-  scratch <- createScratchDir "nova-nix-fetchurl-"
-  bytes <- downloadInto scratch url `onEvalError` removeScratchDir scratch
-  removeScratchDir scratch
-  forM_ pin $ \expected ->
-    let got = sha256Digest bytes
-     in when (expected /= got) $ throwEvalError (fetchHashMismatch url expected got)
-  storePath <- addFixedOutputFile Fetched name bytes
-  pure (VPath storePath)
+  held <- heldPinnedPath name FlatIngestion pin
+  case held of
+    Just storePath -> pure (VPath storePath)
+    Nothing -> do
+      -- Download to a file, not through the text-mode stdout pipe (which
+      -- mangles binary), read the raw bytes, verify the pin if one was
+      -- given, then store at the canonical fixed-output path.  The file
+      -- lives in an exclusively created scratch directory
+      -- ('createScratchDir'), removed once read.
+      scratch <- createScratchDir "nova-nix-fetchurl-"
+      bytes <- downloadInto scratch url `onEvalError` removeScratchDir scratch
+      removeScratchDir scratch
+      forM_ pin $ \expected ->
+        let got = sha256Digest bytes
+         in when (expected /= got) $ throwEvalError (fetchHashMismatch url expected got)
+      storePath <- addFixedOutputFile Fetched name bytes
+      pure (VPath storePath)
+
+-- | Upstream's early exit for a fetch a sha256 pins (fetchTree.cc:484-496
+-- at 2.24.9): the path the pin names, when the store holds it already,
+-- which the fetch then returns without downloading or writing anything.
+-- 2.34.9 ensures the path instead (fetchTree.cc:456-478 at 2.34.9): a
+-- valid one returns at once (build/entry-points.cc:103), and one the
+-- store lacks is substituted where a substituter has it, by a daemon,
+-- which is not read-only (daemon.cc:669-675), or refused by a local store
+-- in read-only mode (substitution-goal.cc:40) and then downloaded.
+-- nova-nix downloads it.
+heldPinnedPath :: (MonadEval m) => Text -> FileIngestionMethod -> Maybe BS.ByteString -> m (Maybe Text)
+heldPinnedPath _ _ Nothing = pure Nothing
+heldPinnedPath name method (Just pin) = do
+  sp <- storePathOrThrow (makeFixedOutputPath name "sha256" method pin)
+  held <- pinnedFetchHeld sp
+  pure (if held then Just (storePathToText defaultStoreDir sp) else Nothing)
 
 -- | Fetch a URL into the scratch directory and hand back its bytes.
 downloadInto :: (MonadEval m) => Text -> Text -> m BS.ByteString

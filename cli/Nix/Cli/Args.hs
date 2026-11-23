@@ -6,7 +6,7 @@
 -- lists against this parser: each command listed for a flag accepts it,
 -- and the flag takes the values its entry names, and none when it names
 -- none.  The parser also accepts some flags where they have no effect,
--- such as @--fallback@ after @eval@, which the reference does not list.
+-- such as @--strict@ before @build@, which the reference does not list.
 module Nix.Cli.Args
   ( CliOpts (..),
     Command (..),
@@ -58,6 +58,10 @@ data CliOpts = CliOpts
     -- | @--check@: the build checks its derivation, as @nix-build --check@
     -- does.
     optCheck :: !Bool,
+    -- | @--read-write-mode@: @eval@ writes what evaluation makes to the
+    -- store and realises what a path's context names, as
+    -- @nix-instantiate --eval --read-write-mode@ does.
+    optReadWriteMode :: !Bool,
     optCommand :: !Command
   }
   deriving (Eq, Show)
@@ -204,7 +208,7 @@ emptyPushArgs = PushArgs Nothing Nothing Nothing Nothing False []
 -- silent drop: an unknown or misspelled flag fails the parse, so nothing
 -- after it (a requested @--substituter@, say) is quietly discarded.
 parseArgs :: [String] -> Either String CliOpts
-parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] False False False False False False CmdUsage)
+parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] False False False False False False False CmdUsage)
   where
     go opts [] = Right opts
     go opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
@@ -234,6 +238,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       go (opts {optNoAllowImportFromDerivation = True}) rest
     go opts ("--fallback" : rest) =
       go (opts {optFallback = True}) rest
+    go opts ("--read-write-mode" : rest) =
+      go (opts {optReadWriteMode = True}) rest
     go opts ("eval" : rest) = goEval opts rest
     go opts ("build" : rest) = goTarget BuildsTarget opts emptyBuildArgs rest
     go opts ("trust" : rest) = goTarget TrustsTarget opts emptyBuildArgs rest
@@ -268,6 +274,14 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       goEval (opts {optNoAllowImportFromDerivation = True}) rest
     goEval opts ("--fallback" : rest) =
       goEval (opts {optFallback = True}) rest
+    goEval opts ("--read-write-mode" : rest) =
+      goEval (opts {optReadWriteMode = True}) rest
+    goEval opts ("--substituter" : url : rest) =
+      goEval (opts {optSubstituter = Just url}) rest
+    goEval opts ("--trusted-key" : key : rest) =
+      goEval (opts {optTrustedKey = Just key}) rest
+    goEval opts ("--exec-wrapper" : spec : rest) =
+      goEval (opts {optExecWrappers = optExecWrappers opts ++ [spec]}) rest
     goEval opts ("--expr" : expr : rest) =
       go (opts {optCommand = CmdEval (TargetExpr expr)}) rest
     goEval _ [flag]
