@@ -129,9 +129,10 @@ Settings (search for "environment variables").
 
 The [action](https://github.com/Novavero-AI/install-nova-nix) installs the
 latest release, or the one its `version` input names, on x64 Linux, arm64
-macOS and x64 Windows runners, and puts `nova-nix` on `PATH`. A Linux or macOS
-runner has to meet the requirements above, as `ubuntu-latest` and
-`macos-latest` do.
+macOS and x64 Windows runners, puts `nova-nix` on `PATH` and sets up
+[the store](#the-store) as the installer does, so no command needs `--store`.
+A Linux or macOS runner has to meet the requirements above, as `ubuntu-latest`
+and `macos-latest` do.
 
 ## Set up
 
