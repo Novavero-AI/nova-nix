@@ -1,0 +1,146 @@
+name: Windows sandbox probe
+
+# A throwaway probe of what a Windows build sandbox would rest on, run
+# before nova-nix-sandbox's Windows backend is written: a restricted token
+# whose restricting SIDs are S-1-5-12 and a SID of the build's own, the
+# store DACL the design proposes, and nested job objects.  It builds
+# probe/windows-sandbox.c with GHC's own C compiler, the one that builds
+# the shipped helper, and prints one PASS or FAIL line per check.  The job
+# fails when a check the design depends on fails.  Everything the probe
+# makes is under the runner's temporary directory.
+
+on:
+  push:
+    branches: [probe/windows-sandbox]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Windows sandbox probe
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      # Who the probe runs as decides what it can show: the hosted runner's
+      # user is an administrator, where nova-nix's usual user is not.
+      - name: Describe the runner
+        run: |
+          "image: $env:ImageOS $env:ImageVersion"
+          [System.Environment]::OSVersion.VersionString
+          whoami /user /groups /priv
+
+      # The probe and the tools it runs under the restricted token sit in a
+      # directory granting S-1-5-12 read and execute, which what is put
+      # there inherits.  The runner's user is granted the same by name, so
+      # the probe's stand-in for a standard user, which holds the
+      # Administrators group deny-only, can start the probe from there too.
+      # The probe makes the rest of its layout itself.
+      - name: Lay out the probe's root
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'nova-nix-sandbox-probe'
+          $tools = Join-Path $root 'tools'
+          $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          New-Item -ItemType Directory -Path (Join-Path $tools 'bin') | Out-Null
+          icacls $tools /grant '*S-1-5-12:(OI)(CI)RX' "*${user}:(OI)(CI)RX"
+          if ($LASTEXITCODE -ne 0) { throw "icacls failed with $LASTEXITCODE" }
+          icacls $tools
+          "PROBE_ROOT=$root" >> $env:GITHUB_ENV
+
+      # ghc --info prints each setting as a Haskell string, its backslashes
+      # and quotes escaped.  The probe links no C runtime (the file's
+      # header says why), so it names its own entry point.  Should GHC's
+      # compiler not build it, the runner's MinGW gcc does, with a warning,
+      # so that the run still answers the probe's questions.
+      - name: Build the probe with GHC's C compiler
+        run: |
+          $probe = Join-Path $env:PROBE_ROOT 'tools\bin\probe.exe'
+          $common = @('-std=c99', '-Wall', '-Wextra', '-pedantic', '-O1', '-ffreestanding', '-fno-stack-protector',
+                      '-mno-stack-arg-probe', '-nostdlib', '-Wl,-e,probe_entry', '-Wl,--subsystem,console',
+                      'probe/windows-sandbox.c', '-o', $probe, '-lkernel32', '-ladvapi32')
+          $built = $false
+          try {
+            $info = (ghc --info) -join "`n"
+            $libdir = (ghc --print-libdir).Trim()
+            function Get-GhcSetting([string] $name) {
+              $pattern = '\("' + [regex]::Escape($name) + '","((?:[^"\\]|\\.)*)"\)'
+              $found = [regex]::Match($info, $pattern)
+              if (-not $found.Success) { throw "ghc --info has no '$name'" }
+              ($found.Groups[1].Value -replace '\\(.)', '$1').Replace('$topdir', $libdir)
+            }
+            $cc = Get-GhcSetting 'C compiler command'
+            $flags = @((Get-GhcSetting 'C compiler flags') -split '\s+' | Where-Object { $_ })
+            $linkFlags = @((Get-GhcSetting 'C compiler link flags') -split '\s+' | Where-Object { $_ })
+            "C compiler command: $cc"
+            "C compiler flags: $flags"
+            "C compiler link flags: $linkFlags"
+            & $cc --version
+            & $cc @flags @linkFlags @common
+            if ($LASTEXITCODE -eq 0) {
+              $built = $true
+              "built with GHC's C compiler: $cc"
+            }
+          } catch {
+            "GHC's C compiler could not be found or run: $_"
+          }
+          if (-not $built) {
+            "::warning::GHC's C compiler did not build the probe; building it with C:\mingw64\bin\gcc.exe"
+            & 'C:\mingw64\bin\gcc.exe' @common
+            if ($LASTEXITCODE -ne 0) { throw "neither GHC's C compiler nor the runner's gcc built the probe" }
+            "built with the runner's gcc: C:\mingw64\bin\gcc.exe"
+          }
+          # What the probe's header says it imports, read from the binary.
+          if (Test-Path 'C:\mingw64\bin\objdump.exe') {
+            & 'C:\mingw64\bin\objdump.exe' -p $probe | Select-String 'DLL Name'
+          } else {
+            "no objdump at C:\mingw64\bin to list the probe's imports"
+          }
+
+      # The runner keeps MSYS2 at C:\msys64, off PATH, and a UCRT MinGW-w64
+      # gcc at C:\mingw64.  They are copied under the probe's root, so the
+      # restricted token is granted only what the probe owns.
+      - name: Copy MSYS2's bash and MinGW gcc under the probe's root
+        run: |
+          $tools = Join-Path $env:PROBE_ROOT 'tools'
+          function Copy-Tree([string] $from, [string] $to) {
+            robocopy $from $to /E /MT:16 /NFL /NDL /NJH /NJS /NP | Out-Null
+            # robocopy's statuses below 8 all mean the copy was made.
+            if ($LASTEXITCODE -ge 8) { throw "robocopy of $from failed with $LASTEXITCODE" }
+          }
+          $bash = '-'
+          $gcc = '-'
+          if (Test-Path 'C:\msys64\usr\bin\bash.exe') {
+            Copy-Tree 'C:\msys64\usr\bin' (Join-Path $tools 'msys64\usr\bin')
+            Copy-Tree 'C:\msys64\etc' (Join-Path $tools 'msys64\etc')
+            $bash = Join-Path $tools 'msys64\usr\bin\bash.exe'
+            "bash: C:\msys64\usr\bin\bash.exe"
+          } else {
+            "no bash at C:\msys64\usr\bin"
+          }
+          if (Test-Path 'C:\mingw64\bin\gcc.exe') {
+            & 'C:\mingw64\bin\gcc.exe' --version | Select-Object -First 1
+            Copy-Tree 'C:\mingw64' (Join-Path $tools 'mingw64')
+            $gcc = Join-Path $tools 'mingw64\bin\gcc.exe'
+            "gcc: C:\mingw64\bin\gcc.exe"
+          } else {
+            "no gcc at C:\mingw64\bin; on PATH: $((Get-Command gcc -ErrorAction SilentlyContinue).Source)"
+          }
+          "PROBE_BASH=$bash" >> $env:GITHUB_ENV
+          "PROBE_GCC=$gcc" >> $env:GITHUB_ENV
+          $global:LASTEXITCODE = 0
+
+      - name: Run the probe
+        run: |
+          & (Join-Path $env:PROBE_ROOT 'tools\bin\probe.exe') run $env:PROBE_ROOT $env:PROBE_BASH $env:PROBE_GCC
+          exit $LASTEXITCODE
