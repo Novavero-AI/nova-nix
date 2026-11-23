@@ -57,16 +57,17 @@ env:
 
 jobs:
   # A push to main by the merge queue carries the commit its merge group's
-  # run tested, since the queue moves main to that commit, so its run skips
-  # the builds, tests and Stage0 legs that run ran there.  The textual
-  # checks through Cabal Check and Stage0 (nova-nix) still run.  A push by
-  # anyone else reaches main untested and runs every job.  github.actor
-  # stays the queue when such a run is re-run.  What a merge group's run
-  # does not run, the ladder and the publishing to the public cache, are
-  # workflows of their own (seed-ladder.yml, public-cache.yml) and run on
-  # every push to main.
+  # run tested, since the queue moves main to that commit, and that run ran
+  # every job here there, so each skips on such a push.  A push by anyone
+  # else reaches main untested and runs every job.  github.actor stays the
+  # queue when such a run is re-run.  What a merge group's run does not
+  # run, the ladder and the publishing to the public cache, are workflows
+  # of their own (seed-ladder.yml, public-cache.yml) and run on every push
+  # to main.  Each job states the condition, rather than leaving it to a
+  # skipped need, so that it holds whatever the job comes to need.
   ascii:
     name: ASCII source
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -86,6 +87,8 @@ jobs:
   actionlint:
     name: Actionlint
     needs: [ascii]
+    # Skipped on a push by the merge queue (the comment above ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
     env:
       ACTIONLINT_VERSION: "1.7.12"
@@ -103,6 +106,8 @@ jobs:
   # one is only noticed while cutting the release, which is the worst time.
   changelog:
     name: Changelog fragments
+    # Skipped on a push by the merge queue (the comment above ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -130,6 +135,8 @@ jobs:
   hlint:
     name: HLint
     needs: [ascii]
+    # Skipped on a push by the merge queue (the comment above ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -144,6 +151,8 @@ jobs:
   ormolu:
     name: Ormolu
     needs: [ascii]
+    # Skipped on a push by the merge queue (the comment above ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -185,6 +194,8 @@ jobs:
   c99-lint:
     name: C99 Strict
     needs: [ascii]
+    # Skipped on a push by the merge queue (the comment above ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -200,6 +211,8 @@ jobs:
   cabal-check:
     name: Cabal Check
     needs: [hlint, ormolu, c99-lint]
+    # Skipped on a push by the merge queue (the comment above ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -872,6 +885,8 @@ jobs:
   stage0-nova-nix:
     name: Stage0 (nova-nix)
     needs: [cabal-check]
+    # Skipped on a push by the merge queue (the comment above ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
