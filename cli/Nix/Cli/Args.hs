@@ -415,10 +415,16 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     answered "--version" = Just CmdVersion
     answered _ = Nothing
     -- Upstream's three flags for the @sandbox@ setting (globals.cc:303-326
-    -- at 2.24.9).
+    -- at 2.24.9).  Each is registered under the setting's older names too,
+    -- and a later registration of a name replaces an earlier one
+    -- (args.cc:24-26), so upstream's @--build-use-chroot@ and
+    -- @--build-use-sandbox@ are @--relaxed-sandbox@.  Upstream lists no
+    -- alias among its flags (args.cc:507), and the reference lists none.
     sandboxFlag "--sandbox" = Just SandboxEnabled
     sandboxFlag "--no-sandbox" = Just SandboxDisabled
     sandboxFlag "--relaxed-sandbox" = Just SandboxRelaxed
+    sandboxFlag "--build-use-chroot" = Just SandboxRelaxed
+    sandboxFlag "--build-use-sandbox" = Just SandboxRelaxed
     sandboxFlag _ = Nothing
     -- Flags that consume the following argument as their value.
     valueFlags =
