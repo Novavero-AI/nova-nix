@@ -250,15 +250,26 @@ jobs:
           path: ${{ env.RESULTS }}
 
       # The binary runs outside cabal, so the <nix/*> expressions come
-      # from the checkout.
+      # from the checkout.  The evaluation reads the output of an import
+      # from derivation, which eval builds or substitutes only under
+      # --read-write-mode, the mode the upstream job evaluates in.  A
+      # nova-nix whose --help lists no --read-write-mode evaluates without
+      # it.
       - name: Evaluate the build system with nova-nix
         id: eval
         continue-on-error: true
         timeout-minutes: 30
         run: |
           set -euo pipefail
+          mode=()
+          help=$("$NOVA_NIX" --help)
+          case "$help" in
+            *--read-write-mode*)
+              mode=(--read-write-mode --substituter "$NIXOS_CACHE_URL" --trusted-key "$NIXOS_CACHE_KEY")
+              ;;
+          esac
           {
-            printed=$("$NOVA_NIX" eval --strict --nix-path "nix=$GITHUB_WORKSPACE/data/nix" --expr "$PATHS_EXPR")
+            printed=$("$NOVA_NIX" eval "${mode[@]}" --strict --nix-path "nix=$GITHUB_WORKSPACE/data/nix" --expr "$PATHS_EXPR")
             echo "$printed"
             grep -o '"[^"]*"' <<<"$printed" | tr -d '"' > "$RESULTS/nova-nix-paths.txt" \
               || { echo "printed no store path" >&2; exit 1; }
