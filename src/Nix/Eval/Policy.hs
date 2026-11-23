@@ -17,9 +17,10 @@
 -- a hash or revision; those decisions live with the builtins and consult
 -- t'EvalPolicy' through 'Nix.Eval.Types.MonadEval'.
 --
--- Everything here is pure so each rule can be tested on its own.  The
--- filesystem side (walking a path through its symlinks, prefix by
--- prefix) lives in "Nix.Eval.IO".
+-- Everything here is pure so each rule can be tested on its own, the
+-- walk of a path through its symlinks included ('walkPath'), which takes
+-- the read of a link as an argument; "Nix.Eval.IO" hands it the
+-- filesystem.
 module Nix.Eval.Policy
   ( -- * Policy
     EvalPolicy (..),
@@ -36,6 +37,17 @@ module Nix.Eval.Policy
     pathComponents,
     joinComponents,
     isAbsolutePath,
+    storeRootPrefix,
+    windowsLinkTargetJoins,
+
+    -- * Walking a path's symlinks
+    PathRules (..),
+    hostPathRules,
+    SymlinkResolution (..),
+    LinkTarget (..),
+    linkTarget,
+    WalkStop (..),
+    walkPath,
     forbiddenPathMessage,
 
     -- * Allowed URIs
@@ -52,7 +64,8 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval.CanonPath (canonPathValue)
-import Nix.Store.Path (StoreDir, qualifyPathText)
+import Nix.Store.Path (StoreDir, defaultStoreDirText, qualifyPathText)
+import qualified System.Info
 
 -- ---------------------------------------------------------------------------
 -- Policy
@@ -154,6 +167,26 @@ isAllowedPrefix (AllowedPaths allowed) path =
   where
     descendantAllowed = maybe False (path `isPrefixOf`) (Set.lookupGE path allowed)
 
+-- | Whether a prefix of a path, both as components, is the canonical
+-- store directory or one of its ancestors while the path lies in the
+-- store.  Such a prefix stands for the store an evaluation was given,
+-- wherever that is, as upstream's store accessor has the store
+-- directory for its root and looks for links only beneath it, so no
+-- link is read there; under any other path it is a host directory.
+storeRootPrefix :: [Text] -> [Text] -> Bool
+storeRootPrefix path prefix = prefix `isPrefixOf` storeDirComponents && storeDirComponents `isPrefixOf` path
+  where
+    storeDirComponents = pathComponents defaultStoreDirText
+
+-- | Whether a link target as Windows reports it names a place a path
+-- value can spell.  Windows answers for every reparse point: a volume
+-- mount point's target is the volume's GUID name (@Volume{...}@ once its
+-- @\\??\\@ prefix is stripped) and a remote link's a UNC or device path,
+-- neither of which a path value names, so a walk leaves such a link in
+-- place for the read to follow.
+windowsLinkTargetJoins :: Text -> Bool
+windowsLinkTargetJoins target = not (any (`T.isPrefixOf` target) ["Volume{", "UNC\\", "\\\\"])
+
 -- | A canonical path's components: the root has none, and a Windows
 -- drive designator is the first one.
 pathComponents :: Text -> [Text]
@@ -165,8 +198,10 @@ joinComponents components = case components of
   (drive : rest)
     | isDriveDesignator drive -> drive <> "/" <> T.intercalate "/" rest
   _ -> "/" <> T.intercalate "/" components
-  where
-    isDriveDesignator d = T.length d == driveDesignatorLength && T.isSuffixOf ":" d
+
+-- | Whether a component is a Windows drive designator, @X:@.
+isDriveDesignator :: Text -> Bool
+isDriveDesignator d = T.length d == driveDesignatorLength && T.isSuffixOf ":" d
 
 -- | @X:@
 driveDesignatorLength :: Int
@@ -185,7 +220,126 @@ isAbsolutePath path = T.isPrefixOf "/" path || hasDrive
     hasDrive = case T.unpack (T.take (driveDesignatorLength + 1) path) of
       [letter, ':', '/'] -> isAsciiLetter letter
       _ -> False
-    isAsciiLetter c = isAsciiLower c || isAsciiUpper c
+
+-- | An ASCII letter, as a drive designator's is.
+isAsciiLetter :: Char -> Bool
+isAsciiLetter c = isAsciiLower c || isAsciiUpper c
+
+-- ---------------------------------------------------------------------------
+-- Walking a path's symlinks
+-- ---------------------------------------------------------------------------
+
+-- | The path rules a link's target is read under: the host's, since the
+-- host's file system wrote it.  A walk takes them as an argument, so the
+-- Windows rules are tested on every host.
+data PathRules
+  = -- | @/@ separates, and a target leading with it is absolute.
+    PosixPaths
+  | -- | @/@ and @\\@ separate, a target leading with either or with a
+    -- drive designator is absolute, and a drive designator met inside a
+    -- path starts it again at that drive.
+    WindowsPaths
+  deriving (Eq, Show)
+
+-- | The rules of the host evaluation runs on.
+hostPathRules :: PathRules
+hostPathRules
+  | System.Info.os == "mingw32" = WindowsPaths
+  | otherwise = PosixPaths
+
+-- | Which symlinks a walk follows, upstream's @SymlinkResolution@: every
+-- one, or every one but the last component's, which is then checked in
+-- place.
+data SymlinkResolution = ResolveFull | ResolveAncestors
+  deriving (Eq, Show)
+
+-- | A link's target as a walk splices it, as components: an absolute one
+-- restarts the walk at the root, a relative one resumes it in the link's
+-- own directory.
+data LinkTarget = AbsoluteTarget [Text] | RelativeTarget [Text]
+  deriving (Eq, Show)
+
+-- | A link's target text under the host's rules, or 'Nothing' for one no
+-- path value names ('windowsLinkTargetJoins'), which a walk leaves in
+-- place.  A target leading with a separator is absolute on every host,
+-- store text among them, where Windows' own @isAbsolute@ wants a drive.
+linkTarget :: PathRules -> Text -> Maybe LinkTarget
+linkTarget rules target = case rules of
+  WindowsPaths
+    | not (windowsLinkTargetJoins target) -> Nothing
+    | rooted || startsWithDrive -> Just (AbsoluteTarget components)
+  PosixPaths
+    | rooted -> Just (AbsoluteTarget components)
+  _ -> Just (RelativeTarget components)
+  where
+    separates c = c == '/' || (rules == WindowsPaths && c == '\\')
+    components = filter (not . T.null) (T.split separates target)
+    rooted = maybe False (separates . fst) (T.uncons target)
+    -- @C:@ alone or before a separator; @C:name@ is drive-relative.
+    startsWithDrive = case T.unpack (T.take (driveDesignatorLength + 1) target) of
+      [letter, ':'] -> isAsciiLetter letter
+      [letter, ':', next] -> isAsciiLetter letter && separates next
+      _ -> False
+
+-- | Why a walk stopped short of a path: the check's refusal of a prefix,
+-- or a chain of links past upstream's bound.
+data WalkStop e = WalkRefused e | WalkLoops
+  deriving (Eq, Show)
+
+-- | The symlink-resolving prefix walk of upstream's
+-- @SourceAccessor::resolveSymlinks@ (source-accessor.cc at 2.35.4) over
+-- an absolute canonical path, giving the path it resolves to.  Each
+-- component is pushed, the check is asked about the prefix so far where
+-- upstream's @maybeLstat@ would be, and a link at that prefix, read with
+-- the reader given, has its target ('linkTarget') spliced in front of
+-- what remains.  The joining is over path-value text alone: the host's
+-- rules decide only how a target reads.  Under 'ResolveAncestors' the
+-- last component's own link is left alone, as upstream consults
+-- @maybeLstat@ only while something remains to resolve.  For a path in
+-- the store the canonical store directory and its ancestors stand for
+-- the store an evaluation was given, wherever that is, so no link is
+-- read there ('storeRootPrefix').
+walkPath ::
+  (Monad m) =>
+  PathRules ->
+  SymlinkResolution ->
+  ([Text] -> Text -> Either e ()) ->
+  (Text -> m (Maybe Text)) ->
+  Text ->
+  m (Either (WalkStop e) Text)
+walkPath rules mode refusalAt readLink canonical = go symlinkFollowLimit [] (pathComponents canonical)
+  where
+    go _ done [] = pure (Right (joined (reverse done)))
+    go linksLeft done (component : rest)
+      | component == "." = go linksLeft done rest
+      | component == ".." = go linksLeft (drop 1 done) rest
+      -- A rooted value whose first component is a drive (@/C:/...@, as
+      -- @/. + "C:\\..."@ spells one) names that drive, so it starts the
+      -- path again there rather than nesting under the store's drive.
+      | WindowsPaths <- rules, isDriveDesignator component, not (null done) = go linksLeft [] (component : rest)
+      | Left refusal <- refusalAt prefix prefixText = pure (Left (WalkRefused refusal))
+      | otherwise = do
+          target <- if followsLinkAt prefix rest then readLink prefixText else pure Nothing
+          case target >>= linkTarget rules of
+            Nothing -> go linksLeft prefixReversed rest
+            Just _ | linksLeft <= 0 -> pure (Left WalkLoops)
+            Just (AbsoluteTarget spliced) -> go (linksLeft - 1) [] (spliced ++ rest)
+            Just (RelativeTarget spliced) -> go (linksLeft - 1) done (spliced ++ rest)
+      where
+        prefixReversed = component : done
+        prefix = reverse prefixReversed
+        prefixText = joined prefix
+    followsLinkAt prefix rest =
+      not (storeRootPrefix (prefix ++ rest) prefix) && (mode == ResolveFull || not (null rest))
+    -- A drive designator leads only a Windows path; on POSIX @C:@ is a
+    -- name like any other.
+    joined components = case rules of
+      WindowsPaths -> joinComponents components
+      PosixPaths -> "/" <> T.intercalate "/" components
+
+-- | Upstream's bound on symlinks followed while resolving one path.
+symlinkFollowLimit :: Int
+symlinkFollowLimit = 1024
 
 -- | Upstream's refusal, from the accessor's error callback in @eval.cc@.
 forbiddenPathMessage :: EvalPolicy -> Text -> Text

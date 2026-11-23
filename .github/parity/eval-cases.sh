@@ -332,6 +332,58 @@ if ! upstreamAtLeast 2.26.0; then
 fi
 echo
 
+echo "== what a path inside a store path coerces to =="
+# A path value is copied to the store under its base name wherever it is
+# (copyPathToStore, eval.cc:2381-2406 at 2.24.9): one inside a store path
+# too, and a store path itself under its <hash>-<name> base name.  The
+# tree is added as a fetch or a channel leaves one, and drv.nix is a
+# derivation in a file imported from it, as nixpkgs' are once nixpkgs is
+# fetched; read-only, both evaluators compute each copy's path without
+# writing it.
+mkdir -p "$fixture/in-store"
+printf 'in the store\n' >"$fixture/in-store/data.txt"
+printf "\"\${./data.txt}\"\n" >"$fixture/in-store/use.nix"
+printf 'derivation { name = "parity-in-store"; system = "x86_64-linux"; builder = "/bin/sh"; args = [ ./data.txt ]; src = ./.; }\n' >"$fixture/in-store/drv.nix"
+ln -s data.txt "$fixture/in-store/link"
+mkdir -p "$fixture/in-store/sub"
+printf 'below a link\n' >"$fixture/in-store/sub/inner.txt"
+ln -s sub "$fixture/in-store/dirlink"
+inStore=$(nix-store --add "$fixture/in-store")
+check "a path inside it, interpolated" "\"\${$inStore/data.txt}\""
+check "the store path itself, interpolated" "\"\${$inStore}\""
+check "a path inside it, in concatStringsSep" "builtins.concatStringsSep \":\" [ $inStore/data.txt \"y\" ]"
+check "a path inside it, in toJSON" "builtins.toJSON [ $inStore/data.txt ]"
+check "a path literal in a file imported from it" "import $inStore/use.nix"
+check "a derivation in a file imported from it, naming path literals in its args and environment" "(import $inStore/drv.nix).drvPath"
+# A link inside it is followed as one outside it is.  builtins.path copies
+# what the link points to at every tag (primops.cc:2472 at 2.24.9, :2880 at
+# 2.35.4), storePath resolves a path inside a store path in full
+# (primops.cc:1613-1614 at 2.24.9, :1970-1971 at 2.35.4), and a coerced
+# path has the links among its ancestors followed at every tag.
+check "builtins.path of a link inside it" "builtins.path { path = $inStore/link; }"
+check "storePath of a link inside it" "builtins.storePath $inStore/link"
+check "a path below a link inside it, interpolated" "\"\${$inStore/dirlink/inner.txt}\""
+echo
+
+echo "== what a coerced path that is a symlink is copied as =="
+# From 2.34.9 copyPathToStore resolves only a path's ancestors
+# (eval.cc:2574 at 2.34.9, :2602 at 2.35.4) and copies a path that is a
+# link as the link, which nova-nix follows.  2.24.9 resolved the path in
+# full (eval.cc:2393) and copied what the link points to, so its row has
+# none of these.
+ln -s data.txt "$fixture/link-to-file"
+ln -s sub "$fixture/link-to-dir"
+if upstreamAtLeast 2.34.0; then
+  check "a link inside a store path, interpolated" "\"\${$inStore/link}\""
+  # Each ${ is Nix's, not the shell's.
+  # shellcheck disable=SC2016
+  {
+    check "a link to a file, interpolated" '"${./link-to-file}"'
+    check "a link to a directory, interpolated" '"${./link-to-dir}"'
+  }
+fi
+echo
+
 echo "== arithmetic and comparison as upstream's primops do them =="
 check "unary minus is 0 - e, so a float zero negates to positive zero" '[ (-(0.0)) (-(-0.0)) ]'
 check "division by a float, and integer division truncating toward zero" '[ (1 / 4.0) (7 / 2) ((-7) / 2) ]'

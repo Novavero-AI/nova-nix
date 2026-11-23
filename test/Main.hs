@@ -48,6 +48,7 @@ import qualified Data.Text.IO as TIO
 import qualified Data.Time.Clock as Clock
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Tuple (swap)
+import Data.Void (absurd)
 import Data.Word (Word16, Word32, Word64, Word8)
 import qualified Database.SQLite.Simple as SQL
 import DirDacl (Dacl (..), DaclEntry (..), directoryDacl, processUserSid)
@@ -104,7 +105,8 @@ import qualified Nix.Eval.Context as Context
 import Nix.Eval.EvalFormals (EvalFormal (..), EvalFormals (..), FormalDefault (..), LambdaName (..))
 import Nix.Eval.IO (EvalFailure (..), EvalState (..), SessionSettings (..), SessionStore (..), allowEvalPath, evalBaseEnv, newEvalStateWith, nixPathSearchPath, renderEvalFailure, runEvalIO, runEvalIOTraced, withEvalSession)
 import Nix.Eval.Operator (evalUpdate)
-import Nix.Eval.Policy (ImportFromDerivation (..), allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, uriAccess)
+import Nix.Eval.Policy (ImportFromDerivation (..), LinkTarget (..), PathRules (..), SymlinkResolution (..), WalkStop (..), allowPathIn, forbiddenPathMessage, isAllowedPath, isAllowedUri, joinComponents, noAllowedPaths, pathComponents, storeRootPrefix, uriAccess, walkPath, windowsLinkTargetJoins)
+import qualified Nix.Eval.Policy as Policy
 import Nix.Eval.Print (PrintOptions (..), printAmbiguous, printSymbol, printValue)
 import Nix.Eval.RealiseContext (ContextRefusal (..), ContextRequest (..), PendingOrigin (..), Plan (..), SessionMode (..), contextRefusalMessage, findFileRefusalMessage, planRealisation, referenceClosure)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
@@ -127,7 +129,7 @@ import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), cacheInfoFileNam
 import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, freshCopyPath, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, replaceWithCopy, resolveDeleteTarget, rewriteBytes, rewriteRegularFile, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, useStoreFileMask, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.Access (DirAccess (..), accessSddl, sidFromText)
-import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
+import Nix.Store.CaseSensitive (CaseSensitivity (..), pathCaseHack, probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
 import qualified Nix.Store.ExecBit as ExecBit
@@ -5542,10 +5544,15 @@ evalStrictIO baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 so
 -- which records the @.drv@ under that path, and the recipe is read back the
 -- way the build driver reads it.  Only the IO evaluator keeps the record.
 evalDerivationIO :: FilePath -> Text -> IO (Either Text Derivation)
-evalDerivationIO baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 ("(" <> source <> ").drvPath")) of
+evalDerivationIO baseDir source = do
+  storeDir <- evalNixIOStoreDir
+  evalDerivationIOStore storeDir baseDir source
+
+-- | 'evalDerivationIO' against an explicit store directory.
+evalDerivationIOStore :: StoreDir -> FilePath -> Text -> IO (Either Text Derivation)
+evalDerivationIOStore storeDir baseDir source = case parseNix baseDir testOrigin (TE.encodeUtf8 ("(" <> source <> ").drvPath")) of
   Left err -> pure (Left (T.pack (show err)))
   Right parsed -> do
-    storeDir <- evalNixIOStoreDir
     st <- testEvalState storeDir baseDir
     runEvalIO st $ do
       pathVal <- evalParsed (pure (evalBaseEnv st)) parsed
@@ -6177,9 +6184,11 @@ symlinksAvailable = do
     Left _ -> False
     Right () -> True
 
--- | Interpolating a path that is a symlink copies what it points to,
--- under the link's own name: upstream's copyPathToStore stores
--- path.resolveSymlinks() under path.baseName() (eval.cc at 2.24.9).
+-- | Interpolating a path that is a symlink copies the link, and one below
+-- a symlinked directory the file it names: upstream's copyPathToStore
+-- stores path.resolveSymlinks(SymlinkResolution::Ancestors) under
+-- path.baseName() (eval.cc:2574 at 2.34.9, :2602 at 2.35.4), where 2.24.9
+-- resolved the path in full and copied what a link points to.
 testInterpolatedSymlinkIO :: IO [Bool]
 testInterpolatedSymlinkIO = do
   putStrLn "eval/interpolated-symlink-io"
@@ -6200,12 +6209,10 @@ testInterpolatedSymlinkBody = do
   BS.writeFile (dir </> "sub" </> "inner.txt") "inner"
   Dir.createFileLink "data.txt" (dir </> "filelink")
   Dir.createDirectoryLink "sub" (dir </> "dirlink")
-  fileEntry <- NAR.serialiseFromPath (dir </> "data.txt")
-  dirEntry <- NAR.serialiseFromPath (dir </> "sub")
   let interpolated name = evalNixIO "." ("\"${/. + " <> nixQuotedPath (dir </> name) <> "}\"")
       copiedAs name entry =
-        either (const Nothing) (Just . storePathToText defaultStoreDir) (makeFixedOutputPath (T.pack name) "sha256" NarIngestion (sha256Digest (NAR.serialise entry)))
-      copies name entry = runTestM ("interpolating " <> T.pack name <> " copies its target") $ do
+        either (const Nothing) (Just . storePathToText defaultStoreDir) (makeFixedOutputPath (T.pack (takeFileName name)) "sha256" NarIngestion (sha256Digest (NAR.serialise entry)))
+      copies label name entry = runTestM label $ do
         result <- interpolated name
         pure $ case (result, copiedAs name entry) of
           (_, Nothing) -> Fail "fixture store path rejected"
@@ -6214,8 +6221,9 @@ testInterpolatedSymlinkBody = do
           (Left err, _) -> Fail ("eval failed: " <> err)
   results <-
     sequence
-      [ copies "filelink" fileEntry,
-        copies "dirlink" dirEntry
+      [ copies "interpolating a link to a file copies the link" "filelink" (NAR.NarSymlink "data.txt"),
+        copies "interpolating a link to a directory copies the link" "dirlink" (NAR.NarSymlink "sub"),
+        copies "interpolating a path below a symlinked directory copies the file it names" ("dirlink" </> "inner.txt") (NAR.NarRegular False "inner")
       ]
   Dir.removePathForcibly dir
   pure results
@@ -31449,31 +31457,6 @@ testClassIFollowups = do
     [ -- path + path concatenates the spellings and canonicalizes
       runTest "path + path canonicalizes the joined spelling" $
         assertEval "pp-canon" "builtins.toString (/a/b + /c/../d)" (mkStr "/a/b/d"),
-      -- concatStringsSep coerces a path element; an in-store path takes
-      -- the short-circuit (itself + enclosing context, no store copy)
-      runTest "concatStringsSep coerces an in-store path element" $
-        assertEval
-          "csep-path"
-          ("builtins.concatStringsSep \":\" [ " <> storeA <> "-x \"y\" ]")
-          (VStr (TE.encodeUtf8 (storeA <> "-x:y")) enclosingCtx),
-      runTest "substring and unsafeDiscardOutputDependency keep a coerced path's context" $
-        assertEval "substring-store-path" ("builtins.substring 0 10 " <> storeA <> "-x") (VStr "/nix/store" enclosingCtx)
-          `andThen` assertEval
-            "discard-output-store-path"
-            ("builtins.unsafeDiscardOutputDependency " <> storeA <> "-x")
-            (VStr (TE.encodeUtf8 (storeA <> "-x")) enclosingCtx),
-      runTest "addDrvOutputDependencies judges a coerced path by its context" $
-        assertEvalError
-          "add-output-store-path"
-          ("builtins.addDrvOutputDependencies " <> storeA <> "-x")
-          ("builtins.addDrvOutputDependencies: path " <> storeA <> "-x is not a derivation"),
-      -- the same in-store short-circuit for general interpolation, on a
-      -- SUBPATH: the text is the subpath, the context the enclosing path
-      runTest "interpolating an in-store subpath keeps text, contexts the enclosing path" $
-        assertEval
-          "interp-substore"
-          ("\"${" <> storeA <> "-x/sub}\"")
-          (VStr (TE.encodeUtf8 (storeA <> "-x/sub")) enclosingCtx),
       -- storePath on a subpath: value text is the subpath itself
       runTest "storePath on a subpath keeps text, contexts the enclosing path" $
         assertEval
@@ -31597,6 +31580,341 @@ testClassIFollowupsIO = do
               Left err -> Fail ("expected a base-name error, got: " <> err)
               Right val -> Fail ("expected failure, got " <> T.pack (show val))
       ]
+
+-- | A path value inside a store path is copied under its base name, as
+-- every path value is (upstream's copyPathToStore, eval.cc:2381-2406 at
+-- 2.24.9), never coerced to itself.  The tree sits in a temporary store
+-- the way a fetch or a channel leaves one, so the copy is read through
+-- the store this evaluation was given: store text names the canonical
+-- directory, where nothing is.  Each expected path is derived from the
+-- NAR the copy must hash, so the base name and the bytes read are both
+-- pinned.
+testInStoreCopyIO :: IO [Bool]
+testInStoreCopyIO = do
+  putStrLn "eval/in-store-copy-io"
+  tmpBase <- getTemporaryDirectory
+  shell <- findTestShell
+  canLink <- symlinksAvailable
+  let evalStore = tmpBase </> "nova-nix-test-in-store-copy"
+      linkedStore = tmpBase </> "nova-nix-test-in-store-copy-linked"
+      hostLinks = tmpBase </> "nova-nix-test-in-store-copy-host"
+      restoreStore = tmpBase </> "nova-nix-test-in-store-copy-restore"
+      buildStore = tmpBase </> "nova-nix-test-in-store-copy-build"
+      treeBase = T.replicate 32 "a" <> "-tree"
+      fileBase = T.replicate 32 "b" <> "-small"
+      otherBase = T.replicate 32 "c" <> "-other"
+      srcBase = T.replicate 32 "d" <> "-src"
+      inStore base = defaultStoreDirText <> "/" <> base
+      onHost name = canonPathValue (T.pack (hostLinks </> "hl" </> name))
+      tree = defaultStoreDirText <> "/" <> treeBase
+      small = defaultStoreDirText <> "/" <> fileBase
+      inTree name = tree <> "/" <> name
+      dataContents = "in the store\n"
+      smallContents = "small\n"
+      srcFileContents = "reached through a host link\n"
+      innerContents = "below a link\n"
+      otherContents = "in another store path\n"
+      scriptContents = "cp \"$1\" \"$out\"\n"
+      caseHackName = "foo~nix~case~hack~1"
+      nixEscape = T.concatMap (\c -> if c == '\\' then "\\\\" else if c == '"' then "\\\"" else T.singleton c)
+      -- The tree a fetch would leave in the store: a file, a link to it
+      -- where the platform makes links, a script the store holds
+      -- executable, a directory holding a case-hacked sibling, and files
+      -- that name the others by path literals.
+      placeTree storeDir = do
+        forceRemoveIfExists storeDir
+        let dir = storeDir </> T.unpack treeBase
+        createDirectoryIfMissing True (dir </> "cased")
+        BS.writeFile (dir </> "data.txt") dataContents
+        createDirectoryIfMissing True (dir </> "sub")
+        BS.writeFile (dir </> "sub" </> "inner.txt") innerContents
+        createDirectoryIfMissing True (storeDir </> T.unpack otherBase)
+        BS.writeFile (storeDir </> T.unpack otherBase </> "f") otherContents
+        when canLink $ do
+          Dir.createFileLink "data.txt" (dir </> "link")
+          Dir.createDirectoryLink "sub" (dir </> "dirlink")
+          -- Absolute, as a NAR carries a link into another store path: it
+          -- names the canonical directory, wherever the store is.
+          Dir.createDirectoryLink (T.unpack (defaultStoreDirText <> "/" <> otherBase)) (dir </> "abslink")
+          -- A store path a host link leads into, holding a relative link
+          -- and absolute ones into another store path.
+          let src = storeDir </> T.unpack srcBase
+          createDirectoryIfMissing True src
+          BS.writeFile (src </> "file.txt") srcFileContents
+          Dir.createFileLink "file.txt" (src </> "rel")
+          Dir.createDirectoryLink (T.unpack (inStore otherBase)) (src </> "abs")
+          Dir.createFileLink (T.unpack (inStore otherBase <> "/f")) (src </> "absf")
+        BS.writeFile (dir </> "run.sh") scriptContents
+        ExecBit.markExecutable (dir </> "run.sh")
+        BS.writeFile (dir </> "cased" </> "Foo") "upper"
+        BS.writeFile (dir </> "cased" </> caseHackName) "lower"
+        BS.writeFile (dir </> "use.nix") "\"${./data.txt}\"\n"
+        BS.writeFile
+          (dir </> "build.nix")
+          "shell: derivation { name = \"in-store-build\"; system = builtins.currentSystem; builder = shell; args = [ ./run.sh ./data.txt ]; }\n"
+        BS.writeFile (storeDir </> T.unpack fileBase) smallContents
+      copyOf name entry = either (fail . show) pure (makeFixedOutputPath name "sha256" NarIngestion (sha256Digest (NAR.serialise entry)))
+      inEval label source expected = runTestM label $ do
+        result <- evalNixIOStore (StoreDir evalStore) tmpBase source
+        pure (assertRight label result (assertEqual label expected))
+      -- The same evaluation through a store directory that is a symlink
+      -- to the evaluation's store.
+      inLinkedStore label source expected = runTestM label $ do
+        forceRemoveIfExists linkedStore
+        Dir.createDirectoryLink evalStore linkedStore
+        result <- evalNixIOStore (StoreDir linkedStore) tmpBase source
+        Dir.removeDirectoryLink linkedStore
+        pure (assertRight label result (assertEqual label expected))
+  placeTree evalStore
+  -- A folding volume holds the case-variant sibling under the suffix and
+  -- reads it back without it, as the store reads its own paths.
+  sensitivity <- probeCaseSensitivity evalStore
+  let foldedName = if volumeCaseHack sensitivity == NAR.CaseHackEnabled then "foo" else BS8.pack caseHackName
+  dataCopy <- copyOf "data.txt" (NAR.NarRegular False dataContents)
+  smallCopy <- copyOf fileBase (NAR.NarRegular False smallContents)
+  scriptCopy <- copyOf "run.sh" (NAR.NarRegular True scriptContents)
+  casedCopy <- copyOf "cased" (NAR.NarDirectory [("Foo", NAR.NarRegular False "upper"), (foldedName, NAR.NarRegular False "lower")])
+  -- The link's copy is the file it points to under the link's name.
+  -- A coerced link's copy is the link; builtins.path's is what it
+  -- points to, under the link's name.
+  linkCopy <- copyOf "link" (NAR.NarSymlink "data.txt")
+  linkTargetCopy <- copyOf "link" (NAR.NarRegular False dataContents)
+  innerCopy <- copyOf "inner.txt" (NAR.NarRegular False innerContents)
+  otherCopy <- copyOf "f" (NAR.NarRegular False otherContents)
+  treePath <- maybe (fail "the tree names no store path") pure (parseStorePath defaultStoreDir tree)
+  otherPath <- maybe (fail "no store path for the other tree") pure (parseStorePath defaultStoreDir (inStore otherBase))
+  -- What builtins.path copies through a host link into the store: the
+  -- target, read on in the store nova-nix was given.
+  absCopy <- copyOf "abs" (NAR.NarDirectory [("f", NAR.NarRegular False otherContents)])
+  relCopy <- copyOf "rel" (NAR.NarRegular False srcFileContents)
+  subCopy <- copyOf "sub" (NAR.NarDirectory [("inner.txt", NAR.NarRegular False innerContents)])
+  absfFlatCopy <- either (fail . show) pure (makeFixedOutputPath "absf" "sha256" FlatIngestion (sha256Digest otherContents))
+  when canLink $ do
+    forceRemoveIfExists hostLinks
+    createDirectoryIfMissing True hostLinks
+    Dir.createDirectoryLink (T.unpack (inStore srcBase)) (hostLinks </> "hl")
+  let dataCopyText = storePathToText defaultStoreDir dataCopy
+      -- 2.24.9's copyPathToStore and both tags' addPath resolve the path in
+      -- full, and storePath resolves a path inside a store path: a link
+      -- inside the store is followed as one outside it is.
+      linkTests
+        | canLink =
+            [ inEval "a link inside a store path is copied as the link" ("\"${" <> inTree "link" <> "}\"") (storePathStringValue linkCopy),
+              inEval "a coerced path inside a store path follows the links among its ancestors" ("\"${" <> inTree "dirlink/inner.txt" <> "}\"") (storePathStringValue innerCopy),
+              inEval
+                "an absolute link among a coerced path's ancestors is followed in the store nova-nix was given"
+                ("\"${" <> inTree "abslink/f" <> "}\"")
+                (storePathStringValue otherCopy),
+              inEval "builtins.path copies what a link inside a store path points to" ("builtins.path { path = " <> inTree "link" <> "; }") (storePathStringValue linkTargetCopy),
+              inEval
+                "storePath names what a link inside a store path points to"
+                ("builtins.storePath " <> inTree "link")
+                (VStr (TE.encodeUtf8 (inTree "data.txt")) (StringContext (Set.singleton (SCPlain treePath)))),
+              -- The store directory stands for the store wherever it is,
+              -- so following links never leaves store text for the
+              -- directory a symlinked store resolves to.
+              inLinkedStore
+                "a store directory that is a symlink keeps resolved store text in the store"
+                ("builtins.storePath " <> inTree "link")
+                (VStr (TE.encodeUtf8 (inTree "data.txt")) (StringContext (Set.singleton (SCPlain treePath)))),
+              -- Upstream's store accessor looks for links only beneath the
+              -- store directory, so a symlinked one is no symlinked ancestor.
+              inLinkedStore "readFileType in a store directory that is a symlink" ("builtins.readFileType " <> inTree "data.txt") (mkStr "regular"),
+              inLinkedStore "filterSource in a store directory that is a symlink" ("builtins.filterSource (p: t: true) " <> inTree "sub") (storePathStringValue subCopy),
+              inLinkedStore
+                "builtins.path with a filter in a store directory that is a symlink"
+                ("builtins.path { path = " <> inTree "sub" <> "; filter = p: t: true; }")
+                (storePathStringValue subCopy),
+              -- A host link into the store is followed on inside the store
+              -- nova-nix was given, as upstream resolves over the union of
+              -- the host's file system and the store's.
+              inEval "builtins.path follows a host link into the store and an absolute link inside it" ("builtins.path { path = " <> onHost "abs" <> "; }") (storePathStringValue absCopy),
+              inEval "builtins.path follows a host link into the store and a relative link inside it" ("builtins.path { path = " <> onHost "rel" <> "; }") (storePathStringValue relCopy),
+              inEval "filterSource follows a host link into the store and the links inside it" ("builtins.filterSource (p: t: true) " <> onHost "abs") (storePathStringValue absCopy),
+              inEval
+                "storePath follows a host link into the store and the links inside it"
+                ("builtins.storePath " <> onHost "abs")
+                (VStr (TE.encodeUtf8 (inStore otherBase)) (StringContext (Set.singleton (SCPlain otherPath)))),
+              inEval
+                "a flat builtins.path follows a host link into the store to a file in another store path"
+                ("builtins.path { path = " <> onHost "absf" <> "; recursive = false; }")
+                (storePathStringValue absfFlatCopy)
+            ]
+        | otherwise = [True <$ putStrLn "  SKIP  links inside a store path: this platform makes no symlinks here"]
+  results <-
+    sequence $
+      linkTests
+        <> [ inEval "interpolating a path inside a store path gives its copy" ("\"${" <> inTree "data.txt" <> "}\"") (storePathStringValue dataCopy),
+             inEval "a path that is exactly a store path is copied under its hash and name" ("\"${" <> small <> "}\"") (storePathStringValue smallCopy),
+             inEval
+               "concatStringsSep copies a path inside a store path"
+               ("builtins.concatStringsSep \":\" [ " <> inTree "data.txt" <> " \"y\" ]")
+               (VStr (TE.encodeUtf8 (dataCopyText <> ":y")) (StringContext (Set.singleton (SCPlain dataCopy)))),
+             inEval
+               "toJSON copies a path inside a store path"
+               ("builtins.toJSON [ " <> inTree "data.txt" <> " ]")
+               (VStr (TE.encodeUtf8 ("[\"" <> dataCopyText <> "\"]")) (StringContext (Set.singleton (SCPlain dataCopy)))),
+             inEval "a path literal in a file imported from the store is copied" ("import " <> inTree "use.nix") (storePathStringValue dataCopy),
+             inEval
+               "substring keeps the copy's context"
+               ("builtins.substring 0 10 " <> inTree "data.txt")
+               (VStr "/nix/store" (StringContext (Set.singleton (SCPlain dataCopy)))),
+             inEval "unsafeDiscardOutputDependency keeps the copy's context" ("builtins.unsafeDiscardOutputDependency " <> inTree "data.txt") (storePathStringValue dataCopy),
+             runTestM "addDrvOutputDependencies judges a path inside a store path by its copy" $ do
+               result <- evalNixIOStore (StoreDir evalStore) tmpBase ("builtins.addDrvOutputDependencies " <> inTree "data.txt")
+               pure $ case result of
+                 Left err -> assertEqual "add-output-copy" ("builtins.addDrvOutputDependencies: path " <> dataCopyText <> " is not a derivation") err
+                 Right val -> Fail ("expected a refusal, got " <> T.pack (show val)),
+             inEval "the copy keeps the executable bit the store holds" ("\"${" <> inTree "run.sh" <> "}\"") (storePathStringValue scriptCopy),
+             inEval "the copy reads names as the store's volume holds them" ("\"${" <> inTree "cased" <> "}\"") (storePathStringValue casedCopy),
+             runTestM "derivation args and env copy a path inside a store path" $ do
+               result <-
+                 evalDerivationIOStore (StoreDir evalStore) tmpBase $
+                   T.concat
+                     [ "derivation { name = \"in-store\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; ",
+                       "args = [ " <> inTree "data.txt" <> " ]; src = " <> inTree "data.txt" <> "; }"
+                     ]
+               pure $ assertRight "in-store-drv" result $ \drv ->
+                 assertEqual "args" [TE.encodeUtf8 dataCopyText] (drvArgs drv)
+                   `andThen` assertEqual "env" (Just (TE.encodeUtf8 dataCopyText)) (Map.lookup "src" (drvEnv drv))
+                   `andThen` assertEqual "inputSrcs" [dataCopy] (drvInputSrcs drv),
+             -- The build driver restores each copy from where evaluation read
+             -- it, the store dir it was given, and the restore must reproduce
+             -- the address evaluation hashed.
+             runTestM "materializeEvalSources restores a copy of a path in the store it was given" $ do
+               placeTree restoreStore
+               store <- openStore (StoreDir restoreStore)
+               outcome <-
+                 try (materializeEvalSources store (Map.fromList [(inTree "cased", storePathToText defaultStoreDir casedCopy), (small, storePathToText defaultStoreDir smallCopy)]))
+               valid <- mapM (isValid store) [casedCopy, smallCopy]
+               restored <- BS.readFile (storePathToFilePath (StoreDir restoreStore) smallCopy)
+               closeStore store
+               forceRemoveIfExists restoreStore
+               pure $ case outcome of
+                 Left (failure :: IOException) -> Fail ("the restore failed: " <> T.pack (show failure))
+                 Right () -> assertEqual "registered" [True, True] valid `andThen` assertEqual "restored" smallContents restored,
+             -- A derivation in a file imported from the store, as nixpkgs is
+             -- once it is fetched: its builder runs the script's copy, which
+             -- copies the data file's, and the script's copy is restored
+             -- executable, as the store holds the script.
+             runTestM "e2e a build naming paths inside a store path finds their copies" $ do
+               placeTree buildStore
+               result <- evalAndBuild (StoreDir buildStore) ("import " <> inTree "build.nix" <> " \"" <> nixEscape shell <> "\"")
+               outcome <- case result of
+                 Left err -> pure (Fail err)
+                 Right (BuildFailure msg code, store) -> Fail ("build failed (" <> T.pack (show code) <> "): " <> msg) <$ closeStore store
+                 Right (BuildSuccess out, store) -> do
+                   built <- BS.readFile (storePathToFilePath (StoreDir buildStore) out)
+                   executable <- ExecBit.isExecutable (storePathToFilePath (StoreDir buildStore) scriptCopy)
+                   closeStore store
+                   pure (assertEqual "output" dataContents built `andThen` assertEqual "executable" True executable)
+               forceRemoveIfExists buildStore
+               pure outcome,
+             -- The store directory and its ancestors stand for the store
+             -- only on the way to a path inside it; under any other path
+             -- they are host directories, whose links are followed.
+             runTest "storeRootPrefix covers the store directory and its ancestors for a path in the store alone" $
+               assertEqual
+                 "store root"
+                 [True, True, False, False, False]
+                 [ storeRootPrefix ["nix", "store", "p"] ["nix"],
+                   storeRootPrefix ["nix", "store", "p"] ["nix", "store"],
+                   storeRootPrefix ["nix", "store", "p"] ["nix", "store", "p"],
+                   storeRootPrefix ["nix", "var", "x"] ["nix"],
+                   storeRootPrefix ["home", "nix", "store"] ["home"]
+                 ],
+             -- What Windows reports for a reparse point: a drive path or a
+             -- relative one joins, a volume mount point's GUID name and a
+             -- UNC or device path do not.
+             runTest "windowsLinkTargetJoins takes a drive or relative target and leaves a volume, UNC or device one" $
+               assertEqual
+                 "joins"
+                 [True, True, False, False, False]
+                 (map windowsLinkTargetJoins ["C:\\target", "..\\sibling", "Volume{0a1b2c3d-0000-0000-0000-000000000000}\\", "UNC\\server\\share", "\\\\?\\C:\\x"]),
+             runTest "pathCaseHack reads store text by the store's volume and a source by the process" $
+               let modeFor sensitivityOf path expected =
+                     if pathCaseHack sensitivityOf path == expected
+                       then Pass
+                       else Fail ("unexpected case-hack mode for " <> path)
+                in modeFor CaseSensitive tree NAR.CaseHackDisabled
+                     `andThen` modeFor CaseInsensitive tree NAR.CaseHackEnabled
+                     `andThen` modeFor CaseSensitive "/src/f" processCaseHack
+                     `andThen` modeFor CaseInsensitive "/src/f" processCaseHack
+           ]
+  forceRemoveIfExists evalStore
+  forceRemoveIfExists hostLinks
+  pure results
+
+-- | The walk of a path through its symlinks is pure over path-value
+-- text, the host's rules reading only a link's target, so Windows-shaped
+-- paths and targets are walked here on every host, over a table of links.
+testWalkPathRules :: IO [Bool]
+testWalkPathRules = do
+  putStrLn "eval/walk-path-rules"
+  let walkOver rules links path =
+        case runIdentity (walkPath rules ResolveFull (\_ _ -> Right ()) (Identity . (`Map.lookup` Map.fromList links)) path) of
+          Right resolved -> Right resolved
+          Left WalkLoops -> Left "loops"
+          Left (WalkRefused refusal) -> absurd refusal
+      walks label rules links path expected =
+        runTest label (assertEqual label (Right expected) (walkOver rules links path :: Either Text Text))
+      store name = "/nix/store/" <> T.replicate 32 name
+  sequence
+    [ -- A rooted value whose first component is a drive, as
+      -- /. + "C:\\..." spells one, qualified with the store's drive.
+      walks "a drive inside a Windows path starts it again at that drive" WindowsPaths [] "C:/C:/Users/RUNNER~1/b.sh" "C:/Users/RUNNER~1/b.sh",
+      walks "a drive-lettered Windows path with no link walks to itself" WindowsPaths [] "C:/Users/RUNNER~1/b.sh" "C:/Users/RUNNER~1/b.sh",
+      walks "on POSIX a component spelled like a drive is a name" PosixPaths [] "/C:/Users/b.sh" "/C:/Users/b.sh",
+      -- Store text leads with a separator, and is absolute on every host,
+      -- however Windows reports it.
+      walks
+        "an absolute store-text target is followed from the root under Windows rules"
+        WindowsPaths
+        [(store "a" <> "-tree/abslink", store "c" <> "-other")]
+        (store "a" <> "-tree/abslink/f")
+        (store "c" <> "-other/f"),
+      walks
+        "a backslashed store-text target is followed from the root under Windows rules"
+        WindowsPaths
+        [(store "a" <> "-tree/abslink", T.replace "/" "\\" (store "c" <> "-other"))]
+        (store "a" <> "-tree/abslink/f")
+        (store "c" <> "-other/f"),
+      walks
+        "an absolute store-text target is followed from the root under POSIX rules"
+        PosixPaths
+        [(store "a" <> "-tree/abslink", store "c" <> "-other")]
+        (store "a" <> "-tree/abslink/f")
+        (store "c" <> "-other/f"),
+      -- A host link into the store, then a link inside it.
+      walks
+        "a Windows host link into the store is followed on inside it"
+        WindowsPaths
+        [("C:/Users/r/hl", "\\nix\\store\\" <> T.replicate 32 "d" <> "-src"), (store "d" <> "-src/abs", store "c" <> "-other")]
+        "C:/Users/r/hl/abs"
+        (store "c" <> "-other"),
+      walks "a relative Windows target resumes in the link's directory" WindowsPaths [("C:/a/link", "..\\b")] "C:/a/link/f" "C:/b/f",
+      walks "a drive-lettered Windows target restarts at that drive" WindowsPaths [("C:/a/link", "D:\\b")] "C:/a/link/f" "D:/b/f",
+      walks "a Windows volume mount point is left in place" WindowsPaths [("C:/m", "Volume{0a1b2c3d-0000-0000-0000-000000000000}\\")] "C:/m/f" "C:/m/f",
+      walks "on POSIX a backslash in a target is part of a name" PosixPaths [("/a/link", "b\\c")] "/a/link" "/a/b\\c",
+      runTest "a link to itself loops" (assertEqual "loops" (Left "loops") (walkOver PosixPaths [("/a", "/a")] "/a/f" :: Either Text Text)),
+      runTest "linkTarget reads a target by the host's rules" $
+        assertEqual
+          "targets"
+          [ Just (AbsoluteTarget ["nix", "store", "x"]),
+            Just (AbsoluteTarget ["nix", "store", "x"]),
+            Just (RelativeTarget ["\\nix\\store\\x"]),
+            Just (AbsoluteTarget ["C:", "x"]),
+            Just (RelativeTarget ["C:x"]),
+            Nothing
+          ]
+          [ Policy.linkTarget WindowsPaths "/nix/store/x",
+            Policy.linkTarget WindowsPaths "\\nix\\store\\x",
+            Policy.linkTarget PosixPaths "\\nix\\store\\x",
+            Policy.linkTarget WindowsPaths "C:\\x",
+            Policy.linkTarget WindowsPaths "C:x",
+            Policy.linkTarget WindowsPaths "Volume{0a1b2c3d-0000-0000-0000-000000000000}\\"
+          ]
+    ]
 
 -- | Bytecode short_arg spill: op-level payload counts at or above the
 -- 0xFFFF sentinel move to the first data word, so literals are not
@@ -34376,6 +34694,8 @@ runSuite = do
           testStoreNameSinksIO,
           testClassIFollowups,
           testClassIFollowupsIO,
+          testInStoreCopyIO,
+          testWalkPathRules,
           testAbsolutePathStrings,
           testEvalPolicyRules,
           testEvalPolicyIO,
@@ -34741,6 +35061,26 @@ testEvalPolicyIO = do
             expectLeft "filterSource beside the root is refused" (forbidden restrictedPolicy outside) (restricted ("builtins.filterSource (p: t: true) " <> lit outside)),
             expectLeft "tryEval does not catch a refusal" (forbidden restrictedPolicy outside) (restricted ("builtins.tryEval (builtins.readFile " <> lit (outside </> "secret.txt") <> ")")),
             linked "a symlink under the root pointing outside is refused at its target" (\label -> expectLeft label (forbidden restrictedPolicy outside) (restricted ("builtins.readFile " <> lit (allowed </> "link")))),
+            -- A coerced path's own link is read in place, as 2.34.9 and
+            -- newer copy it, and only its ancestors are walked: the link
+            -- is copied whatever it points to, while a link above the path
+            -- is followed and its target checked.
+            -- The link as the host's walk dumps it, its target spelled as
+            -- the host reports it.
+            linked "interpolating a symlink under the root pointing outside copies the link" $ \label -> do
+              linkEntry <- ExecBit.serialiseFromPath processCaseHack (allowed </> "link")
+              let expected = either (const "") (TE.encodeUtf8 . storePathToText defaultStoreDir) (makeFixedOutputPath "link" "sha256" NarIngestion (sha256Digest (NAR.serialise linkEntry)))
+              case linkEntry of
+                NAR.NarSymlink _ ->
+                  expectRightWith
+                    label
+                    ( \case
+                        VStr got _ -> assertEqual label expected got
+                        other -> Fail (label <> ": expected a string, got " <> T.pack (show other))
+                    )
+                    (restricted ("\"${" <> lit (allowed </> "link") <> "}\""))
+                _ -> runTest label (Fail "the fixture link does not dump as a link"),
+            linked "interpolating a path below a symlinked directory pointing outside is refused at its target" (\label -> expectLeft label (forbidden restrictedPolicy outside) (restricted ("\"${" <> lit (allowed </> "dirlink" </> "x.nix") <> "}\""))),
             linked "a directory import whose default.nix is a symlink outside the root is refused at the link's target" (\label -> expectLeft label (forbidden restrictedPolicy outside) (restricted ("import " <> lit (allowed </> "dir")))),
             linked "scopedImport of that directory is refused the same way" (\label -> expectLeft label (forbidden restrictedPolicy outside) (restricted ("builtins.scopedImport {} " <> lit (allowed </> "dir")))),
             linked "pathExists checks a symlink to a forbidden file in place: true" (\label -> expectRight label (VBool True) (restricted ("builtins.pathExists " <> lit (allowed </> "link")))),

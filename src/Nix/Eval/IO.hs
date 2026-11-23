@@ -55,7 +55,7 @@ module Nix.Eval.IO
 where
 
 import Control.Exception (Exception, IOException, SomeAsyncException, SomeException, bracket, bracket_, catch, catchJust, displayException, fromException, onException, throwIO, try)
-import Control.Monad (unless, void, when)
+import Control.Monad (mfilter, unless, void, when)
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT (..), ask, asks, local)
@@ -75,6 +75,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Void (absurd)
 import Data.Word (Word32)
 import Foreign.C.Error (Errno (..), eACCES, ePERM)
 import Foreign.Ptr (castPtr)
@@ -96,7 +97,7 @@ import Nix.Eval.CThunk (CThunkPtr, cthunkMarkBlackhole, cthunkMarkPending, cthun
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Context (contextRequest)
-import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, uriAccess)
+import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), SymlinkResolution (..), WalkStop (..), allowPathIn, forbiddenPathMessage, hostPathRules, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, linkTarget, noAllowedPaths, pathComponents, pathsRestricted, storeRootPrefix, uriAccess, walkPath)
 import Nix.Eval.RealiseContext (ContextRefusal (..), ContextRequest (..), PendingOrigin (..), Plan (..), SessionMode (..), firstInvalidPath, planRealisation, readableIn, referenceClosure)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetKeys, bytesToTextLossy, evaluated, marshalLambda, pathCell, primopCell, readComputed, readPending, storePathOrThrow, stringCell, warnMessage, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
@@ -105,14 +106,14 @@ import Nix.Expr.Types (Expr)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Store (UpstreamHazard (..), canonicalizeMetadata, unpackNarEntry, upstreamManagedRefusal)
-import Nix.Store.CaseSensitive (probeCaseSensitivity, processCaseHack, volumeCaseHack)
+import Nix.Store.CaseSensitive (pathCaseHack, probeCaseSensitivity, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Ops (BuildStop (..), EvalObjects (..), StoreOps (..), StoreQueries (..), nothingToAdd)
 import qualified Nix.Store.Path as SP
 import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
 import System.Exit (ExitCode (..))
-import System.FilePath (isAbsolute, isPathSeparator, isRelative, takeDirectory, (</>))
+import System.FilePath (isRelative, takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Error (ioeGetErrorString, isUserError)
 import qualified System.Process as Proc
@@ -684,17 +685,25 @@ instance MonadEval EvalIO where
         let name = canonBaseName rawPath
         when (T.null name) $
           throwEvalError ("cannot copy '" <> rawPath <> "' to the store: the path has no base name")
-        accessPath rawPath
-        -- The tree behind the path's symlinks, under the path's own name:
-        -- upstream's copyPathToStore stores path.resolveSymlinks() under
-        -- path.baseName() (eval.cc:2393 at 2.24.9), so a path that is a
-        -- link copies what it points to, not the link.
-        resolvedText <- resolveSymlinks rawPath
+        -- The path with the links among its ancestors followed and its
+        -- own left alone, under the path's own name, inside the store
+        -- too: upstream's copyPathToStore stores
+        -- path.resolveSymlinks(SymlinkResolution::Ancestors) under
+        -- path.baseName() (eval.cc:2602 at 2.35.4, :2574 at 2.34.9), so a
+        -- path that is a link is copied as the link, and the policy walks
+        -- no further, since upstream's accessor reads the link rather
+        -- than following it.  2.24.9 resolved the path in full
+        -- (eval.cc:2393) and copied what a link points to; nova-nix
+        -- follows the newest release.
+        accessPathResolving ResolveAncestors rawPath
+        resolvedText <- resolvedAncestors rawPath
+        -- Read where the text names it and under the case-hack its
+        -- volume needs, as copyPathToStore reads: a path inside the
+        -- store is copied too, and store text names the store this
+        -- evaluation was given, not the canonical directory.
+        caseHack <- readCaseHack resolvedText
         resolvedSource <- evalStoreTextPath resolvedText
-        -- A path already in the store never reaches here (it coerces to
-        -- itself), so this is a source, read as the build driver's
-        -- restore reads it again.
-        entry <- serialiseSource resolvedText processCaseHack resolvedSource
+        entry <- serialiseSource resolvedText caseHack resolvedSource
         let narDigest = sha256Digest (NAR.serialise entry)
         sp <- storePathOrThrow (makeFixedOutputPath name "sha256" NarIngestion narDigest)
         let spText = canonicalStorePathText sp
@@ -969,15 +978,16 @@ instance MonadEval EvalIO where
 
   qualifyPath path = EvalIO (asks ((`SP.qualifyPathText` path) . esStoreDir))
 
-  -- Store text stays canonical in the value domain, as it does for an
-  -- import target ('resolveImportTarget' says why); every other path
-  -- resolves as the platform path it opens, the policy walk having
-  -- followed the same links first.
+  -- Every path is resolved in the value domain, as upstream resolves
+  -- one over the union of the host's file system and the store
+  -- (eval.cc:267-293 at 2.35.4): each link is read through the store
+  -- this evaluation was given, so a host link into the store is
+  -- followed on inside it, and store text keeps its canonical spelling,
+  -- as an import target's does ('resolveImportTarget' says why).
   resolveSymlinks path = do
     accessPath path
-    if SP.isCanonicalStoreText path
-      then pure (canonPath path)
-      else evalStoreTextPath path >>= \native -> wrapIO (canonPathValue . T.pack <$> Dir.canonicalizePath native)
+    st <- EvalIO ask
+    either absurd id <$> walkLinks ResolveFull (\_ _ -> Right ()) st (locatedPath st path)
 
   resolvePathLiteral path = do
     baseDir <- EvalIO (asks esBaseDir)
@@ -1218,11 +1228,28 @@ allowClosures queries outputs = do
 -- target is checked where the walk follows it.  A no-op when nothing
 -- restricts access.
 accessPath :: Text -> EvalIO ()
-accessPath path = do
+accessPath = accessPathResolving ResolveFull
+
+-- | 'accessPath' walking as the given resolution does: under
+-- 'ResolveAncestors' the last component is checked in place and its
+-- link not followed, for a read of the link itself.
+accessPathResolving :: SymlinkResolution -> Text -> EvalIO ()
+accessPathResolving mode path = do
   st <- EvalIO ask
   when (pathsRestricted (esPolicy st)) $ do
     allowed <- EvalIO (liftIO (readIORef (esAllowedPaths st)))
-    walkAllowed ResolveFull st allowed path >>= either throwEvalError pure
+    walkAllowed mode st allowed path >>= either throwEvalError pure
+
+-- | Path-value text with the links among its ancestors followed and its
+-- own last component left alone, upstream's
+-- @resolveSymlinks(SymlinkResolution::Ancestors)@, walked in the value
+-- domain ('walkLinks'): each link is read through the store mapping, so
+-- store text stays canonical, and every other path is walked on the
+-- drive its read opens ('locatedPath').
+resolvedAncestors :: Text -> EvalIO Text
+resolvedAncestors path = do
+  st <- EvalIO ask
+  either absurd id <$> walkLinks ResolveAncestors (\_ _ -> Right ()) st (locatedPath st path)
 
 -- | Refuse a read unless the path itself is allowed, no symlink walk: the
 -- check upstream's accessor makes on an lstat or readlink of the path it
@@ -1252,11 +1279,17 @@ pathAllowed mode path = do
 -- one: upstream's posix accessor asserts this on an lstat or readlink of
 -- the path it is handed (@PosixSourceAccessor::assertNoSymlinks@ over
 -- the parent, at 2.24.9), in every mode, and names the first symlink it
--- meets walking up from the parent.
+-- meets walking up from the parent.  It looks only beneath its root, and
+-- the store's accessor has the store directory for its root
+-- (posix-source-accessor.cc:342-404 at 2.35.4), so the store directory
+-- and its ancestors are not looked at for a path in the store
+-- ('storeRootPrefix').
 refuseSymlinkedAncestor :: Text -> EvalIO ()
 refuseSymlinkedAncestor path = do
   st <- EvalIO ask
-  mapM_ (check st) (strictAncestors (canonPathValue path))
+  let canonical = canonPathValue path
+      beneathRoot ancestor = not (storeRootPrefix (pathComponents canonical) (pathComponents ancestor))
+  mapM_ (check st) (filter beneathRoot (strictAncestors canonical))
   where
     check st ancestor = do
       target <- EvalIO (liftIO (symlinkTargetAt st ancestor))
@@ -1297,60 +1330,39 @@ lstatExists fp = do
 relativePathMessage :: Text -> Text
 relativePathMessage path = "string '" <> path <> "' doesn't represent an absolute path"
 
--- | Which symlinks a walk follows, upstream's @SymlinkResolution@: every
--- one, or every one but the last component's, which is then checked in
--- place.
-data SymlinkResolution = ResolveFull | ResolveAncestors
-  deriving (Eq, Show)
-
--- | The symlink-resolving prefix walk of upstream's
--- @SourceAccessor::resolveSymlinks@ at 2.24.9, with the allow list
--- consulted where its @maybeLstat@ would be: each component is pushed,
--- the prefix so far must be allowed, and a symlink at that prefix has
--- its target spliced in front of what remains (an absolute target
--- restarts at the root).  'Left' carries the refusal for the first
--- prefix outside the allow list.  Under 'ResolveAncestors' the last
--- component's own symlink is left alone, as upstream consults
--- @maybeLstat@ only while something remains to resolve.  The path is
--- walked on the drive its read opens ('locatedPath'), the form the allow
--- list holds.
+-- | The allow list consulted along upstream's symlink walk
+-- ('walkLinks'): the prefix so far must be allowed, and 'Left' carries
+-- the refusal for the first prefix outside it.  The path is walked on
+-- the drive its read opens ('locatedPath'), the form the allow list
+-- holds.
 walkAllowed :: SymlinkResolution -> EvalState -> AllowedPaths -> Text -> EvalIO (Either Text ())
 walkAllowed mode st allowed path
   | not (isAbsolutePath canonical) = pure (Left (relativePathMessage path))
-  | otherwise = go symlinkFollowLimit [] (pathComponents canonical)
+  | otherwise = void <$> walkLinks mode refusalAt st canonical
   where
     canonical = locatedPath st path
-    policy = esPolicy st
-    go _ _ [] = pure (Right ())
-    go linksLeft done (component : rest)
-      | component == "." = go linksLeft done rest
-      | component == ".." = go linksLeft (drop 1 done) rest
-      | not (isAllowedPrefix allowed prefix) = pure (Left (forbiddenPathMessage policy prefixText))
-      | otherwise = do
-          target <- if followsLinkAt rest then EvalIO (liftIO (symlinkTargetAt st prefixText)) else pure Nothing
-          case target of
-            Nothing -> go linksLeft prefixReversed rest
-            Just _
-              | linksLeft == 0 ->
-                  throwEvalError ("infinite symlink recursion in path '" <> canonical <> "'")
-            Just link ->
-              let linkComponents = filter (not . T.null) (T.split isPathSeparator link)
-                  -- Spliced in front of the remainder; the walk resumes from
-                  -- the root for an absolute target and from the link's own
-                  -- directory otherwise.
-                  resumeFrom = if isAbsoluteTarget link then [] else done
-               in go (linksLeft - 1) resumeFrom (linkComponents ++ rest)
-      where
-        prefixReversed = component : done
-        prefix = reverse prefixReversed
-        prefixText = joinComponents prefix
-    followsLinkAt rest = mode == ResolveFull || not (null rest)
-    isAbsoluteTarget link = T.isPrefixOf "/" link || isAbsolute (T.unpack link)
+    refusalAt prefix prefixText
+      | isAllowedPrefix allowed prefix = Right ()
+      | otherwise = Left (forbiddenPathMessage (esPolicy st) prefixText)
+
+-- | The walk of a path through its symlinks ('walkPath') under the
+-- host's rules, each link read through the store mapping
+-- ('symlinkTargetAt').  A chain of links past upstream's bound is
+-- refused as upstream refuses it.
+walkLinks :: SymlinkResolution -> ([Text] -> Text -> Either e ()) -> EvalState -> Text -> EvalIO (Either e Text)
+walkLinks mode refusalAt st canonical =
+  walkPath hostPathRules mode refusalAt (EvalIO . liftIO . symlinkTargetAt st) canonical >>= \case
+    Left WalkLoops -> throwEvalError ("infinite symlink recursion in path '" <> canonical <> "'")
+    Left (WalkRefused refusal) -> pure (Left refusal)
+    Right resolved -> pure (Right resolved)
 
 -- | The target of the symlink at a path value, read through the store
 -- mapping, or 'Nothing' when there is no symlink there.  A path that
 -- does not exist is simply not a symlink; the read that follows reports
--- it missing.
+-- it missing.  On Windows a reparse point whose target no path value
+-- spells, a volume mount point among them, is not taken for a link
+-- ('linkTarget'): the read that follows lets Windows resolve it, as a
+-- POSIX read crosses a mount.
 symlinkTargetAt :: EvalState -> Text -> IO (Maybe Text)
 symlinkTargetAt st pathText = do
   let fsPath = SP.storeTextToFilePath (esStoreDir st) pathText
@@ -1361,11 +1373,7 @@ symlinkTargetAt st pathText = do
           if isLink then Just . T.pack <$> Dir.getSymbolicLinkTarget fsPath else pure Nothing
       ) ::
       IO (Either IOException (Maybe Text))
-  pure (fromRight Nothing outcome)
-
--- | Upstream's bound on symlinks followed while resolving one path.
-symlinkFollowLimit :: Int
-symlinkFollowLimit = 1024
+  pure (mfilter (isJust . linkTarget hostPathRules) (fromRight Nothing outcome))
 
 -- | Where a recorded fetch is kept: one file per key, under this user's
 -- cache directory, named by the key's own hash. Outside the store on
@@ -1445,17 +1453,13 @@ narBytesIfPresent caseHack path = do
     then pure Nothing
     else fmap NAR.serialise <$> ExecBit.serialiseIfReadable caseHack path
 
--- | The case-hack mode a read of path-value text runs under.  Store
--- text names a tree on the store's volume, read back as the store
--- reads its own paths ('volumeCaseHack' of the probed volume); any
--- other path is a source, read under the process's setting
--- ('processCaseHack').
+-- | The case-hack mode a read of path-value text runs under
+-- ('pathCaseHack'), against the volume of the store this evaluation
+-- was given.
 readCaseHack :: Text -> EvalIO NAR.CaseHack
-readCaseHack path
-  | SP.isCanonicalStoreText path = do
-      storeRoot <- EvalIO (asks (SP.unStoreDir . esStoreDir))
-      wrapIO (volumeCaseHack <$> probeCaseSensitivity storeRoot)
-  | otherwise = pure processCaseHack
+readCaseHack path = do
+  storeRoot <- EvalIO (asks (SP.unStoreDir . esStoreDir))
+  wrapIO ((`pathCaseHack` path) <$> probeCaseSensitivity storeRoot)
 
 -- | Where an eval-time store write of a path lands: 'storeFilePath'
 -- against the store this evaluation was given.  Every eval-time writer

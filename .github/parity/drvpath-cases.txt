@@ -16,6 +16,11 @@ tofile           import ./tofile.nix
 deepContext      import ./deep-context.nix
 fetchgit         import ./fetchgit.nix
 
+# nixpkgs imported from a store path: every path literal a derivation
+# names is inside the store, and is copied under its base name as any
+# other path is, the first stage of the bootstrap among them.
+mescc-in-store   (import <nixpkgs-in-store> { system = "x86_64-linux"; config = { }; overlays = [ ]; }).minimal-bootstrap.mescc-tools
+
 # Other stdenv layers: no C compiler, the i686 and musl bootstraps, and
 # the LLVM toolchain.
 stdenvNoCC       pkgs.stdenvNoCC
