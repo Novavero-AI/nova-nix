@@ -12,9 +12,12 @@
 -- cited here as LDG).  The work is split three ways: this module decides
 -- and plans; "Nix.Builder.Sandbox.Spawn" makes the chroot's skeleton,
 -- probes the system and runs the helper; and the helper, a C program of
--- its own (@sandbox\/nova-nix-sandbox.c@), makes the namespaces, the
--- mounts and the root, which happens between the namespaces' creation and
--- the builder's exec, where the process library runs nothing.
+-- its own, carries the plan out.  The helper's core
+-- (@sandbox\/nova-nix-sandbox.c@) reads the plan and reports a failed step
+-- as it does on every OS, and links the backend for its OS, which makes
+-- the sandbox: on Linux (@sandbox\/linux.c@) the namespaces, the mounts and
+-- the root, between the namespaces' creation and the builder's exec,
+-- where the process library runs nothing.
 --
 -- == The protocol
 --
