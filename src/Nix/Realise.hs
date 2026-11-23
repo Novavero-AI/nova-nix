@@ -468,14 +468,13 @@ data BuildMode
     BuildCheck
   deriving (Eq, Show)
 
--- | The settings that decide how a graph is realised.
+-- | The settings that decide how a graph is realised, as upstream's
+-- @fallback@ and @always-allow-substitutes@ do.  What is done with the
+-- derivation asked for is the 'BuildMode' a call to 'realise' is given,
+-- as upstream's @Store::buildPaths@ is given its mode with each call.
 data RealiseSettings = RealiseSettings
   { rsFallback :: !Fallback,
-    rsSubstitutes :: !SubstitutesSetting,
-    -- | What 'realise' does with its root.  Every other derivation in the
-    -- graph, and every request 'realiseRequests' is given, is realised as
-    -- under 'BuildNormal', whatever this says.
-    rsMode :: !BuildMode
+    rsSubstitutes :: !SubstitutesSetting
   }
   deriving (Eq, Show)
 
@@ -616,8 +615,10 @@ data RealiseEffects s m = RealiseEffects
   }
 
 -- | Realise a graph from its root, or under 'BuildCheck' check the root
--- ('checkRoot').  A derivation that is valid or substituted takes its
--- inputs out of the work, and what remains builds leaves first.
+-- ('checkRoot').  Every other derivation in the graph is realised as
+-- under 'BuildNormal', whatever the mode.  A derivation that is valid or
+-- substituted takes its inputs out of the work, and what remains builds
+-- leaves first.
 --
 -- Each derivation is realised for the outputs asked of it, as upstream's
 -- goal for it is (@DerivationGoal@'s @wantedOutputs@ at 2.24.9): the root
@@ -629,8 +630,8 @@ data RealiseEffects s m = RealiseEffects
 -- every output.
 --
 -- The graph has to be acyclic ('Nix.DependencyGraph.topoSort' decides that).
-realise :: (Monad m) => RealiseSettings -> RealiseEffects s m -> DepGraph -> StorePath -> m (Either RealiseFailure ())
-realise settings effects graph root = case rsMode settings of
+realise :: (Monad m) => RealiseSettings -> BuildMode -> RealiseEffects s m -> DepGraph -> StorePath -> m (Either RealiseFailure ())
+realise settings mode effects graph root = case mode of
   BuildNormal -> void <$> realiseNode settings effects graph Map.empty (root, everyOutput)
   BuildCheck -> checkRoot settings effects graph root
   where
@@ -947,11 +948,11 @@ failureReach failure = case failure of
 -- how their work interleaves; realising them in turn answers as upstream
 -- does when each request's work ends before the next one's begins.
 --
--- Every request is realised as under 'BuildNormal', whatever 'rsMode'
--- says, as import from derivation builds its requests under @bmNormal@
--- (@EvalState::realiseContext@, primops.cc:88).  A derivation the graph
--- does not hold has nothing to realise, as for 'realise', and the graph
--- has to be acyclic.
+-- The requests are realised and never checked, as import from derivation
+-- builds its requests under @bmNormal@ (@EvalState::realiseContext@,
+-- primops.cc:88): a check is of one derivation, which 'realise' checks
+-- under 'BuildCheck'.  A derivation the graph does not hold has nothing
+-- to realise, as for 'realise', and the graph has to be acyclic.
 realiseRequests ::
   (Monad m) =>
   RealiseSettings ->

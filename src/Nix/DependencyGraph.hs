@@ -11,6 +11,7 @@ module Nix.DependencyGraph
 
     -- * Graph construction
     buildDepGraph,
+    buildDepGraphFrom,
 
     -- * Topological sort
     topoSort,
@@ -77,8 +78,31 @@ buildDepGraph ::
   Derivation ->
   StorePath ->
   m (Either Text DepGraph)
-buildDepGraph readDrv rootDrv rootPath =
-  runExceptT (go Map.empty (Seq.singleton (rootPath, rootDrv)))
+buildDepGraph readDrv rootDrv rootPath = runExceptT (graphFrom readDrv [(rootPath, rootDrv)])
+
+-- | Build the dependency graph of several root derivations, each read
+-- with @readDrv@ as an input is, so the graph holds every root and every
+-- derivation one of them depends on.  The roots are read in the order of
+-- their paths, and @Left@ answers for the first .drv file that cannot be
+-- read, a root's included.
+buildDepGraphFrom ::
+  (Monad m) =>
+  (StorePath -> m (Either Text Derivation)) ->
+  [StorePath] ->
+  m (Either Text DepGraph)
+buildDepGraphFrom readDrv roots =
+  runExceptT (traverse readRoot (Set.toAscList (Set.fromList roots)) >>= graphFrom readDrv)
+  where
+    readRoot root = (,) root <$> ExceptT (readDrv root)
+
+-- | The graph reached from derivations already read, reading each input
+-- the first time it is reached.
+graphFrom ::
+  (Monad m) =>
+  (StorePath -> m (Either Text Derivation)) ->
+  [(StorePath, Derivation)] ->
+  ExceptT Text m DepGraph
+graphFrom readDrv roots = go Map.empty (Seq.fromList roots)
   where
     go visited queue = case Seq.viewl queue of
       Seq.EmptyL -> pure (DepGraph visited)

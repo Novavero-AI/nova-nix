@@ -46,9 +46,12 @@
 module Nix.Builder
   ( -- * Build execution
     BuildResult (..),
+    BuildStop (..),
     buildDerivation,
     checkDerivation,
     buildWithDeps,
+    buildRequests,
+    checkStored,
     substitutePaths,
     substituteFromCaches,
 
@@ -111,13 +114,13 @@ import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder.BuildDir (withBuildDir)
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
 import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimits, runBuiltinUnpack)
-import Nix.DependencyGraph (TopoResult (..), buildDepGraph, topoSort)
+import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, buildDepGraphFrom, topoSort)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fixedOutput, fromATerm, platformToText)
 import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, renderAttrsShell, stringsAttr, structuredAttrsKey, withOutputPlaceholders)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Push (narHashMatches)
-import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, Fallback (..), FetchOutcome (..), RealiseEffects (..), RealiseSettings (..), Realised (..), Registration (..), SubstEffects (..), SubstitutesSetting (..), Undelivered (..), realise, realiseFailureMessage, realiseFailureStatus, substituteClosure)
+import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, Fallback (..), FetchOutcome (..), RealiseEffects (..), RealiseSettings (..), Realised (..), Registration (..), SubstEffects (..), SubstitutesSetting (..), Undelivered (..), realise, realiseFailureMessage, realiseFailureStatus, realiseRequests, requestsFailureMessage, requestsFailureStatus, substituteClosure)
 import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (isPlainFile)
@@ -378,6 +381,7 @@ buildDerivation config store drv drvPath =
 -- | Why a build stopped short of what it was for: the message and exit
 -- code a 'BuildFailure' reports.
 data BuildStop = BuildStop !Text !Int
+  deriving (Eq, Show)
 
 -- | The build result a stopped build reports.
 stoppedResult :: BuildStop -> BuildResult
@@ -2107,22 +2111,70 @@ buildWithDeps config store rootDrv rootDrvPath = do
   maybe realiseRoot (\reason -> pure (BuildFailure reason 1)) refusal
   where
     realiseRoot = do
-      graph <- buildDepGraph (readDrvFromStore config) rootDrv rootDrvPath
-      case graph of
-        Left err -> pure (BuildFailure ("dependency graph error: " <> err) 1)
-        Right depGraph ->
-          case topoSort depGraph of
-            TopoCycle _ ->
-              pure (BuildFailure "dependency cycle detected" 1)
-            TopoSorted _ -> do
-              let settings = RealiseSettings {rsFallback = bcFallback config, rsSubstitutes = bcSubstitutes config, rsMode = bcMode config}
-              result <- evalStateT (realise settings (realiseEffects config store) depGraph rootDrvPath) emptyNarInfoMemo
-              case result of
-                Left failure -> pure (BuildFailure (realiseFailureMessage (bcStoreDir config) failure) (realiseFailureStatus failure))
-                Right () ->
-                  case drvOutputs rootDrv of
-                    (firstOut : _) -> pure (BuildSuccess (doPath firstOut))
-                    [] -> pure (BuildFailure noOutputsMessage 1)
+      graph <- acyclicGraph <$> buildDepGraph (readDrvFromStore config) rootDrv rootDrvPath
+      either (pure . stoppedResult) realiseGraph graph
+    realiseGraph depGraph = do
+      result <- evalStateT (realise (realiseSettings config) (bcMode config) (realiseEffects config store) depGraph rootDrvPath) emptyNarInfoMemo
+      case result of
+        Left failure -> pure (BuildFailure (realiseFailureMessage (bcStoreDir config) failure) (realiseFailureStatus failure))
+        Right () ->
+          case drvOutputs rootDrv of
+            (firstOut : _) -> pure (BuildSuccess (doPath firstOut))
+            [] -> pure (BuildFailure noOutputsMessage 1)
+
+-- | Realise several derivations the store holds, each for the outputs a
+-- request names ("Nix.Realise"'s 'realiseRequests'): each requested
+-- @.drv@ and every input it reaches is read from the store, a cycle among
+-- them is refused, and the requests are realised with one record of what
+-- is realised.  They are realised and never checked, whatever 'bcMode'
+-- says; 'checkStored' checks a derivation.  It stops with the message and
+-- status the build reports, which for one request for every output of a
+-- derivation are those 'buildWithDeps' gives the same failure.
+--
+-- A store upstream Nix's database may also manage is refused, with
+-- status 1, before anything is read or any cache asked
+-- ("Nix.Store.Upstream").
+buildRequests :: BuildConfig -> Store -> [(StorePath, Set Text)] -> IO (Either BuildStop ())
+buildRequests config store requests = do
+  refusal <- upstreamManagedRefusal ReplacesUpstreamPaths (bcStoreDir config)
+  maybe realiseGraph (\reason -> pure (Left (BuildStop reason 1))) refusal
+  where
+    realiseGraph = do
+      graph <- acyclicGraph <$> buildDepGraphFrom (readDrvFromStore config) (map fst requests)
+      either (pure . Left) realiseIn graph
+    realiseIn depGraph = do
+      result <- evalStateT (realiseRequests (realiseSettings config) (realiseEffects config store) depGraph requests) emptyNarInfoMemo
+      pure (first (\failure -> BuildStop (requestsFailureMessage (bcStoreDir config) failure) (requestsFailureStatus failure)) result)
+
+-- | Check one derivation the store holds, every output of it, as
+-- 'buildWithDeps' does under 'BuildCheck', whatever 'bcMode' says: its
+-- @.drv@ is read from the store, and a check that passes answers
+-- @Right ()@.  A store upstream Nix's database may also manage is
+-- refused, with status 1, before anything is read ("Nix.Store.Upstream").
+checkStored :: BuildConfig -> Store -> StorePath -> IO (Either BuildStop ())
+checkStored config store drvPath = do
+  refusal <- upstreamManagedRefusal ReplacesUpstreamPaths (bcStoreDir config)
+  maybe (readDrvFromStore config drvPath >>= either (pure . Left . unreadableGraph) check) (\reason -> pure (Left (BuildStop reason 1))) refusal
+  where
+    check drv = stopOf <$> buildWithDeps config {bcMode = BuildCheck} store drv drvPath
+    stopOf (BuildSuccess _) = Right ()
+    stopOf (BuildFailure message code) = Left (BuildStop message code)
+
+-- | A graph that was read and holds no cycle, or the stop a build reports
+-- for it.
+acyclicGraph :: Either Text DepGraph -> Either BuildStop DepGraph
+acyclicGraph (Left err) = Left (unreadableGraph err)
+acyclicGraph (Right graph) = case topoSort graph of
+  TopoCycle _ -> Left (BuildStop "dependency cycle detected" 1)
+  TopoSorted _ -> Right graph
+
+-- | The stop a build reports for a @.drv@ it cannot read.
+unreadableGraph :: Text -> BuildStop
+unreadableGraph err = BuildStop ("dependency graph error: " <> err) 1
+
+-- | The realisation settings a build configuration gives.
+realiseSettings :: BuildConfig -> RealiseSettings
+realiseSettings config = RealiseSettings {rsFallback = bcFallback config, rsSubstitutes = bcSubstitutes config}
 
 -- | Read and parse a .drv file from the store, as bytes (no locale
 -- decode, no newline translation).
