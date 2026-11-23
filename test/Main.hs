@@ -10166,22 +10166,19 @@ testSubstituter = do
           Left (Subst.TransientFailure _)
             | survived -> Fail "tree survived a truncated stream"
             | otherwise -> Pass,
-      -- The download cap derives from the SIGNED NarSize; the unsigned
-      -- FileSize may only lower it, never raise it.
-      runTest "downloadCapFor lets FileSize lower but never raise the cap" $
+      -- The download cap is the ceiling of the SIGNED NarSize, so the
+      -- unsigned FileSize moves it in neither direction: one smaller
+      -- than the body, as a narinfo records after its cache compressed
+      -- the NAR again, and one inflated past the ceiling.
+      runTest "downloadCapFor ignores FileSize" $
         let base = streamTestNarInfo streamTestNar
             narSize = NarInfo.niNarSize base
             ceilingCap = Subst.compressedBodyCeiling narSize
-            absent = Subst.downloadCapFor base {NarInfo.niFileSize = Nothing}
-            lowered = Subst.downloadCapFor base {NarInfo.niFileSize = Just 100}
-            inflated = Subst.downloadCapFor base {NarInfo.niFileSize = Just (ceilingCap * 1000)}
-         in case (absent, lowered, inflated) of
-              (Right capAbsent, Right capLowered, Right capInflated)
-                | toInteger capAbsent == ceilingCap
-                    && capLowered == 100
-                    && toInteger capInflated == ceilingCap ->
-                    Pass
-              other -> Fail ("unexpected caps: " <> T.pack (show other)),
+            capFor fileSize = Subst.downloadCapFor base {NarInfo.niFileSize = fileSize}
+         in assertEqual
+              "caps"
+              (replicate 3 (Right (fromInteger ceilingCap)))
+              (map capFor [Nothing, Just (narSize - 1), Just (ceilingCap * 1000)]),
       runTest "compressedBodyCeiling floors small and scales large" $
         let smallCeiling = Subst.compressedBodyCeiling 10
             largeSize = 64 * 1024 * 1024
@@ -18321,7 +18318,35 @@ testSubstituterRetry = do
                 pure $
                   if warnedTorn
                     then assertEqual "substituted after one retry" (Right payload, [narInfoPath, narPath, narPath], [250]) (outcome, seen, sleeps)
-                    else Fail ("unexpected warnings: " <> T.pack (show warnings))
+                    else Fail ("unexpected warnings: " <> T.pack (show warnings)),
+              -- A cache that names a NAR by its NarHash, as cache.nixos.org
+              -- names its zstd NARs, serves one file for every path with
+              -- that NAR, and an upload that compresses the NAR again
+              -- replaces it, so an earlier narinfo's FileSize and FileHash
+              -- describe bytes the cache no longer serves.  The signed
+              -- NarHash and NarSize still describe the NAR in the file.
+              runTestM "a NAR longer than its narinfo's FileSize, under a FileHash of other bytes, is substituted" $
+                case signedNarInfoFor staleFileFields of
+                  Left err -> pure (Fail (T.pack err))
+                  Right (_, staleText) -> do
+                    (_, outcome, seen, sleeps, _) <-
+                      substitute "stale-file-fields" (const (Send (httpResponse "200 OK" (TE.encodeUtf8 staleText)))) (const narOk)
+                    pure (assertEqual "substituted" (Right payload, [narInfoPath, narPath], []) (outcome, seen, sleeps)),
+              -- The signed NarSize bounds the body.  This body is the start
+              -- of a NAR whose one file runs past the ceiling, so the parser
+              -- is still reading when the cap stops the transfer, and a body
+              -- past its signed ceiling is never asked for again.
+              runTestM "a NAR body one byte past its signed ceiling fails after one request" $ do
+                let ceilingBytes = Subst.compressedBodyCeiling (NarInfo.niNarSize unsigned)
+                    pastCeiling = BS.take (fromInteger ceilingBytes + 1) (NAR.serialise (NAR.NarRegular False (BS.replicate (fromInteger ceilingBytes) 0x78)))
+                (base, outcome, seen, sleeps, _) <-
+                  substitute "past-ceiling" (const narInfoOk) (const (Send (httpResponse "200 OK" pastCeiling)))
+                pure $
+                  assertEqual "body" (fromInteger ceilingBytes + 1) (BS.length pastCeiling)
+                    `andThen` assertEqual
+                      "stopped"
+                      (Left (Subst.SubstError (base <> ": NAR body exceeds its download ceiling (" <> T.pack (show ceilingBytes) <> " bytes)")), [narInfoPath, narPath], [])
+                      (outcome, seen, sleeps)
             ]
               -- Upstream's NotFound and Forbidden: a binary cache store
               -- reads both as the file not being in that cache.
@@ -18367,11 +18392,21 @@ testSubstituterRetry = do
           NarInfo.niSigs = [],
           NarInfo.niCA = Nothing
         }
-    signedNarInfo = do
+    -- The file fields another compression of the NAR gives: a FileSize
+    -- 139 bytes short of the body served, and a FileHash of other bytes.
+    staleFileFields =
+      unsigned
+        { NarInfo.niFileSize = Just (NarInfo.niNarSize unsigned - 139),
+          NarInfo.niFileHash = Just (CHash.formatNixHash (CHash.hashBytes "another compression of the NAR"))
+        }
+    signedNarInfo = signedNarInfoFor unsigned
+    -- A narinfo signed by 'sigTestKeyText' and rendered, with the public
+    -- key that verifies it.
+    signedNarInfoFor info = do
       secretKey <- Signing.parseSecretKey sigTestKeyText
       publicKey <- Signing.toPublicKey secretKey
-      sig <- Signing.sign secretKey unsigned
-      pure (Signing.renderPublicKey publicKey, NarInfo.renderNarInfo unsigned {NarInfo.niSigs = [sig]})
+      sig <- Signing.sign secretKey info
+      pure (Signing.renderPublicKey publicKey, NarInfo.renderNarInfo info {NarInfo.niSigs = [sig]})
     route narInfoReply narReply path earlier
       | path == narInfoPath = narInfoReply earlier
       | path == narPath = narReply earlier
