@@ -21,22 +21,33 @@
  *     whole tree when the outer job is terminated, and drain;
  *   - whether MSYS2's bash and a MinGW gcc run under the token;
  *   - whether the token is still kept from the user's own directories;
- *   - why a restricted build could not start a process, or load a system
- *     DLL that is not a known DLL, and what each candidate change to the
- *     design does about it and would expose elsewhere.  A candidate is
- *     always a finding: the required checks hold the design as it is.
+ *   - why a restricted build cannot start a process: the same operations,
+ *     starting a process with CreateProcessW and with the native call
+ *     beneath it, and opening what starting one reads, under the checks'
+ *     own token, a standard user's stand-in, the design's token, a token
+ *     restricted to S-1-5-12 alone, a write-restricted token, and the
+ *     candidates that add an application package SID;
+ *   - what a write-restricted token, whose restricting SIDs apply to
+ *     writes alone, does in a layout of its own: the design's checks run
+ *     again under it, with what it can read that the design's token
+ *     cannot;
+ *   - what each candidate token would expose elsewhere on the machine.
+ *     A candidate is always a finding: the required checks hold the
+ *     design as it is.
  *
  * Each line starts PASS or FAIL and says "required" when the design
  * depends on the outcome, or "finding" when the outcome only informs it,
- * with the error the operation met.  The process exits with the number of
- * required checks that failed.
+ * with the error the operation met.  A finding's PASS says its claim
+ * held, not that the outcome is a good one.  The process exits with the
+ * number of required checks that failed.
  *
  * The program links no C runtime, only kernel32 and advapi32, so a child
  * under the restricted token loads those and the system DLLs they import,
  * and no runtime of the probe's own: a child that cannot start points at
  * the token, not at a runtime the probe brought.  Whether a program built
  * against the UCRT runs under the token is check 9's to say, through gcc
- * and what it builds.
+ * and what it builds.  The few native calls it makes, ntdll being mapped
+ * into every process, are looked up by name.
  *
  * Each token is made as the sandbox helper would make a build's: its
  * default owner the user, its default DACL naming the user, SYSTEM and
@@ -52,6 +63,10 @@
  *                                    whose handle JOB is
  *   probe hold                       a stand-in sandbox helper, for the
  *                                    check that ends a whole tree
+ *   probe trace STEP BASH GCC        one thing under the design's token,
+ *                                    for a trace of what it is refused:
+ *                                    STEP is control, spawn-probe,
+ *                                    spawn-cmd, bash or gcc
  *   probe child OP ARG...            one operation, under whatever token
  *                                    the process was given
  */
@@ -65,12 +80,13 @@
 #include <aclapi.h>
 #include <sddl.h>
 #include <winioctl.h>
+#include <winternl.h>
 
 /* ------------------------------------------------------------------------
  * What a program with no C runtime needs
  * ------------------------------------------------------------------------ */
 
-/* The compiler may call these for a structure's initialisation or copy. */
+/* The compiler may call these for a structure's initialization or copy. */
 void *memset(void *destination, int value, size_t length)
 {
     unsigned char *at = destination;
@@ -90,6 +106,8 @@ void *memcpy(void *destination, const void *source, size_t length)
 
 /* The exit status when the probe's own heap cannot grow. */
 #define EXIT_NO_MEMORY 250
+/* The exit status of a command line the probe does not know. */
+#define EXIT_USAGE 249
 
 /* Every allocation comes from one private heap, destroyed on exit. */
 static HANDLE arena;
@@ -269,27 +287,47 @@ static WCHAR *error_text(DWORD error)
 }
 
 static DWORD required_failures;
-static DWORD findings_unexpected;
+static DWORD findings_failed;
 
 #define REQUIRED 1
 #define FINDING 0
 
+/* The pass the checks run in.  In the design's pass a required check
+ * counts as one; a candidate's pass runs the same checks under a
+ * candidate token, in a layout of its own, and every line of it is a
+ * finding whose label starts with the candidate's name. */
+static const WCHAR *pass_prefix = L"";
+static int pass_is_candidate;
+
+static void begin_candidate_pass(const WCHAR *prefix)
+{
+    pass_prefix = prefix;
+    pass_is_candidate = 1;
+}
+
+static void end_candidate_pass(void)
+{
+    pass_prefix = L"";
+    pass_is_candidate = 0;
+}
+
 /* Print a check's line and count it. */
 static void verdict(int passed, int required, const WCHAR *label, const WCHAR *what, const WCHAR *detail)
 {
-    say(join(passed ? L"PASS " : L"FAIL ", required ? L"required " : L"finding  ", label, L": ", what,
+    int counts = required && !pass_is_candidate;
+    say(join(passed ? L"PASS " : L"FAIL ", counts ? L"required " : L"finding  ", pass_prefix, label, L": ", what,
              detail != NULL ? L" [" : L"", detail != NULL ? detail : L"", detail != NULL ? L"]" : L"", END));
     if (!passed) {
-        if (required)
+        if (counts)
             required_failures++;
         else
-            findings_unexpected++;
+            findings_failed++;
     }
 }
 
 static void info(const WCHAR *label, const WCHAR *text)
 {
-    say(join(L"INFO ", label, L": ", text, END));
+    say(join(L"INFO ", pass_prefix, label, L": ", text, END));
 }
 
 /* ------------------------------------------------------------------------
@@ -317,27 +355,64 @@ static WCHAR *sid_text(PSID sid)
     return copy;
 }
 
+#define OWNER_AND_DACL (OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION)
+
+/* A descriptor's owner and DACL in SDDL, or why they cannot be. */
+static WCHAR *descriptor_text(PSECURITY_DESCRIPTOR descriptor)
+{
+    WCHAR *text = NULL;
+    WCHAR *copy;
+    if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, SDDL_REVISION_1, OWNER_AND_DACL, &text, NULL))
+        return join(L"unconvertible, ", error_text(GetLastError()), END);
+    copy = join(text, END);
+    LocalFree(text);
+    return copy;
+}
+
 /* A path's owner and DACL in SDDL, or why they cannot be read. */
 static WCHAR *sddl_of(const WCHAR *path)
 {
     PSECURITY_DESCRIPTOR descriptor = NULL;
-    WCHAR *text = NULL;
-    WCHAR *copy;
-    DWORD error = GetNamedSecurityInfoW(path, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                                        NULL, NULL, NULL, NULL, &descriptor);
+    WCHAR *text;
+    DWORD error = GetNamedSecurityInfoW(path, SE_FILE_OBJECT, OWNER_AND_DACL, NULL, NULL, NULL, NULL, &descriptor);
     if (error != ERROR_SUCCESS)
         return join(L"unreadable, ", error_text(error), END);
-    if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, SDDL_REVISION_1,
-                                                              OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                                                              &text, NULL)) {
-        error = GetLastError();
-        LocalFree(descriptor);
-        return join(L"unconvertible, ", error_text(error), END);
-    }
-    copy = join(text, END);
-    LocalFree(text);
+    text = descriptor_text(descriptor);
     LocalFree(descriptor);
-    return copy;
+    return text;
+}
+
+/* A kernel object's owner and DACL in SDDL, a token's, a process's or an
+ * object directory's, or why they cannot be read.  GetKernelObjectSecurity
+ * asks the kernel through the handle alone; GetSecurityInfo goes through
+ * ntmarta.dll, which is not a known DLL, and fails with error 127 inside a
+ * restricted child. */
+static WCHAR *object_sddl(HANDLE object)
+{
+    DWORD needed = 0;
+    PSECURITY_DESCRIPTOR descriptor;
+    GetKernelObjectSecurity(object, OWNER_AND_DACL, NULL, 0, &needed);
+    if (needed == 0)
+        return join(L"unreadable, ", error_text(GetLastError()), END);
+    descriptor = take(needed);
+    if (!GetKernelObjectSecurity(object, OWNER_AND_DACL, descriptor, needed, &needed))
+        return join(L"unreadable, ", error_text(GetLastError()), END);
+    return descriptor_text(descriptor);
+}
+
+/* A registry key's owner and DACL in SDDL, or why they cannot be read. */
+static WCHAR *key_sddl(HKEY key)
+{
+    DWORD needed = 0;
+    PSECURITY_DESCRIPTOR descriptor;
+    LSTATUS status = RegGetKeySecurity(key, OWNER_AND_DACL, NULL, &needed);
+    if (status != ERROR_INSUFFICIENT_BUFFER)
+        return join(L"unreadable, ", error_text((DWORD)status), END);
+    descriptor = take(needed);
+    status = RegGetKeySecurity(key, OWNER_AND_DACL, descriptor, &needed);
+    if (status != ERROR_SUCCESS)
+        return join(L"unreadable, ", error_text((DWORD)status), END);
+    return descriptor_text(descriptor);
 }
 
 /* A directory made with the security descriptor SDDL gives.  Answers 0 or
@@ -434,6 +509,91 @@ static WCHAR *widen(const char *bytes, DWORD length)
 }
 
 /* ------------------------------------------------------------------------
+ * Native calls, looked up in ntdll by name
+ * ------------------------------------------------------------------------ */
+
+/* Any function's pointer type, cast to the function's own to call it. */
+typedef void (*any_function)(void);
+
+typedef NTSTATUS(NTAPI *directory_call)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+typedef NTSTATUS(NTAPI *last_status_call)(void);
+typedef ULONG(NTAPI *status_error_call)(NTSTATUS);
+typedef NTSTATUS(NTAPI *create_parameters_call)(PRTL_USER_PROCESS_PARAMETERS *, PUNICODE_STRING, PUNICODE_STRING,
+                                                PUNICODE_STRING, PUNICODE_STRING, PVOID, PUNICODE_STRING,
+                                                PUNICODE_STRING, PUNICODE_STRING, PUNICODE_STRING);
+typedef NTSTATUS(NTAPI *destroy_parameters_call)(PRTL_USER_PROCESS_PARAMETERS);
+typedef NTSTATUS(NTAPI *create_user_process_call)(PUNICODE_STRING, ULONG, PRTL_USER_PROCESS_PARAMETERS,
+                                                  PSECURITY_DESCRIPTOR, PSECURITY_DESCRIPTOR, HANDLE, BOOLEAN, HANDLE,
+                                                  HANDLE, void *);
+
+/* An ntdll function, or NULL. */
+static any_function native(const char *name)
+{
+    return (any_function)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), name);
+}
+
+/* The Win32 error an NTSTATUS maps to, for a step's status. */
+static DWORD status_error(NTSTATUS status)
+{
+    status_error_call call = (status_error_call)native("RtlNtStatusToDosError");
+    return call != NULL ? (DWORD)call(status) : ERROR_GEN_FAILURE;
+}
+
+/* An NTSTATUS on standard output, where a step's status has no room for
+ * it. */
+static void say_status(NTSTATUS status)
+{
+    say(join(L"ntstatus ", number((DWORD)status, 1), END));
+}
+
+/* The last NTSTATUS this thread converted to a Win32 error, on standard
+ * output, and whether it maps to ERROR, the error a call just failed with.
+ * A call that sets its error without converting a status leaves an older
+ * status there, which then does not map to ERROR or maps by chance. */
+static void say_last_status(DWORD error)
+{
+    last_status_call last = (last_status_call)native("RtlGetLastNtStatus");
+    status_error_call convert = (status_error_call)native("RtlNtStatusToDosErrorNoTeb");
+    NTSTATUS status;
+    if (last == NULL)
+        return;
+    status = last();
+    say(join(L"last ntstatus ", number((DWORD)status, 1),
+             convert == NULL              ? L""
+             : convert(status) == error   ? L", which maps to the error"
+                                          : L", which does not map to the error",
+             END));
+}
+
+/* TEXT as a counted string, over a copy of its own. */
+static UNICODE_STRING counted(const WCHAR *text)
+{
+    UNICODE_STRING string;
+    string.Buffer = join(text, END);
+    string.Length = (USHORT)(wide_length(text) * sizeof(WCHAR));
+    string.MaximumLength = (USHORT)(string.Length + sizeof(WCHAR));
+    return string;
+}
+
+/* STATUS_PROCEDURE_NOT_FOUND, from ntstatus.h, which windows.h leaves
+ * out: what a native call answers when ntdll lacks it. */
+#define NATIVE_CALL_MISSING ((NTSTATUS)0xC000007AL)
+
+/* Open an object directory, or make one, OBJ_OPENIF opening it should it
+ * be there.  Answers the NTSTATUS, the handle in DIRECTORY. */
+static NTSTATUS object_directory(const WCHAR *path, ACCESS_MASK access, int making, HANDLE *directory)
+{
+    directory_call call = (directory_call)native(making ? "NtCreateDirectoryObject" : "NtOpenDirectoryObject");
+    UNICODE_STRING name = counted(path);
+    OBJECT_ATTRIBUTES attributes;
+    *directory = NULL;
+    if (call == NULL)
+        return NATIVE_CALL_MISSING;
+    InitializeObjectAttributes(&attributes, &name, OBJ_CASE_INSENSITIVE | (making ? OBJ_OPENIF : 0), NULL, NULL);
+    return call(directory, access, &attributes);
+}
+
+/* ------------------------------------------------------------------------
  * Running a process in a job of its own
  * ------------------------------------------------------------------------ */
 
@@ -468,6 +628,9 @@ struct run {
 #define SETTLE_MS 5000
 
 #define SPAWN_DETACHED 1
+/* The process is left in whatever job this one is in, with no job of its
+ * own. */
+#define SPAWN_NO_JOB 2
 
 static WCHAR *describe(const struct run *run);
 
@@ -494,7 +657,8 @@ static void read_available(HANDLE pipe, struct run *result)
  * Standard input is NUL and standard output and error one pipe, and only
  * those two handles are inherited.  The job's completion port says when
  * its last process is gone; the wait gives up after TIMEOUT_MS and ends
- * the job. */
+ * the job.  With SPAWN_NO_JOB the process gets no job of its own, staying
+ * in whatever jobs this one is in, and the wait is on the process itself. */
 static void spawn(HANDLE token, const WCHAR *command, const WCHAR *directory, SIZE_T memory_cap, DWORD timeout_ms,
                   int flags, struct run *result)
 {
@@ -586,7 +750,7 @@ static void spawn(HANDLE token, const WCHAR *command, const WCHAR *directory, SI
         result->start_error = GetLastError();
         goto done;
     }
-    if (!AssignProcessToJobObject(job, process.hProcess)) {
+    if (!(flags & SPAWN_NO_JOB) && !AssignProcessToJobObject(job, process.hProcess)) {
         result->start_error = GetLastError();
         TerminateProcess(process.hProcess, 1);
         goto done;
@@ -599,7 +763,16 @@ static void spawn(HANDLE token, const WCHAR *command, const WCHAR *directory, SI
     ResumeThread(process.hThread);
 
     deadline = GetTickCount64() + timeout_ms;
-    while (!result->active_zero) {
+    if (flags & SPAWN_NO_JOB)
+        while (WaitForSingleObject(process.hProcess, PORT_POLL_MS) != WAIT_OBJECT_0) {
+            read_available(read_end, result);
+            if (GetTickCount64() > deadline) {
+                result->timed_out = 1;
+                TerminateProcess(process.hProcess, 1);
+                break;
+            }
+        }
+    while (!(flags & SPAWN_NO_JOB) && !result->active_zero) {
         DWORD message = 0;
         ULONG_PTR key = 0;
         LPOVERLAPPED detail = NULL;
@@ -713,8 +886,9 @@ static DWORD make_junction(const WCHAR *path, const WCHAR *target)
 
 /* A restricted token: every privilege but bypassing traverse checks
  * removed, and the restricting SIDs S-1-5-12 and, when given, BUILD and
- * EXTRA, a SID's string. */
-static HANDLE restricted_token(HANDLE base, PSID build, const WCHAR *extra, DWORD *error)
+ * EXTRA, a SID's string.  FLAGS adds CreateRestrictedToken's own, such as
+ * WRITE_RESTRICTED. */
+static HANDLE restricted_token(HANDLE base, PSID build, const WCHAR *extra, DWORD flags, DWORD *error)
 {
     SID_AND_ATTRIBUTES restricting[3];
     PSID restricted_code = sid_of(L"S-1-5-12");
@@ -736,7 +910,7 @@ static HANDLE restricted_token(HANDLE base, PSID build, const WCHAR *extra, DWOR
         restricting[count].Sid = extra_sid;
         restricting[count++].Attributes = 0;
     }
-    if (!CreateRestrictedToken(base, DISABLE_MAX_PRIVILEGE, 0, NULL, 0, NULL, count, restricting, &token)) {
+    if (!CreateRestrictedToken(base, DISABLE_MAX_PRIVILEGE | flags, 0, NULL, 0, NULL, count, restricting, &token)) {
         *error = GetLastError();
         token = NULL;
     }
@@ -806,12 +980,14 @@ static WCHAR *build_default_sddl(const WCHAR *user, const WCHAR *build, const WC
 /* READ_CONTROL, TOKEN_QUERY, TOKEN_QUERY_SOURCE and TOKEN_ADJUST_DEFAULT:
  * what a build may do with its own token. */
 #define RIGHTS_OWN_TOKEN L"0x20098"
+/* Those with TOKEN_ASSIGN_PRIMARY and TOKEN_DUPLICATE. */
+#define RIGHTS_OWN_TOKEN_DUPLICATE L"0x2009b"
 
 /* A build token's own object DACL: the user and SYSTEM in full, the build
- * allowed to query and adjust it. */
-static WCHAR *build_token_sddl(const WCHAR *user, const WCHAR *build)
+ * the RIGHTS given. */
+static WCHAR *build_token_sddl(const WCHAR *user, const WCHAR *build, const WCHAR *rights)
 {
-    return join(L"D:(A;;GA;;;", user, L")(A;;GA;;;SY)(A;;", RIGHTS_OWN_TOKEN, L";;;", build, L")", END);
+    return join(L"D:(A;;GA;;;", user, L")(A;;GA;;;SY)(A;;", rights, L";;;", build, L")", END);
 }
 
 /* How a build's token is made: as the design has it, or with a candidate
@@ -821,63 +997,67 @@ struct token_shape {
     const WCHAR *extra_sid;
     /* The build SID's rights in the token's default DACL, in SDDL. */
     const WCHAR *build_rights;
-    /* Whether the token object grants the build query and adjust. */
-    int grant_self;
+    /* What the token object grants the build, in SDDL, or NULL to leave
+     * its DACL as made. */
+    const WCHAR *own_token_rights;
+    /* CreateRestrictedToken's flags beside DISABLE_MAX_PRIVILEGE. */
+    DWORD flags;
 };
 
 /* The design: read, write, execute and delete for the build's SID on what
  * the build makes. */
-static const struct token_shape design_shape = {NULL, L"GRGWGXSD", 1};
+static const struct token_shape design_shape = {NULL, L"GRGWGXSD", RIGHTS_OWN_TOKEN, 0};
 /* The same, the token object's DACL left as made. */
-static const struct token_shape bare_shape = {NULL, L"GRGWGXSD", 0};
-/* Candidate: the build's SID given all access to what the build makes, as
- * Chromium's restricted tokens give their restricting SID. */
-static const struct token_shape all_access_shape = {NULL, L"GA", 1};
-/* Candidates: all access, and a third restricting SID that system files
- * grant read and execute: ALL RESTRICTED APPLICATION PACKAGES, ALL
- * APPLICATION PACKAGES, or Users. */
-static const struct token_shape lpac_shape = {L"S-1-15-2-2", L"GA", 1};
-static const struct token_shape app_packages_shape = {L"S-1-15-2-1", L"GA", 1};
-static const struct token_shape users_shape = {L"S-1-5-32-545", L"GA", 1};
+static const struct token_shape bare_shape = {NULL, L"GRGWGXSD", NULL, 0};
+/* Candidate: the token object letting the build duplicate its token and
+ * assign it to a process too. */
+static const struct token_shape token_grant_shape = {NULL, L"GRGWGXSD", RIGHTS_OWN_TOKEN_DUPLICATE, 0};
+/* Candidate: the restricting SIDs checked for writes alone, every read
+ * left to the user's own SIDs. */
+static const struct token_shape write_restricted_shape = {NULL, L"GRGWGXSD", RIGHTS_OWN_TOKEN, WRITE_RESTRICTED};
+/* Candidates: a third restricting SID that system files grant read and
+ * execute, ALL RESTRICTED APPLICATION PACKAGES or ALL APPLICATION
+ * PACKAGES. */
+static const struct token_shape lpac_shape = {L"S-1-15-2-2", L"GRGWGXSD", RIGHTS_OWN_TOKEN, 0};
+static const struct token_shape app_packages_shape = {L"S-1-15-2-1", L"GRGWGXSD", RIGHTS_OWN_TOKEN, 0};
 
-/* A build's token, made and dressed as SHAPE says. */
+/* The steps of making a build's token, for the status it answers. */
+#define TOKEN_STEP_RESTRICT 1
+#define TOKEN_STEP_DRESS 2
+
+/* A build's token, made and dressed as SHAPE says, or NULL with ERROR
+ * holding the step that failed and its error.  BUILD is the build's SID
+ * and BUILD_TEXT its string; with BUILD NULL the token restricts to
+ * S-1-5-12 alone, and BUILD_TEXT names the SID its default DACL and
+ * object grant. */
 static HANDLE build_token(HANDLE base, PSID user, const WCHAR *user_text, PSID build, const WCHAR *build_text,
                           const struct token_shape *shape, DWORD *error)
 {
-    HANDLE token = restricted_token(base, build, shape->extra_sid, error);
-    if (token == NULL)
-        return NULL;
-    *error = dress_token(token, user, build_default_sddl(user_text, build_text, shape->build_rights),
-                         shape->grant_self ? build_token_sddl(user_text, build_text) : NULL);
-    if (*error != 0) {
-        CloseHandle(token);
+    DWORD failure;
+    HANDLE token = restricted_token(base, build, shape->extra_sid, shape->flags, &failure);
+    if (token == NULL) {
+        *error = STEP_FAILED(TOKEN_STEP_RESTRICT, failure);
         return NULL;
     }
+    failure = dress_token(token, user, build_default_sddl(user_text, build_text, shape->build_rights),
+                          shape->own_token_rights != NULL
+                              ? build_token_sddl(user_text, build_text, shape->own_token_rights)
+                              : NULL);
+    if (failure != 0) {
+        CloseHandle(token);
+        *error = STEP_FAILED(TOKEN_STEP_DRESS, failure);
+        return NULL;
+    }
+    *error = 0;
     return token;
 }
 
-/* A kernel object's owner and DACL in SDDL, a token's or a process's,
- * or why they cannot be read. */
-static WCHAR *object_sddl(HANDLE object)
+/* Why build_token made no token, from the status it answered. */
+static WCHAR *token_failure(DWORD status)
 {
-    PSECURITY_DESCRIPTOR descriptor = NULL;
-    WCHAR *text = NULL;
-    WCHAR *copy;
-    DWORD error = GetSecurityInfo(object, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                                  NULL, NULL, NULL, NULL, &descriptor);
-    if (error != ERROR_SUCCESS)
-        return join(L"unreadable, ", error_text(error), END);
-    if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, SDDL_REVISION_1,
-                                                              OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                                                              &text, NULL)) {
-        error = GetLastError();
-        LocalFree(descriptor);
-        return join(L"unconvertible, ", error_text(error), END);
-    }
-    copy = join(text, END);
-    LocalFree(text);
-    LocalFree(descriptor);
-    return copy;
+    return join(STEP_OF(status) == TOKEN_STEP_RESTRICT ? L"CreateRestrictedToken failed, "
+                                                       : L"setting its owner, default DACL or object DACL failed, ",
+                error_text(ERROR_OF(status)), END);
 }
 
 static WCHAR *own_path(void)
@@ -885,6 +1065,21 @@ static WCHAR *own_path(void)
     WCHAR *path = take(32768 * sizeof(WCHAR));
     GetModuleFileNameW(NULL, path, 32768);
     return path;
+}
+
+/* The directory holding PATH, which names a file or directory below
+ * another. */
+static WCHAR *parent_directory(const WCHAR *path)
+{
+    WCHAR *directory = join(path, END);
+    WCHAR *last = NULL;
+    WCHAR *at;
+    for (at = directory; *at != 0; at++)
+        if (*at == L'\\')
+            last = at;
+    if (last != NULL)
+        *last = 0;
+    return directory;
 }
 
 /* Under a token with no restricting SID, whose own token is a standard
@@ -898,7 +1093,7 @@ static DWORD standard_user_spawn(void)
     struct run result;
     if (!OpenProcessToken(GetCurrentProcess(), BASE_TOKEN_ACCESS, &base))
         return STEP_FAILED(1, GetLastError());
-    token = restricted_token(base, NULL, NULL, &error);
+    token = restricted_token(base, NULL, NULL, 0, &error);
     CloseHandle(base);
     if (token == NULL)
         return STEP_FAILED(2, error);
@@ -912,6 +1107,141 @@ static DWORD standard_user_spawn(void)
     if (result.exit_code != 0)
         return STEP_FAILED(4, ERROR_GEN_FAILURE);
     return 0;
+}
+
+/* The root key a path starts with, HKLM\ or HKU\, and the rest of the
+ * path in REST.  Answers 0 for any other. */
+static int key_root(const WCHAR *path, HKEY *root, const WCHAR **rest)
+{
+    static const struct {
+        const WCHAR *prefix;
+        HKEY root;
+    } roots[] = {{L"HKLM\\", HKEY_LOCAL_MACHINE}, {L"HKU\\", HKEY_USERS}};
+    size_t i;
+    for (i = 0; i < sizeof roots / sizeof roots[0]; i++) {
+        size_t length = wide_length(roots[i].prefix);
+        size_t at = 0;
+        while (at < length && path[at] == roots[i].prefix[at])
+            at++;
+        if (at == length) {
+            *root = roots[i].root;
+            *rest = path + length;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The exit code cmd.exe is asked for, which it gives only by running the
+ * command it was handed. */
+#define CMD_EXIT_CODE 7
+
+/* Start a program with CreateProcessW under this process's own token and
+ * wait for it: WHAT is "probe", this program's noop, or "cmd", cmd.exe
+ * exiting with CMD_EXIT_CODE.  FLAGS are CreateProcessW's; with
+ * CREATE_BREAKAWAY_FROM_JOB the program is ended at once instead, since
+ * no job would end it.  Where CreateProcessW fails, the thread's last
+ * NTSTATUS goes to standard output; where the program ends with another
+ * code than it should, that code does. */
+static DWORD start_process(const WCHAR *what, DWORD flags)
+{
+    STARTUPINFOW startup;
+    PROCESS_INFORMATION process;
+    WCHAR *system = take(MAX_PATH * sizeof(WCHAR));
+    WCHAR *command;
+    DWORD expected;
+    DWORD code = 0;
+    DWORD status = 0;
+    if (wide_equal(what, L"cmd")) {
+        if (GetSystemDirectoryW(system, MAX_PATH) == 0)
+            return STEP_FAILED(1, GetLastError());
+        /* /d leaves out the AutoRun commands the registry may hold. */
+        command = join(L"\"", system, L"\\cmd.exe\" /d /c exit ", number(CMD_EXIT_CODE, 0), END);
+        expected = CMD_EXIT_CODE;
+    } else {
+        command = join(L"\"", own_path(), L"\" child noop", END);
+        expected = 0;
+    }
+    memset(&startup, 0, sizeof startup);
+    startup.cb = sizeof startup;
+    if (!CreateProcessW(NULL, command, NULL, NULL, FALSE, flags, NULL, NULL, &startup, &process)) {
+        DWORD error = GetLastError();
+        say_last_status(error);
+        return STEP_FAILED(2, error);
+    }
+    if (flags & CREATE_BREAKAWAY_FROM_JOB) {
+        /* It escaped every job, so nothing else would end it. */
+        TerminateProcess(process.hProcess, 1);
+    } else if (WaitForSingleObject(process.hProcess, SETTLE_MS) != WAIT_OBJECT_0) {
+        TerminateProcess(process.hProcess, 1);
+        status = STEP_FAILED(3, WAIT_TIMEOUT);
+    } else if (!GetExitCodeProcess(process.hProcess, &code)) {
+        status = STEP_FAILED(4, GetLastError());
+    } else if (code != expected) {
+        say(join(L"it exited with ", number(code, 1), END));
+        status = STEP_FAILED(4, ERROR_GEN_FAILURE);
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return status;
+}
+
+/* What RtlCreateUserProcess answers (RTL_USER_PROCESS_INFORMATION): its
+ * length, the process's and thread's handles and IDs, then the image's
+ * SECTION_IMAGE_INFORMATION, given more room here than it takes. */
+struct native_process {
+    ULONG length;
+    HANDLE process;
+    HANDLE thread;
+    CLIENT_ID client;
+    BYTE image[256];
+};
+
+/* Start this program's noop with RtlCreateUserProcess, the native call
+ * that creates a process and its first thread without what CreateProcessW
+ * does around that in user mode: the code-authorization and compatibility
+ * checks and the registration with the Windows subsystem.  The thread
+ * starts suspended; resumed, the noop runs its own startup.  A failure's
+ * NTSTATUS goes to standard output. */
+static DWORD start_native_process(void)
+{
+    create_parameters_call create_parameters = (create_parameters_call)native("RtlCreateProcessParameters");
+    destroy_parameters_call destroy_parameters = (destroy_parameters_call)native("RtlDestroyProcessParameters");
+    create_user_process_call create_process = (create_user_process_call)native("RtlCreateUserProcess");
+    UNICODE_STRING image;
+    UNICODE_STRING command;
+    PRTL_USER_PROCESS_PARAMETERS parameters = NULL;
+    struct native_process made;
+    NTSTATUS status;
+    DWORD code = 0;
+    DWORD result = 0;
+    if (create_parameters == NULL || destroy_parameters == NULL || create_process == NULL)
+        return STEP_FAILED(1, ERROR_PROC_NOT_FOUND);
+    image = counted(join(L"\\??\\", own_path(), END));
+    command = counted(join(L"\"", own_path(), L"\" child noop", END));
+    status = create_parameters(&parameters, &image, NULL, NULL, &command, NULL, NULL, NULL, NULL, NULL);
+    if (!NT_SUCCESS(status)) {
+        say_status(status);
+        return STEP_FAILED(2, status_error(status));
+    }
+    memset(&made, 0, sizeof made);
+    status = create_process(&image, OBJ_CASE_INSENSITIVE, parameters, NULL, NULL, NULL, FALSE, NULL, NULL, &made);
+    destroy_parameters(parameters);
+    if (!NT_SUCCESS(status)) {
+        say_status(status);
+        return STEP_FAILED(3, status_error(status));
+    }
+    ResumeThread(made.thread);
+    if (WaitForSingleObject(made.process, SETTLE_MS) != WAIT_OBJECT_0) {
+        TerminateProcess(made.process, 1);
+        result = STEP_FAILED(4, WAIT_TIMEOUT);
+    } else if (GetExitCodeProcess(made.process, &code) && code != 0) {
+        say(join(L"it exited with ", number(code, 1), END));
+        result = STEP_FAILED(5, ERROR_GEN_FAILURE);
+    }
+    CloseHandle(made.thread);
+    CloseHandle(made.process);
+    return result;
 }
 
 static DWORD child(int count, WCHAR **arguments)
@@ -977,10 +1307,9 @@ static DWORD child(int count, WCHAR **arguments)
     }
     if (wide_equal(op, L"noop"))
         return 0;
-    if (wide_equal(op, L"open-token") || wide_equal(op, L"open-token-adjust")) {
+    if (wide_equal(op, L"open-token")) {
         HANDLE token = NULL;
-        DWORD access = wide_equal(op, L"open-token") ? TOKEN_QUERY : TOKEN_ADJUST_DEFAULT;
-        if (!OpenProcessToken(GetCurrentProcess(), access, &token))
+        if (!OpenProcessToken(GetCurrentProcess(), parse_number(first), &token))
             return STEP_FAILED(1, GetLastError());
         CloseHandle(token);
         return 0;
@@ -1015,26 +1344,34 @@ static DWORD child(int count, WCHAR **arguments)
         FreeLibrary(module);
         return status;
     }
-    /* Start a process, breaking away from the job or, for the check's
-     * control, not. */
-    if (wide_equal(op, L"breakaway") || wide_equal(op, L"spawn-plain")) {
-        int breaking = wide_equal(op, L"breakaway");
-        STARTUPINFOW startup;
-        PROCESS_INFORMATION process;
-        WCHAR *command = join(L"\"", own_path(), L"\" child noop", END);
-        memset(&startup, 0, sizeof startup);
-        startup.cb = sizeof startup;
-        if (!CreateProcessW(NULL, command, NULL, NULL, FALSE,
-                            (breaking ? CREATE_BREAKAWAY_FROM_JOB : 0) | DETACHED_PROCESS, NULL, NULL, &startup,
-                            &process))
-            return STEP_FAILED(1, GetLastError());
-        if (breaking)
-            /* It escaped every job, so nothing else would end it. */
-            TerminateProcess(process.hProcess, 1);
-        else
-            WaitForSingleObject(process.hProcess, SETTLE_MS);
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
+    if (wide_equal(op, L"spawn"))
+        return start_process(first, parse_number(second));
+    if (wide_equal(op, L"native-spawn"))
+        return start_native_process();
+    if (wide_equal(op, L"open-directory") || wide_equal(op, L"create-directory")) {
+        HANDLE directory;
+        NTSTATUS status = object_directory(first, parse_number(second), wide_equal(op, L"create-directory"), &directory);
+        if (!NT_SUCCESS(status)) {
+            say_status(status);
+            return STEP_FAILED(1, status_error(status));
+        }
+        CloseHandle(directory);
+        return 0;
+    }
+    /* A registry key opened for reading, under HKLM\ or HKU\.  The
+     * user's own hive is named under HKU by its SID, since HKCU can stand
+     * for the default user's hive when the user's own cannot be opened. */
+    if (wide_equal(op, L"open-key")) {
+        HKEY root;
+        const WCHAR *path;
+        HKEY key;
+        LSTATUS status;
+        if (!key_root(first, &root, &path))
+            return STEP_FAILED(1, ERROR_INVALID_PARAMETER);
+        status = RegOpenKeyExW(root, path, 0, KEY_READ, &key);
+        if (status != ERROR_SUCCESS)
+            return STEP_FAILED(2, (DWORD)status);
+        RegCloseKey(key);
         return 0;
     }
     if (wide_equal(op, L"sleep")) {
@@ -1115,14 +1452,14 @@ static WCHAR *describe_program(const struct run *run)
 }
 
 /* Run one child operation under TOKEN, or under this process's own token
- * when TOKEN is NULL. */
-static struct outcome operation(HANDLE token, const WCHAR *op, const WCHAR *first, const WCHAR *second)
+ * when TOKEN is NULL, spawned with FLAGS. */
+static struct outcome operation_with(HANDLE token, int flags, const WCHAR *op, const WCHAR *first, const WCHAR *second)
 {
     struct outcome result;
     WCHAR *command = join(L"\"", self_path, L"\" child ", op, first != NULL ? L" \"" : L"", first != NULL ? first : L"",
                           first != NULL ? L"\"" : L"", second != NULL ? L" \"" : L"", second != NULL ? second : L"",
                           second != NULL ? L"\"" : L"", END);
-    spawn(token, command, child_directory, CHECK_MEMORY_CAP, CHECK_TIMEOUT_MS, SPAWN_DETACHED, &result.run);
+    spawn(token, command, child_directory, CHECK_MEMORY_CAP, CHECK_TIMEOUT_MS, flags, &result.run);
     result.ran = operation_status(&result.run);
     result.succeeded = result.ran && result.run.exit_code == 0;
     result.denied = result.ran && result.run.exit_code != 0 && ERROR_OF(result.run.exit_code) == ERROR_ACCESS_DENIED;
@@ -1130,6 +1467,12 @@ static struct outcome operation(HANDLE token, const WCHAR *op, const WCHAR *firs
     if (result.run.output_length > 0)
         result.detail = join(result.detail, L", wrote \"", widen(result.run.output, result.run.output_length), L"\"", END);
     return result;
+}
+
+/* Run one child operation under TOKEN in a job of its own. */
+static struct outcome operation(HANDLE token, const WCHAR *op, const WCHAR *first, const WCHAR *second)
+{
+    return operation_with(token, SPAWN_DETACHED, op, first, second);
 }
 
 static void expect_allowed(int required, const WCHAR *label, const WCHAR *what, struct outcome result)
@@ -1181,6 +1524,29 @@ static int exists(const WCHAR *path)
 #define RESTRICTED_SID L"S-1-5-12"
 #define OWNER_RIGHTS_SID L"S-1-3-4"
 
+/* Token rights a process asks of its own token. */
+#define ACCESS_TOKEN_ASSIGN_PRIMARY L"0x1"
+#define ACCESS_TOKEN_DUPLICATE L"0x2"
+#define ACCESS_TOKEN_QUERY L"0x8"
+#define ACCESS_TOKEN_ADJUST_DEFAULT L"0x80"
+/* TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE and TOKEN_QUERY at once. */
+#define ACCESS_TOKEN_DUPLICATE_ASSIGN_QUERY L"0xb"
+
+/* CreateProcessW's flags for a child's own children: DETACHED_PROCESS,
+ * and with CREATE_BREAKAWAY_FROM_JOB or CREATE_PRESERVE_CODE_AUTHZ_LEVEL,
+ * which leaves out the code-authorization (Safer) check. */
+#define FLAGS_DETACHED L"0x8"
+#define FLAGS_BREAKAWAY L"0x1000008"
+#define FLAGS_PRESERVE_AUTHZ L"0x2000008"
+
+/* Object directory rights (the DDK's wdm.h): DIRECTORY_QUERY and
+ * DIRECTORY_TRAVERSE; and those with DIRECTORY_CREATE_OBJECT,
+ * DIRECTORY_CREATE_SUBDIRECTORY and READ_CONTROL, what MSYS2's runtime
+ * asks of the object directory it makes for itself in
+ * \BaseNamedObjects. */
+#define ACCESS_DIRECTORY_LOOK L"0x3"
+#define ACCESS_DIRECTORY_MSYS L"0x2000f"
+
 /* The tools' jobs get more room than an operation's. */
 #define TOOL_MEMORY_CAP ((SIZE_T)1024 * 1024 * 1024)
 #define TOOL_TIMEOUT_MS 180000
@@ -1209,12 +1575,20 @@ struct context {
     HANDLE build_bare;
     /* A standard user's stand-in for nova-nix itself, or NULL. */
     HANDLE standard;
-    /* The first build's token made with each candidate change, or NULL
-     * where it could not be made. */
-    HANDLE all_access;
+    /* The first build's token restricted to S-1-5-12 alone. */
+    HANDLE restricted_code_only;
+    /* The first build's token whose object also grants it duplicating
+     * and assigning the token. */
+    HANDLE token_grant;
+    /* The first and second builds' tokens made write-restricted. */
+    HANDLE write_restricted;
+    HANDLE write_restricted_two;
+    /* The first build's token with an application package SID
+     * restricting too, or NULL where it could not be made, and why. */
     HANDLE lpac;
     HANDLE app_packages;
-    HANDLE users_group;
+    const WCHAR *lpac_failure;
+    const WCHAR *app_packages_failure;
     const WCHAR *user;
     const WCHAR *b1;
     const WCHAR *tools;
@@ -1237,6 +1611,10 @@ struct context {
     const WCHAR *system_drive;
     const WCHAR *program_data;
     const WCHAR *public_directory;
+    /* The object directory this session's named objects go in. */
+    const WCHAR *session_objects;
+    /* A file in the user's profile the user can read, or NULL. */
+    const WCHAR *profile_file;
 };
 
 /* Whether TEXT holds NEEDLE. */
@@ -1291,17 +1669,17 @@ static void check_own_token(const struct context *c)
 {
     expect_allowed(REQUIRED, L"token-self-query",
                    L"a build whose token object grants its SID query opens its own token",
-                   operation(c->build_one, L"open-token", NULL, NULL));
-    /* The first run found the undressed token's process opening its own
-     * token too.  The DACL each child's token object has, read from inside
-     * it, says whether the object a process runs with is the one the
-     * helper dressed, or another made from the default DACL. */
+                   operation(c->build_one, L"open-token", ACCESS_TOKEN_QUERY, NULL));
+    /* Whether a token object left with the DACL it was made with still
+     * lets its process open it.  The DACL each child's token object has,
+     * read from inside it, says whether the object a process runs with is
+     * the one the helper dressed, or another made from the default DACL. */
     expect_allowed(FINDING, L"token-self-query-undressed",
                    L"a build whose token object keeps the DACL it was made with still opens its own token for query",
-                   operation(c->build_bare, L"open-token", NULL, NULL));
+                   operation(c->build_bare, L"open-token", ACCESS_TOKEN_QUERY, NULL));
     expect_allowed(FINDING, L"token-self-adjust-undressed",
                    L"and for adjusting its default DACL",
-                   operation(c->build_bare, L"open-token-adjust", NULL, NULL));
+                   operation(c->build_bare, L"open-token", ACCESS_TOKEN_ADJUST_DEFAULT, NULL));
     info(L"token-child-object", operation(c->build_one, L"token-sddl", NULL, NULL).detail);
     info(L"token-child-object-undressed", operation(c->build_bare, L"token-sddl", NULL, NULL).detail);
 }
@@ -1520,8 +1898,8 @@ static void check_jobs(const struct context *c)
             join(L"64 MB ", describe(&under), L"; 400 MB ", describe(&over), END));
     verdict(over.memory_limit_reached, FINDING, L"jobs-memory-message",
             L"the job's completion port reports the memory limit reached", NULL);
-    plain = operation(c->build_one, L"spawn-plain", NULL, NULL);
-    breaking = operation(c->build_one, L"breakaway", NULL, NULL);
+    plain = operation(c->build_one, L"spawn", L"probe", FLAGS_DETACHED);
+    breaking = operation(c->build_one, L"spawn", L"probe", FLAGS_BREAKAWAY);
     verdict(plain.succeeded && breaking.denied, REQUIRED, L"jobs-no-breakaway",
             L"a restricted child that can start a process cannot start one that breaks away from its job",
             join(L"plain ", plain.detail, L"; breaking away ", breaking.detail, END));
@@ -1532,16 +1910,23 @@ static void check_jobs(const struct context *c)
             describe(&crashed));
 }
 
+/* PATH as the sandbox would set it for a build: the tools it was given,
+ * then System32, so a DLL is never looked for where the token cannot
+ * read. */
+static void set_tool_path(const WCHAR *tools, const WCHAR *system_root)
+{
+    SetEnvironmentVariableW(L"PATH", join(tools, L"\\mingw64\\bin;", tools, L"\\msys64\\usr\\bin;",
+                                          system_root != NULL ? system_root : L"C:\\Windows", L"\\System32", END));
+}
+
 /* 9. */
 static void check_tools(const struct context *c)
 {
     /* As the sandbox would set them for a build: temporary files in its
-     * build directory, and a PATH holding only the tools it was given, so
-     * a DLL is never looked for where the token cannot read. */
+     * build directory, and the tools' PATH. */
     SetEnvironmentVariableW(L"TEMP", c->build);
     SetEnvironmentVariableW(L"TMP", c->build);
-    SetEnvironmentVariableW(L"PATH", join(c->tools, L"\\mingw64\\bin;", c->tools, L"\\msys64\\usr\\bin;",
-                                          c->system_root != NULL ? c->system_root : L"C:\\Windows", L"\\System32", END));
+    set_tool_path(c->tools, c->system_root);
     if (wide_equal(c->bash, L"-")) {
         verdict(0, REQUIRED, L"tools-bash", L"MSYS2 bash runs a command under the token", L"no bash was given");
     } else {
@@ -1593,113 +1978,180 @@ static void check_tools(const struct context *c)
     }
 }
 
-/* A token a comparison runs under: its name in labels, what it holds, and
- * the token itself, NULL where it could not be made. */
+/* A token the comparisons run under: its name in labels, what it is, the
+ * token itself, NULL for the checks' own, and why it could not be made,
+ * or NULL. */
 struct candidate {
     const WCHAR *name;
     const WCHAR *holds;
     HANDLE token;
+    const WCHAR *failure;
 };
 
-/* A run expected to fail in whatever way the operation reports, a
- * function not found as well as access refused. */
-static void expect_failure(int required, const WCHAR *label, const WCHAR *what, struct outcome result)
-{
-    verdict(result.ran && !result.succeeded, required, label, what, result.detail);
-}
-
-/* FILE_READ_DATA and FILE_EXECUTE: what creating a process reads of its
- * image. */
-#define ACCESS_READ_EXECUTE_DATA L"0x21"
+/* FILE_ADD_SUBDIRECTORY on a directory. */
 #define ACCESS_ADD_SUBDIRECTORY L"0x4"
 
-/* Why a restricted build could start no process in the first run.  A
- * process's default DACL comes from its creator's token, and the handle
- * CreateProcess answers has PROCESS_ALL_ACCESS, so the creator's
- * restricting SIDs must be granted all of that on the new process. */
-static void check_process_creation(const struct context *c)
+/* Registry keys starting a process reads, or may: its image's execution
+ * options, the application compatibility settings and cache, the
+ * code-authorization (Safer) policy, and the Session Manager key, the
+ * parent of the AppCertDlls list.  And the roots every key under HKLM or
+ * HKU is opened through, so that a refusal there is not taken for the
+ * key's own. */
+#define REGISTRY_IFEO L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"
+#define REGISTRY_APPCOMPAT_FLAGS L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags"
+#define REGISTRY_APPCOMPAT_CACHE L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\AppCompatCache"
+#define REGISTRY_SAFER L"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Safer\\CodeIdentifiers"
+#define REGISTRY_SESSION_MANAGER L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager"
+#define REGISTRY_MACHINE L"HKLM\\"
+#define REGISTRY_USERS L"HKU\\"
+
+#define KNOWN_DLLS L"\\KnownDlls"
+#define GLOBAL_OBJECTS L"\\BaseNamedObjects"
+
+/* The user's own registry hive, by its SID, as a build would reach it. */
+static WCHAR *user_hive(const struct context *c)
 {
-    info(L"spawn-image-dacl", sddl_of(self_path));
-    expect_allowed(FINDING, L"spawn-image-open",
-                   L"a restricted build opens the probe's image to read and execute it, as starting a process from it does",
-                   operation(c->build_one, L"open", self_path, ACCESS_READ_EXECUTE_DATA));
-    expect_denied(FINDING, L"spawn-design",
-                  L"with its SID given read, write, execute and delete by its default DACL, a build cannot start a process",
-                  operation(c->build_one, L"spawn-plain", NULL, NULL));
-    if (c->all_access == NULL) {
-        verdict(0, FINDING, L"candidate-all-access-spawn", L"make the candidate token", NULL);
-        return;
-    }
-    expect_allowed(FINDING, L"candidate-all-access-spawn",
-                   L"with its SID given all access in its default DACL, a build starts a process",
-                   operation(c->all_access, L"spawn-plain", NULL, NULL));
-    expect_denied(FINDING, L"candidate-all-access-no-breakaway",
-                  L"and still cannot start one that breaks away from its job",
-                  operation(c->all_access, L"breakaway", NULL, NULL));
+    return join(L"HKU\\", c->user, L"\\Software", END);
 }
 
-/* What msys-2.0.dll met in the first run.  advapi32 is a known DLL, which
- * Windows maps from its own copy; its export SystemFunction036 forwards to
- * cryptbase.dll, which the loader then reads from System32 as a file,
- * under the token. */
-static void check_dll_loading(const struct context *c)
+/* The owner and DACL of each object directory and key the spawning
+ * comparisons open, read by the checks' own token. */
+static void describe_objects(const struct context *c)
 {
-    const struct candidate candidates[] = {
-        {L"lpac", L"ALL RESTRICTED APPLICATION PACKAGES", c->lpac},
-        {L"app-packages", L"ALL APPLICATION PACKAGES", c->app_packages},
-        {L"users", L"Users", c->users_group},
+    const WCHAR *directories[] = {KNOWN_DLLS, GLOBAL_OBJECTS, c->session_objects != NULL ? c->session_objects : GLOBAL_OBJECTS};
+    const WCHAR *keys[] = {REGISTRY_MACHINE, REGISTRY_USERS,           REGISTRY_IFEO,
+                           REGISTRY_APPCOMPAT_FLAGS, REGISTRY_APPCOMPAT_CACHE, REGISTRY_SAFER,
+                           REGISTRY_SESSION_MANAGER, user_hive(c)};
+    size_t i;
+    for (i = 0; i < sizeof directories / sizeof directories[0]; i++) {
+        HANDLE directory;
+        NTSTATUS status = object_directory(directories[i], READ_CONTROL, 0, &directory);
+        if (!NT_SUCCESS(status)) {
+            info(L"object-dacl", join(directories[i], L" unopened, ntstatus ", number((DWORD)status, 1), END));
+            continue;
+        }
+        info(L"object-dacl", join(directories[i], L" ", object_sddl(directory), END));
+        CloseHandle(directory);
+    }
+    for (i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        HKEY root;
+        const WCHAR *path;
+        HKEY key;
+        LSTATUS status;
+        if (!key_root(keys[i], &root, &path))
+            continue;
+        status = RegOpenKeyExW(root, path, 0, READ_CONTROL, &key);
+        if (status != ERROR_SUCCESS) {
+            info(L"key-dacl", join(keys[i], L" unopened, ", error_text((DWORD)status), END));
+            continue;
+        }
+        info(L"key-dacl", join(keys[i], L" ", key_sddl(key), END));
+        RegCloseKey(key);
+    }
+}
+
+/* Why a restricted build could start no process, one operation at a time
+ * under each token, the checks' own and the standard user's stand-in the
+ * controls: starting a process from a job of its own and from none of
+ * the checks', without the code-authorization check, of a system
+ * program, and through the native call beneath CreateProcessW; opening
+ * its own token as starting a process might; and opening what starting a
+ * process, or MSYS2's runtime, reads.  Each claim is that the operation
+ * succeeds.  A row starts by reading the DACL of the token object its
+ * process runs with, which also makes every later step in the row the
+ * second or later process made from that token. */
+static void check_spawning(const struct context *c)
+{
+    const struct candidate rows[] = {
+        {L"own", L"the checks' own token", NULL, NULL},
+        {L"standard", L"the standard user's stand-in, no privilege and no restricting SID", c->standard,
+         c->standard == NULL ? L"no stand-in token was made" : NULL},
+        {L"design", L"the design's token", c->build_one, NULL},
+        {L"token-grant", L"the design's token, its object also granting the build duplicating and assigning it",
+         c->token_grant, c->token_grant == NULL ? L"the token was not made" : NULL},
+        {L"restricted-code", L"S-1-5-12 alone restricting", c->restricted_code_only,
+         c->restricted_code_only == NULL ? L"the token was not made" : NULL},
+        {L"write-restricted", L"the design's restricting SIDs for writes alone", c->write_restricted,
+         c->write_restricted == NULL ? L"the token was not made" : NULL},
+        {L"lpac", L"ALL RESTRICTED APPLICATION PACKAGES restricting too", c->lpac, c->lpac_failure},
+        {L"app-packages", L"ALL APPLICATION PACKAGES restricting too", c->app_packages, c->app_packages_failure},
+    };
+    const struct {
+        const WCHAR *name;
+        int flags;
+        const WCHAR *op;
+        const WCHAR *first;
+        const WCHAR *second;
+        const WCHAR *what;
+    } steps[] = {
+        {L"token-object", SPAWN_DETACHED, L"token-sddl", NULL, NULL,
+         L"reads its own token object's owner and DACL"},
+        {L"spawn-probe", SPAWN_DETACHED, L"spawn", L"probe", FLAGS_DETACHED,
+         L"starts the probe with CreateProcessW from a job of its own, and it runs"},
+        {L"spawn-probe-no-job", SPAWN_DETACHED | SPAWN_NO_JOB, L"spawn", L"probe", FLAGS_DETACHED,
+         L"the same from no job but the one the checks run in"},
+        {L"spawn-probe-preserve-authz", SPAWN_DETACHED, L"spawn", L"probe", FLAGS_PRESERVE_AUTHZ,
+         L"the same with CREATE_PRESERVE_CODE_AUTHZ_LEVEL, leaving out the code-authorization check"},
+        {L"spawn-cmd", SPAWN_DETACHED, L"spawn", L"cmd", FLAGS_DETACHED,
+         L"starts System32's cmd.exe with CreateProcessW, and it runs its command"},
+        {L"native-spawn", SPAWN_DETACHED, L"native-spawn", NULL, NULL,
+         L"starts the probe with RtlCreateUserProcess, beneath CreateProcessW, and it runs"},
+        {L"token-query", SPAWN_DETACHED, L"open-token", ACCESS_TOKEN_QUERY, NULL, L"opens its own token for TOKEN_QUERY"},
+        {L"token-duplicate", SPAWN_DETACHED, L"open-token", ACCESS_TOKEN_DUPLICATE, NULL,
+         L"opens its own token for TOKEN_DUPLICATE"},
+        {L"token-assign-primary", SPAWN_DETACHED, L"open-token", ACCESS_TOKEN_ASSIGN_PRIMARY, NULL,
+         L"opens its own token for TOKEN_ASSIGN_PRIMARY"},
+        {L"token-all-three", SPAWN_DETACHED, L"open-token", ACCESS_TOKEN_DUPLICATE_ASSIGN_QUERY, NULL,
+         L"opens its own token for all three at once"},
+        {L"known-dlls", SPAWN_DETACHED, L"open-directory", KNOWN_DLLS, ACCESS_DIRECTORY_LOOK,
+         L"opens \\KnownDlls to look a known DLL up"},
+        {L"session-objects", SPAWN_DETACHED, L"open-directory", c->session_objects, ACCESS_DIRECTORY_LOOK,
+         L"opens its session's named-object directory"},
+        {L"msys-directory", SPAWN_DETACHED, L"create-directory",
+         join(GLOBAL_OBJECTS, L"\\nova-nix-probe-", number(GetCurrentProcessId(), 0), END), ACCESS_DIRECTORY_MSYS,
+         L"makes an object directory in \\BaseNamedObjects, as MSYS2's runtime makes its own"},
+        {L"key-machine-root", SPAWN_DETACHED, L"open-key", REGISTRY_MACHINE, NULL, L"reads HKLM's root"},
+        {L"key-users-root", SPAWN_DETACHED, L"open-key", REGISTRY_USERS, NULL, L"reads HKU's root"},
+        {L"key-ifeo", SPAWN_DETACHED, L"open-key", REGISTRY_IFEO, NULL, L"reads the Image File Execution Options key"},
+        {L"key-appcompat-flags", SPAWN_DETACHED, L"open-key", REGISTRY_APPCOMPAT_FLAGS, NULL,
+         L"reads the AppCompatFlags key"},
+        {L"key-appcompat-cache", SPAWN_DETACHED, L"open-key", REGISTRY_APPCOMPAT_CACHE, NULL,
+         L"reads the AppCompatCache key"},
+        {L"key-safer", SPAWN_DETACHED, L"open-key", REGISTRY_SAFER, NULL,
+         L"reads the code-authorization (Safer) policy key"},
+        {L"key-session-manager", SPAWN_DETACHED, L"open-key", REGISTRY_SESSION_MANAGER, NULL,
+         L"reads the Session Manager key"},
+        {L"system-function", SPAWN_DETACHED, L"resolve", L"advapi32.dll", L"SystemFunction036",
+         L"resolves advapi32's SystemFunction036, which forwards to cryptbase.dll, as MSYS2's runtime does"},
     };
     size_t i;
-    expect_allowed(FINDING, L"dll-resolve-unrestricted", L"an unrestricted process resolves advapi32's SystemFunction036",
-                   operation(NULL, L"resolve", L"advapi32.dll", L"SystemFunction036"));
-    expect_failure(FINDING, L"dll-resolve-design",
-                   L"under the design's token resolving advapi32's SystemFunction036 fails, as it failed msys-2.0.dll",
-                   operation(c->build_one, L"resolve", L"advapi32.dll", L"SystemFunction036"));
-    expect_failure(FINDING, L"dll-load-cryptbase-design", L"under the design's token cryptbase.dll does not load",
-                   operation(c->build_one, L"load", L"cryptbase.dll", NULL));
-    expect_allowed(FINDING, L"dll-load-ucrtbase-design", L"under the design's token ucrtbase.dll loads",
-                   operation(c->build_one, L"load", L"ucrtbase.dll", NULL));
-    for (i = 0; i < sizeof candidates / sizeof candidates[0]; i++) {
-        const WCHAR *label = join(L"candidate-", candidates[i].name, L"-resolve", END);
-        const WCHAR *what = join(L"with ", candidates[i].holds,
-                                 L" restricting too, resolving advapi32's SystemFunction036 succeeds", END);
-        if (candidates[i].token == NULL)
-            verdict(0, FINDING, label, what, L"the candidate token was not made");
-        else
-            expect_allowed(FINDING, label, what,
-                           operation(candidates[i].token, L"resolve", L"advapi32.dll", L"SystemFunction036"));
+    size_t j;
+    for (i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+        if (rows[i].failure != NULL) {
+            verdict(0, FINDING, join(L"why-", rows[i].name, END), join(L"make ", rows[i].holds, END), rows[i].failure);
+            continue;
+        }
+        for (j = 0; j < sizeof steps / sizeof steps[0]; j++) {
+            const WCHAR *label = join(L"why-", rows[i].name, L"-", steps[j].name, END);
+            const WCHAR *what = join(L"under ", rows[i].holds, L", a process ", steps[j].what, END);
+            if (wide_equal(steps[j].op, L"open-directory") && steps[j].first == NULL)
+                verdict(0, FINDING, label, what, L"not tried: the session's directory is unknown");
+            else
+                expect_allowed(FINDING, label, what,
+                               operation_with(rows[i].token, steps[j].flags, steps[j].op, steps[j].first,
+                                              steps[j].second));
+        }
     }
 }
 
-/* The tools under the candidate changes, after check_tools has set the
- * environment a build gets. */
+/* MSYS2's bash under the candidates that add an application package SID. */
 static void check_candidate_tools(const struct context *c)
 {
     const struct candidate candidates[] = {
-        {L"lpac", L"ALL RESTRICTED APPLICATION PACKAGES", c->lpac},
-        {L"app-packages", L"ALL APPLICATION PACKAGES", c->app_packages},
-        {L"users", L"Users", c->users_group},
+        {L"lpac", L"ALL RESTRICTED APPLICATION PACKAGES", c->lpac, c->lpac_failure},
+        {L"app-packages", L"ALL APPLICATION PACKAGES", c->app_packages, c->app_packages_failure},
     };
     size_t i;
-    if (c->all_access != NULL && !wide_equal(c->gcc, L"-")) {
-        const WCHAR *program = join(c->store, L"\\hello-all-access.exe", END);
-        struct run compiled;
-        struct run hello;
-        spawn(c->all_access, join(L"\"", c->gcc, L"\" -o \"", program, L"\" \"", c->build, L"\\hello.c\"", END),
-              c->build, TOOL_MEMORY_CAP, TOOL_TIMEOUT_MS, SPAWN_DETACHED, &compiled);
-        verdict(compiled.start_error == 0 && compiled.exit_code == 0 && exists(program), FINDING,
-                L"candidate-all-access-gcc", L"with its SID given all access in its default DACL, gcc compiles under the token",
-                describe_program(&compiled));
-        if (compiled.exit_code != 0 || compiled.start_error != 0)
-            show_output(L"candidate-all-access-gcc-output", &compiled);
-        if (exists(program)) {
-            spawn(c->all_access, join(L"\"", program, L"\"", END), c->build, CHECK_MEMORY_CAP, CHECK_TIMEOUT_MS,
-                  SPAWN_DETACHED, &hello);
-            verdict(hello.start_error == 0 && hello.exit_code == 0 && starts_with(hello.output, "hello"), FINDING,
-                    L"candidate-all-access-run-output", L"and the program it built, a UCRT program, runs and writes its output",
-                    join(describe_program(&hello), L", output \"", widen(hello.output, hello.output_length), L"\"", END));
-        }
-    }
     if (wide_equal(c->bash, L"-"))
         return;
     for (i = 0; i < sizeof candidates / sizeof candidates[0]; i++) {
@@ -1708,8 +2160,8 @@ static void check_candidate_tools(const struct context *c)
                                  L" restricting too, MSYS2 bash writes a file into the proposed store directory", END);
         const WCHAR *out = join(c->store, L"\\bash-", candidates[i].name, END);
         struct run ran;
-        if (candidates[i].token == NULL) {
-            verdict(0, FINDING, label, what, L"the candidate token was not made");
+        if (candidates[i].failure != NULL) {
+            verdict(0, FINDING, label, what, join(L"the candidate token was not made: ", candidates[i].failure, END));
             continue;
         }
         spawn(candidates[i].token, join(L"\"", c->bash, L"\" -c \"echo ok > '", forward_slashes(out), L"'\"", END),
@@ -1721,16 +2173,17 @@ static void check_candidate_tools(const struct context *c)
     }
 }
 
-/* What each restricting SID set would reach elsewhere on the machine: a
+/* What each candidate token would reach elsewhere on the machine: a
  * candidate that lets a build read system DLLs must not also let it write
  * where every user may. */
 static void check_candidate_exposure(const struct context *c)
 {
     const struct candidate candidates[] = {
-        {L"design", L"S-1-5-12 and the build's SID", c->build_one},
-        {L"lpac", L"ALL RESTRICTED APPLICATION PACKAGES", c->lpac},
-        {L"app-packages", L"ALL APPLICATION PACKAGES", c->app_packages},
-        {L"users", L"Users", c->users_group},
+        {L"design", L"S-1-5-12 and the build's SID restricting", c->build_one, NULL},
+        {L"write-restricted", L"S-1-5-12 and the build's SID restricting writes", c->write_restricted,
+         c->write_restricted == NULL ? L"the token was not made" : NULL},
+        {L"lpac", L"ALL RESTRICTED APPLICATION PACKAGES restricting too", c->lpac, c->lpac_failure},
+        {L"app-packages", L"ALL APPLICATION PACKAGES restricting too", c->app_packages, c->app_packages_failure},
     };
     const struct {
         const WCHAR *name;
@@ -1750,21 +2203,40 @@ static void check_candidate_exposure(const struct context *c)
     size_t i;
     size_t j;
     for (i = 0; i < sizeof candidates / sizeof candidates[0]; i++) {
-        if (candidates[i].token == NULL) {
-            verdict(0, FINDING, join(L"exposure-", candidates[i].name, END), L"make the candidate token", NULL);
+        if (candidates[i].failure != NULL) {
+            verdict(0, FINDING, join(L"exposure-", candidates[i].name, END), L"make the candidate token",
+                    candidates[i].failure);
             continue;
         }
         for (j = 0; j < sizeof places / sizeof places[0]; j++)
             if (places[j].path != NULL)
                 expect_denied(FINDING, join(L"exposure-", candidates[i].name, L"-", places[j].name, END),
-                              join(L"with ", candidates[i].holds, L" restricting, a build cannot ", places[j].what, END),
+                              join(L"with ", candidates[i].holds, L", a build cannot ", places[j].what, END),
                               operation(candidates[i].token, L"open", places[j].path, places[j].access));
         if (c->system_root != NULL && i > 0)
             expect_allowed(FINDING, join(L"exposure-", candidates[i].name, L"-system-read", END),
-                           join(L"with ", candidates[i].holds, L" restricting, a build reads kernel32.dll as a file", END),
+                           join(L"with ", candidates[i].holds, L", a build reads kernel32.dll as a file", END),
                            operation(candidates[i].token, L"open", join(c->system_root, L"\\System32\\kernel32.dll", END),
                                      ACCESS_READ));
     }
+}
+
+/* What a build can read of the user's own: a file whose DACL grants the
+ * user alone, a file in the user's profile, and the user's registry
+ * hive.  Another build's outputs are check 6's to read. */
+static void check_read_exposure(const struct context *c)
+{
+    expect_denied(FINDING, L"read-user-only-file", L"a build cannot read a file whose DACL grants the user alone",
+                  operation(c->build_one, L"open", join(c->outside, L"\\sentinel", END), ACCESS_READ));
+    if (c->profile_file == NULL)
+        verdict(0, FINDING, L"read-profile-file", L"a build cannot read a file in the user's profile",
+                L"not tried: no file there the user can read was found");
+    else
+        expect_denied(FINDING, L"read-profile-file",
+                      join(L"a build cannot read a file in the user's profile, ", c->profile_file, END),
+                      operation(c->build_one, L"open", c->profile_file, ACCESS_READ));
+    expect_denied(FINDING, L"read-user-hive", L"a build cannot read the user's registry hive",
+                  operation(c->build_one, L"open-key", user_hive(c), NULL));
 }
 
 /* 10. */
@@ -1924,6 +2396,102 @@ static HANDLE standard_token(HANDLE base, PSID administrators, PSID user, const 
     return token;
 }
 
+/* How deep below the user's profile the search for a readable file goes. */
+#define PROFILE_SEARCH_DEPTH 3
+
+/* A regular file at most DEPTH directories below DIRECTORY that this
+ * process can read, junctions and links passed over, or NULL. */
+static WCHAR *readable_file_below(const WCHAR *directory, int depth)
+{
+    WIN32_FIND_DATAW found;
+    HANDLE search = FindFirstFileW(join(directory, L"\\*", END), &found);
+    WCHAR *answer = NULL;
+    if (search == INVALID_HANDLE_VALUE)
+        return NULL;
+    do {
+        WCHAR *path;
+        if (wide_equal(found.cFileName, L".") || wide_equal(found.cFileName, L"..")
+            || (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+            continue;
+        path = join(directory, L"\\", found.cFileName, END);
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (depth > 0)
+                answer = readable_file_below(path, depth - 1);
+        } else if (read_start(path) != NULL) {
+            answer = path;
+        }
+    } while (answer == NULL && FindNextFileW(search, &found));
+    FindClose(search);
+    return answer;
+}
+
+/* The layout's paths under ROOT. */
+static void place(struct context *c, const WCHAR *root)
+{
+    c->store = join(root, L"\\store", END);
+    c->nogrant = join(root, L"\\nogrant", END);
+    c->inherit = join(root, L"\\inherit", END);
+    c->valid = join(root, L"\\valid", END);
+    c->valid_directory = join(c->valid, L"\\d", END);
+    c->own = join(root, L"\\own", END);
+    c->ownow = join(root, L"\\ownow", END);
+    c->outside = join(root, L"\\outside", END);
+    c->build = join(root, L"\\build", END);
+    c->b1_out = join(c->store, L"\\b1-out", END);
+}
+
+/* A candidate token, made as SHAPE says for the build BUILD names, or
+ * NULL with why it was not in FAILURE, which is also reported under
+ * LABEL. */
+static HANDLE candidate_token(HANDLE base, PSID user, const WCHAR *user_text, PSID build, const WCHAR *build_text,
+                              const struct token_shape *shape, const WCHAR *label, const WCHAR **failure)
+{
+    DWORD error;
+    HANDLE token = build_token(base, user, user_text, build, build_text, shape, &error);
+    *failure = NULL;
+    if (token == NULL) {
+        *failure = token_failure(error);
+        info(label, *failure);
+    }
+    return token;
+}
+
+/* The design's checks again under write-restricted tokens, in a layout of
+ * their own under ROOT: what such a token allows of what the design
+ * refuses, and what it reads that the design's token cannot. */
+static void write_restricted_pass(const struct context *c, const WCHAR *root)
+{
+    struct context w = *c;
+    const WCHAR *pass_root = join(root, L"\\write-restricted", END);
+    begin_candidate_pass(L"wr-");
+    info(L"pass", L"the design's checks under write-restricted tokens, in a layout of their own; every line a finding");
+    if (c->write_restricted == NULL || c->write_restricted_two == NULL) {
+        verdict(0, FINDING, L"setup-tokens", L"make the write-restricted tokens", NULL);
+        end_candidate_pass();
+        return;
+    }
+    if (!CreateDirectoryW(pass_root, NULL)) {
+        verdict(0, FINDING, L"setup-root", join(L"make ", pass_root, END), error_text(GetLastError()));
+        end_candidate_pass();
+        return;
+    }
+    w.build_one = c->write_restricted;
+    w.build_two = c->write_restricted_two;
+    place(&w, pass_root);
+    if (lay_out(&w)) {
+        check_pipe(&w);
+        check_owner(&w);
+        check_store(&w);
+        check_valid_path(&w);
+        check_isolation(&w);
+        check_jobs(&w);
+        check_tools(&w);
+        check_user_directories(&w);
+        check_read_exposure(&w);
+    }
+    end_candidate_pass();
+}
+
 static void checks(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc)
 {
     struct context c;
@@ -1933,6 +2501,8 @@ static void checks(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc)
     PSID build_two_sid = NULL;
     PSID administrators = NULL;
     DWORD error;
+    DWORD session = 0;
+    DWORD session_error = 0;
     DWORD seed = GetTickCount() ^ GetCurrentProcessId();
     WCHAR *b2;
 
@@ -1946,6 +2516,13 @@ static void checks(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc)
     c.system_drive = environment(L"SystemDrive");
     c.program_data = environment(L"ProgramData");
     c.public_directory = environment(L"PUBLIC");
+    c.tools = parent_directory(child_directory);
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &session))
+        session_error = GetLastError();
+    else
+        c.session_objects = session == 0 ? GLOBAL_OBJECTS
+                                         : join(L"\\Sessions\\", number(session, 0), L"\\BaseNamedObjects", END);
+    c.profile_file = c.user_profile != NULL ? readable_file_below(c.user_profile, PROFILE_SEARCH_DEPTH) : NULL;
 
     if (!OpenProcessToken(GetCurrentProcess(), BASE_TOKEN_ACCESS, &base)) {
         verdict(0, REQUIRED, L"setup-token", L"open this process's token", error_text(GetLastError()));
@@ -1961,6 +2538,10 @@ static void checks(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc)
     info(L"context-paths", join(L"TEMP=", c.user_temp ? c.user_temp : L"?", L" USERPROFILE=",
                                 c.user_profile ? c.user_profile : L"?", L" APPDATA=",
                                 c.user_appdata ? c.user_appdata : L"?", END));
+    info(L"context-session", session_error != 0
+                                 ? join(L"unknown, ", error_text(session_error), END)
+                                 : join(number(session, 0), L", its named objects in ", c.session_objects, END));
+    info(L"context-profile-file", c.profile_file != NULL ? c.profile_file : L"none found");
 
     c.b1 = join(L"S-1-9-", number(seed, 0), L"-", number(GetCurrentProcessId(), 0), L"-1", END);
     b2 = join(L"S-1-9-", number(seed, 0), L"-", number(GetCurrentProcessId(), 0), L"-2", END);
@@ -1975,64 +2556,49 @@ static void checks(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc)
     }
     c.build_one = build_token(base, user_sid, c.user, build_one_sid, c.b1, &design_shape, &error);
     if (c.build_one == NULL) {
-        verdict(0, REQUIRED, L"setup-token-build-one", L"make the first build's token", error_text(error));
+        verdict(0, REQUIRED, L"setup-token-build-one", L"make the first build's token", token_failure(error));
         goto cleanup;
     }
     c.build_two = build_token(base, user_sid, c.user, build_two_sid, b2, &design_shape, &error);
     if (c.build_two == NULL) {
-        verdict(0, REQUIRED, L"setup-token-build-two", L"make the second build's token", error_text(error));
+        verdict(0, REQUIRED, L"setup-token-build-two", L"make the second build's token", token_failure(error));
         goto cleanup;
     }
     c.build_bare = build_token(base, user_sid, c.user, build_one_sid, c.b1, &bare_shape, &error);
     if (c.build_bare == NULL) {
         verdict(0, REQUIRED, L"setup-token-build-bare", L"make the first build's token without its object grant",
-                error_text(error));
+                token_failure(error));
         goto cleanup;
     }
-    /* The candidate changes, each to the first build's token.  One that
-     * cannot be made is reported, and its comparisons say so. */
-    c.all_access = build_token(base, user_sid, c.user, build_one_sid, c.b1, &all_access_shape, &error);
-    if (c.all_access == NULL)
-        info(L"candidate-all-access-token", error_text(error));
-    c.lpac = build_token(base, user_sid, c.user, build_one_sid, c.b1, &lpac_shape, &error);
-    if (c.lpac == NULL)
-        info(L"candidate-lpac-token", error_text(error));
-    c.app_packages = build_token(base, user_sid, c.user, build_one_sid, c.b1, &app_packages_shape, &error);
-    if (c.app_packages == NULL)
-        info(L"candidate-app-packages-token", error_text(error));
-    c.users_group = build_token(base, user_sid, c.user, build_one_sid, c.b1, &users_shape, &error);
-    if (c.users_group == NULL)
-        info(L"candidate-users-token", error_text(error));
+    /* The candidate tokens.  One that cannot be made is reported, with
+     * the step that failed, and its comparisons say so. */
+    {
+        const WCHAR *failure;
+        c.restricted_code_only = candidate_token(base, user_sid, c.user, NULL, RESTRICTED_SID, &design_shape,
+                                                 L"candidate-restricted-code-token", &failure);
+        c.token_grant = candidate_token(base, user_sid, c.user, build_one_sid, c.b1, &token_grant_shape,
+                                        L"candidate-token-grant-token", &failure);
+        c.write_restricted = candidate_token(base, user_sid, c.user, build_one_sid, c.b1, &write_restricted_shape,
+                                             L"candidate-write-restricted-token", &failure);
+        c.write_restricted_two = candidate_token(base, user_sid, c.user, build_two_sid, b2, &write_restricted_shape,
+                                                 L"candidate-write-restricted-two-token", &failure);
+        c.lpac = candidate_token(base, user_sid, c.user, build_one_sid, c.b1, &lpac_shape, L"candidate-lpac-token",
+                                 &c.lpac_failure);
+        c.app_packages = candidate_token(base, user_sid, c.user, build_one_sid, c.b1, &app_packages_shape,
+                                         L"candidate-app-packages-token", &c.app_packages_failure);
+    }
     c.standard = standard_token(base, administrators, user_sid, c.user, &error);
     if (c.standard == NULL)
         info(L"context-standard-user", join(L"no stand-in token, ", error_text(error), END));
     info(L"token-build-object", object_sddl(c.build_one));
     info(L"token-build-bare-object", object_sddl(c.build_bare));
+    if (c.write_restricted != NULL)
+        info(L"token-write-restricted-object", object_sddl(c.write_restricted));
     if (c.standard != NULL)
         info(L"token-standard-object", object_sddl(c.standard));
+    describe_objects(&c);
 
-    {
-        /* The directory holding the probe, whose parent holds the tools. */
-        WCHAR *tools = join(child_directory, END);
-        WCHAR *last = NULL;
-        WCHAR *at;
-        for (at = tools; *at != 0; at++)
-            if (*at == L'\\')
-                last = at;
-        if (last != NULL)
-            *last = 0;
-        c.tools = tools;
-    }
-    c.store = join(root, L"\\store", END);
-    c.nogrant = join(root, L"\\nogrant", END);
-    c.inherit = join(root, L"\\inherit", END);
-    c.valid = join(root, L"\\valid", END);
-    c.valid_directory = join(c.valid, L"\\d", END);
-    c.own = join(root, L"\\own", END);
-    c.ownow = join(root, L"\\ownow", END);
-    c.outside = join(root, L"\\outside", END);
-    c.build = join(root, L"\\build", END);
-    c.b1_out = join(c.store, L"\\b1-out", END);
+    place(&c, root);
     if (!lay_out(&c))
         goto cleanup;
 
@@ -2046,31 +2612,25 @@ static void checks(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc)
     check_hostile_entry(&c);
     check_junction(&c);
     check_jobs(&c);
-    check_process_creation(&c);
-    check_dll_loading(&c);
+    check_spawning(&c);
     check_tools(&c);
     check_candidate_tools(&c);
     check_user_directories(&c);
     check_candidate_exposure(&c);
+    check_read_exposure(&c);
     check_standard_user(&c);
+    write_restricted_pass(&c, root);
 
 cleanup:
-    if (c.standard != NULL)
-        CloseHandle(c.standard);
-    if (c.users_group != NULL)
-        CloseHandle(c.users_group);
-    if (c.app_packages != NULL)
-        CloseHandle(c.app_packages);
-    if (c.lpac != NULL)
-        CloseHandle(c.lpac);
-    if (c.all_access != NULL)
-        CloseHandle(c.all_access);
-    if (c.build_bare != NULL)
-        CloseHandle(c.build_bare);
-    if (c.build_two != NULL)
-        CloseHandle(c.build_two);
-    if (c.build_one != NULL)
-        CloseHandle(c.build_one);
+    {
+        HANDLE tokens[] = {c.standard,   c.app_packages,         c.lpac,        c.write_restricted_two,
+                           c.write_restricted, c.token_grant, c.restricted_code_only, c.build_bare,
+                           c.build_two,  c.build_one};
+        size_t i;
+        for (i = 0; i < sizeof tokens / sizeof tokens[0]; i++)
+            if (tokens[i] != NULL)
+                CloseHandle(tokens[i]);
+    }
     if (administrators != NULL)
         LocalFree(administrators);
     if (build_two_sid != NULL)
@@ -2130,7 +2690,7 @@ static DWORD hold(void)
     }
     token = build_token(base, user, user_text, build, HOLD_BUILD_SID, &design_shape, &error);
     if (token == NULL) {
-        status = STEP_FAILED(2, error);
+        status = STEP_FAILED(2, ERROR_OF(error));
         goto done;
     }
     job = CreateJobObjectW(NULL, NULL);
@@ -2450,6 +3010,77 @@ static DWORD run(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc)
     return checks_failures + required_failures;
 }
 
+/* The build SID the trace command's token is made with. */
+#define TRACE_BUILD_SID L"S-1-9-1-4"
+
+/* Run one thing under a token made as the design makes a build's, for the
+ * workflow's trace of what the token is refused, and say how it ended.
+ * STEP is control, a child reading kernel32.dll as a file, which the
+ * token is refused, so that the trace shows it records a refusal;
+ * spawn-probe or spawn-cmd, a child starting the probe or cmd.exe with
+ * CreateProcessW; or bash or gcc, MSYS2's bash running "exit 0" or gcc
+ * preprocessing an empty file, which starts cc1.exe.  Answers 0 when the
+ * thing was run, whatever came of it. */
+static DWORD trace(const WCHAR *step, const WCHAR *bash, const WCHAR *gcc)
+{
+    HANDLE base = NULL;
+    HANDLE token = NULL;
+    PSID user = NULL;
+    PSID build = NULL;
+    WCHAR *user_text = NULL;
+    WCHAR *command = NULL;
+    BOOL in_job = FALSE;
+    DWORD error;
+    DWORD status = 0;
+    int ours = 0;
+    struct run ran;
+    if (wide_equal(step, L"control")) {
+        WCHAR *system = take(MAX_PATH * sizeof(WCHAR));
+        if (GetSystemDirectoryW(system, MAX_PATH) != 0)
+            command = join(L"\"", self_path, L"\" child open \"", system, L"\\kernel32.dll\" ", ACCESS_READ, END);
+        ours = 1;
+    } else if (wide_equal(step, L"spawn-probe") || wide_equal(step, L"spawn-cmd")) {
+        command = join(L"\"", self_path, L"\" child spawn ", wide_equal(step, L"spawn-cmd") ? L"cmd" : L"probe", L" ",
+                       FLAGS_DETACHED, END);
+        ours = 1;
+    } else if (wide_equal(step, L"bash") && !wide_equal(bash, L"-")) {
+        command = join(L"\"", bash, L"\" -c \"exit 0\"", END);
+    } else if (wide_equal(step, L"gcc") && !wide_equal(gcc, L"-")) {
+        command = join(L"\"", gcc, L"\" -E -x c NUL", END);
+    }
+    if (command == NULL) {
+        say(join(L"TRACE ", step, L": nothing to run", END));
+        return EXIT_USAGE;
+    }
+    if (!OpenProcessToken(GetCurrentProcess(), BASE_TOKEN_ACCESS, &base) || (user = own_user(base, &user_text)) == NULL
+        || (build = sid_of(TRACE_BUILD_SID)) == NULL) {
+        say(join(L"TRACE ", step, L": no token, ", error_text(GetLastError()), END));
+        status = 1;
+        goto done;
+    }
+    token = build_token(base, user, user_text, build, TRACE_BUILD_SID, &design_shape, &error);
+    if (token == NULL) {
+        say(join(L"TRACE ", step, L": no token, ", token_failure(error), END));
+        status = 1;
+        goto done;
+    }
+    IsProcessInJob(GetCurrentProcess(), NULL, &in_job);
+    set_tool_path(parent_directory(child_directory), environment(L"SystemRoot"));
+    spawn(token, command, child_directory, TOOL_MEMORY_CAP, TOOL_TIMEOUT_MS, SPAWN_DETACHED, &ran);
+    say(join(L"TRACE ", step, L": ", ours ? describe(&ran) : describe_program(&ran), L", wrote \"",
+             widen(ran.output, ran.output_length), L"\"; the trace ran ", in_job ? L"in a job" : L"in no job", END));
+done:
+    if (token != NULL)
+        CloseHandle(token);
+    if (base != NULL)
+        CloseHandle(base);
+    if (user != NULL)
+        LocalFree(user);
+    if (build != NULL)
+        LocalFree(build);
+    return status;
+}
+
 /* ------------------------------------------------------------------------
  * The entry point
  * ------------------------------------------------------------------------ */
@@ -2487,9 +3118,6 @@ static WCHAR **split_arguments(const WCHAR *line, int *count)
     return arguments;
 }
 
-/* The exit status of a command line the probe does not know. */
-#define EXIT_USAGE 249
-
 void probe_entry(void)
 {
     int count;
@@ -2500,19 +3128,9 @@ void probe_entry(void)
         ExitProcess(EXIT_NO_MEMORY);
     arguments = split_arguments(GetCommandLineW(), &count);
     self_path = own_path();
-    {
-        /* Children start in the directory holding the probe, which the
-         * restricting SID may read. */
-        WCHAR *directory = join(self_path, END);
-        WCHAR *last = NULL;
-        WCHAR *at;
-        for (at = directory; *at != 0; at++)
-            if (*at == L'\\')
-                last = at;
-        if (last != NULL)
-            *last = 0;
-        child_directory = directory;
-    }
+    /* Children start in the directory holding the probe, which the
+     * restricting SID may read. */
+    child_directory = parent_directory(self_path);
     if (count >= 2 && wide_equal(arguments[1], L"child"))
         finish(child(count, arguments));
     if (count >= 2 && wide_equal(arguments[1], L"hold"))
@@ -2521,12 +3139,14 @@ void probe_entry(void)
         outer_job = (HANDLE)(ULONG_PTR)parse_number(arguments[5]);
         checks(arguments[2], arguments[3], arguments[4]);
         status = required_failures;
-        say(join(L"CHECKS required failures: ", number(required_failures, 0),
-                 L", findings that differed from what the design expects: ", number(findings_unexpected, 0), END));
+        say(join(L"CHECKS required failures: ", number(required_failures, 0), L", findings whose claim did not hold: ",
+                 number(findings_failed, 0), END));
         finish(status);
     }
     if (count >= 5 && wide_equal(arguments[1], L"run"))
         finish(run(arguments[2], arguments[3], arguments[4]));
-    say(join(L"usage: probe run ROOT BASH GCC", END));
+    if (count >= 5 && wide_equal(arguments[1], L"trace"))
+        finish(trace(arguments[2], arguments[3], arguments[4]));
+    say(join(L"usage: probe run ROOT BASH GCC, or probe trace STEP BASH GCC", END));
     finish(EXIT_USAGE);
 }

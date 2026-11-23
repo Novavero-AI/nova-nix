@@ -6,8 +6,9 @@ name: Windows sandbox probe
 # store DACL the design proposes, and nested job objects.  It builds
 # probe/windows-sandbox.c with GHC's own C compiler, the one that builds
 # the shipped helper, and prints one PASS or FAIL line per check.  The job
-# fails when a check the design depends on fails.  Everything the probe
-# makes is under the runner's temporary directory.
+# fails when a check the design depends on fails.  Every file the probe
+# makes is under the runner's temporary directory, and the trace step
+# turns failure auditing on for its own steps alone.
 
 on:
   push:
@@ -147,6 +148,77 @@ jobs:
           }
           "PROBE_BASH=$bash" >> $env:GITHUB_ENV
           "PROBE_GCC=$gcc" >> $env:GITHUB_ENV
+          $global:LASTEXITCODE = 0
+
+      # Each trace step runs one thing under a build's token while failure
+      # auditing covers every file and registry key, so the Security log
+      # names each object a restricted token of the runner's user was
+      # refused, and the process refused it: event 4656 with a
+      # RestrictedSidCount above 0.  Other kernel objects (tokens,
+      # processes, object directories) are not covered.  The control step
+      # is a file refusal the probe already knows of, so an empty trace of
+      # another step means no file was refused rather than nothing was
+      # recorded; no step controls for keys.  The trace informs: it never
+      # fails the job, and the auditing it turns on is turned off after it.
+      - name: Trace what a restricted build is refused
+        continue-on-error: true
+        run: |
+          $probe = Join-Path $env:PROBE_ROOT 'tools\bin\probe.exe'
+          # The File System and Registry audit subcategories.
+          $subcategories = '{0CCE921D-69AE-11D9-BED3-505054503030}', '{0CCE921E-69AE-11D9-BED3-505054503030}'
+          $types = 'File', 'Key'
+          $auditing = $true
+          foreach ($subcategory in $subcategories) {
+            auditpol /set "/subcategory:$subcategory" /failure:enable
+            if ($LASTEXITCODE -ne 0) { $auditing = $false }
+          }
+          foreach ($type in $types) {
+            auditpol /resourceSACL /set "/type:$type" /user:Everyone /failure /access:GA
+            if ($LASTEXITCODE -ne 0) { $auditing = $false }
+          }
+          if (-not $auditing) { '::warning::failure auditing could not be turned on, so the trace shows outcomes alone' }
+          try {
+            $starts = foreach ($step in 'control', 'spawn-probe', 'spawn-cmd', 'bash', 'gcc') {
+              [pscustomobject]@{ Step = $step; Start = (Get-Date) }
+              & $probe trace $step $env:PROBE_BASH $env:PROBE_GCC | Out-Host
+            }
+          } finally {
+            foreach ($type in $types) { auditpol /resourceSACL /clear "/type:$type" | Out-Host }
+            foreach ($subcategory in $subcategories) { auditpol /set "/subcategory:$subcategory" /failure:disable | Out-Host }
+          }
+          if ($auditing) {
+            # Audit Failure, the keyword a refused request is logged with.
+            $failure = 0x10000000000000
+            $filter = @{ LogName = 'Security'; Id = 4656; Keywords = $failure; StartTime = $starts[0].Start }
+            $events = @()
+            try {
+              $events = @(Get-WinEvent -FilterHashtable $filter -ErrorAction Stop)
+            } catch {
+              if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') {
+                "::warning::the Security log could not be read: $_"
+              }
+            }
+            # The build tokens carry the runner's user; restricted service
+            # tokens on the machine carry their service accounts.
+            $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            # A step's records run until the next step starts, so a record
+            # written late still falls to the step that caused it.
+            for ($i = 0; $i -lt $starts.Count; $i++) {
+              $from = $starts[$i].Start
+              $until = if ($i + 1 -lt $starts.Count) { $starts[$i + 1].Start } else { [datetime]::MaxValue }
+              "refused under the build's token during $($starts[$i].Step):"
+              $during = $events | Where-Object { $_.TimeCreated -ge $from -and $_.TimeCreated -lt $until }
+              $refused = @($during | ForEach-Object {
+                $data = @{}
+                foreach ($field in ([xml]$_.ToXml()).Event.EventData.Data) { $data[$field.Name] = $field.'#text' }
+                if ([int]$data['RestrictedSidCount'] -gt 0 -and $data['SubjectUserSid'] -eq $user) {
+                  $process = [System.IO.Path]::GetFileName([string]$data['ProcessName'])
+                  '  {0}: {1} {2}, access {3}' -f $process, $data['ObjectType'], $data['ObjectName'], $data['AccessMask']
+                }
+              } | Select-Object -Unique)
+              if ($refused.Count -eq 0) { '  nothing recorded' } else { $refused }
+            }
+          }
           $global:LASTEXITCODE = 0
 
       - name: Run the probe
