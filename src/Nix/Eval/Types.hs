@@ -1702,13 +1702,14 @@ class (MonadCData m) => MonadEval m where
   -- otherwise read it on whatever drive that program has current.
   qualifyPath :: Text -> m Text
 
--- | Unwrap a store-path construction result (the @makeStorePath@ family
--- in "Nix.Hash"), raising a refused name as upstream's @BadStorePath@
+-- | Unwrap the result of a construction that makes a store path (the
+-- @makeStorePath@ family in "Nix.Hash", and the @.drv@ files of
+-- "Nix.Derivation"), raising a refused name as upstream's @BadStorePath@
 -- text.  The message names the path and not the builtin, as upstream's
 -- does: upstream names the builtin in its trace.  Every eval-side path
 -- construction goes through this, so a refused name is an eval error
 -- before anything is written.
-storePathOrThrow :: (MonadEval m) => Either BadStorePath StorePath -> m StorePath
+storePathOrThrow :: (MonadEval m) => Either BadStorePath a -> m a
 storePathOrThrow = either (throwEvalError . badStorePathText) pure
 
 -- | Error raised during pure evaluation.  'PThrow' (@builtins.throw@, a

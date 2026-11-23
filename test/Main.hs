@@ -77,7 +77,7 @@ import qualified Nix.Cli.Reference as Ref
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import qualified Nix.DependencyGraph as DepGraph
-import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, extraPlatforms, fromATerm, platformToText, textToPlatform, toATerm, toATermForHash)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), DrvFile, Platform (..), currentPlatform, drvFileATerm, drvFileDerivation, drvFilePath, extraPlatforms, fromATerm, inputAddressed, platformToText, textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
 import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, checkGitRef, checkGitRev, checkGitUrl, currentSystemStr, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evalParsed, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, listedBuiltins, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
@@ -25151,6 +25151,263 @@ testFromATerm = do
     ]
 
 -- ---------------------------------------------------------------------------
+-- Tests: input-addressed derivations
+-- ---------------------------------------------------------------------------
+
+-- | 'inputAddressed' over derivations whose paths upstream computed, as the
+-- evaluator tests pin them: @a@ and the @b@ chains are nix-instantiate
+-- 2.24.9's ('selfHoldingPrintedStrict', 'testDeepContextClosureIO'), @sa@
+-- is 2.33.2's ('testStructuredAttrs').  Then its laws over generated
+-- derivations, and what derivationStrict records held to them.
+testInputAddressed :: IO [Bool]
+testInputAddressed = do
+  putStrLn "derivation/input-addressed"
+  storeDir <- evalNixIOStoreDir
+  sequence
+    [ runTest "a derivation gets upstream's drvPath and output path"
+        $ assertRight "a" aFile
+        $ assertEqual "a" ("/nix/store/l9ldjc53ry43x24hvq73jx7dx0489mhj-a.drv", [("out", "/nix/store/0pd4llb3k36fnppfxwp6nlwsxwlv0y2c-a")]) . drvFilePathTexts,
+      runTest "every output gets upstream's path, and the variable of its name holds it" $
+        assertRight "sa" (inputAddressed "sa" [] structured) $ \file ->
+          assertEqual "sa-outputs" saOutputs (snd (drvFilePathTexts file))
+            `andThen` assertEqual "sa-env" (Map.fromList (("__json", saJson) : [(output, TE.encodeUtf8 path) | (output, path) <- saOutputs])) (drvEnv (drvFileDerivation file)),
+      runTest "an input derivation's modulo hash stands in for its path" $
+        assertRight "a" aFile $ \a ->
+          assertRight "b" (inputAddressed "b" [(moduloHex [] a, ["out"])] (overDrvPath "b" a [a])) $
+            assertEqual "b" "/nix/store/r3pz4ykyxg5s9f08fafcksw6bxfds40r-b.drv" . fst . drvFilePathTexts,
+      runTest "each input of a chain stands in by its own modulo hash" $
+        assertRight "a" aFile $ \a ->
+          let aHash = (moduloHex [] a, ["out"])
+              m = (plainDerivation "m" [("dep", outPathBytes a)]) {drvInputDrvs = Map.singleton (drvFilePath a) ["out"]}
+           in assertRight "m" (inputAddressed "m" [aHash] m) $ \mFile ->
+                assertRight "b" (inputAddressed "b" [aHash, (moduloHex [aHash] mFile, ["out"])] (overDrvPath "b" mFile [a, mFile])) $
+                  assertEqual "b" "/nix/store/00pfjcd57v5dd5j4w4zmsp3s8lcpv6wg-b.drv" . fst . drvFilePathTexts,
+      runTestM "only the outputs and their variables change, each variable holding its output's path" $
+        quickCheckPasses $
+          QC.forAll genFillCase $ \(FillCase name inputHashes drv) ->
+            case inputAddressed name inputHashes drv of
+              Left err -> QC.counterexample (show err) False
+              Right file ->
+                let filled = drvFileDerivation file
+                    withoutOutputs d = d {drvOutputs = [], drvEnv = foldr (Map.delete . doName) (drvEnv d) (drvOutputs drv)}
+                 in ( withoutOutputs filled,
+                      map doName (drvOutputs filled),
+                      [(Map.lookup (doName output) (drvEnv filled), doHashAlgo output, doHash output) | output <- drvOutputs filled],
+                      drvFileATerm file,
+                      spName (drvFilePath file)
+                    )
+                      QC.=== ( withoutOutputs drv,
+                               sort (map doName (drvOutputs drv)),
+                               [(Just (TE.encodeUtf8 (storePathToText defaultStoreDir (doPath output))), "", "") | output <- drvOutputs filled],
+                               toATerm filled,
+                               name <> ".drv"
+                             ),
+      runTestM "the file does not depend on what the outputs and their variables held" $
+        quickCheckPasses $
+          QC.forAll genFillCase $ \(FillCase name inputHashes drv) ->
+            QC.forAll (genHolding drv) $ \holding ->
+              let file = inputAddressed name inputHashes drv
+               in (inputAddressed name inputHashes holding, inputAddressed name inputHashes . drvFileDerivation =<< file) QC.=== (file, file),
+      runTestM "what derivationStrict records is filled in already, at the paths it returns" $
+        quickCheckPasses (QC.forAll genStrictCase (QC.ioProperty . strictCaseAgrees storeDir))
+    ]
+  where
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    aFile = inputAddressed "a" [] (plainDerivation "a" [])
+    -- The modulo hash a dependent substitutes for a filled-in derivation:
+    -- upstream's hashDerivationModulo, unmasked, over its own inputs' hashes.
+    moduloHex inputHashes file = Hash.bytesToHexText (sha256Digest (toATermForHash False (Just inputHashes) (drvFileDerivation file)))
+    -- @x = "${dep.drvPath}";@: the .drv closure in inputSrcs, and each .drv
+    -- in it among the inputs with every output, here @out@ alone.
+    overDrvPath name dep closure =
+      (plainDerivation name [("x", TE.encodeUtf8 (fst (drvFilePathTexts dep)))])
+        { drvInputDrvs = Map.fromList [(drvFilePath file, ["out"]) | file <- closure],
+          drvInputSrcs = map drvFilePath closure
+        }
+    structured =
+      Derivation
+        { drvOutputs = map pendingOutput ["out", "dev", "lib"],
+          drvInputDrvs = Map.empty,
+          drvInputSrcs = [],
+          drvPlatform = X86_64_Linux,
+          drvBuilder = "/bin/sh",
+          drvArgs = [],
+          drvEnv = Map.singleton "__json" saJson
+        }
+    saJson = "{\"builder\":\"/bin/sh\",\"name\":\"sa\",\"outputs\":[\"out\",\"dev\",\"lib\"],\"system\":\"x86_64-linux\"}"
+    saOutputs =
+      [ ("dev", "/nix/store/jfnikb9k7953srg5mlp3mccmqaijvxyy-sa-dev"),
+        ("lib", "/nix/store/zpjd7d2l5jqzynv3377a36nk6rzb5il4-sa-lib"),
+        ("out", "/nix/store/bs6ppbphi38qlbjfz67pfk86sx7l4vks-sa")
+      ]
+
+-- | A file's drvPath, and each output's name and path, as text.
+drvFilePathTexts :: DrvFile -> (Text, [(Text, Text)])
+drvFilePathTexts file =
+  ( storePathToText defaultStoreDir (drvFilePath file),
+    [(doName output, storePathToText defaultStoreDir (doPath output)) | output <- drvOutputs (drvFileDerivation file)]
+  )
+
+-- | The path of a file's @out@, as an environment value holds it.
+outPathBytes :: DrvFile -> BS.ByteString
+outPathBytes file = TE.encodeUtf8 (fromMaybe "" (lookup "out" (snd (drvFilePathTexts file))))
+
+-- | An output carrying only its name, as derivationStrict hands one to
+-- 'inputAddressed'.
+pendingOutput :: Text -> DerivationOutput
+pendingOutput name = DerivationOutput name (StorePath "" "") "" ""
+
+-- | @derivation { name = <name>; system = "x"; builder = "/bin/sh"; }@
+-- with more variables, as derivationStrict hands it to 'inputAddressed':
+-- no inputs, and its @out@ pending.
+plainDerivation :: Text -> [(Text, BS.ByteString)] -> Derivation
+plainDerivation name variables =
+  Derivation
+    { drvOutputs = [pendingOutput "out"],
+      drvInputDrvs = Map.empty,
+      drvInputSrcs = [],
+      drvPlatform = OtherPlatform "x",
+      drvBuilder = "/bin/sh",
+      drvArgs = [],
+      drvEnv = Map.fromList ([("builder", "/bin/sh"), ("name", TE.encodeUtf8 name), ("system", "x")] <> variables)
+    }
+
+-- | A derivation for 'inputAddressed''s laws with the name and input hashes
+-- it is filled in with: outputs and their variables holding anything,
+-- inputs the hashes need not match, and any bytes in its fields.
+data FillCase = FillCase !Text ![(Text, [Text])] !Derivation
+  deriving (Show)
+
+genFillCase :: QC.Gen FillCase
+genFillCase = do
+  name <- genDrvName
+  outputs <- genOutputNames >>= traverse genHeldOutput
+  inputDrvs <- Map.fromList <$> QC.resize 3 (QC.listOf ((,) <$> genFixturePath ".drv" <*> genOutputNames))
+  inputSrcs <- QC.resize 3 (QC.listOf (genFixturePath ""))
+  platform <- QC.elements [X86_64_Linux, Aarch64_Darwin, OtherPlatform "x"]
+  builder <- genFieldBytes
+  args <- QC.resize 3 (QC.listOf genFieldBytes)
+  env <- Map.fromList <$> QC.resize 6 (QC.listOf ((,) <$> QC.elements (["name", "system", "builder", "src", "__json"] <> outputPool) <*> genFieldBytes))
+  inputHashes <- QC.resize 3 (QC.listOf ((,) <$> genTextOf 64 "0123456789abcdef" <*> genOutputNames))
+  pure
+    ( FillCase
+        name
+        inputHashes
+        Derivation
+          { drvOutputs = outputs,
+            drvInputDrvs = inputDrvs,
+            drvInputSrcs = inputSrcs,
+            drvPlatform = platform,
+            drvBuilder = builder,
+            drvArgs = args,
+            drvEnv = env
+          }
+    )
+
+-- | A derivation with each output, and the variable of its name, holding
+-- something else.
+genHolding :: Derivation -> QC.Gen Derivation
+genHolding drv = do
+  outputs <- traverse (genHeldOutput . doName) (drvOutputs drv)
+  held <- traverse (const genFieldBytes) outputs
+  pure drv {drvOutputs = outputs, drvEnv = foldr (uncurry Map.insert) (drvEnv drv) (zip (map doName outputs) held)}
+
+-- | An output holding a path and hash fields of any kind.
+genHeldOutput :: Text -> QC.Gen DerivationOutput
+genHeldOutput name =
+  DerivationOutput name
+    <$> genFixturePath ""
+    <*> QC.elements ["", "sha256", "r:sha256"]
+    <*> QC.elements ["", "0123456789abcdef", "impure"]
+
+-- | A derivation name the store accepts, short enough that every output's
+-- composed name is accepted too.
+genDrvName :: QC.Gen Text
+genDrvName = T.pack <$> ((:) <$> QC.elements nameStart <*> QC.resize 15 (QC.listOf (QC.elements (nameStart <> "+-._?="))))
+  where
+    nameStart = ['a' .. 'z'] <> ['A' .. 'Z'] <> ['0' .. '9']
+
+-- | Output names, at least one and none twice, in any order.
+genOutputNames :: QC.Gen [Text]
+genOutputNames = QC.sublistOf outputPool `QC.suchThat` (not . null) >>= QC.shuffle
+
+-- | The output names the generators draw on.
+outputPool :: [Text]
+outputPool = ["out", "dev", "lib", "bin", "doc", "man"]
+
+-- | A store path of a generated name, its hash in the nix-base32 alphabet.
+genFixturePath :: Text -> QC.Gen StorePath
+genFixturePath suffix = StorePath <$> genTextOf 32 "0123456789abcdfghijklmnpqrsvwxyz" <*> ((<> suffix) <$> genDrvName)
+
+-- | Text of a given length drawn from an alphabet.
+genTextOf :: Int -> String -> QC.Gen Text
+genTextOf len alphabet = T.pack <$> QC.vectorOf len (QC.elements alphabet)
+
+-- | Bytes for a builder, an argument or a variable: any bytes, the ATerm
+-- specials among them.
+genFieldBytes :: QC.Gen BS.ByteString
+genFieldBytes = BS.pack <$> QC.resize 12 (QC.listOf QC.arbitrary)
+
+-- | A derivationStrict call as Nix source, with the name it gives: its
+-- outputs in any order, structured or not, some attributes, and perhaps
+-- one that depends on another derivation, through an output, through its
+-- drvPath, or through a fixed output.
+data StrictCase = StrictCase !Text !Text
+  deriving (Show)
+
+genStrictCase :: QC.Gen StrictCase
+genStrictCase = do
+  name <- genDrvName
+  system <- QC.elements ["x", "x86_64-linux"]
+  builder <- QC.elements ["/bin/sh", "b"]
+  outputs <- genOutputNames
+  structured <- QC.elements ["true", "false"]
+  attributes <- QC.sublistOf ["s = \"line\\n\\\"quoted\\\" \\\\ \\${x}\";", "i = 42;", "l = [ \"a\" \"b c\" ];", "n = null;", "t = true;"]
+  dependency <- QC.elements ["", "dep = d;", "dep = d.dev;", "dep = \"${d.drvPath}\";", "dep = f;"]
+  pure . StrictCase name . T.unwords $
+    [ "let d = derivation { name = \"d\"; system = \"x\"; builder = \"b\"; outputs = [ \"out\" \"dev\" ]; };",
+      "f = derivation { name = \"f\"; system = \"x\"; builder = \"b\"; outputHash = \"sha256-47DEQpj8HBSKTXA6xJbgU1CNMmz7W08F06XOTYP1hmM=\"; };",
+      "r = derivationStrict { name = \"" <> name <> "\"; system = \"" <> system <> "\"; builder = \"" <> builder <> "\";",
+      "outputs = [ " <> T.unwords ["\"" <> output <> "\"" | output <- outputs] <> " ]; __structuredAttrs = " <> structured <> ";"
+    ]
+      <> attributes
+      <> [ dependency,
+           "}; in builtins.concatStringsSep \"\\n\" (map (n: n + \"=\" + builtins.unsafeDiscardStringContext r.${n}) (builtins.attrNames r))"
+         ]
+
+-- | Whether what derivationStrict records for a case is filled in already:
+-- 'inputAddressed', given the case's name and the modulo hashes the session
+-- cached for the recorded inputs, gives back the recorded derivation, at
+-- the drvPath and output paths derivationStrict returned.
+strictCaseAgrees :: StoreDir -> StrictCase -> IO QC.Property
+strictCaseAgrees storeDir (StrictCase name source) = case parseNix testBaseDir testOrigin (TE.encodeUtf8 source) of
+  Left err -> pure (QC.counterexample (show err) False)
+  Right parsed -> do
+    st <- testEvalState storeDir testBaseDir
+    outcome <- runEvalIO st $ do
+      returned <-
+        evalParsed (pure (evalBaseEnv st)) parsed >>= \case
+          VStr bytes _ -> pure [T.drop 1 <$> T.breakOn "=" line | line <- T.lines (bytesText bytes)]
+          other -> throwEvalError ("expected a string, got " <> typeName other)
+      recorded <- maybe (pure Nothing) lookupSessionDrv (lookup "drvPath" returned)
+      drv <- maybe (throwEvalError "no .drv was recorded") pure recorded
+      inputHashes <- traverse cachedHash (Map.toList (drvInputDrvs drv))
+      pure (returned, drv, inputHashes)
+    pure $ case outcome of
+      Left err -> QC.counterexample (T.unpack err) False
+      Right (returned, drv, inputHashes) -> case inputAddressed name inputHashes drv of
+        Left err -> QC.counterexample (show err) False
+        Right file ->
+          let (drvPath, outputs) = drvFilePathTexts file
+           in (drvFileDerivation file, sort returned) QC.=== (drv, sort (("drvPath", drvPath) : outputs))
+  where
+    cachedHash (input, outputs) = do
+      let inputText = storePathToText defaultStoreDir input
+      lookupDrvHash inputText >>= maybe (throwEvalError ("no modulo hash was cached for " <> inputText)) (\hash -> pure (hash, outputs))
+
+-- ---------------------------------------------------------------------------
 -- Tests: Builder (Phase 2, Batch 4)
 -- ---------------------------------------------------------------------------
 
@@ -34744,6 +35001,7 @@ runSuite = do
           testSymlinkWalksIO,
           testLinkOrdering,
           testFromATerm,
+          testInputAddressed,
           testBuilder,
           testFlatOutputFormIO,
           testE2E,

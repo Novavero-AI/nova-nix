@@ -59,6 +59,14 @@ module Nix.Derivation
     toATermForHash,
     fromATerm,
 
+    -- * The .drv file
+    DrvFile,
+    drvFileDerivation,
+    drvFileATerm,
+    drvFilePath,
+    drvFile,
+    inputAddressed,
+
     -- * Platform
     Platform (..),
     currentPlatform,
@@ -74,7 +82,7 @@ import qualified Data.ByteString.Builder as B
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as LBS
 import Data.Function (on)
-import Data.List (sortBy)
+import Data.List (sort, sortBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -82,6 +90,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
+import Nix.Hash (makeOutputPath, makeTextPath, sha256Digest)
 import Nix.Store.Path (StorePath)
 import qualified Nix.Store.Path as SP
 import qualified System.Info as SI
@@ -386,6 +395,81 @@ escapeATermBytes s =
     escapeOne '\t' = "\\t"
     -- Unreachable: 'BC.break atermSpecial' only stops at the five specials.
     escapeOne c = B.charUtf8 c
+
+-- ---------------------------------------------------------------------------
+-- The .drv file
+-- ---------------------------------------------------------------------------
+
+-- | A derivation and the @.drv@ file it is written as: its ATerm, and the
+-- text path that ATerm, its inputs and its name give it, as upstream's
+-- @infoForDerivation@ makes them (derivations.cc:111-129 at 2.35.4).  The
+-- constructor is not exported, so the bytes are always the derivation's
+-- rendering and the path always theirs.
+data DrvFile = DrvFile !Derivation !ByteString !StorePath
+  deriving (Eq, Show)
+
+-- | The derivation the file holds.
+drvFileDerivation :: DrvFile -> Derivation
+drvFileDerivation (DrvFile drv _ _) = drv
+
+-- | The file's contents: the derivation's 'toATerm'.
+drvFileATerm :: DrvFile -> ByteString
+drvFileATerm (DrvFile _ aterm _) = aterm
+
+-- | The file's store path, the derivation's @drvPath@.
+drvFilePath :: DrvFile -> StorePath
+drvFilePath (DrvFile _ _ path) = path
+
+-- | The @.drv@ file of a derivation named @name@: the text path named
+-- @name.drv@ for its ATerm, referring to its input sources and input
+-- derivations and not to its outputs.  'Left' when @name.drv@ breaks the
+-- store-path name rules, as 'makeTextPath' refuses it.
+drvFile :: Text -> Derivation -> Either SP.BadStorePath DrvFile
+drvFile name drv =
+  DrvFile drv aterm <$> makeTextPath (name <> drvExtension) (sha256Digest aterm) references
+  where
+    aterm = toATerm drv
+    references = drvInputSrcs drv <> Map.keys (drvInputDrvs drv)
+
+-- | What a derivation's file name ends in, after the derivation's name.
+drvExtension :: Text
+drvExtension = ".drv"
+
+-- | The @.drv@ file of a derivation named @name@ with every output
+-- input-addressed.  Upstream makes one by deferring its outputs with their
+-- variables empty, as @derivationStrict@ does (primops.cc:1839-1852 at
+-- 2.35.4) and @nix develop@ does to a fixed or input-addressed target
+-- (develop.cc:271-288), then filling the outputs in (@fillInOutputPaths@,
+-- derivations.cc:1261-1411) and writing the result (@writeDerivation@,
+-- primops.cc:1859-1860).
+--
+-- @inputHashes@ pairs the modulo hash (hex) of each input derivation with
+-- the outputs taken from it, as 'toATermForHash' substitutes them.  Each
+-- output keeps its name and gets the path @makeOutputPath@ gives for
+-- upstream's masked @hashDerivationModulo@ (derivations.cc:900-970): the
+-- hash of the rendering with every output's path, hash fields and variable
+-- empty and the input hashes in place of the input derivations.  The
+-- variable of each output's name then holds its path.  Whatever the
+-- outputs and their variables held before counts for nothing, and the rest
+-- of the derivation is kept.
+--
+-- 'Left' on a name the store-path rules refuse: an output's composed name
+-- first, in name order, then @name.drv@, as upstream refuses them.
+inputAddressed :: Text -> [(Text, [Text])] -> Derivation -> Either SP.BadStorePath DrvFile
+inputAddressed name inputHashes drv = do
+  outputs <- traverse filledIn (sort (map doName (drvOutputs drv)))
+  drvFile name drv {drvOutputs = outputs, drvEnv = foldr withPath (drvEnv drv) outputs}
+  where
+    masked =
+      drv
+        { drvOutputs = [output {doHashAlgo = "", doHash = ""} | output <- drvOutputs drv],
+          drvEnv = foldr (\output -> Map.insert (doName output) "") (drvEnv drv) (drvOutputs drv)
+        }
+    moduloHash = sha256Digest (toATermForHash True (Just inputHashes) masked)
+    filledIn outputName = do
+      path <- makeOutputPath outputName moduloHash name
+      pure (DerivationOutput outputName path "" "")
+    withPath output = Map.insert (doName output) (TE.encodeUtf8 (SP.storePathToText SP.defaultStoreDir (doPath output)))
 
 -- ---------------------------------------------------------------------------
 -- ATerm parser (hand-rolled recursive descent)
