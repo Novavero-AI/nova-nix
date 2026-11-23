@@ -96,9 +96,10 @@ data StoreOps m = StoreOps
 -- | What an evaluation named or wrote in the store without registering
 -- it, as its session records them ("Nix.Eval.IO"'s @EvalState@).
 data EvalObjects = EvalObjects
-  { -- | Each source a path value was coerced from, with the store path
-    -- evaluation named it by ('Nix.Store.materializeEvalSources').
-    eoSources :: !(Map Text Text),
+  { -- | Each copy of a path value evaluation coerced, by its store path,
+    -- with the path-value text of the tree evaluation read for it
+    -- ('Nix.Store.materializeEvalSources').
+    eoSources :: !(Map StorePath Text),
     -- | Each tree evaluation wrote, by its store path, with its
     -- references and the way its path was named
     -- ('Nix.Store.materializeEvalStoreWrites').
