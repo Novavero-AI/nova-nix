@@ -21872,14 +21872,21 @@ testGcPure = do
           (map (fmap splitDirectories . upstreamDatabasePath) ["/nix/store", "/home/u/nix/store/", "/nix/nova-store", "/home/u/store"])
     ]
 
+-- | The descriptors this process holds open, where the system lists them
+-- under @/dev/fd@, or 'Nothing' where it does not (Windows).
+openDescriptors :: IO (Maybe [FilePath])
+openDescriptors = do
+  listed <- Dir.doesDirectoryExist "/dev/fd"
+  if listed then Just . sort <$> Dir.listDirectory "/dev/fd" else pure Nothing
+
 -- | Garbage collection end to end against a temp store: a rooted closure
 -- survives and the orphan goes, the rooted path and what it reaches
 -- cannot be deleted, one directory keys one store however it is
 -- spelled while a foreign spelling is refused, a removed root lets the
 -- closure go, a dead cycle sweeps, a dead path's lock file goes with it,
 -- a second open handle holds the collector off, a failed lease renewal
--- leaves a closable handle, and an out-link root behaves as nix-build's
--- result link does.
+-- leaves a closable handle, an open whose database fails keeps nothing
+-- open, and an out-link root behaves as nix-build's result link does.
 testStoreGC :: IO [Bool]
 testStoreGC = do
   putStrLn "store/gc"
@@ -22092,7 +22099,28 @@ testStoreGC = do
                 pure $ case (swapped :: Either SomeException (), closed) of
                   (Left _, Just ()) -> Pass
                   (Right (), _) -> Fail "renewal succeeded against a directory"
-                  (Left _, Nothing) -> Fail "closeStore hung after a failed renewal"
+                  (Left _, Nothing) -> Fail "closeStore hung after a failed renewal",
+          -- An open that fails after taking the lease must give it back,
+          -- or every later collection waits on it for as long as the
+          -- process runs.  A file that is no database fails at the
+          -- first statement, once SQLite holds it open.
+          runTestM "a store whose database fails to open keeps neither its lease nor the database open" $ do
+            let failingStore = tmpBase </> "nova-nix-test-open-release"
+                metaPath = failingStore </> metaDirName
+            Dir.removePathForcibly failingStore
+            createDirectoryIfMissing True metaPath
+            BS.writeFile (metaPath </> dbFileName) "not a database"
+            before <- openDescriptors
+            opened <- try (openStore (StoreDir failingStore))
+            after <- openDescriptors
+            probe <- FileLock.tryLockFile (gcLockFilePath (StoreDir failingStore)) FileLock.Exclusive
+            mapM_ FileLock.unlockFile probe
+            outcome <- case opened of
+              Left (_ :: SQL.SQLError) ->
+                pure (assertEqual "lease released" True (isJust probe) `andThen` assertEqual "descriptors" before after)
+              Right opener -> Fail "the database opened" <$ closeStore opener
+            Dir.removePathForcibly failingStore
+            pure outcome
         ]
     linked <-
       if not canLink
