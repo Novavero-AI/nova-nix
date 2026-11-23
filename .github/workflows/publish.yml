@@ -119,19 +119,47 @@ jobs:
       # build sees at /bin/sh, as packaged upstream Nix carries its
       # busybox-sandbox-shell: nova-nix defaults sandbox-paths to it when
       # it is in libexec/, so a derivation whose builder is /bin/sh builds
-      # in the sandbox.  Its copyright file rides beside it.
-      - name: Bundle the sandbox shell (Linux)
+      # in the sandbox.  BusyBox is GPL-2.0, so the release carries the
+      # source the binary was built from: Ubuntu's source package of the
+      # installed version, which apt fetches against the archive's signed
+      # index and which is checked here against its own .dsc's hashes.  The
+      # copyright notice beside the binary names that asset.
+      - name: Bundle the sandbox shell and its source (Linux)
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          VERSION: ${{ needs.check-tag.outputs.version }}
         run: |
           set -euo pipefail
+          codename=$(sed -n 's/^VERSION_CODENAME=//p' /etc/os-release)
+          printf '%s\n' 'Types: deb-src' 'URIs: http://archive.ubuntu.com/ubuntu' \
+            "Suites: $codename $codename-updates $codename-security" 'Components: main' \
+            'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+            | sudo tee /etc/apt/sources.list.d/nova-nix-busybox-source.sources >/dev/null
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends busybox-static
           shell=$(command -v busybox)
           file -L "$shell" | grep -q 'statically linked' || { echo "::error::$shell is not statically linked"; exit 1; }
+          package=$(dpkg-query -W -f='${source:Package}' busybox-static)
+          source_version=$(dpkg-query -W -f='${source:Version}' busybox-static)
+          binary_version=$(dpkg-query -W -f='${Version}' busybox-static)
+          # Debian leaves the epoch out of file names.
+          asset="$stem-busybox-${source_version#*:}-source.tar.gz"
+          workdir=$(mktemp -d)
+          (cd "$workdir" && apt-get source --download-only "$package=$source_version")
+          dsc=$(find "$workdir" -maxdepth 1 -name '*.dsc')
+          awk '/^Checksums-Sha256:/ { listed = 1; next } /^[^ ]/ { listed = 0 } listed && NF == 3 { print $1 "  " $3 }' "$dsc" \
+            | (cd "$workdir" && sha256sum --strict -c -)
+          tar czf "$asset" -C "$workdir" .
           mkdir -p "$stem/libexec/nova-nix"
           cp -L "$shell" "$stem/libexec/nova-nix/sh"
-          cp /usr/share/doc/busybox-static/copyright "$stem/libexec/nova-nix/sh.copyright"
+          {
+            echo "libexec/nova-nix/sh is BusyBox, from Ubuntu's busybox-static ${binary_version}, under the GNU General Public License, version 2."
+            echo "Its complete corresponding source, Ubuntu's source package ${package} ${source_version}, is the release asset"
+            echo "${asset} of https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${VERSION}."
+            echo
+            cat /usr/share/doc/busybox-static/copyright
+          } > "$stem/libexec/nova-nix/sh.copyright"
 
       # The asset has to work before it is published, not after someone
       # reports that it does not.  nova_nix_datadir is pointed at nothing so
@@ -247,6 +275,9 @@ jobs:
           > bin\\nova-nix.exe build pkgs\\windows\\hello.nix
           \`\`\`
 
+          The Linux archive's \`libexec/nova-nix/sh\` is BusyBox, GPL-2.0;
+          its source is the \`busybox\` source asset beside the archives.
+
           Verify the archive you downloaded with
           \`sha256sum --ignore-missing -c SHA256SUMS\`, which skips the lines for
           the archives you did not.
@@ -264,8 +295,8 @@ jobs:
         run: |
           set -euo pipefail
           count=$(gh release view "v${VERSION}" --json assets --jq '.assets | length')
-          if [ "$count" -ne 4 ]; then
-            echo "expected 4 assets (3 archives + SHA256SUMS), found ${count}" >&2
+          if [ "$count" -ne 5 ]; then
+            echo "expected 5 assets (3 archives, the Linux archive's busybox source, SHA256SUMS), found ${count}" >&2
             gh release view "v${VERSION}" --json assets --jq '.assets[].name' >&2
             exit 1
           fi
