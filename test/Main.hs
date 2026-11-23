@@ -26,14 +26,14 @@ import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Char (intToDigit, isAsciiLower, isAsciiUpper, isDigit, ord)
-import Data.Either (fromLeft, isLeft, isRight)
+import Data.Either (fromLeft, fromRight, isLeft, isRight)
 import Data.Foldable (for_, toList, traverse_)
 import Data.Functor ((<&>))
 import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Int (Int64)
-import Data.List (find, genericLength, inits, intercalate, isInfixOf, isPrefixOf, isSuffixOf, mapAccumL, nub, sort, sortOn, transpose, unfoldr)
+import Data.Int (Int32, Int64)
+import Data.List (find, genericLength, inits, intercalate, isInfixOf, isPrefixOf, isSuffixOf, mapAccumL, nub, sort, sortOn, stripPrefix, transpose, unfoldr)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as Map
@@ -66,6 +66,7 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildLayout (..), BuildPlace (..), BuildResult (..), BuildStop (..), BuilderInvocation (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, builderInvocation, checkDerivation, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substituteFromCaches, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
 import Nix.Builder.BuildDir (buildDirFor, createBuildDir, withBuildDir)
+import Nix.Builder.Buildenv (Activity (..), DerivationsError (..), Element (..), builtinBuildenvBuilder, elementPackages, parseDerivations)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
 import qualified Nix.Builder.Sandbox as Sandbox
@@ -119,11 +120,12 @@ import Nix.Expr.Resolve (impureOnlyGlobalNames, staticGlobalNames, undefinedVari
 import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), compressHash, hashPlaceholder, makeFixedOutputPath, makeTextPath, sha256Digest)
 import qualified Nix.Hash as Hash
-import Nix.HostPath (hostPathFromBytes)
+import Nix.HostPath (hostPathFromBytes, hostPathText)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), defaultFetchRetryPolicy, fetchExceptionFailure, fetchStatusFailure, ioRetryEffects, retryDelayMs, retryTransient, statusError, transferBodyReader, transferFailureHandlers, userAgent, withUserAgent)
 import Nix.Json (IntegerRange (..), Json (..), JsonBuilder (..), parseJson, parseJsonInto, renderJson)
 import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope, parsedExpr, parsedNames)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
+import Nix.Profile.Tree (BuildEnvFailure (..), Built (..), EntryKind (..), Listing (..), Node (..), Package (..), ReadFailure (..), Tree, TreeReader (..), Warning (..), buildEnvFailureText, buildProfile, propagatedTokens, warningText)
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), PushSummary (..), checkRecordedNarHash, computeClosure, defaultPartSize, isDerivationPath, loadKeyFile, mkNarInfo, mkPartSize, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, partSizeBytes, planMissing, preparePath, pushPaths, splitParts, storePathBasename, stripHashPrefix)
 import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), cacheInfoFileName, cacheInfoText, checkCacheInfo, ed25519SeedBytes, loadSecretKeyFile, pushTarget, pushToDirectory, signNarInfo)
 import qualified Nix.Realise as Realise
@@ -151,6 +153,7 @@ import qualified NovaCache.Signing as Signing
 import qualified NovaCache.Zstd as CZstd
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
+import qualified System.Directory.OsPath as OsDir
 import System.Environment (getArgs, getEnvironment, getExecutablePath, lookupEnv, setEnv, unsetEnv)
 import qualified System.Environment.Blank as Blank
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
@@ -15648,6 +15651,558 @@ testUnpackBuildIO = do
                 assertEqual "top level" ["repo-0123456"] topLevel
             ]
       pure (seedChecks ++ collideChecks ++ escapeChecks ++ maliciousChecks ++ dirLinkChecks ++ collisionGuardChecks ++ budgetChecks ++ guardChecks ++ gitHubChecks)
+
+-- ---------------------------------------------------------------------------
+-- Profile trees and builtin:buildenv
+-- ---------------------------------------------------------------------------
+
+-- | A node of the in-memory store the tree tests read.
+data FakeNode = FakeDirectory | FakeFile !BS.ByteString | FakeLink !OsPath
+  deriving (Show)
+
+-- | An in-memory store: every node by its path's components.
+newtype FakeStore = FakeStore (Map.Map [OsPath] FakeNode)
+  deriving (Show)
+
+-- | A store holding these nodes, with every ancestor of each a directory.
+fakeStore :: [(OsPath, FakeNode)] -> FakeStore
+fakeStore entries = FakeStore (Map.union (Map.fromList nodes) ancestors)
+  where
+    nodes = [(OP.splitDirectories path, node) | (path, node) <- entries]
+    ancestors = Map.fromList [(prefix, FakeDirectory) | (key, _) <- nodes, prefix <- drop 1 (inits key), prefix /= key]
+
+-- | How many links resolving one path follows before it reads a loop, as
+-- a POSIX system's @SYMLOOP_MAX@ bounds it.
+fakeLinkBudget :: Int
+fakeLinkBudget = 40
+
+-- | The components a path names in the store with every link on it
+-- followed, or 'Nothing' for a loop.  The store's link targets are
+-- absolute.
+fakeResolve :: FakeStore -> OsPath -> Maybe [OsPath]
+fakeResolve (FakeStore nodes) = go fakeLinkBudget [] . OP.splitDirectories
+  where
+    go budget walked remaining = case remaining of
+      [] -> Just walked
+      component : rest ->
+        let here = walked ++ [component]
+         in case Map.lookup here nodes of
+              Just (FakeLink target)
+                | budget > 0 -> go (budget - 1) [] (OP.splitDirectories target ++ rest)
+                | otherwise -> Nothing
+              _ -> go budget here rest
+
+-- | The names directly in a directory of the store.
+fakeChildren :: FakeStore -> [OsPath] -> [OsPath]
+fakeChildren (FakeStore nodes) key = [name | (other, _) <- Map.toList nodes, Just [name] <- [stripPrefix key other]]
+
+-- | The path of a package's propagated-user-env-packages file.
+propagatedFileOf :: OsPath -> OsPath
+propagatedFileOf pkg = pkg OP.</> asciiOsPath "nix-support" OP.</> asciiOsPath "propagated-user-env-packages"
+
+-- | A t'TreeReader' over an in-memory store, following links as @stat@
+-- does, and naming a propagated package by its bytes.
+fakeReader :: FakeStore -> TreeReader Identity
+fakeReader store@(FakeStore nodes) =
+  TreeReader
+    { trEntries = \path -> pure $ do
+        key <- resolved path
+        case Map.lookup key nodes of
+          Just FakeDirectory -> Right (Entries (fakeChildren store key))
+          Just _ -> Right NotADirectory
+          Nothing -> Left (failure "cannot read directory" path),
+      trKind = \path -> pure (fmap kindOf . (`Map.lookup` nodes) <$> resolved path),
+      trResolve = \path -> pure (OP.joinPath <$> resolved path),
+      trPropagated = \pkg -> pure $ case fakeResolve store (propagatedFileOf pkg) >>= (`Map.lookup` nodes) of
+        Just (FakeFile bytes) -> traverse (maybe (Left (failure "no path in" pkg)) Right . hostPathFromBytes) (propagatedTokens bytes)
+        _ -> Right []
+    }
+  where
+    resolved path = maybe (Left (failure "too many links in" path)) Right (fakeResolve store path)
+    failure doing path = ReadFailure (doing <> " " <> hostPathText path)
+    kindOf node = case node of
+      FakeDirectory -> DirectoryEntry
+      _ -> NonDirectoryEntry
+
+-- | A path in the in-memory store, from ASCII components under its root.
+fakeTreePath :: [String] -> OsPath
+fakeTreePath = foldl' (\path component -> path OP.</> asciiOsPath component) (asciiOsPath "/s")
+
+-- | A file in the in-memory store.
+fakeFile :: [String] -> (OsPath, FakeNode)
+fakeFile components = (fakeTreePath components, FakeFile "contents")
+
+-- | The directory the tree tests name the tree's own paths under.
+fakeOut :: OsPath
+fakeOut = asciiOsPath "/out"
+
+-- | A path's bytes as a propagated-user-env-packages file spells it.
+-- Test paths are ASCII, so its text's UTF-8 is exact.
+propagatedBytes :: OsPath -> BS.ByteString
+propagatedBytes = TE.encodeUtf8 . hostPathText
+
+-- | A propagated-user-env-packages file naming these packages.
+propagating :: [OsPath] -> FakeNode
+propagating = FakeFile . BS.intercalate "\n" . map propagatedBytes
+
+-- | What 'buildProfile' makes of packages in an in-memory store.
+fakeBuild :: FakeStore -> [Package] -> Built
+fakeBuild store = runIdentity . buildProfile (fakeReader store) fakeOut
+
+-- | A directory of the tree, from ASCII names.
+namedTree :: [(String, Node)] -> Tree
+namedTree entries = Map.fromList [(asciiOsPath name, node) | (name, node) <- entries]
+
+-- | The tree two packages sharing @bin@ make at priority 5, the first
+-- with a program @hello@ and a @share@ directory and the second with a
+-- program @world@: @bin@ is a directory of the tree's own, which holds
+-- the first package's program under what its @bin@ resolves to, and
+-- @share@ is linked whole.  Both the golden case and the build through
+-- the builder are held to it.
+sharedBinTree :: OsPath -> OsPath -> OsPath -> Tree
+sharedBinTree first firstBinResolved second =
+  namedTree
+    [ ( "bin",
+        Directory
+          ( namedTree
+              [ ("hello", Link (firstBinResolved OP.</> asciiOsPath "hello") 5),
+                ("world", Link (second OP.</> asciiOsPath "bin" OP.</> asciiOsPath "world") 5)
+              ]
+          )
+      ),
+      ("share", Link (first OP.</> asciiOsPath "share") 5)
+    ]
+
+-- | Every link target in a tree.
+treeLinkTargets :: Tree -> [OsPath]
+treeLinkTargets = concatMap targets . Map.elems
+  where
+    targets node = case node of
+      Link target _ -> [target]
+      Directory sub -> treeLinkTargets sub
+
+-- | Packages and every package they propagate, transitively.
+fakePropagationClosure :: FakeStore -> [OsPath] -> [OsPath]
+fakePropagationClosure store = go Set.empty []
+  where
+    go _ found [] = found
+    go seen found (path : rest)
+      | Set.member key seen = go seen found rest
+      | otherwise = go (Set.insert key seen) (path : found) (propagated ++ rest)
+      where
+        key = OP.splitDirectories path
+        propagated = fromRight [] (runIdentity (trPropagated (fakeReader store) path))
+
+-- | Every node of the store reachable from these paths, each by the
+-- components it resolves to: the paths themselves and everything below
+-- them, through links.
+fakeReachable :: FakeStore -> [OsPath] -> Set.Set [OsPath]
+fakeReachable store@(FakeStore nodes) roots = go Set.empty (mapMaybe (fakeResolve store) roots)
+  where
+    go seen pending = case pending of
+      [] -> seen
+      key : rest
+        | Set.member key seen -> go seen rest
+        | otherwise -> go (Set.insert key seen) (children key ++ rest)
+    children key = case Map.lookup key nodes of
+      Just FakeDirectory -> mapMaybe (\name -> fakeResolve store (OP.joinPath (key ++ [name]))) (fakeChildren store key)
+      _ -> []
+
+-- | Whether a tree holds a directory of its own at its top, which only
+-- expanding a link to a directory makes.
+madeDirectory :: Tree -> Bool
+madeDirectory = any isDirectory . Map.elems
+  where
+    isDirectory node = case node of
+      Directory _ -> True
+      Link _ _ -> False
+
+-- | The law that a tree stays inside its packages: every link in it names
+-- a node that is there, which a package given or one propagated reaches.
+-- Each class of case is held to about a third of its share of 20000
+-- generated at QuickCheck's sizes: a tree built in 69% of them, and one
+-- with a directory of its own in 25%.
+linksResolveIntoPackages :: (FakeStore, [Package]) -> QC.Property
+linksResolveIntoPackages (store@(FakeStore nodes), packages) =
+  QC.cover 20 (isRight tree) "the tree was built"
+    $ QC.cover 8 (either (const False) madeDirectory tree) "a link to a directory was expanded"
+    $ QC.conjoin [QC.counterexample (show target) (reaches target) | target <- either (const []) treeLinkTargets tree]
+  where
+    tree = builtTree (fakeBuild store packages)
+    reachable = fakeReachable store (fakePropagationClosure store (map pkgPath packages))
+    reaches target = case fakeResolve store target of
+      Just key -> Map.member key nodes && Set.member key reachable
+      Nothing -> False
+
+-- | How deep a generated package's directories go.
+fakeTreeDepth :: Int
+fakeTreeDepth = 2
+
+-- | An in-memory store of one to four packages, and packages to build
+-- from it.  Each name keeps one kind wherever it is, so two packages meet
+-- at a name only with two of a kind: @bin@, @share@, @lib@ and @info@
+-- are directories; @x@, @dir@, @log@ and @.hid@ files; @lnd@ a link to
+-- some package's @bin@ or @share@, @lnf@ a link to some package's @x@,
+-- and @gone@ a link to nothing.  A package is sometimes a file, and
+-- sometimes propagates others.  Priorities are few, so files meet at one
+-- priority as well as at two.
+genFakeProfile :: QC.Gen (FakeStore, [Package])
+genFakeProfile = do
+  count <- QC.choose (1, 4 :: Int)
+  let roots = [fakeTreePath ["p" <> show index] | index <- [1 .. count]]
+  contents <- traverse (genFakePackage roots) roots
+  packages <- QC.listOf1 (Package <$> QC.elements roots <*> QC.elements ([0 .. 9] ++ [1000, 1001]))
+  pure (fakeStore (concat contents), packages)
+
+-- | One generated package of 'genFakeProfile', at @root@.
+genFakePackage :: [OsPath] -> OsPath -> QC.Gen [(OsPath, FakeNode)]
+genFakePackage roots root =
+  QC.frequency
+    [ (1, pure [(root, FakeFile "not a directory")]),
+      (8, (++) <$> genFakeDirectory roots fakeTreeDepth root <*> propagation)
+    ]
+  where
+    propagation =
+      QC.frequency
+        [ (2, pure []),
+          (1, (\named -> [(propagatedFileOf root, propagating named)]) <$> QC.sublistOf roots)
+        ]
+
+-- | A generated directory of 'genFakeProfile' at @dir@, @depth@ levels of
+-- directories deep at most.
+genFakeDirectory :: [OsPath] -> Int -> OsPath -> QC.Gen [(OsPath, FakeNode)]
+genFakeDirectory roots depth dir = do
+  names <- QC.sublistOf (if depth > 0 then directoryNames ++ leafNames else leafNames)
+  ((dir, FakeDirectory) :) . concat <$> traverse entry names
+  where
+    directoryNames = ["bin", "share", "lib", "info"]
+    leafNames = ["x", "dir", "log", ".hid", "lnd", "lnf", "gone"]
+    entry name
+      | name `elem` directoryNames = genFakeDirectory roots (depth - 1) path
+      | name == "lnd" = linkTo <$> QC.elements [root OP.</> asciiOsPath sub | root <- roots, sub <- ["bin", "share"]]
+      | name == "lnf" = linkTo <$> QC.elements [root OP.</> asciiOsPath "x" | root <- roots]
+      | name == "gone" = pure (linkTo (fakeTreePath ["nowhere"]))
+      | otherwise = pure [(path, FakeFile (BS8.pack name))]
+      where
+        path = dir OP.</> asciiOsPath name
+        linkTo target = [(path, FakeLink target)]
+
+-- | 'buildProfile' (upstream's buildenv.cc at 2.35.4) over an in-memory
+-- store: one golden case per rule, then the laws that the tree does not
+-- depend on the order the packages are given in and that it stays inside
+-- them.
+testProfileTree :: IO [Bool]
+testProfileTree = do
+  putStrLn "profile/tree"
+  sequence
+    [ runTest "one package's entries are linked whole" $
+        assertEqual
+          "built"
+          (Built [] (Right (namedTree [("bin", Link (pkg "a" ["bin"]) 5), ("share", Link (pkg "a" ["share"]) 5)])))
+          (fakeBuild (fakeStore [fakeFile ["a", "bin", "hello"], fakeFile ["a", "share", "doc", "a.txt"]]) [Package (pkg "a" []) 5]),
+      runTest "two packages sharing bin make it a directory of the tree's own, given in either order" $
+        let store = fakeStore [fakeFile ["a", "bin", "hello"], fakeFile ["a", "share", "man", "a.1"], fakeFile ["b", "bin", "world"]]
+            expected = Built [] (Right (sharedBinTree (pkg "a" []) (pkg "a" ["bin"]) (pkg "b" [])))
+         in assertEqual "b then a" expected (fakeBuild store [Package (pkg "b" []) 5, Package (pkg "a" []) 5])
+              `andThen` assertEqual "a then b" expected (fakeBuild store [Package (pkg "a" []) 5, Package (pkg "b" []) 5]),
+      runTest "a link to a directory is expanded at the priority it was linked at, so its files keep their place" $
+        assertEqual
+          "built"
+          (Built [] (Right (namedTree [("lib", Directory (namedTree [("liba", Link (pkg "a" ["lib", "liba"]) 3), ("libb", Link (pkg "b" ["lib", "libb"]) 7)]))])))
+          (fakeBuild (fakeStore [fakeFile ["a", "lib", "liba"], fakeFile ["b", "lib", "liba"], fakeFile ["b", "lib", "libb"]]) [Package (pkg "a" []) 3, Package (pkg "b" []) 7]),
+      runTest "a link to a directory is expanded from what it resolves to" $
+        assertEqual
+          "built"
+          (Built [] (Right (namedTree [("lib", Directory (namedTree [("x", Link (fakeTreePath ["real", "lib", "x"]) 5), ("y", Link (pkg "b" ["lib", "y"]) 6)]))])))
+          (fakeBuild (fakeStore [(pkg "a" ["lib"], FakeLink (fakeTreePath ["real", "lib"])), fakeFile ["real", "lib", "x"], fakeFile ["b", "lib", "y"]]) [Package (pkg "a" []) 5, Package (pkg "b" []) 6]),
+      runTest "of two files at one path the lower priority number stays, whichever is linked first" $
+        assertEqual
+          "lower linked first"
+          (Built [] (Right (namedTree [("bin", Directory (namedTree [("tool", Link (pkg "b" ["bin", "tool"]) 4)]))])))
+          (fakeBuild (fakeStore [fakeFile ["a", "bin", "tool"], fakeFile ["b", "bin", "tool"]]) [Package (pkg "a" []) 6, Package (pkg "b" []) 4])
+          `andThen` assertEqual
+            "lower linked second, by propagation"
+            (Built [] (Right (namedTree [("bin", Directory (namedTree [("tool", Link (pkg "p" ["bin", "tool"]) 1000)]))])))
+            (fakeBuild (fakeStore [fakeFile ["e", "bin", "tool"], (propagatedFileOf (pkg "e" []), propagating [pkg "p" []]), fakeFile ["p", "bin", "tool"]]) [Package (pkg "e" []) 2000]),
+      runTest "two files at one path with one priority conflict, in upstream's words" $
+        let conflict = FileConflict (pkg "a" ["bin", "tool"]) (pkg "b" ["bin", "tool"]) 5
+         in assertEqual "built" (Built [] (Left conflict)) (fakeBuild (fakeStore [fakeFile ["a", "bin", "tool"], fakeFile ["b", "bin", "tool"]]) [Package (pkg "b" []) 5, Package (pkg "a" []) 5])
+              `andThen` assertEqual
+                "message"
+                ("Unable to build profile. There is a conflict for the following files:\n\n  \"" <> hostPathText (pkg "a" ["bin", "tool"]) <> "\"\n  \"" <> hostPathText (pkg "b" ["bin", "tool"]) <> "\"")
+                (buildEnvFailureText conflict),
+      runTest "propagated packages follow at priority 1000 and up, one number per queued path in path order" $
+        let store =
+              fakeStore
+                [ fakeFile ["a", "bin", "a"],
+                  (propagatedFileOf (pkg "a" []), FakeFile (propagatedBytes (pkg "q" []) <> "\n" <> propagatedBytes (pkg "p" []) <> "  " <> propagatedBytes (pkg "q" []) <> " " <> propagatedBytes (pkg "a" []) <> "\n")),
+                  fakeFile ["p", "share", "p"],
+                  (propagatedFileOf (pkg "p" []), propagating [pkg "q" [], pkg "r" []]),
+                  fakeFile ["q", "share", "q"],
+                  fakeFile ["r", "etc", "r"]
+                ]
+         in -- a names itself, which is added already and is not queued.
+            -- p takes 1000 and q 1001; q, queued again by p before q was
+            -- added, takes 1002 unused, and r 1003.
+            assertEqual
+              "built"
+              ( Built
+                  []
+                  ( Right
+                      ( namedTree
+                          [ ("bin", Link (pkg "a" ["bin"]) 5),
+                            ("etc", Link (pkg "r" ["etc"]) 1003),
+                            ("share", Directory (namedTree [("p", Link (pkg "p" ["share", "p"]) 1000), ("q", Link (pkg "q" ["share", "q"]) 1001)]))
+                          ]
+                      )
+                  )
+              )
+              (fakeBuild store [Package (pkg "a" []) 5]),
+      runTest "the files upstream keeps out of profiles are skipped wherever they are, and dir only in info" $
+        let store =
+              fakeStore
+                ( map (\name -> fakeFile ["a", name]) ["propagated-build-inputs", "perllocal.pod", "log", "manifest.nix", "manifest.json"]
+                    ++ [ fakeFile ["a", "nix-support", "setup-hook"],
+                         fakeFile ["a", "bin", "x"],
+                         fakeFile ["a", "lib", "perl5", "perllocal.pod"],
+                         fakeFile ["a", "share", "info", "dir"],
+                         fakeFile ["a", "share", "info", "a.info"],
+                         fakeFile ["a", "share", "doc", "dir"],
+                         fakeFile ["b", "log", "b.log"],
+                         fakeFile ["b", "lib", "perl5", "perllocal.pod"],
+                         fakeFile ["b", "lib", "perl5", "B.pm"],
+                         fakeFile ["b", "share", "info", "dir"],
+                         fakeFile ["b", "share", "info", "b.info"],
+                         fakeFile ["b", "share", "doc", "other"]
+                       ]
+                )
+            share =
+              namedTree
+                [ ("doc", Directory (namedTree [("dir", Link (pkg "a" ["share", "doc", "dir"]) 5), ("other", Link (pkg "b" ["share", "doc", "other"]) 5)])),
+                  ("info", Directory (namedTree [("a.info", Link (pkg "a" ["share", "info", "a.info"]) 5), ("b.info", Link (pkg "b" ["share", "info", "b.info"]) 5)]))
+                ]
+         in assertEqual
+              "built"
+              ( Built
+                  []
+                  ( Right
+                      ( namedTree
+                          [ ("bin", Link (pkg "a" ["bin"]) 5),
+                            ("lib", Directory (namedTree [("perl5", Directory (namedTree [("B.pm", Link (pkg "b" ["lib", "perl5", "B.pm"]) 5)]))])),
+                            ("share", Directory share)
+                          ]
+                      )
+                  )
+              )
+              (fakeBuild store [Package (pkg "a" []) 5, Package (pkg "b" []) 5]),
+      runTest "names starting with a dot are skipped" $
+        assertEqual
+          "built"
+          (Built [] (Right (namedTree [("bin", Directory (namedTree [("other", Link (pkg "b" ["bin", "other"]) 5), ("tool", Link (pkg "a" ["bin", "tool"]) 5)]))])))
+          (fakeBuild (fakeStore [fakeFile ["a", ".hidden"], fakeFile ["a", "bin", ".x"], fakeFile ["a", "bin", "tool"], fakeFile ["b", "bin", ".x"], fakeFile ["b", "bin", "other"]]) [Package (pkg "a" []) 5, Package (pkg "b" []) 5]),
+      runTest "an entry whose link leads nowhere is skipped with upstream's warning, by its path in the tree" $
+        let dangling = fakeOut OP.</> asciiOsPath "dangling"
+            store = fakeStore [(pkg "a" ["dangling"], FakeLink (fakeTreePath ["missing"])), fakeFile ["a", "bin", "tool"], (pkg "b" ["bin", "broken"], FakeLink (fakeTreePath ["gone"])), fakeFile ["b", "bin", "other"]]
+         in assertEqual
+              "built"
+              ( Built
+                  [DanglingLink dangling, DanglingLink (fakeOut OP.</> asciiOsPath "bin" OP.</> asciiOsPath "broken")]
+                  (Right (namedTree [("bin", Directory (namedTree [("other", Link (pkg "b" ["bin", "other"]) 5), ("tool", Link (pkg "a" ["bin", "tool"]) 5)]))]))
+              )
+              (fakeBuild store [Package (pkg "a" []) 5, Package (pkg "b" []) 5])
+              `andThen` assertEqual "message" ("skipping dangling symlink '" <> hostPathText dangling <> "'") (warningText (DanglingLink dangling)),
+      runTest "a package that is not a directory is left out with upstream's warning" $
+        let file = pkg "file" []
+         in assertEqual "built" (Built [NotIncluded file] (Right (namedTree [("bin", Link (pkg "a" ["bin"]) 6)]))) (fakeBuild (fakeStore [(file, FakeFile "a file"), fakeFile ["a", "bin", "tool"]]) [Package file 5, Package (pkg "a" []) 6])
+              `andThen` assertEqual "message" ("not including \"" <> hostPathText file <> "\" in the user environment because it's not a directory") (warningText (NotIncluded file)),
+      runTest "a path given twice is added once, at its lower priority number" $
+        assertEqual "built" (Built [] (Right (namedTree [("bin", Link (pkg "a" ["bin"]) 3)]))) (fakeBuild (fakeStore [fakeFile ["a", "bin", "tool"]]) [Package (pkg "a" []) 5, Package (pkg "a" []) 3]),
+      runTest "a directory where a link to a file stands fails whatever the priorities, in upstream's words" $
+        let collision = LinkToNonDirectory (pkg "b" ["share"]) (pkg "a" ["share"])
+         in assertEqual "built" (Built [] (Left collision)) (fakeBuild (fakeStore [fakeFile ["a", "share"], fakeFile ["b", "share", "x"]]) [Package (pkg "a" []) 3, Package (pkg "b" []) 5])
+              `andThen` assertEqual "message" ("collision between \"" <> hostPathText (pkg "b" ["share"]) <> "\" and non-directory \"" <> hostPathText (pkg "a" ["share"]) <> "\"") (buildEnvFailureText collision),
+      runTest "a file where a directory of the tree's own stands fails, in upstream's words" $
+        let collision = FileOverDirectory (pkg "c" ["bin"]) (fakeOut OP.</> asciiOsPath "bin")
+         in assertEqual "built" (Built [] (Left collision)) (fakeBuild (fakeStore [fakeFile ["a", "bin", "x"], fakeFile ["b", "bin", "y"], fakeFile ["c", "bin"]]) [Package (pkg "a" []) 1, Package (pkg "b" []) 2, Package (pkg "c" []) 3])
+              `andThen` assertEqual "message" ("collision between non-directory '" <> hostPathText (pkg "c" ["bin"]) <> "' and directory '" <> hostPathText (fakeOut OP.</> asciiOsPath "bin") <> "'") (buildEnvFailureText collision),
+      runTest "a package that is not there fails the build" $
+        assertEqual
+          "built"
+          (Built [] (Left (ReadFailed (ReadFailure ("cannot read directory " <> hostPathText (pkg "missing" []))))))
+          (fakeBuild (fakeStore [fakeFile ["a", "bin", "tool"]]) [Package (pkg "missing" []) 5]),
+      runTest "a propagated-user-env-packages file splits on spaces and newlines alone" $
+        assertEqual "tokens" ["a", "b", "c\td\r"] (propagatedTokens " a\n\nb  c\td\r\n"),
+      -- A failure counts too: which pair a conflict names does not
+      -- depend on the order either.  Each class is held to about a third
+      -- of its share of 20000 cases at QuickCheck's sizes: a tree built in
+      -- 69% of them, and two files meeting at one priority in 27%.
+      runTestM "the tree does not depend on the order the packages are given in" $
+        property . QC.checkCoverage . QC.forAll genFakeProfile $ \(store, packages) ->
+          let built = builtTree (fakeBuild store packages)
+              conflicted = case built of
+                Left (FileConflict {}) -> True
+                _ -> False
+           in QC.cover 20 (isRight built) "the tree was built" $
+                QC.cover 8 conflicted "two files met at one priority" $
+                  QC.forAll (QC.shuffle packages) $
+                    \shuffled -> fakeBuild store shuffled QC.=== fakeBuild store packages,
+      runTestM "every link in the tree names a node that a package given or one propagated reaches" $
+        property (QC.checkCoverage (QC.forAll genFakeProfile linksResolveIntoPackages))
+    ]
+  where
+    pkg name rest = fakeTreePath (name : rest)
+    property :: (QC.Testable prop) => prop -> IO TestResult
+    property prop = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} prop
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+
+-- | Elements, and the @derivations@ attribute @buildenv.nix@ makes of
+-- them, with each separator a run of tokenizeString's separators.
+genDerivationsCase :: QC.Gen ([Element], BS.ByteString)
+genDerivationsCase = do
+  elements <- QC.listOf genElement
+  let tokens = concatMap elementTokens elements
+  lead <- separators QC.listOf
+  following <- traverse (const (separators QC.listOf1)) tokens
+  pure (elements, BS.concat (lead : zipWith (<>) tokens following))
+  where
+    genElement = Element <$> QC.elements [Active, Inactive] <*> (fromIntegral <$> (QC.arbitrary :: QC.Gen Int32)) <*> QC.listOf genPath
+    genPath = ("/nix/store/" <>) . BS8.pack <$> QC.listOf1 (QC.elements ['a' .. 'z'])
+    separators runOf = BS8.pack <$> runOf (QC.elements " \t\n\r")
+    elementTokens (Element activity priority paths) =
+      [if activity == Active then "true" else "false", BS8.pack (show priority), BS8.pack (show (length paths))] ++ paths
+
+-- | Reading the @derivations@ attribute of a @builtin:buildenv@
+-- derivation (buildenv.cc:185-201 at 2.35.4).
+testBuildenvDerivations :: IO [Bool]
+testBuildenvDerivations = do
+  putStrLn "builder/buildenv-derivations"
+  sequence
+    [ runTest "an empty attribute, or one of separators alone, names no elements" $
+        assertEqual "empty" (Right []) (parseDerivations "")
+          `andThen` assertEqual "separators" (Right []) (parseDerivations " \t\n\r  \n"),
+      runTest "tokens are split on spaces, tabs, carriage returns and newlines, with the empty ones dropped" $
+        assertEqual
+          "elements"
+          (Right [Element Active 5 ["/nix/store/a", "/nix/store/b"], Element Inactive 3 ["/nix/store/c"], Element Active 0 []])
+          (parseDerivations "\n true \t5\r\n2  /nix/store/a\t\t/nix/store/b\nfalse 3 1 /nix/store/c\r\n\r\ntrue 0 0 \n"),
+      runTest "only false makes an element inactive" $
+        assertEqual "activities" (Right [Inactive, Active, Active, Active]) (map elementActivity <$> parseDerivations "false 1 0 False 1 0 0 1 0 true 1 0"),
+      runTest "a priority is read as stoi reads it: space, a sign and digits, with whatever follows ignored" $
+        assertEqual "priorities" (Right [5, -3, 7, 9, -2147483648, 2147483647]) (map elementPriority <$> parseDerivations "true 5.500000 0 true -3 0 true +7x 0 true \v9 0 true -2147483648 0 true 2147483647 0"),
+      runTest "a priority no digit leads, or one out of an int's range, is refused before the count is read" $
+        assertEqual "letters" (Left (BadPriority "high")) (parseDerivations "true high 0")
+          `andThen` assertEqual "too large" (Left (BadPriority "2147483648")) (parseDerivations "true 2147483648 0")
+          `andThen` assertEqual "sign alone" (Left (BadPriority "-")) (parseDerivations "true - 0")
+          `andThen` assertEqual "no count after it" (Left (BadPriority "x")) (parseDerivations "true x"),
+      runTest "an output count of -0 is zero, and a negative or non-numeric one is refused" $
+        assertEqual "minus zero" (Right [Element Active 5 []]) (parseDerivations "true 5 -0")
+          `andThen` assertEqual "negative" (Left (BadOutputCount "-1")) (parseDerivations "true 5 -1 /nix/store/a")
+          `andThen` assertEqual "letters" (Left (BadOutputCount "one")) (parseDerivations "true 5 one /nix/store/a"),
+      runTest "an attribute that ends inside an element is refused" $
+        assertEqual "no priority" (Left EndsInsideElement) (parseDerivations "true")
+          `andThen` assertEqual "no count" (Left EndsInsideElement) (parseDerivations "true 5")
+          `andThen` assertEqual "too few paths" (Left EndsInsideElement) (parseDerivations "true 5 2 /nix/store/a"),
+      runTest "an inactive element's paths are not packages" $
+        assertEqual
+          "packages"
+          [("/nix/store/a", 5), ("/nix/store/b", 5), ("/nix/store/d", 2)]
+          (elementPackages [Element Active 5 ["/nix/store/a", "/nix/store/b"], Element Inactive 1 ["/nix/store/c"], Element Active 2 ["/nix/store/d"]]),
+      runTestM "elements written as buildenv.nix writes them, with any separators between their tokens, read back" $ do
+        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} (QC.forAll genDerivationsCase (\(elements, rendered) -> parseDerivations rendered QC.=== Right elements))
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    ]
+
+-- | A tree on disk as read back: each link by its target, each directory
+-- by its entries.
+data Shape = ShapeLink !OsPath | ShapeDirectory !(Map.Map OsPath Shape)
+  deriving (Eq, Show)
+
+-- | A tree's shape, without the priorities its links were made at.
+shapeOf :: Tree -> Map.Map OsPath Shape
+shapeOf = Map.map nodeShape
+  where
+    nodeShape node = case node of
+      Link target _ -> ShapeLink target
+      Directory sub -> ShapeDirectory (shapeOf sub)
+
+-- | The shape of the tree in a directory on disk, links not followed.
+readShape :: OsPath -> IO (Map.Map OsPath Shape)
+readShape dir = do
+  names <- OsDir.listDirectory dir
+  Map.fromList <$> traverse (\name -> (name,) <$> entryShape (dir OP.</> name)) names
+  where
+    entryShape path = do
+      isLink <- OsDir.pathIsSymbolicLink path
+      if isLink then ShapeLink <$> OsDir.getSymbolicLinkTarget path else ShapeDirectory <$> readShape path
+
+-- | @builtin:buildenv@ through the builder, in a derivation of
+-- buildenv.nix's shape: two packages sharing @bin@, and an inactive
+-- element naming a path that is not there, make the tree the golden case
+-- of two packages sharing @bin@ describes, under the store's spelling of
+-- their paths, with @manifest.nix@ linked to the manifest.  The manifest
+-- is the one input, as nix-env's is, and the packages reach the closure
+-- as its references.
+testBuildenvBuildIO :: IO [Bool]
+testBuildenvBuildIO = do
+  putStrLn "builder/buildenv"
+  canLink <- symlinksAvailable
+  if not canLink
+    then do
+      putStrLn "  SKIP  cannot create symlinks here (Windows needs Developer Mode or elevation)"
+      pure []
+    else withTempStore $ \store -> do
+      tmpBase <- getTemporaryDirectory
+      let storeDir = stDir store
+          stage name = tmpBase </> ("nova-nix-test-buildenv-" <> name)
+          hello = StorePath (T.replicate 31 "0" <> "a") "hello"
+          world = StorePath (T.replicate 31 "0" <> "b") "world"
+          absent = StorePath (T.replicate 31 "0" <> "c") "absent"
+          manifest = StorePath (T.replicate 31 "0" <> "d") "env-manifest.nix"
+          environment = StorePath (T.replicate 31 "0" <> "f") "user-environment"
+          canonical = storePathToText defaultStoreDir
+          writeStaged path bytes = createDirectoryIfMissing True (takeDirectory path) *> BS.writeFile path bytes
+          onDisk = OP.encodeFS . storePathToFilePath storeDir
+      writeStaged (stage "hello" </> "bin" </> "hello") "hello"
+      writeStaged (stage "hello" </> "share" </> "man" </> "hello.1") "manual"
+      writeStaged (stage "world" </> "bin" </> "world") "world"
+      writeStaged (stage "manifest") (TE.encodeUtf8 (T.unwords [canonical hello, canonical world]))
+      addToStore store (stage "hello") hello Nothing []
+      addToStore store (stage "world") world Nothing []
+      addToStore store (stage "manifest") manifest Nothing [hello, world]
+      let drv =
+            Derivation
+              { drvOutputs = [DerivationOutput {doName = "out", doPath = environment, doHashAlgo = "", doHash = ""}],
+                drvInputDrvs = Map.empty,
+                drvInputSrcs = [manifest],
+                drvPlatform = OtherPlatform "builtin",
+                drvBuilder = builtinBuildenvBuilder,
+                drvArgs = [],
+                drvEnv =
+                  Map.fromList
+                    [ ("derivations", TE.encodeUtf8 (T.unwords ["true", "5", "1", canonical world, "false", "5", "1", canonical absent, "true", "5", "1", canonical hello])),
+                      ("manifest", TE.encodeUtf8 (canonical manifest))
+                    ]
+              }
+      result <- buildDerivation (defaultBuildConfig storeDir) store drv testDrvPath
+      case result of
+        BuildFailure message code ->
+          sequence [runTest "a buildenv derivation builds" (Fail ("build failed (exit " <> T.pack (show code) <> "): " <> message))]
+        BuildSuccess built ->
+          sequence
+            [ runTest "a buildenv derivation builds" Pass,
+              runTestM "its output is the tree of the golden case, with manifest.nix linked to the manifest" $ do
+                helloRoot <- onDisk hello
+                worldRoot <- onDisk world
+                manifestPath <- onDisk manifest
+                helloBin <- OsDir.canonicalizePath (helloRoot OP.</> asciiOsPath "bin")
+                made <- onDisk built >>= readShape
+                let expected = Map.insert (asciiOsPath "manifest.nix") (ShapeLink manifestPath) (shapeOf (sharedBinTree helloRoot helloBin worldRoot))
+                pure (assertEqual "tree" expected made),
+              runTestM "its output references the packages and the manifest" $ do
+                references <- queryReferences (stDB store) built
+                pure (assertEqual "references" (Set.fromList (map (T.pack . storePathToFilePath storeDir) [hello, world, manifest])) (Set.fromList references))
+            ]
 
 -- | Step 2 of the ladder: a dependency-aware build end-to-end.  A root
 -- derivation depends on a leaf; both @.drv@ files are pre-written to the store
@@ -34804,6 +35359,9 @@ runSuite = do
           testBuildCoresIO,
           testScrubbedBuildEnvIO,
           testUnpackBuildIO,
+          testBuildenvDerivations,
+          testProfileTree,
+          testBuildenvBuildIO,
           testDependentBuildIO,
           testBuildCheckIO,
           testStoreOpsIO,
