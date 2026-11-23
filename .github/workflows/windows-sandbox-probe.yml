@@ -35,11 +35,20 @@ jobs:
 
       # Who the probe runs as decides what it can show: the hosted runner's
       # user is an administrator, where nova-nix's usual user is not.
+      # A DLL on the known-DLL list is mapped from the system's own copy;
+      # any other is read from its file, under the token that loads it.
+      # The list and the ACLs of the System32 DLLs the checks load say
+      # which is which here.
       - name: Describe the runner
         run: |
           "image: $env:ImageOS $env:ImageVersion"
           [System.Environment]::OSVersion.VersionString
           whoami /user /groups /priv
+          reg query 'HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs'
+          foreach ($dll in 'kernel32.dll', 'advapi32.dll', 'cryptbase.dll', 'ucrtbase.dll') {
+            icacls (Join-Path $env:SystemRoot "System32\$dll")
+          }
+          $global:LASTEXITCODE = 0
 
       # The probe and the tools it runs under the restricted token sit in a
       # directory granting S-1-5-12 read and execute, which what is put
