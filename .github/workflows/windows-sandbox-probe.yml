@@ -9,8 +9,10 @@ name: Windows sandbox probe
 # the shipped helper, uploads it for running on a desktop too, and prints
 # one PASS or FAIL line per check.  The job fails when a check the design
 # depends on fails.  The probe's layout is under the runner's temporary
-# directory; the probe also makes, and removes, two local accounts and a
-# file in the user's profile for each pass, and the trace step turns
+# directory.  The probe also makes, and removes, two local accounts and a
+# window station and desktop for them, and a file in the user's profile
+# for each pass; the workflow makes, and removes, a scheduled task that
+# runs the probe's accounts command as SYSTEM; and the trace step turns
 # failure auditing on for its own steps alone.
 
 on:
@@ -25,7 +27,7 @@ jobs:
   probe:
     name: Windows sandbox probe
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 90
     defaults:
       run:
         shell: pwsh
@@ -250,15 +252,63 @@ jobs:
           }
           $global:LASTEXITCODE = 0
 
-      # The build accounts are started through the Secondary Logon service,
-      # which starts on demand; starting it here says so when it cannot.
       # write-profile lets the probe make a file in the runner user's
       # profile, which it removes, for a build to try to delete.
       - name: Run the probe
+        if: ${{ !cancelled() }}
         run: |
-          try { Start-Service seclogon } catch { "::warning::the Secondary Logon service did not start: $_" }
           & (Join-Path $env:PROBE_ROOT 'tools\bin\probe.exe') run $env:PROBE_ROOT $env:PROBE_BASH $env:PROBE_GCC write-profile
           exit $LASTEXITCODE
+
+      # The design's build accounts, run as the service they rest on would
+      # run builds: the probe's accounts command as SYSTEM, which holds the
+      # privileges to start a process under another logon's token.  A
+      # scheduled task runs it as SYSTEM at normal priority, the probe
+      # itself the action, writing its lines to a log under the probe's
+      # root, printed here.  The user a build must be kept from is the
+      # runner's, and this step's process the one it must not open.  A
+      # result of 0 counts only when the log has the probe's last line.
+      # Windows PowerShell carries the ScheduledTasks module itself.
+      - name: Run the build-account checks as SYSTEM
+        if: ${{ !cancelled() }}
+        shell: powershell
+        run: |
+          $probe = Join-Path $env:PROBE_ROOT 'tools\bin\probe.exe'
+          $log = Join-Path $env:PROBE_ROOT 'accounts.log'
+          $task = 'nova-nix-sandbox-probe-accounts'
+          $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          # LastTaskResult before a task has run.
+          $notRun = 267011
+          # A task's priority, 4 to 6 being the normal class.
+          $normalPriority = 5
+          $limit = New-TimeSpan -Minutes 40
+          $pollSeconds = 5
+          $arguments = "accounts `"$log`" `"$env:PROBE_ROOT`" `"$env:PROBE_BASH`" `"$env:PROBE_GCC`" $user " +
+            "`"$env:USERPROFILE`" `"$env:TEMP`" `"$env:APPDATA`" $PID write-profile"
+          $action = New-ScheduledTaskAction -Execute $probe -Argument $arguments
+          $principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+          $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit $limit -Priority $normalPriority
+          Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings | Out-Null
+          try {
+            Start-ScheduledTask -TaskName $task
+            $deadline = (Get-Date) + $limit
+            do {
+              Start-Sleep -Seconds $pollSeconds
+              $state = (Get-ScheduledTask -TaskName $task).State
+              $result = (Get-ScheduledTaskInfo -TaskName $task).LastTaskResult
+            } while (($state -eq 'Running' -or $state -eq 'Queued' -or $result -eq $notRun) -and (Get-Date) -lt $deadline)
+          } finally {
+            if ((Get-ScheduledTask -TaskName $task).State -eq 'Running') { Stop-ScheduledTask -TaskName $task }
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false
+          }
+          $lines = @()
+          if (Test-Path -LiteralPath $log) { $lines = @(Get-Content -LiteralPath $log -Encoding UTF8) }
+          $lines
+          "the accounts command ended with $result"
+          if (-not ($lines | Select-String -SimpleMatch 'CHECKS required failures')) {
+            throw 'the accounts command did not finish: its log has no last line'
+          }
+          exit $result
 
       # The probe removes the build accounts it makes, and their batch
       # logon right; this removes any account a run that ended early left,
@@ -271,7 +321,9 @@ jobs:
         if: always()
         shell: powershell
         run: |
-          Get-LocalUser | Where-Object Name -like 'nnprobe*' | ForEach-Object {
+          # Listed in full first, so that removing one does not cut the
+          # listing short.
+          @(Get-LocalUser | Where-Object Name -like 'nnprobe*') | ForEach-Object {
             "removing the leftover account $($_.Name)"
             Remove-LocalUser -SID $_.SID
           }

@@ -7,10 +7,10 @@
  * passes, each under one kind of token in a layout of its own:
  *
  *   - the design: two local build accounts, logged on with generated
- *     passwords and started through the Secondary Logon service, as this
- *     process holds no privilege to assign another logon's token (the
- *     "account-" pass, last, and only when the probe runs elevated and not
- *     in desktop mode);
+ *     passwords and started as the service the design rests on starts
+ *     builds, by a process running as SYSTEM, with CreateProcessAsUserW,
+ *     on a window station and desktop of their own (the "account-" pass,
+ *     which the accounts command runs);
  *   - the restricted token, S-1-5-12 and the build's SID restricting (no
  *     prefix), with the checks only it gets: its own token, the present
  *     store layout, a hostile store entry, a junction, and nova-nix as a
@@ -83,6 +83,14 @@
  *   probe checks ROOT BASH GCC JOB [write-profile | desktop]
  *                                    the checks, inside the job run made,
  *                                    whose handle JOB is
+ *   probe accounts LOG ROOT BASH GCC VICTIM PROFILE TEMP APPDATA PID
+ *                    [write-profile]
+ *                                    the design's pass, run as SYSTEM,
+ *                                    its lines written to LOG: VICTIM is
+ *                                    the SID of the user whose own a build
+ *                                    must not reach, PROFILE, TEMP and
+ *                                    APPDATA that user's directories, PID
+ *                                    one of that user's processes
  *   probe hold                       a stand-in sandbox helper, for the
  *                                    check that ends a whole tree
  *   probe trace STEP BASH GCC        one thing under the restricted
@@ -134,6 +142,8 @@ void *memcpy(void *destination, const void *source, size_t length)
 #define EXIT_NO_MEMORY 250
 /* The exit status of a command line the probe does not know. */
 #define EXIT_USAGE 249
+/* The exit status when the accounts command cannot open its log. */
+#define EXIT_NO_LOG 248
 
 /* The run command's options: write-profile lets the probe make, and
  * remove, a file in the user's profile, for the check that a build cannot
@@ -710,8 +720,12 @@ struct run {
 
 typedef HRESULT(WINAPI *create_pseudoconsole_call)(COORD, HANDLE, HANDLE, DWORD, HPCON *);
 typedef void(WINAPI *close_pseudoconsole_call)(HPCON);
-typedef BOOL(WINAPI *create_with_token_call)(HANDLE, DWORD, LPCWSTR, LPWSTR, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW,
-                                              LPPROCESS_INFORMATION);
+
+/* The window station and desktop, "STATION\\DESKTOP", a process started
+ * under a token is given, or NULL for this process's own: the accounts
+ * command, running as SYSTEM, starts the build accounts on one of their
+ * own. */
+static const WCHAR *build_desktop;
 
 static WCHAR *describe(const struct run *run);
 
@@ -789,27 +803,6 @@ done:
     return error;
 }
 
-/* Whether TOKEN belongs to another logon session than this process's, as
- * a build account's does.  This process, holding no privilege to assign
- * such a token to a process, starts it through the Secondary Logon
- * service, as CreateProcessWithTokenW does with SeImpersonatePrivilege. */
-static int other_logon(HANDLE token)
-{
-    TOKEN_STATISTICS theirs;
-    TOKEN_STATISTICS ours;
-    HANDLE own = NULL;
-    DWORD size;
-    int other = 0;
-    if (!GetTokenInformation(token, TokenStatistics, &theirs, sizeof theirs, &size)
-        || !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &own))
-        return 0;
-    if (GetTokenInformation(own, TokenStatistics, &ours, sizeof ours, &size))
-        other = theirs.AuthenticationId.LowPart != ours.AuthenticationId.LowPart
-                || theirs.AuthenticationId.HighPart != ours.AuthenticationId.HighPart;
-    CloseHandle(own);
-    return other;
-}
-
 /* Run COMMAND under TOKEN (or this process's own when NULL) in a job of
  * its own, as the sandbox helper would run a builder: created suspended,
  * assigned to a job that kills its tree when closed, caps each process's
@@ -822,14 +815,8 @@ static int other_logon(HANDLE token)
  * With SPAWN_NO_JOB the process gets no job of its own, staying in
  * whatever jobs this one is in, and the wait is on the process itself.
  * With SPAWN_PSEUDOCONSOLE it is attached to a pseudoconsole this process
- * owns, and SPAWN_DETACHED does not apply.  A token of another logon
- * session is started through the Secondary Logon service, given a
- * STARTUPINFO alone: no handle list, so the process may inherit every
- * inheritable handle this one holds, and no pseudoconsole; the
- * environment this process has; and the new console the service gives by
- * default, on this process's desktop, which the service grants the
- * token's user.  Whether it is in this process's jobs is the service's to
- * decide, and the nesting check says. */
+ * owns, and SPAWN_DETACHED does not apply.  A process under a token starts
+ * on build_desktop when that is set. */
 static void spawn(HANDLE token, const WCHAR *command, const WCHAR *directory, SIZE_T memory_cap, DWORD timeout_ms,
                   int flags, struct run *result)
 {
@@ -849,8 +836,6 @@ static void spawn(HANDLE token, const WCHAR *command, const WCHAR *directory, SI
     LPPROC_THREAD_ATTRIBUTE_LIST list = NULL;
     int list_ready = 0;
     DWORD attribute_count = (flags & SPAWN_PSEUDOCONSOLE) ? 2 : 1;
-    int through_service = token != NULL && other_logon(token);
-    WCHAR *environment_block = NULL;
     JOBOBJECT_ASSOCIATE_COMPLETION_PORT association;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
     WCHAR *mutable_command = join(command, END);
@@ -867,10 +852,6 @@ static void spawn(HANDLE token, const WCHAR *command, const WCHAR *directory, SI
     inheritable.lpSecurityDescriptor = NULL;
     inheritable.bInheritHandle = TRUE;
 
-    if (through_service && (flags & SPAWN_PSEUDOCONSOLE)) {
-        result->start_error = ERROR_NOT_SUPPORTED;
-        goto done;
-    }
     if (!CreatePipe(&read_end, &write_end, &inheritable, 0)) {
         result->start_error = GetLastError();
         goto done;
@@ -900,7 +881,9 @@ static void spawn(HANDLE token, const WCHAR *command, const WCHAR *directory, SI
         result->start_error = GetLastError();
         goto done;
     }
-    startup.StartupInfo.cb = through_service ? (DWORD)sizeof startup.StartupInfo : (DWORD)sizeof startup;
+    startup.StartupInfo.cb = sizeof startup;
+    if (token != NULL && build_desktop != NULL)
+        startup.StartupInfo.lpDesktop = (LPWSTR)build_desktop;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdInput = nul;
     startup.StartupInfo.hStdOutput = write_end;
@@ -925,27 +908,14 @@ static void spawn(HANDLE token, const WCHAR *command, const WCHAR *directory, SI
         goto done;
     }
 
-    creation = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
-    if (through_service) {
-        create_with_token_call create_with_token =
-            (create_with_token_call)function_in(L"advapi32.dll", "CreateProcessWithTokenW");
-        environment_block = GetEnvironmentStringsW();
-        if (create_with_token == NULL) {
-            result->start_error = ERROR_PROC_NOT_FOUND;
-            goto done;
-        }
-        created = create_with_token(token, 0, NULL, mutable_command, creation, environment_block, directory,
-                                    &startup.StartupInfo, &process);
-    } else {
-        creation |= EXTENDED_STARTUPINFO_PRESENT
-                    | ((flags & SPAWN_DETACHED) && console == NULL ? DETACHED_PROCESS : 0);
-        if (token != NULL)
-            created = CreateProcessAsUserW(token, NULL, mutable_command, NULL, NULL, TRUE, creation, NULL, directory,
-                                           &startup.StartupInfo, &process);
-        else
-            created = CreateProcessW(NULL, mutable_command, NULL, NULL, TRUE, creation, NULL, directory,
-                                     &startup.StartupInfo, &process);
-    }
+    creation = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT
+               | ((flags & SPAWN_DETACHED) && console == NULL ? DETACHED_PROCESS : 0);
+    if (token != NULL)
+        created = CreateProcessAsUserW(token, NULL, mutable_command, NULL, NULL, TRUE, creation, NULL, directory,
+                                       &startup.StartupInfo, &process);
+    else
+        created = CreateProcessW(NULL, mutable_command, NULL, NULL, TRUE, creation, NULL, directory,
+                                 &startup.StartupInfo, &process);
     if (!created) {
         result->start_error = GetLastError();
         goto done;
@@ -1011,8 +981,6 @@ done:
         if (close_console != NULL)
             close_console(console);
     }
-    if (environment_block != NULL)
-        FreeEnvironmentStringsW(environment_block);
     if (process.hThread != NULL)
         CloseHandle(process.hThread);
     if (process.hProcess != NULL)
@@ -1899,6 +1867,10 @@ struct context {
     HANDLE account_one;
     HANDLE account_two;
     const WCHAR *user;
+    /* The user whose own files, hive and processes a build must not
+     * reach: this process's user, or the one the accounts command is
+     * given. */
+    const WCHAR *victim;
     /* The first build's SID, whom the build directory grants. */
     const WCHAR *b1;
     /* The SIDs the layout grants what a build needs, NULL past the last:
@@ -1927,7 +1899,7 @@ struct context {
     const WCHAR *public_directory;
     /* The object directory this session's named objects go in. */
     const WCHAR *session_objects;
-    /* A file in the user's profile the user can read, or NULL. */
+    /* A file in the user's profile this process can read, or NULL. */
     const WCHAR *profile_file;
     /* Whether the run may make a file in the user's profile, for the
      * check that a build cannot delete one. */
@@ -1937,10 +1909,17 @@ struct context {
      * other process, opens nothing outside the root for writing, makes no
      * account, and leaves nothing it cannot remove. */
     int desktop;
-    /* This process's ID and the address of its memory marker, for the
-     * check that a build cannot read another process's memory. */
+    /* This process's ID and the address of its memory marker, which the
+     * spawning comparisons read. */
     const WCHAR *checks_pid;
     const WCHAR *marker_address;
+    /* One of the victim's processes and an address in it, for the check
+     * that a build cannot read another of the user's processes: this
+     * process and its marker, or the process the accounts command is given
+     * and address 0, which holds nothing, so that a build that opens it
+     * fails its read, not its open. */
+    const WCHAR *victim_pid;
+    const WCHAR *victim_address;
 };
 
 /* Whether TEXT holds NEEDLE. */
@@ -1972,17 +1951,12 @@ static void check_pipe(const struct context *c)
 {
     struct outcome piped = operation(c->build_one, L"pipe", NULL, NULL);
     struct run attached;
-    /* Whether a process the Secondary Logon service starts is in this
-     * one's jobs is the service's to decide; the service the build
-     * accounts' design rests on starts builds itself, so the nesting
-     * there is a finding. */
-    int through_service = other_logon(c->build_one);
     verdict(piped.succeeded && piped.run.output_length == sizeof pipe_marker - 1
                 && starts_with(piped.run.output, pipe_marker),
             REQUIRED, L"pipe-log",
             L"a restricted child writes the pipe it inherits as standard output, and the parent reads it", piped.detail);
-    verdict(piped.run.start_error == 0 && piped.run.in_own_job && piped.run.in_outer_job,
-            through_service ? FINDING : REQUIRED, L"jobs-nesting",
+    verdict(piped.run.start_error == 0 && piped.run.in_own_job && (outer_job == NULL || piped.run.in_outer_job),
+            REQUIRED, L"jobs-nesting",
             L"a restricted child started inside the checks' job is assigned a job of its own and stays in both",
             join(L"own job ", piped.run.in_own_job ? L"yes" : L"no", L", outer job ",
                  piped.run.in_outer_job ? L"yes" : L"no", L", ", piped.detail, END));
@@ -2268,24 +2242,6 @@ static const struct console_way console_ways[] = {
     {L"-pseudoconsole", L"attached to a pseudoconsole the checks own, which its subprograms share", SPAWN_PSEUDOCONSOLE},
 };
 
-/* The one way a token of another logon session runs: the Secondary
- * Logon service gives the process a new console of its own and takes no
- * pseudoconsole, and gcc's subprograms share that console. */
-static const struct console_way service_ways[] = {
-    {L"", L"started through the Secondary Logon service with a console of its own, which its subprograms share", 0},
-};
-
-/* The console ways a token can take, and how many in COUNT. */
-static const struct console_way *console_ways_for(HANDLE token, size_t *count)
-{
-    if (other_logon(token)) {
-        *count = sizeof service_ways / sizeof service_ways[0];
-        return service_ways;
-    }
-    *count = sizeof console_ways / sizeof console_ways[0];
-    return console_ways;
-}
-
 /* MSYS2's bash writing a file into the store, the way WAY gives it a
  * console; with FORKING, after running an MSYS2 program first, which bash
  * forks to start. */
@@ -2310,8 +2266,8 @@ static void run_bash(const struct context *c, const struct console_way *way, int
  * built.  The ways past the first are findings. */
 static void check_tools(const struct context *c)
 {
-    size_t ways;
-    const struct console_way *way = console_ways_for(c->build_one, &ways);
+    size_t ways = sizeof console_ways / sizeof console_ways[0];
+    const struct console_way *way = console_ways;
     size_t i;
     /* As the sandbox would set them for a build: temporary files in its
      * build directory, and the tools' PATH. */
@@ -2397,7 +2353,7 @@ struct candidate {
 /* The user's own registry hive, by its SID, as a build would reach it. */
 static WCHAR *user_hive(const struct context *c)
 {
-    return join(L"HKU\\", c->user, L"\\Software", END);
+    return join(L"HKU\\", c->victim, L"\\Software", END);
 }
 
 typedef HWINSTA(WINAPI *window_station_call)(void);
@@ -2514,7 +2470,7 @@ static const struct {
     {L"spawn-probe", SPAWN_DETACHED, L"spawn", L"probe", FLAGS_DETACHED, ARGUMENTS_FIXED,
      L"starts the probe with CreateProcessW from a job of its own, and it runs"},
     {L"spawn-probe-no-job", SPAWN_DETACHED | SPAWN_NO_JOB, L"spawn", L"probe", FLAGS_DETACHED, ARGUMENTS_FIXED,
-     L"the same from no job but the one the checks run in"},
+     L"the same with no job of its own, staying in whatever jobs the checks run in"},
     {L"spawn-probe-preserve-authz", SPAWN_DETACHED, L"spawn", L"probe", FLAGS_PRESERVE_AUTHZ, ARGUMENTS_FIXED,
      L"the same with CREATE_PRESERVE_CODE_AUTHZ_LEVEL, leaving out the code-authorization check"},
     {L"spawn-cmd", SPAWN_DETACHED, L"spawn", L"cmd", FLAGS_DETACHED, ARGUMENTS_FIXED,
@@ -2592,18 +2548,14 @@ static void spawning_row(const struct context *c, const struct candidate *row)
             info(label, L"not tried: on a desktop the probe opens no other process for reading");
         else if (spawning_steps[j].arguments == ARGUMENTS_SESSION_OBJECTS && first == NULL)
             verdict(0, FINDING, label, what, L"not tried: the session's directory is unknown");
-        else if (!(spawning_steps[j].flags & SPAWN_DETACHED) && row->token != NULL && other_logon(row->token))
-            verdict(0, FINDING, label, what,
-                    L"not tried: the Secondary Logon service gives the process a console of its own, and takes no "
-                    L"pseudoconsole");
         else
             expect_allowed(FINDING, label, what,
                            operation_with(row->token, spawning_steps[j].flags, spawning_steps[j].op, first, second));
     }
 }
 
-/* Every token's row but the build account's, which runs once the accounts
- * are made, last. */
+/* Every token's row but the build account's, which the accounts command
+ * runs. */
 static void check_spawning(const struct context *c)
 {
     const struct candidate rows[] = {
@@ -2686,8 +2638,8 @@ static void check_read_exposure(const struct context *c)
         info(L"read-process-memory", L"not tried: on a desktop the probe opens no other process for reading");
     else
         expect_denied(REQUIRED, L"read-process-memory",
-                      L"a build cannot open another of the user's processes, the checks', to read its memory",
-                      operation(c->build_one, L"read-memory", c->checks_pid, c->marker_address));
+                      L"a build cannot open another of the user's processes to read its memory",
+                      operation(c->build_one, L"read-memory", c->victim_pid, c->victim_address));
     if (!c->profile_writes) {
         info(L"delete-profile-file", L"not tried: the run was not given write-profile");
         return;
@@ -2825,7 +2777,7 @@ static WCHAR *describe_context(HANDLE base)
     {
         TOKEN_OWNER *owner = take(needed);
         if (GetTokenInformation(base, TokenOwner, owner, needed, &needed))
-            info(L"context-owner", join(L"the runner's new objects are owned by ", sid_text(owner->Owner), END));
+            info(L"context-owner", join(L"this process's new objects are owned by ", sid_text(owner->Owner), END));
     }
     needed = 0;
     GetTokenInformation(base, TokenIntegrityLevel, NULL, 0, &needed);
@@ -3079,8 +3031,9 @@ static void targeted_pass(const struct context *c, const WCHAR *root, const WCHA
  * Build accounts, standing in for the per-slot accounts a service runs
  * builds as: two local accounts, each granted the right to log on as a
  * batch job and logged on with a password generated for it, for a
- * primary token of its own.  Made only when this process is elevated, and
- * removed again, logon right first, whatever came of the checks.  netapi32
+ * primary token of its own.  Made by the accounts command, running as
+ * SYSTEM, and removed again, logon right first, whatever came of the
+ * checks.  netapi32
  * and these advapi32 functions are looked up here, in the parent alone.
  * ------------------------------------------------------------------------ */
 
@@ -3245,12 +3198,117 @@ static void remove_accounts(struct accounts *accounts)
         FreeLibrary(accounts->netapi);
 }
 
-/* Whether a token is elevated. */
-static int elevated(HANDLE token)
+/* The window station and desktop the build accounts start on, which grant
+ * SYSTEM and each account all access: a process this one starts as SYSTEM
+ * would otherwise start on SYSTEM's own, which the accounts cannot open. */
+#define BUILD_STATION_PREFIX L"nova-nix-builds-"
+#define BUILD_DESKTOP_NAME L"builds"
+
+typedef HWINSTA(WINAPI *create_station_call)(LPCWSTR, DWORD, ACCESS_MASK, LPSECURITY_ATTRIBUTES);
+typedef BOOL(WINAPI *set_station_call)(HWINSTA);
+typedef HDESK(WINAPI *create_desktop_call)(LPCWSTR, LPCWSTR, void *, DWORD, ACCESS_MASK, LPSECURITY_ATTRIBUTES);
+typedef BOOL(WINAPI *close_station_call)(HWINSTA);
+typedef BOOL(WINAPI *close_desktop_call)(HDESK);
+
+struct builds_desktop {
+    HMODULE user32;
+    HWINSTA station;
+    HDESK desktop;
+    PSECURITY_DESCRIPTOR descriptor;
+};
+
+/* Make the builds' window station and desktop, and set build_desktop to
+ * them.  Answers NULL, or why they could not be made; what was made is in
+ * MADE either way, for close_builds_desktop. */
+static const WCHAR *make_builds_desktop(struct builds_desktop *made, const struct accounts *accounts,
+                                        const WCHAR *pid)
 {
-    TOKEN_ELEVATION elevation;
-    DWORD size = sizeof elevation;
-    return GetTokenInformation(token, TokenElevation, &elevation, size, &size) && elevation.TokenIsElevated;
+    window_station_call current;
+    create_station_call create_station;
+    set_station_call set_station;
+    create_desktop_call create_desktop;
+    SECURITY_ATTRIBUTES attributes;
+    HWINSTA previous;
+    WCHAR *station_name = join(BUILD_STATION_PREFIX, pid, END);
+    WCHAR *sddl = join(L"D:(A;;GA;;;SY)(A;;GA;;;", accounts->slot[0].sid_text, L")(A;;GA;;;",
+                       accounts->slot[1].sid_text, L")", END);
+    made->user32 = LoadLibraryExW(L"user32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (made->user32 == NULL)
+        return join(L"user32 did not load, ", error_text(GetLastError()), END);
+    current = (window_station_call)(any_function)GetProcAddress(made->user32, "GetProcessWindowStation");
+    create_station = (create_station_call)(any_function)GetProcAddress(made->user32, "CreateWindowStationW");
+    set_station = (set_station_call)(any_function)GetProcAddress(made->user32, "SetProcessWindowStation");
+    create_desktop = (create_desktop_call)(any_function)GetProcAddress(made->user32, "CreateDesktopW");
+    if (current == NULL || create_station == NULL || set_station == NULL || create_desktop == NULL)
+        return join(L"a user32 function was not found, ", error_text(ERROR_PROC_NOT_FOUND), END);
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &made->descriptor, NULL))
+        return join(L"the descriptor could not be made, ", error_text(GetLastError()), END);
+    attributes.nLength = sizeof attributes;
+    attributes.lpSecurityDescriptor = made->descriptor;
+    attributes.bInheritHandle = FALSE;
+    made->station = create_station(station_name, 0, WINSTA_ALL_ACCESS | READ_CONTROL, &attributes);
+    if (made->station == NULL)
+        return join(L"CreateWindowStationW failed, ", error_text(GetLastError()), END);
+    /* A desktop is made on this process's own window station, which is
+     * set back once it is made. */
+    previous = current();
+    if (!set_station(made->station))
+        return join(L"SetProcessWindowStation failed, ", error_text(GetLastError()), END);
+    made->desktop = create_desktop(BUILD_DESKTOP_NAME, NULL, NULL, 0, GENERIC_ALL, &attributes);
+    if (made->desktop == NULL) {
+        DWORD error = GetLastError();
+        set_station(previous);
+        return join(L"CreateDesktopW failed, ", error_text(error), END);
+    }
+    set_station(previous);
+    build_desktop = join(station_name, L"\\", BUILD_DESKTOP_NAME, END);
+    info(L"builds-window-station", user_object_text(made->user32, made->station));
+    info(L"builds-desktop", user_object_text(made->user32, made->desktop));
+    return NULL;
+}
+
+/* Close what make_builds_desktop made.  user32 stays loaded until the
+ * process ends, as it is not unloaded once a thread has used it. */
+static void close_builds_desktop(struct builds_desktop *made)
+{
+    if (made->user32 != NULL) {
+        close_desktop_call close_desktop =
+            (close_desktop_call)(any_function)GetProcAddress(made->user32, "CloseDesktop");
+        close_station_call close_station =
+            (close_station_call)(any_function)GetProcAddress(made->user32, "CloseWindowStation");
+        if (made->desktop != NULL && close_desktop != NULL)
+            close_desktop(made->desktop);
+        if (made->station != NULL && close_station != NULL)
+            close_station(made->station);
+    }
+    if (made->descriptor != NULL)
+        LocalFree(made->descriptor);
+    build_desktop = NULL;
+}
+
+typedef BOOL(WINAPI *lookup_privilege_call)(LPCWSTR, LPCWSTR, PLUID);
+
+/* The privileges CreateProcessAsUserW asks of a process starting another
+ * logon's token, by name (winnt.h spells them as narrow text without
+ * UNICODE). */
+#define ASSIGN_PRIMARY_TOKEN_PRIVILEGE L"SeAssignPrimaryTokenPrivilege"
+#define INCREASE_QUOTA_PRIVILEGE L"SeIncreaseQuotaPrivilege"
+
+/* Enable a privilege this process's token holds.  Answers 0 or the
+ * error; ERROR_NOT_ALL_ASSIGNED when the token does not hold it. */
+static DWORD enable_privilege(HANDLE token, const WCHAR *name)
+{
+    lookup_privilege_call lookup = (lookup_privilege_call)function_in(L"advapi32.dll", "LookupPrivilegeValueW");
+    TOKEN_PRIVILEGES wanted;
+    if (lookup == NULL)
+        return ERROR_PROC_NOT_FOUND;
+    wanted.PrivilegeCount = 1;
+    wanted.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!lookup(NULL, name, &wanted.Privileges[0].Luid))
+        return GetLastError();
+    if (!AdjustTokenPrivileges(token, FALSE, &wanted, sizeof wanted, NULL, NULL))
+        return GetLastError();
+    return GetLastError();
 }
 
 /* The design: the checks under the two build accounts' own tokens, the
@@ -3262,15 +3320,112 @@ static void account_pass(const struct context *c, const WCHAR *root, const struc
     a.builders[1] = accounts->slot[1].sid_text;
     a.b1 = accounts->slot[0].sid_text;
     full_pass(&a, root, L"account",
-              L"the design: the checks under two build accounts' own tokens, started through the Secondary Logon "
-              L"service",
+              L"the design: the checks under two build accounts' own tokens, started as SYSTEM with "
+              L"CreateProcessAsUserW on a window station and desktop of their own",
               DESIGN_PASS, c->account_one, c->account_two);
 }
+
+/* The accounts command: the build accounts' design, run as the service it
+ * rests on runs builds, as SYSTEM, which holds the privileges to start a
+ * process under another logon's token.  The user a build must be kept
+ * from is VICTIM, a SID, with its profile, TEMP and APPDATA directories;
+ * VICTIM_PID is one of that user's processes, which a build must not
+ * open to read.  Answers the required failures. */
+static DWORD accounts_command(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc, const WCHAR *victim,
+                              const WCHAR *profile, const WCHAR *temp, const WCHAR *appdata, const WCHAR *victim_pid,
+                              const WCHAR *option)
+{
+    struct context c;
+    struct accounts accounts;
+    struct builds_desktop desktop;
+    HANDLE base = NULL;
+    const WCHAR *failure;
+    DWORD error;
+    DWORD session = 0;
+    memset(&c, 0, sizeof c);
+    memset(&accounts, 0, sizeof accounts);
+    memset(&desktop, 0, sizeof desktop);
+    c.bash = bash;
+    c.gcc = gcc;
+    c.profile_writes = option != NULL && wide_equal(option, WRITE_PROFILE);
+    c.victim = victim;
+    c.user_profile = profile;
+    c.user_temp = temp;
+    c.user_appdata = appdata;
+    c.system_root = environment(L"SystemRoot");
+    c.system_drive = environment(L"SystemDrive");
+    c.program_data = environment(L"ProgramData");
+    c.public_directory = environment(L"PUBLIC");
+    c.tools = parent_directory(child_directory);
+    c.checks_pid = number(GetCurrentProcessId(), 0);
+    c.marker_address = number((ULONG_PTR)memory_marker, 1);
+    c.victim_pid = victim_pid;
+    c.victim_address = L"0x0";
+    if (ProcessIdToSessionId(GetCurrentProcessId(), &session))
+        c.session_objects = session == 0 ? GLOBAL_OBJECTS
+                                         : join(L"\\Sessions\\", number(session, 0), L"\\BaseNamedObjects", END);
+    c.profile_file = readable_file_below(profile, PROFILE_SEARCH_DEPTH);
+    if (!OpenProcessToken(GetCurrentProcess(), BASE_TOKEN_ACCESS | TOKEN_ADJUST_PRIVILEGES, &base)) {
+        verdict(0, REQUIRED, L"setup-token", L"open this process's token", error_text(GetLastError()));
+        return required_failures;
+    }
+    c.user = describe_context(base);
+    info(L"context-victim", join(victim, L", profile ", profile, L", TEMP ", temp, L", APPDATA ", appdata,
+                                 L", process ", victim_pid,
+                                 L"; at the integrity of the process given, which a build at a lower one is refused "
+                                 L"by integrity before its DACL",
+                                 END));
+    info(L"context-profile-file", c.profile_file != NULL ? c.profile_file : L"none found");
+    if (c.user == NULL) {
+        verdict(0, REQUIRED, L"setup-user", L"read this process's user SID", error_text(GetLastError()));
+        goto done;
+    }
+    if ((error = enable_privilege(base, ASSIGN_PRIMARY_TOKEN_PRIVILEGE)) != 0
+        || (error = enable_privilege(base, INCREASE_QUOTA_PRIVILEGE)) != 0) {
+        verdict(0, REQUIRED, L"setup-privileges",
+                L"enable the privileges to assign another logon's token to a process", error_text(error));
+        goto done;
+    }
+    if ((failure = make_accounts(&accounts, &c)) != NULL) {
+        verdict(0, REQUIRED, L"build-account-setup", L"make two build accounts and log each on", failure);
+        goto done;
+    }
+    if ((failure = make_builds_desktop(&desktop, &accounts, number(GetCurrentProcessId(), 0))) != NULL) {
+        verdict(0, REQUIRED, L"build-account-desktop", L"make the builds' window station and desktop", failure);
+        goto done;
+    }
+    c.account_one = accounts.slot[0].token;
+    c.account_two = accounts.slot[1].token;
+    /* The why row first, and the design's pass only once an account's
+     * process is seen to run: a pass whose every child hangs would spend
+     * the task's time limit before the accounts were removed. */
+    {
+        const struct candidate row = {L"account", L"a build account's own token", accounts.slot[0].token, NULL};
+        struct outcome started;
+        begin_pass(L"", CANDIDATE_PASS);
+        spawning_row(&c, &row);
+        end_pass();
+        started = operation(c.account_one, L"noop", NULL, NULL);
+        verdict(started.succeeded, REQUIRED, L"account-start", L"a build account's process starts and ends",
+                started.detail);
+        if (started.succeeded)
+            account_pass(&c, root, &accounts);
+        else
+            info(L"account-pass", L"not run: a build account's process did not start and end");
+    }
+done:
+    close_builds_desktop(&desktop);
+    remove_accounts(&accounts);
+    CloseHandle(base);
+    say(join(L"CHECKS required failures: ", number(required_failures, 0), L", findings whose claim did not hold: ",
+             number(findings_failed, 0), END));
+    return required_failures;
+}
+
 
 static void checks(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc, const WCHAR *option)
 {
     struct context c;
-    struct accounts accounts;
     HANDLE base = NULL;
     PSID user_sid = NULL;
     PSID build_one_sid = NULL;
@@ -3283,7 +3438,6 @@ static void checks(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc, const
     WCHAR *b2;
 
     memset(&c, 0, sizeof c);
-    memset(&accounts, 0, sizeof accounts);
     c.bash = bash;
     c.gcc = gcc;
     c.profile_writes = option != NULL && wide_equal(option, WRITE_PROFILE);
@@ -3298,6 +3452,8 @@ static void checks(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc, const
     c.tools = parent_directory(child_directory);
     c.checks_pid = number(GetCurrentProcessId(), 0);
     c.marker_address = number((ULONG_PTR)memory_marker, 1);
+    c.victim_pid = c.checks_pid;
+    c.victim_address = c.marker_address;
     if (!ProcessIdToSessionId(GetCurrentProcessId(), &session))
         session_error = GetLastError();
     else
@@ -3316,6 +3472,7 @@ static void checks(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc, const
         CloseHandle(base);
         return;
     }
+    c.victim = c.user;
     info(L"context-user", c.user);
     info(L"context-paths", join(L"TEMP=", c.user_temp ? c.user_temp : L"?", L" USERPROFILE=",
                                 c.user_profile ? c.user_profile : L"?", L" APPDATA=",
@@ -3440,33 +3597,7 @@ static void checks(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc, const
                   L"the write-restricted token with the user's SID deny-only, on what the plain one deletes and reads; "
                   L"every line a finding",
                   c.write_restricted, c.write_restricted_deny_user);
-    /* The design last, so that the accounts and their logon right exist
-     * for as short a time as they can. */
-    if (c.desktop) {
-        info(L"build-account-setup", L"not run: on a desktop the probe makes no account");
-    } else if (!elevated(base)) {
-        info(L"build-account-setup", L"not run: this process is not elevated, and only an administrator makes "
-                                     L"accounts");
-    } else {
-        const WCHAR *failure = make_accounts(&accounts, &c);
-        if (failure != NULL) {
-            verdict(0, REQUIRED, L"build-account-setup", L"make two build accounts and log each on", failure);
-        } else {
-            const struct candidate row = {L"account", L"a build account's own token", accounts.slot[0].token, NULL};
-            c.account_one = accounts.slot[0].token;
-            c.account_two = accounts.slot[1].token;
-            account_pass(&c, root, &accounts);
-            begin_pass(L"", CANDIDATE_PASS);
-            spawning_row(&c, &row);
-            end_pass();
-            /* The Secondary Logon service grants each account the window
-             * station and desktop it starts it on; what it leaves there. */
-            describe_user_objects(L"after-accounts");
-        }
-    }
-
 cleanup:
-    remove_accounts(&accounts);
     {
         HANDLE tokens[] = {c.standard,
                            c.write_restricted_deny_user,
@@ -3827,8 +3958,7 @@ static DWORD run(const WCHAR *root, const WCHAR *bash, const WCHAR *gcc, const W
         verdict(0, REQUIRED, L"setup-outer-job", L"make the checks' job", error_text(GetLastError()));
         return required_failures;
     }
-    /* The checks inherit their job and the standard handles alone, so
-     * that nothing else this process holds can pass on to a build. */
+    /* The checks inherit their job and the standard handles alone. */
     inherited[inherited_count++] = job;
     if (out != NULL && out != INVALID_HANDLE_VALUE) {
         SetHandleInformation(out, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
@@ -4031,13 +4161,6 @@ void probe_entry(void)
             finish(EXIT_USAGE);
         }
         outer_job = (HANDLE)parse_address(arguments[5]);
-        /* Inherited from run, and to be inherited by nothing: a build
-         * started through the Secondary Logon service, which takes no
-         * handle list, would otherwise receive them, the step's output
-         * pipe among them. */
-        SetHandleInformation(outer_job, HANDLE_FLAG_INHERIT, 0);
-        SetHandleInformation(GetStdHandle(STD_OUTPUT_HANDLE), HANDLE_FLAG_INHERIT, 0);
-        SetHandleInformation(GetStdHandle(STD_ERROR_HANDLE), HANDLE_FLAG_INHERIT, 0);
         checks(arguments[2], arguments[3], arguments[4], option);
         status = required_failures;
         say(join(L"CHECKS required failures: ", number(required_failures, 0), L", findings whose claim did not hold: ",
@@ -4052,8 +4175,38 @@ void probe_entry(void)
         }
         finish(run(arguments[2], arguments[3], arguments[4], option));
     }
+    if (count >= 11 && wide_equal(arguments[1], L"accounts")) {
+        const WCHAR *option = count >= 12 ? arguments[11] : NULL;
+        HANDLE log;
+        HANDLE job;
+        if (option != NULL && !wide_equal(option, WRITE_PROFILE)) {
+            say(join(L"unknown option: ", option, END));
+            finish(EXIT_USAGE);
+        }
+        /* Run by a scheduled task, which gives no standard output: the
+         * lines go to LOG.  The command's own job ends whatever it leaves
+         * running when it ends. */
+        log = CreateFileW(arguments[2], GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                          NULL);
+        if (log == INVALID_HANDLE_VALUE)
+            finish(EXIT_NO_LOG);
+        SetStdHandle(STD_OUTPUT_HANDLE, log);
+        SetStdHandle(STD_ERROR_HANDLE, log);
+        job = library_job(FALSE);
+        if (job == NULL || !AssignProcessToJobObject(job, GetCurrentProcess()))
+            verdict(0, REQUIRED, L"setup-outer-job", L"put the accounts command in a job of its own",
+                    error_text(GetLastError()));
+        else
+            outer_job = job;
+        status = accounts_command(arguments[3], arguments[4], arguments[5], arguments[6], arguments[7],
+                                  arguments[8], arguments[9], arguments[10], option);
+        CloseHandle(log);
+        finish(status);
+    }
     if (count >= 5 && wide_equal(arguments[1], L"trace"))
         finish(trace(arguments[2], arguments[3], arguments[4]));
-    say(join(L"usage: probe run ROOT BASH GCC [" WRITE_PROFILE L" | " DESKTOP L"], or probe trace STEP BASH GCC", END));
+    say(join(L"usage: probe run ROOT BASH GCC [" WRITE_PROFILE L" | " DESKTOP L"], probe accounts LOG ROOT BASH GCC "
+             L"VICTIM PROFILE TEMP APPDATA PID [" WRITE_PROFILE L"], or probe trace STEP BASH GCC",
+             END));
     finish(EXIT_USAGE);
 }
