@@ -307,22 +307,26 @@ executable nova-nix
     , text                >= 2.0 && < 2.2
 
 -- ---------------------------------------------------------------------------
--- Sandbox helper: the process that makes a Linux build's namespaces and
--- chroot.  It is C because the setup runs between the namespaces'
--- creation and the builder's exec, where nova-nix itself can run nothing
--- (sandbox/nova-nix-sandbox.c says why); the runtime it links is never
--- started.  nova-nix finds it beside itself.
+-- Sandbox helper: the program every sandboxed build runs through.  Its
+-- core, sandbox/nova-nix-sandbox.c, reads the plan and reports a failed
+-- step as every OS does, and links the backend for the OS it is built
+-- for (sandbox/backend.h), which makes the sandbox: on Linux,
+-- sandbox/linux.c, namespaces and a chroot, set up between their creation
+-- and the builder's exec, where nova-nix itself can run nothing.  The
+-- runtime it links is never started.  nova-nix finds it beside itself.
 -- ---------------------------------------------------------------------------
 
 executable nova-nix-sandbox
   main-is:          nova-nix-sandbox.c
   hs-source-dirs:   sandbox
-  c-sources:        sandbox/plan.c sandbox/mountinfo.c
+  c-sources:        sandbox/plan.c
   default-language:  Haskell2010
   cc-options:       -std=c99 -Wall -Wextra -pedantic
   build-depends:
       base                >= 4.22 && < 5
-  if !os(linux)
+  if os(linux)
+    c-sources:      sandbox/linux.c sandbox/mountinfo.c
+  else
     buildable: False
 
 -- ---------------------------------------------------------------------------
