@@ -2,15 +2,25 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
 -- | The build sandbox's IO: whether this system can sandbox a build, the
--- chroot a sandboxed build runs in, and the one warning a process prints
--- when its builds fall back to running unsandboxed.  What is decided is
--- "Nix.Builder.Sandbox"; this module only carries it out.
+-- run of the @nova-nix-sandbox@ helper that carries a build's plan out,
+-- the chroot a sandboxed build runs in, and the one warning a process
+-- prints when its builds fall back to running unsandboxed.  What is
+-- decided is "Nix.Builder.Sandbox"; this module only carries it out.
+--
+-- == The helper
+--
+-- The helper's command line, plan and status record are its core's, the
+-- same whichever backend it links, so probing it and running it are
+-- written once here.  What a backend needs around the run is not: on
+-- Linux, a chroot made from its skeleton before the run, sealed after it,
+-- and removed.
 --
 -- == Where it runs
 --
--- Only Linux has a sandbox nova-nix makes ('sandboxSupported').  The
--- chroot code is POSIX and builds everywhere but Windows, so it runs in
--- the test suite on macOS as well; on Windows it refuses.
+-- The helper is built for Linux alone ('sandboxSupported'), and nothing
+-- probes or runs it elsewhere.  The chroot code is POSIX, so it runs in
+-- the test suite on macOS as well; Windows has no chroot, and there
+-- making or sealing one refuses.
 --
 -- == Process state
 --
@@ -53,7 +63,6 @@ import qualified Data.ByteString.Char8 as BS8
 import Data.Foldable (for_)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
-import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -63,8 +72,12 @@ import Nix.Builder.Sandbox (SkeletonEntry (..), Unavailability (..), fallbackWar
 import System.Exit (ExitCode (..))
 import System.IO (Handle, hClose, hFlush, stderr)
 import System.IO.Unsafe (unsafePerformIO)
+import qualified System.Info
 import qualified System.Process as Proc
-#if !defined(mingw32_HOST_OS)
+#if defined(mingw32_HOST_OS)
+import Nix.Builder.Sandbox (unavailabilityCause)
+#else
+import qualified Data.Set as Set
 import qualified GHC.Foreign as GHC
 import GHC.IO.Encoding (getFileSystemEncoding)
 import System.Directory (createDirectoryIfMissing, listDirectory, removePathForcibly)
@@ -81,13 +94,10 @@ import System.Posix.User (getEffectiveUserID, getRealUserID)
 -- Availability
 -- ---------------------------------------------------------------------------
 
--- | Whether this platform has a sandbox nova-nix makes.
+-- | Whether the helper is built for this platform, which has a backend
+-- for Linux alone.
 sandboxSupported :: Bool
-#if defined(linux_HOST_OS)
-sandboxSupported = True
-#else
-sandboxSupported = False
-#endif
+sandboxSupported = System.Info.os == "linux"
 
 -- | What the probe found for a helper, and whether the fallback warning
 -- has been printed.
@@ -122,7 +132,7 @@ sandboxAvailability helper
 -- | Run the helper's probe.
 probe :: FilePath -> IO (Either Unavailability FilePath)
 probe helper = do
-  ran <- try (Proc.readCreateProcessWithExitCode ((Proc.proc helper ["probe"]) {Proc.env = Just []}) "")
+  ran <- try (Proc.readCreateProcessWithExitCode ((Proc.proc helper [helperProbeVerb]) {Proc.env = Just []}) "")
   pure $ case ran of
     Left (failure :: IOException) -> Left (HelperUnrunnable (T.pack (show failure)))
     Right (ExitSuccess, "", _) -> Right helper
@@ -163,20 +173,21 @@ data HelperRun = HelperRun
 
 -- | Run the helper over a builder, given the build log, the helper, the
 -- plan, the directory it starts in, and the program and arguments it
--- executes.  It is spawned as a builder is ("Nix.Builder"), with its
+-- runs.  It is spawned as a builder is ("Nix.Builder"), with its
 -- protocol around it ("Nix.Builder.Sandbox"): an empty environment, so the
 -- loader reads no variable a derivation set; the plan on its standard
 -- input, which stays open after it as the lifeline the helper kills the
--- build on the end of; its standard output the status pipe; and standard
--- error the log, which the helper makes the builder's standard output too.
--- The status is read once the log ends and the helper is gone, since it
--- holds at most one short record, which the pipe buffers.
+-- build on the end of; its standard output the status channel; and
+-- standard error the log, which the builder writes its standard output to
+-- as well.  The status is read once the log ends and the helper is gone,
+-- since it holds at most one short record, which the pipe buffers.
 --
--- Whatever ends the run early, an interrupt included, the helper is sent
--- @SIGTERM@ and waited for before this returns, with asynchronous
--- exceptions masked so a second one cannot cut the wait short.  The helper
--- answers by killing the builder, and exits only once it has reaped it:
--- the builder is PID 1 of its namespace, which the kernel empties before
+-- Whatever ends the run early, an interrupt included, the helper is
+-- terminated ('Proc.terminateProcess') and waited for before this
+-- returns, with asynchronous exceptions masked so a second one cannot cut
+-- the wait short.  On Linux that is @SIGTERM@, which the helper answers by
+-- killing the builder, and it exits only once it has reaped it: the
+-- builder is PID 1 of its namespace, which the kernel empties before
 -- PID 1 can be reaped, so when this returns no process of the build is
 -- left to write into its directory or chroot.
 runHelper :: Handle -> FilePath -> ByteString -> FilePath -> [String] -> IO HelperRun
@@ -220,9 +231,11 @@ runHelper buildLog helper plan workDir command =
     -- is over either way.
     hCloseQuietly handle = hClose handle `E.catch` \(_ :: IOException) -> pure ()
 
--- | The helper's verb for running a builder.
-helperRunVerb :: String
+-- | The helper's verbs: run a builder, and check that this system can
+-- make the sandbox.
+helperRunVerb, helperProbeVerb :: String
 helperRunVerb = "run"
+helperProbeVerb = "probe"
 
 -- ---------------------------------------------------------------------------
 -- The chroot
@@ -292,7 +305,7 @@ mountPointsWithin mountinfo dir =
 -- change anything there as the user may.
 sealChroot :: FilePath -> FilePath -> IO (Either Text (Set FilePath))
 #if defined(mingw32_HOST_OS)
-sealChroot _ _ = pure (Right Set.empty)
+sealChroot _ _ = pure (Left (unavailabilityCause PlatformUnsupported))
 #else
 sealChroot root storeDir = do
   user <- getEffectiveUserID
@@ -342,7 +355,7 @@ sealChroot root storeDir = do
 -- ('mountPointsWithin').
 withChroot :: FilePath -> [SkeletonEntry] -> (FilePath -> IO a) -> IO (Either Text a)
 #if defined(mingw32_HOST_OS)
-withChroot _ _ _ = pure (Left "sandboxing builds is not supported on this platform")
+withChroot _ _ _ = pure (Left (unavailabilityCause PlatformUnsupported))
 #else
 withChroot buildDir skeleton action = do
   leftover <- removeChroot clearLeftover parent
