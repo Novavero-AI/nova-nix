@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 -- | The Nix store: content-addressed, immutable package storage.
@@ -44,6 +45,9 @@ module Nix.Store
     -- * Deletion
     resolveDeleteTarget,
 
+    -- * The process
+    useStoreFileMask,
+
     -- * Store operations
     addToStore,
     copyPathInto,
@@ -51,6 +55,8 @@ module Nix.Store
     registrationFor,
     materializeEvalSources,
     materializeEvalStoreWrites,
+    replaceWithCopy,
+    freshCopyPath,
     rewriteBytes,
     rewriteStoreHashes,
     scanReferences,
@@ -71,6 +77,9 @@ module Nix.Store
 
     -- * Link ordering (exposed for testing)
     orderLinks,
+
+    -- * Rewriting a file in place (exposed for testing)
+    rewriteRegularFile,
 
     -- * Case-hack naming (exposed for testing)
     onDiskNameKey,
@@ -136,6 +145,27 @@ import System.IO (Handle, IOMode (ReadMode), hClose, withBinaryFile)
 import System.IO.Error (isAlreadyExistsError)
 import System.OsPath (OsPath)
 import qualified System.OsPath as OP
+#if !defined(mingw32_HOST_OS)
+import Data.Bits ((.|.))
+import Data.Functor (void)
+import System.Posix.Files (FileStatus, deviceID, fileID, fileMode, fileSize, getFdStatus, groupWriteMode, isRegularFile, otherWriteMode, ownerWriteMode, setFdMode, setFdSize, setFileCreationMask)
+import System.Posix.IO (OpenFileFlags (..), OpenMode (..), closeFd, defaultFileFlags, openFd)
+import qualified System.Posix.IO.ByteString as PosixBytes
+import System.Posix.Types (Fd)
+#endif
+
+-- | Give the process upstream's file-creation mask, 0022, as every
+-- upstream command does (@initNix@, shared.cc:172-175 at 2.24.9): what it
+-- writes, and what a builder it starts writes, is then readable by
+-- everybody and writable by its owner alone, so no build's output is
+-- refused as one others could have changed (@registerOutputs@).  Windows
+-- has no such mask.
+useStoreFileMask :: IO ()
+#if defined(mingw32_HOST_OS)
+useStoreFileMask = pure ()
+#else
+useStoreFileMask = void (setFileCreationMask (groupWriteMode .|. otherWriteMode))
+#endif
 
 -- | Check if a store path is registered as valid in the database.
 isValid :: Store -> StorePath -> IO Bool
@@ -300,10 +330,7 @@ rewriteStoreHashes rewrites root = rewriteAt id root
         WalkDirectory -> do
           entries <- listDirectory path
           mapM_ (rewriteEntry path) entries
-        WalkRegular -> do
-          bytes <- BS.readFile path
-          let updated = rewriteBytes byteRewrites bytes
-          unless (updated == bytes) (whileWritable path (BS.writeFile path updated))
+        WalkRegular -> rewriteRegularFile (rewriteBytes byteRewrites) path
         WalkAbsent -> pure ()
     rewriteEntry dir entry = do
       rewriteAt (whileWritable dir) (dir </> entry)
@@ -312,6 +339,87 @@ rewriteStoreHashes rewrites root = rewriteAt id root
         taken <- doesPathExist (dir </> renamed)
         when taken (ioError (userError ("rewriting a store hash would overwrite " <> (dir </> renamed))))
         whileWritable dir (renamePath (dir </> entry) (dir </> renamed))
+
+-- | Change a regular file's bytes in place, never following a link.  On
+-- POSIX the file is opened without following one, read and written
+-- through descriptors that name the inode the first open found, a second
+-- open that finds another refused, and made writable for the write
+-- through its own descriptor, its mode put back after: a link put at the
+-- name after the walk's @lstat@ fails the rewrite, where a path-based read
+-- and write would follow it out of the tree.
+rewriteRegularFile :: (BS.ByteString -> BS.ByteString) -> FilePath -> IO ()
+#if defined(mingw32_HOST_OS)
+rewriteRegularFile change path = do
+  bytes <- BS.readFile path
+  let updated = change bytes
+  unless (updated == bytes) (whileWritable path (BS.writeFile path updated))
+#else
+rewriteRegularFile change path =
+  bracket (openFd path ReadOnly noFollow) closeFd $ \reader -> do
+    status <- getFdStatus reader
+    unless (isRegularFile status) (ioError (userError ("'" <> path <> "' is not a regular file")))
+    -- The file is canonical by now, so only its owner may write it, and
+    -- what its size says is the bytes there are to read.
+    bytes <- readSize reader (fromIntegral (fileSize status))
+    let updated = change bytes
+    unless (updated == bytes) $
+      bracket (setFdMode reader (fileMode status .|. ownerWriteMode)) (\() -> setFdMode reader (fileMode status)) $ \() ->
+        bracket (openFd path WriteOnly noFollow) closeFd $ \writer -> do
+          reopened <- getFdStatus writer
+          unless (sameNode status reopened) (ioError (userError ("'" <> path <> "' was replaced while it was rewritten")))
+          writeWhole writer updated
+          setFdSize writer (fromIntegral (BS.length updated))
+  where
+    noFollow = defaultFileFlags {nofollow = True, cloexec = True}
+
+-- | Whether two statuses are of one inode.
+sameNode :: FileStatus -> FileStatus -> Bool
+sameNode one other = deviceID one == deviceID other && fileID one == fileID other
+
+-- | The bytes a read makes at most at once from a descriptor.
+readChunkBytes :: Int
+readChunkBytes = 65536
+
+-- | Read a number of bytes from a descriptor, failing at an end before
+-- them.
+readSize :: Fd -> Int -> IO BS.ByteString
+readSize fd = go []
+  where
+    go chunks 0 = pure (BS.concat (reverse chunks))
+    go chunks remaining = do
+      chunk <- PosixBytes.fdRead fd (fromIntegral (min remaining readChunkBytes))
+      go (chunk : chunks) (remaining - BS.length chunk)
+
+-- | Write all of some bytes to a descriptor, from where it is.
+writeWhole :: Fd -> BS.ByteString -> IO ()
+writeWhole fd bytes
+  | BS.null bytes = pure ()
+  | otherwise = do
+      written <- PosixBytes.fdWrite fd bytes
+      writeWhole fd (BS.drop (fromIntegral written) bytes)
+#endif
+
+-- | Replace a node with a fresh copy of itself, as upstream replaces a
+-- fixed-output output before it hashes one (local-derivation-goal.cc:
+-- 2594-2600 at 2.24.9): a descriptor the builder passed out of its build
+-- names the old inode, which the copy leaves behind, so nothing written
+-- through it reaches what is registered.  The copy is made beside the
+-- node ('freshCopyPath'), then renamed over it, and removed should the
+-- replacement fail.
+replaceWithCopy :: FilePath -> IO ()
+replaceWithCopy path = do
+  let copy = freshCopyPath path
+  Dir.removePathForcibly copy
+  ( do
+      copyPathInto path copy
+      Dir.removePathForcibly path
+      renamePath copy path
+    )
+    `onException` Dir.removePathForcibly copy
+
+-- | Where 'replaceWithCopy' copies a node, upstream's name beside it.
+freshCopyPath :: FilePath -> FilePath
+freshCopyPath path = path <> ".tmp"
 
 -- | Point a symlink somewhere else.  'Dir.removePathForcibly' removes a file
 -- link or a directory link alike, which differ on Windows.
