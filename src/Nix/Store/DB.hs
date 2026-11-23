@@ -53,7 +53,7 @@ module Nix.Store.DB
   )
 where
 
-import Control.Exception (throwIO)
+import Control.Exception (bracketOnError, throwIO)
 import Data.List (sortOn)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -149,14 +149,20 @@ createRefsSQL =
 -- | Open (or create) the store database.
 -- Creates the store directory, metadata subdirectory, and database
 -- tables if they don't exist.  Enables WAL mode for concurrency and
--- foreign-key enforcement for referential integrity.
+-- foreign-key enforcement for referential integrity.  A statement that
+-- fails closes the connection it ran on.
 openStoreDB :: StoreDir -> IO StoreDB
 openStoreDB dir = do
   let storeRoot = unStoreDir dir
       metaDir = storeRoot </> metaDirName
       dbPath = metaDir </> dbFileName
   createDirectoryIfMissing True metaDir
-  conn <- open dbPath
+  bracketOnError (open dbPath) close (configureDB dir)
+
+-- | Set a connection to a store's database up: its pragmas and its
+-- tables.
+configureDB :: StoreDir -> Connection -> IO StoreDB
+configureDB dir conn = do
   execute_ conn "PRAGMA journal_mode=WAL"
   -- SQLite's default busy timeout is zero, so a second process hitting
   -- a peer's write transaction died on an uncaught ErrorBusy SQLError

@@ -41,7 +41,7 @@ module Nix.Store.Handle
 where
 
 import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar, withMVar)
-import Control.Exception (SomeException, mask, onException, throwIO, try)
+import Control.Exception (SomeException, bracketOnError, mask, onException, throwIO, try)
 import qualified Data.Text as T
 import Nix.Eval.CanonPath (canonPath)
 import Nix.Store.CaseSensitive (CaseSensitivity, probeCaseSensitivity)
@@ -88,20 +88,23 @@ canonicalStoreDir (StoreDir dir) = StoreDir . T.unpack . canonPath . T.pack <$> 
 -- collection is over.  It waits with the collector's own line: upstream's
 -- opener never waits here (it hands its roots to the running collector
 -- through a socket instead), so there is no upstream line for the wait,
--- and the collector's names what is being waited for.
+-- and the collector's names what is being waited for.  A step that fails
+-- once the lease is held releases what was taken before it, the database
+-- and the lease, so a failed open holds nothing that a later collection
+-- would wait on.
 openStore :: StoreDir -> IO Store
 openStore rawDir = do
   dir <- canonicalStoreDir rawDir
   let metaDir = unStoreDir dir </> metaDirName
       lockPath = gcLockFilePath dir
   createDirectoryIfMissing True metaDir
-  lease <- acquireLockFileWith LockShared bigGcLockMessage lockPath
-  db <- openStoreDB dir
-  -- After the directory exists: the probe answers for a path on disk,
-  -- and a fresh store's directory sits on the volume it will live on.
-  sensitivity <- probeCaseSensitivity (unStoreDir dir)
-  leaseVar <- newMVar lease
-  pure Store {stDir = dir, stDB = db, stGcLease = leaseVar, stCaseSensitivity = sensitivity}
+  bracketOnError (acquireLockFileWith LockShared bigGcLockMessage lockPath) releasePathLock $ \lease ->
+    bracketOnError (openStoreDB dir) closeStoreDB $ \db -> do
+      -- After the directory exists: the probe answers for a path on disk,
+      -- and a fresh store's directory sits on the volume it will live on.
+      sensitivity <- probeCaseSensitivity (unStoreDir dir)
+      leaseVar <- newMVar lease
+      pure Store {stDir = dir, stDB = db, stGcLease = leaseVar, stCaseSensitivity = sensitivity}
 
 -- | Close the store: the database first, then the lease, so the lock
 -- outlives every write this handle made.  Waits for an in-progress
