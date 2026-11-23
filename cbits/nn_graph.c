@@ -110,6 +110,7 @@ static void attrset_children(const nn_attrset_t *set, const nn_graph_visitor_t *
         v->symbol(ctx, keys[i]);
         object(v, ctx, NN_GRAPH_THUNK, values[i]);
     }
+    object(v, ctx, NN_GRAPH_ATTRSET, nn_attrset_base(set));
 }
 
 static void lambda_children(const nn_lambda_t *lam, const nn_graph_visitor_t *v, void *ctx)

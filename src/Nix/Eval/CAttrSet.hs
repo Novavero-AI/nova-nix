@@ -6,12 +6,16 @@
 -- @Data.Map.Strict@ node.
 --
 -- Construction is two-phase: insert entries, then freeze (sort + dedup).
--- After freeze, lookup is O(log n) binary search over contiguous memory.
+-- After freeze, a lookup is a binary search of each layer's contiguous
+-- arrays, top first, at most @NN_ATTRSET_MAX_LAYERS@ (8) of them.
 --
--- A set is read by name ('cattrsetLookup', 'cattrsetFind',
--- 'cattrsetMember') or walked in symbol order ('cattrsetWalk').  Only a
--- name table ('cattrsetFromNames'), a t'FlatCAttrSet', is read and
--- written by index into its arrays.
+-- A set 'cattrsetUpdate' makes can be a layer on its left operand,
+-- holding the right operand's entries alone, as upstream 2.34's
+-- @Bindings@ layer on one another (attr-set.hh:56-112 at 2.34.9).  A set
+-- is read by name ('cattrsetLookup', 'cattrsetFind', 'cattrsetMember'),
+-- which searches its layers top first, or walked in symbol order
+-- ('cattrsetWalk').  Only a name table ('cattrsetFromNames'), a
+-- t'FlatCAttrSet', is read and written by index into its arrays.
 --
 -- Values are 'CThunkPtr' cells stored as @void*@ on the C side.  The set
 -- never dereferences them, and the census ("Nix.Eval.CStats") follows
@@ -67,13 +71,13 @@ module Nix.Eval.CAttrSet
   )
 where
 
-import Control.Monad (forM_, unless)
+import Control.Monad (forM, forM_, unless)
 import Data.Word (Word32)
 import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Alloc (allocaBytesAligned)
-import Foreign.Marshal.Array (withArray)
+import Foreign.Marshal.Array (allocaArray, withArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
-import Foreign.Storable (alignment, peek, sizeOf)
+import Foreign.Storable (alignment, peek, peekElemOff, sizeOf)
 import Nix.Eval.AllocSite (SetSite, setSiteIndex)
 import Nix.Eval.CData (MonadCData, cdataIO)
 import Nix.Eval.CStatus (cStatusFailure, checkedCPtr)
@@ -146,6 +150,12 @@ foreign import ccall unsafe "nn_attrset_size"
 
 foreign import ccall unsafe "nn_attrset_layer_count"
   c_nn_attrset_layer_count :: CAttrSet -> IO Word32
+
+foreign import ccall unsafe "nn_attrset_base"
+  c_nn_attrset_base :: CAttrSet -> IO CAttrSet
+
+foreign import ccall unsafe "nn_attrset_entries"
+  c_nn_attrset_entries :: CAttrSet -> Ptr Word32 -> Ptr Word32 -> Ptr (Ptr ()) -> IO ()
 
 foreign import ccall unsafe "nn_attrset_union"
   c_nn_attrset_union :: CAttrSet -> CAttrSet -> Word32 -> IO CAttrSet
@@ -250,9 +260,17 @@ cattrsetMember set (Symbol sym) = cdataIO ((/= 0) <$> c_nn_attrset_find set sym 
 -- ---------------------------------------------------------------------------
 
 -- | A walk over a set's entries in symbol order, at the entry it reads
--- next: the set, that entry's index into the set's arrays, and how many
--- entries they hold.
-data CAttrSetWalk = CAttrSetWalk !CAttrSet !Word32 !Word32
+-- next.
+data CAttrSetWalk
+  = -- | A flat set read in place: the set, that entry's index into its
+    -- arrays, and how many entries they hold.
+    CAttrSetInPlace !CAttrSet !Word32 !Word32
+  | -- | A layered set's entries still to read, copied out of its layers
+    -- when the walk began.
+    CAttrSetCopied ![CAttrSetCopy]
+
+-- | An entry copied out of a layered set: its name, position and value.
+data CAttrSetCopy = CAttrSetCopy !Symbol !PosIdx !CThunkPtr
 
 -- | What a walk reads next.
 data CAttrSetStep
@@ -262,23 +280,44 @@ data CAttrSetStep
     -- with the walk past it.
     CAttrSetEntry !Symbol !PosIdx !CThunkPtr !CAttrSetWalk
 
--- | A walk from a set's first entry, which reads the set's arrays in
--- place, one entry at a time.  A frozen set's entries never move, so
--- whatever runs between two steps, the walk reads each entry once.
+-- | A walk from a set's first entry.  A flat set's arrays are read in
+-- place, one entry at a time: a frozen set's entries never move, so
+-- whatever runs between two steps, the walk reads each entry once.  A
+-- layered set's entries are copied out of its layers in symbol order
+-- first (@nn_attrset_entries@), each name from its topmost layer.
 {-# INLINE cattrsetWalk #-}
 cattrsetWalk :: (MonadCData m) => CAttrSet -> m CAttrSetWalk
-cattrsetWalk set = cdataIO (CAttrSetWalk set 0 <$> c_nn_attrset_layer_count set)
+cattrsetWalk set = cdataIO $ do
+  base <- c_nn_attrset_base set
+  if base == nullPtr
+    then CAttrSetInPlace set 0 <$> c_nn_attrset_layer_count set
+    else CAttrSetCopied <$> copiedEntries set
+
+-- | The entries a layered set binds, copied out of its layers in symbol
+-- order into arrays sized for them.
+copiedEntries :: CAttrSet -> IO [CAttrSetCopy]
+copiedEntries set = do
+  size <- fromIntegral <$> c_nn_attrset_size set
+  allocaArray size $ \names -> allocaArray size $ \positions -> allocaArray size $ \values -> do
+    c_nn_attrset_entries set names positions values
+    forM [0 .. size - 1] $ \i -> do
+      name <- peekElemOff names i
+      pos <- peekElemOff positions i
+      value <- peekElemOff values i
+      pure $! CAttrSetCopy (Symbol name) (PosIdx pos) (castPtr value)
 
 -- | The entry a walk reads next, or 'CAttrSetDone' past the last.
 {-# INLINE cattrsetWalkNext #-}
 cattrsetWalkNext :: (MonadCData m) => CAttrSetWalk -> m CAttrSetStep
-cattrsetWalkNext (CAttrSetWalk set idx count)
+cattrsetWalkNext (CAttrSetInPlace set idx count)
   | idx >= count = pure CAttrSetDone
   | otherwise = cdataIO $ do
       name <- c_nn_attrset_get_key set idx
       pos <- c_nn_attrset_get_pos set idx
       value <- c_nn_attrset_get_value set idx
-      pure (CAttrSetEntry (Symbol name) (PosIdx pos) (castPtr value) (CAttrSetWalk set (idx + 1) count))
+      pure (CAttrSetEntry (Symbol name) (PosIdx pos) (castPtr value) (CAttrSetInPlace set (idx + 1) count))
+cattrsetWalkNext (CAttrSetCopied []) = pure CAttrSetDone
+cattrsetWalkNext (CAttrSetCopied (CAttrSetCopy name pos value : rest)) = pure (CAttrSetEntry name pos value (CAttrSetCopied rest))
 
 -- ---------------------------------------------------------------------------
 -- Name tables by index
@@ -298,7 +337,8 @@ cattrsetSetValue (FlatCAttrSet set) idx ptr = cdataIO (c_nn_attrset_set_value se
 -- Bulk access
 -- ---------------------------------------------------------------------------
 
--- | Number of entries (unique keys after freeze).
+-- | Number of entries (after freeze: the names the set binds, in every
+-- layer, each once).
 cattrsetSize :: (MonadCData m) => CAttrSet -> m Word32
 cattrsetSize = cdataIO . c_nn_attrset_size
 
@@ -306,13 +346,19 @@ cattrsetSize = cdataIO . c_nn_attrset_size
 -- Set operations
 -- ---------------------------------------------------------------------------
 
--- | Right-biased union (// semantics) at a site.  Result is frozen.
+-- | Right-biased union (// semantics) at a site: a new flat set holding
+-- the entries of both.  Result is frozen.
 cattrsetUnion :: (MonadCData m) => SetSite -> CAttrSet -> CAttrSet -> m CAttrSet
 cattrsetUnion site a b = cdataIO (checkedCPtr "nn_attrset_union" =<< c_nn_attrset_union a b (setSiteIndex site))
 
--- | @a // b@ at a site: the set 'cattrsetUnion' makes, whose entries the
--- census counts as copied while it counts sites ("Nix.Eval.CStats"), as
--- upstream counts them in @nrOpUpdateValuesCopied@.  Result is frozen.
+-- | @a // b@ at a site, as upstream 2.34 makes it (eval.cc:1916-1989 at
+-- 2.34.9): a layer on @a@ holding @b@'s entries while @a@'s chain holds
+-- fewer than @NN_ATTRSET_MAX_LAYERS@ (8) sets and @b@ at most
+-- @NN_ATTRSET_LAYER_RHS_MAX@ entries (16 where a pointer takes 8 bytes),
+-- else the set 'cattrsetUnion' makes.  While
+-- the census counts sites ("Nix.Eval.CStats") it counts the entries
+-- copied, @b@'s for a layer and the result's for a union, as upstream
+-- counts them in @nrOpUpdateValuesCopied@.  Result is frozen.
 cattrsetUpdate :: (MonadCData m) => SetSite -> CAttrSet -> CAttrSet -> m CAttrSet
 cattrsetUpdate site a b = cdataIO (checkedCPtr "nn_attrset_update" =<< c_nn_attrset_update a b (setSiteIndex site))
 

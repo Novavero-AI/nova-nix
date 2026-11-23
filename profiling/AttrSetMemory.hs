@@ -18,9 +18,11 @@
 --
 -- A C set is built through "Nix.Eval.CAttrSet" as the evaluator builds a
 -- set literal's, with room for its entries and no more.  The evaluator's
--- sets from @\/\/@ and @removeAttrs@ have room for every entry of their
--- inputs, so a C set of the same size there costs at least what it does
--- here; bench.sh's memory report gives the census's own figure beside.
+-- sets from @removeAttrs@, and from @\/\/@ when it merges, have room for
+-- every entry of their inputs, so a C set of the same size there costs at
+-- least what it does here, while one @\/\/@ layers holds the right
+-- operand's entries alone; bench.sh's memory report gives the census's
+-- own figure beside.
 -- A flat set holds the same keys and positions in one 'PrimArray', the
 -- keys first as the C set's shared block holds them, and its values in a
 -- 'SmallArray'.  Every value is one shared closure, so that the figures

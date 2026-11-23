@@ -4,7 +4,8 @@
  * Parallel arrays of symbols, positions and values, sorted by symbol
  * (nn_attrset.c draws the layout), against the 48 bytes per node of the
  * pointer-chasing balanced tree Haskell's Data.Map.Strict would take.
- * Binary search for O(log n) lookup; linear scan for iteration.
+ * A lookup is a binary search of each layer, top first, at most
+ * NN_ATTRSET_MAX_LAYERS of them; iteration is a scan, merged across them.
  *
  * Construction is two-phase:
  *   1. nn_attrset_new(cap) + nn_attrset_insert() - append unsorted
@@ -13,6 +14,15 @@
  * After freeze, the set is immutable (values can be updated in-place
  * but keys cannot change).  This matches Nix semantics: attribute sets
  * are constructed once and never gain/lose keys.
+ *
+ * A set nn_attrset_update makes can be a layer: its own arrays hold the
+ * right operand's entries, and it sits on the left operand, its base,
+ * which it binds the rest of, as upstream 2.34's Bindings layer on one
+ * another (attr-set.hh:56-112 at 2.34.9).  A lookup searches the layers
+ * top first, and the set binds each name once, to its topmost entry, in
+ * symbol order.  A set's size counts every name it binds; the functions
+ * that take an index read a flat set alone, one with no base, as a name
+ * table always is.
  *
  * Values are the nn_thunk_t * of each attribute, or NULL in a frame's
  * name table until the frame fills it.  The set never dereferences them;
@@ -63,6 +73,16 @@ typedef struct nn_attrset nn_attrset_t;
 /* nn_attrset_index's answer for an absent key: no index reaches it. */
 #define NN_ATTRSET_NOT_FOUND UINT32_MAX
 
+/* The most sets one chain of layers holds, the set and its bases,
+ * upstream's Bindings::maxLayers (attr-set.hh:117 at 2.34.9). */
+#define NN_ATTRSET_MAX_LAYERS 8u
+
+/* The most entries a right operand of nn_attrset_update has for the
+ * result to be a layer on the left: upstream's default for
+ * eval-attrset-update-layer-rhs-threshold (eval-settings.hh:451-453 at
+ * 2.34.9), which is larger where a pointer takes 4 bytes. */
+#define NN_ATTRSET_LAYER_RHS_MAX (sizeof(void *) == 4 ? 8192u : 16u)
+
 /* --- Lifecycle --- */
 
 /* Allocate a new empty attribute set at `site` with space for `capacity`
@@ -98,7 +118,7 @@ void nn_attrset_freeze(nn_attrset_t *set);
 /* --- Query (after freeze) --- */
 
 /* Look up a key by symbol.  Returns the value pointer, or NULL if
- * the key is not present.  O(log n) binary search. */
+ * the key is not present.  A binary search of each layer, top first. */
 void *nn_attrset_lookup(const nn_attrset_t *set, nn_symbol_t key);
 
 /* Whether the set binds `key`, writing its entry's position through
@@ -106,12 +126,14 @@ void *nn_attrset_lookup(const nn_attrset_t *set, nn_symbol_t key);
  * that is NULL, as a name table's is until its frame fills it, is found
  * as well, where nn_attrset_lookup answers NULL as for a key not bound.
  * Returns 1 when the set binds the key, else 0 with nothing written.
- * O(log n) binary search. */
+ * A binary search of each layer, top first. */
 int nn_attrset_find(const nn_attrset_t *set, nn_symbol_t key,
                     uint32_t *pos, void **value);
 
 /* Return the index of a key, or NN_ATTRSET_NOT_FOUND.
- * Useful for updating value slots in place. */
+ * Useful for updating value slots in place.  This and the functions
+ * below that take an index read a flat set; a layered one aborts
+ * (NN_ASSERT). */
 uint32_t nn_attrset_index(const nn_attrset_t *set, nn_symbol_t key);
 
 /* Update the value at a known index.  Index must be valid (0 <= idx < count).
@@ -130,8 +152,19 @@ uint32_t nn_attrset_get_pos(const nn_attrset_t *set, uint32_t idx);
 
 /* --- Bulk access --- */
 
-/* Number of entries (after freeze: unique keys). */
+/* Number of entries (after freeze: the names the set binds, in every
+ * layer, each once). */
 uint32_t nn_attrset_size(const nn_attrset_t *set);
+
+/* The set a layer sits on, or NULL for a flat set. */
+const nn_attrset_t *nn_attrset_base(const nn_attrset_t *set);
+
+/* Write the entries a frozen set binds, nn_attrset_size of them, in
+ * symbol order: each name's key, position and value, from the topmost
+ * layer that holds the name, to the three arrays, each with room for
+ * that many. */
+void nn_attrset_entries(const nn_attrset_t *set, nn_symbol_t *keys,
+                        uint32_t *positions, void **values);
 
 /* --- Lifecycle: bulk cleanup --- */
 
@@ -142,27 +175,32 @@ void nn_attrset_free_all(void);
 
 /* --- Set operations --- */
 
-/* Create a new set at `site` that is the right-biased union of `a` and
- * `b` (keys in `b` override `a`, positions with them).  Both inputs must
- * be frozen.
+/* Create a new flat set at `site` that is the right-biased union of `a`
+ * and `b` (keys in `b` override `a`, positions with them), sized for the
+ * entries of both.  Both inputs must be frozen.
  * The result is returned frozen and is arena-tracked (freed by
  * nn_attrset_free_all).  Returns NULL when the union would pass
  * NN_ATTRSET_MAX_ENTRIES or an allocation fails. */
 nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b,
                                uint32_t site);
 
-/* `a // b`: the set nn_attrset_union makes of `a` and `b` at `site`.
- * While the census counts sites (nn_stats.h), the entries the result
- * holds count as copied, as upstream's ExprOpUpdate::eval adds the
- * merged set's size to nrOpUpdateValuesCopied.  The evaluator gives the
- * other operand for an empty one, as upstream does before it counts, and
- * so calls this with two sets that hold entries (eval.cc:1920-1930 and
- * :1988 at 2.34.9).  Returns NULL as nn_attrset_union does. */
+/* `a // b` at `site`, as upstream's ExprOpUpdate::eval makes it
+ * (eval.cc:1916-1989 at 2.34.9): while a's chain holds fewer than
+ * NN_ATTRSET_MAX_LAYERS sets and b at most NN_ATTRSET_LAYER_RHS_MAX
+ * entries, a layer on `a` holding b's entries, else the set
+ * nn_attrset_union makes.  While the census counts sites (nn_stats.h),
+ * the entries copied count: b's for a layer, the result's for a union,
+ * as upstream counts them in nrOpUpdateValuesCopied.  The evaluator
+ * gives the other operand for an empty one, as upstream does before it
+ * counts, so it calls this with two sets that hold entries; given one
+ * with none, this makes the union.  Both inputs must be frozen.  Returns
+ * NULL as nn_attrset_union does, and for a layer whose size would pass
+ * NN_ATTRSET_MAX_ENTRIES. */
 nn_attrset_t *nn_attrset_update(const nn_attrset_t *a, const nn_attrset_t *b,
                                 uint32_t site);
 
-/* Create a new set at `site` with the given keys removed.  Input must be
- * frozen.
+/* Create a new flat set at `site` with the given keys removed, sized for
+ * the entries of `set`.  Input must be frozen.
  * The result is returned frozen and is arena-tracked (freed by
  * nn_attrset_free_all).  Returns NULL when an allocation fails. */
 nn_attrset_t *nn_attrset_remove_keys(
@@ -186,12 +224,13 @@ void nn_attrset_sweep(uint32_t from, nn_tracker_keep_t keep, void *ctx);
  * positions and values at its capacity. */
 uint64_t nn_attrset_bytes(const nn_attrset_t *set);
 
-/* The entries a frozen set's own arrays hold, in symbol order: their
- * number, and the arrays of their keys and their values, which hold that
- * many and are valid until the set is freed.  Before freeze the arrays
- * hold the inserts in their order, a name repeated among them, and move
- * when the set grows.  The object graph follows a set by them
- * (nn_graph.h), and the census counts its size by them. */
+/* The entries a frozen set's own arrays hold, in symbol order, a
+ * layer's without its base's: their number, and the arrays of their
+ * keys and their values, which hold that many and are valid until the
+ * set is freed.  Before freeze the arrays hold the inserts in their
+ * order, a name repeated among them, and move when the set grows.  The
+ * object graph follows a set by them and its base (nn_graph.h), and the
+ * census counts its size by them. */
 uint32_t nn_attrset_layer_count(const nn_attrset_t *set);
 const nn_symbol_t *nn_attrset_layer_keys(const nn_attrset_t *set);
 void *const *nn_attrset_layer_values(const nn_attrset_t *set);

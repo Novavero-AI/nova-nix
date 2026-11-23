@@ -287,17 +287,17 @@ nixEqual forceFn (VAttrs as) (VAttrs bs) = do
 nixEqual _ _ _ = pure False
 
 -- | Upstream's walk over two sets of one size (eval.cc:2776-2781 at
--- 2.24.9): both in their arrays' order, each pair's names compared and
--- then its values, stopping at the first difference, so no value past it
--- is forced ('attrSetAllPairs').  Upstream's @Bindings@ are sorted by
--- @Symbol@, whose id is the order its table interned the name in
--- (attr-set.hh and symbol-table.hh), and the arrays here are sorted by
--- symbol id the same way.  Two sets therefore compare in upstream's order
--- wherever the two tables interned the sets' names in one order: the
--- startup names first ('Nix.Eval.StartupSymbols'), each name in source
--- where upstream's parser interns it, and each name @listToAttrs@,
--- @groupBy@ and @fromJSON@ make where those builtins intern it upstream.
--- No string value takes a symbol in either.
+-- 2.24.9): both in symbol order, each pair's names compared and then its
+-- values, stopping at the first difference, so no value past it is forced
+-- ('attrSetAllPairs').  Upstream's @Bindings@ are sorted by @Symbol@,
+-- whose id is the order its table interned the name in (attr-set.hh and
+-- symbol-table.hh), and a set here walks in symbol id order the same way.
+-- Two sets therefore compare in upstream's order wherever the two tables
+-- interned the sets' names in one order: the startup names first
+-- ('Nix.Eval.StartupSymbols'), each name in source where upstream's
+-- parser interns it, and each name @listToAttrs@, @groupBy@ and
+-- @fromJSON@ make where those builtins intern it upstream.  No string
+-- value takes a symbol in either.
 attrsEqual :: (MonadEval m) => Force m -> AttrSet -> AttrSet -> m Bool
 attrsEqual forceFn = attrSetAllPairs samePair
   where
@@ -404,10 +404,13 @@ evalUpdate evalLeft evalRight = do
 -- @ExprOpUpdate::eval@ copies the other operand's @Value@ (eval.cc:1908-1909
 -- at 2.24.9): no set is made, and a printer, which enters a set by its
 -- bindings, finds the operand's.  Otherwise C-side @nn_attrset_update@
--- merges the two sorted arrays into a new set, O(n+m), and the census
--- counts the entries it holds as copied, as upstream adds the merged
--- set's size to @nrOpUpdateValuesCopied@ (eval.cc:1934 at 2.24.9, :1988
--- at 2.34.9).  An empty operand copies and counts nothing in either.
+-- makes the set as upstream 2.34 does: a layer on the left holding the
+-- right's entries alone when the right is small and the left's chain of
+-- layers short, else a merge of the two into a new set, O(n+m)
+-- ('Nix.Eval.CAttrSet.cattrsetUpdate').  The census counts the entries
+-- either copies, as upstream adds them to @nrOpUpdateValuesCopied@
+-- (eval.cc:1944-1988 at 2.34.9).  An empty operand copies and counts
+-- nothing in either.
 mergeAttrSets :: (MonadCData m) => AttrSet -> AttrSet -> m AttrSet
 mergeAttrSets left@(AttrSet a) right@(AttrSet b) = do
   leftSize <- attrSetSize left

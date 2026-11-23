@@ -256,7 +256,8 @@ data Census = Census
     censusIndexSeconds :: !Double,
     -- | Wall-clock seconds the mark took.
     censusMarkSeconds :: !Double,
-    -- | The reached attribute sets by their number of entries.
+    -- | The reached attribute sets by the number of entries each holds in
+    -- its own arrays, a layer's without the set under it.
     censusSetSizes :: !(Map Word32 Word64),
     -- | What counting by site has found, when it is on.
     censusSites :: !(Maybe SiteCounts)
