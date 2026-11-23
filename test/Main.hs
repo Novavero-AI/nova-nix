@@ -14,7 +14,7 @@ import qualified Codec.Compression.GZip as GZip
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
 import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
-import Control.Concurrent.Async (asyncThreadId, cancel, wait, waitCatch, withAsync)
+import Control.Concurrent.Async (asyncThreadId, cancel, wait, waitCatch, withAsync, withAsyncBound)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
 import Control.Monad (filterM, foldM, forM_, guard, replicateM, replicateM_, unless, void, when, zipWithM, (>=>))
 import Control.Monad.Except (runExceptT)
@@ -26,8 +26,8 @@ import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Char (intToDigit, isAsciiLower, isAsciiUpper, isDigit, ord)
-import Data.Either (isLeft, isRight)
-import Data.Foldable (toList, traverse_)
+import Data.Either (fromLeft, isLeft, isRight)
+import Data.Foldable (for_, toList, traverse_)
 import Data.Functor ((<&>))
 import Data.Functor.Identity (Identity (..))
 import qualified Data.Graph as Graph
@@ -51,11 +51,12 @@ import Data.Tuple (swap)
 import Data.Word (Word16, Word32, Word64, Word8)
 import qualified Database.SQLite.Simple as SQL
 import DirDacl (Dacl (..), DaclEntry (..), directoryDacl, processUserSid)
-import Foreign.C.Error (Errno (..), eACCES, eISDIR, eNOENT, eNOTDIR)
-import Foreign.C.Types (CChar, CInt (..), CSize (..))
-import Foreign.Marshal.Alloc (alloca)
+import Foreign.C.Error (Errno (..), eACCES, eINVAL, eISDIR, eNOENT, eNOTDIR, getErrno)
+import Foreign.C.String (withCString)
+import Foreign.C.Types (CChar, CInt (..), CLong (..), CSize (..))
+import Foreign.Marshal.Alloc (alloca, free)
 import Foreign.Ptr (Ptr, WordPtr, castPtr, nullPtr, ptrToWordPtr)
-import Foreign.Storable (Storable, peekByteOff, peekElemOff, poke, pokeByteOff, sizeOf)
+import Foreign.Storable (Storable, peek, peekByteOff, peekElemOff, poke, pokeByteOff, sizeOf)
 import qualified GHC.Foreign as GHCForeign
 import GHC.IO.Encoding (getFileSystemEncoding, mkTextEncoding, setFileSystemEncoding)
 import GHC.IO.Exception (IOErrorType (..), IOException (..))
@@ -66,6 +67,8 @@ import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildLayout (..), Buil
 import Nix.Builder.BuildDir (buildDirFor, createBuildDir, withBuildDir)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
+import qualified Nix.Builder.Sandbox as Sandbox
+import qualified Nix.Builder.Sandbox.Spawn as Spawn
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, defaultUnpackLimits, entryComponents, envSrcs, resolveLinkTarget, runBuiltinUnpack)
 import Nix.Builtins (builtinEnv, isNixPathPseudoUrl, parseNixPath, rootScopeNames, splitNixPath)
 import qualified Nix.Cli.Args as Cli
@@ -11696,7 +11699,7 @@ testBuilderLayout = do
     seenOut = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-p"
     seenDev = "/nix/store/cccccccccccccccccccccccccccccccc-p-dev"
     onDiskAt seen = BuildPlace seen (T.unpack diskRoot <> seen)
-    layout = BuildLayout (BuildPlace seenTop diskTop) [("out", onDiskAt seenOut), ("dev", onDiskAt seenDev)]
+    layout = BuildLayout (BuildPlace seenTop diskTop) [("out", onDiskAt seenOut), ("dev", onDiskAt seenDev)] seenTop
     topVars = ["NIX_BUILD_TOP", "TMPDIR", "TEMPDIR", "TMP", "TEMP", if SI.os == "mingw32" then "USERPROFILE" else "HOME"]
     encoded = TE.encodeUtf8 . T.pack
     invoke :: [(Text, Text)] -> [Text] -> Either Text BuilderInvocation
@@ -11716,6 +11719,1190 @@ testBuilderLayout = do
       passed <- QC.sublistOf names
       args <- QC.listOf genValue
       pure (("passAsFile", T.unwords passed) : zip names values, args)
+
+-- | The sandbox's settings, decision, plan, chroot and reports, which
+-- "Nix.Builder.Sandbox" works out without IO, held to upstream's
+-- (local-derivation-goal.cc and globals.cc at 2.24.9).
+testSandboxPure :: IO [Bool]
+testSandboxPure = do
+  putStrLn "builder/sandbox"
+  sequence
+    [ runTest "sandbox takes true, relaxed and false, under its own name and both of upstream's older ones" $
+        foldr
+          andThen
+          Pass
+          [ assertEqual (TE.decodeLatin1 (name <> " = " <> value)) (Right (Just mode)) (ncSandbox <$> Config.resolveConfig [Config.ConfigAssignment name value])
+          | name <- ["sandbox", "build-use-chroot", "build-use-sandbox"],
+            (value, mode) <- [("true", Sandbox.SandboxEnabled), ("relaxed", Sandbox.SandboxRelaxed), ("false", Sandbox.SandboxDisabled)]
+          ],
+      runTest "sandbox refuses a value upstream refuses, naming the setting whatever name set it" $
+        assertEqual "refusal" (Left "option 'sandbox' has invalid value 'yes'") (ncSandbox <$> Config.resolveConfig [Config.ConfigAssignment "build-use-chroot" "yes"]),
+      runTest "sandbox-paths replaces its default where an extra- assignment adds to it, keeping each path's bytes" $
+        let resolved assignments = ncSandboxPaths <$> Config.resolveConfig assignments
+         in assertEqual "plain, through an alias" (Right (Config.PathSetValue Config.ReplacesDefault (Set.fromList ["/a", "/b=\xff"]))) (resolved [Config.ConfigAssignment "build-chroot-dirs" "/b=\xff /a"])
+              `andThen` assertEqual "extra" (Right (Config.PathSetValue Config.KeepsDefault (Set.fromList ["/c"]))) (resolved [Config.ConfigAssignment "extra-sandbox-paths" "/c"])
+              `andThen` assertEqual "extra after plain, through an alias" (Right (Config.PathSetValue Config.ReplacesDefault (Set.fromList ["/a", "/c"]))) (resolved [Config.ConfigAssignment "sandbox-paths" "/a", Config.ConfigAssignment "extra-build-sandbox-paths" "/c"]),
+      runTest "the other sandbox settings read upstream's values, and those whose defaults take IO stay unset" $
+        let set =
+              Config.resolveConfig
+                [ Config.ConfigAssignment "sandbox-fallback" "false",
+                  Config.ConfigAssignment "sandbox-build-dir" "/tmp/b",
+                  Config.ConfigAssignment "sandbox-dev-shm-size" "10%",
+                  Config.ConfigAssignment "require-drop-supplementary-groups" "yes",
+                  Config.ConfigAssignment "ssl-cert-file" "/certs.pem"
+                ]
+            fields config = (ncSandboxFallback config, ncSandboxBuildDir config, ncSandboxDevShmSize config, ncRequireDropSupplementaryGroups config, ncSslCertFile config)
+         in assertEqual "set" (Right (False, "/tmp/b", "10%", Just True, Just "/certs.pem")) (fields <$> set)
+              `andThen` assertEqual "defaults" (True, "/build", "50%", Nothing, Nothing) (fields Config.defaultNixConfig)
+              `andThen` assertEqual "sandbox unset" Nothing (ncSandbox Config.defaultNixConfig)
+              `andThen` assertEqual "extra- reaches no scalar" (Right Config.defaultNixConfig) (Config.resolveConfig [Config.ConfigAssignment "extra-sandbox-build-dir" "/x"]),
+      runTest "build, eval and trust take upstream's sandbox flags, the later flag winning" $
+        let mode args = Cli.optSandbox <$> Cli.parseArgs args
+         in foldr
+              andThen
+              Pass
+              [ assertEqual (T.pack (unwords arguments)) (Right (Just expected)) (mode arguments)
+              | (flag, expected) <-
+                  [ ("--sandbox", Sandbox.SandboxEnabled),
+                    ("--no-sandbox", Sandbox.SandboxDisabled),
+                    ("--relaxed-sandbox", Sandbox.SandboxRelaxed)
+                  ],
+                command <- ["build", "eval", "trust"],
+                arguments <- [[flag, command, "--expr", "1"], [command, flag, "--expr", "1"], [command, "--expr", "1", flag]]
+              ]
+              `andThen` assertEqual "the later" (Right (Just Sandbox.SandboxEnabled)) (mode ["build", "--no-sandbox", "--expr", "1", "--sandbox"])
+              `andThen` assertEqual "none" (Right Nothing) (mode ["build", "--expr", "1"]),
+      runTest "sandbox-paths entries are upstream's: TARGET=SOURCE split at the first =, a bare path naming itself, ? after an optional source" $
+        assertEqual
+          "entries"
+          [ Sandbox.SandboxPath "/a" "/b=c" Sandbox.OptionalPath,
+            Sandbox.SandboxPath "/bin/sh" "/host/sh" Sandbox.RequiredPath,
+            Sandbox.SandboxPath "/dev/nvidiactl" "/dev/nvidiactl" Sandbox.OptionalPath,
+            Sandbox.SandboxPath "/usr" "/usr" Sandbox.RequiredPath
+          ]
+          (Sandbox.parseSandboxPaths (Set.fromList ["/usr", "/bin/sh=/host/sh", "/dev/nvidiactl?", "/a=/b=c?", ""])),
+      runTest "a build is sandboxed as upstream's mode, derivation type and __noChroot decide" $
+        let plain = mkTestBuildDrv "/bin/sh" sandboxOutPath ""
+            fixed = mkFixedOutputDrv "/bin/sh" sandboxOutPath "" "sha256" (T.replicate 64 "0")
+            floating = plain {drvOutputs = [DerivationOutput "out" sandboxOutPath "r:sha256" ""]}
+            noChroot drv = drv {drvEnv = Map.insert "__noChroot" "1" (drvEnv drv)}
+            refusal = Left "derivation '/nix/store/dddddddddddddddddddddddddddddddd-x.drv' has '__noChroot' set, but that's not allowed when 'sandbox' is 'true'"
+            cases =
+              [ ("true, input-addressed", Sandbox.SandboxEnabled, plain, Right (Sandbox.Sandboxed Sandbox.PrivateNetwork)),
+                ("true, fixed-output", Sandbox.SandboxEnabled, fixed, Right (Sandbox.Sandboxed Sandbox.HostNetwork)),
+                ("true, floating", Sandbox.SandboxEnabled, floating, Right (Sandbox.Sandboxed Sandbox.PrivateNetwork)),
+                ("true, __noChroot", Sandbox.SandboxEnabled, noChroot plain, refusal),
+                ("relaxed, input-addressed", Sandbox.SandboxRelaxed, plain, Right (Sandbox.Sandboxed Sandbox.PrivateNetwork)),
+                ("relaxed, fixed-output", Sandbox.SandboxRelaxed, fixed, Right Sandbox.Unsandboxed),
+                ("relaxed, floating", Sandbox.SandboxRelaxed, floating, Right (Sandbox.Sandboxed Sandbox.PrivateNetwork)),
+                ("relaxed, __noChroot", Sandbox.SandboxRelaxed, noChroot plain, Right Sandbox.Unsandboxed),
+                ("false", Sandbox.SandboxDisabled, plain, Right Sandbox.Unsandboxed),
+                ("false, __noChroot", Sandbox.SandboxDisabled, noChroot plain, Right Sandbox.Unsandboxed)
+              ]
+         in foldr andThen Pass [assertEqual label expected (Sandbox.sandboxUse mode sandboxDrvPath drv) | (label, mode, drv, expected) <- cases],
+      runTest "__noChroot among structured attributes is a JSON Boolean, and anything else is upstream's error" $
+        let structured json = (mkTestBuildDrv "/bin/sh" sandboxOutPath "") {drvEnv = Map.fromList [("__json", json)]}
+         in assertEqual "true" (Right Sandbox.Unsandboxed) (Sandbox.sandboxUse Sandbox.SandboxRelaxed sandboxDrvPath (structured "{\"__noChroot\":true}"))
+              `andThen` assertEqual "false" (Right (Sandbox.Sandboxed Sandbox.PrivateNetwork)) (Sandbox.sandboxUse Sandbox.SandboxRelaxed sandboxDrvPath (structured "{\"__noChroot\":false}"))
+              `andThen` assertEqual "not a Boolean" (Left "attribute '__noChroot' of derivation 'dddddddddddddddddddddddddddddddd-x.drv' must be a Boolean") (Sandbox.sandboxUse Sandbox.SandboxEnabled sandboxDrvPath (structured "{\"__noChroot\":1}")),
+      runTest "a plan binds each input and device node read-only, the build directory writable where the builder sees it, and no output" $
+        let inputs = sandboxPlanInputs {Sandbox.piInputs = [storeIn "aaaa", storeIn "bbbb"], Sandbox.piOutputs = [storeIn "oooo"], Sandbox.piSandboxPaths = [Sandbox.SandboxPath (storeIn "oooo") "/host/out" Sandbox.RequiredPath]}
+         in assertRight "plan" (Sandbox.sandboxPlan inputs) $ \plan ->
+              assertEqual
+                "binds"
+                ( [Sandbox.Bind "/build" "/state/builds/h" Sandbox.ReadWriteBind Sandbox.RequiredPath Sandbox.SourceAsGiven]
+                    ++ [Sandbox.Bind node node Sandbox.ReadOnlyBind Sandbox.RequiredPath Sandbox.SourceResolved | node <- sandboxDeviceNodes]
+                    ++ [Sandbox.Bind path path Sandbox.ReadOnlyBind Sandbox.RequiredPath Sandbox.SourceAsGiven | path <- [storeIn "aaaa", storeIn "bbbb"]]
+                )
+                (Sandbox.planBinds plan),
+      runTest "a fixed-output build's plan adds the host's network files and CA bundle, optional and read-only, after what is already there" $
+        let inputs =
+              sandboxPlanInputs
+                { Sandbox.piNetwork = Sandbox.HostNetwork,
+                  Sandbox.piCaFile = Just "/host/ca.pem",
+                  Sandbox.piSandboxPaths = [Sandbox.SandboxPath "/dev/null" "/host/null" Sandbox.RequiredPath, Sandbox.SandboxPath "/etc/hosts" "/host/hosts" Sandbox.OptionalPath]
+                }
+            optional target source = Sandbox.Bind target source Sandbox.ReadOnlyBind Sandbox.OptionalPath Sandbox.SourceResolved
+         in assertRight "plan" (Sandbox.sandboxPlan inputs) $ \plan ->
+              assertEqual "/dev/null" [Sandbox.Bind "/dev/null" "/host/null" Sandbox.ReadOnlyBind Sandbox.RequiredPath Sandbox.SourceAsGiven] (filter ((== "/dev/null") . Sandbox.bindTarget) (Sandbox.planBinds plan))
+                `andThen` assertEqual
+                  "/etc"
+                  [ Sandbox.Bind "/etc/hosts" "/host/hosts" Sandbox.ReadOnlyBind Sandbox.OptionalPath Sandbox.SourceAsGiven,
+                    optional "/etc/resolv.conf" "/etc/resolv.conf",
+                    optional "/etc/services" "/etc/services",
+                    optional "/etc/ssl/certs/ca-certificates.crt" "/host/ca.pem"
+                  ]
+                  (filter (("/etc/" `BS.isPrefixOf`) . Sandbox.bindTarget) (Sandbox.planBinds plan)),
+      runTest "a plan binds no device node of its own when /dev is bound whole" $
+        assertRight "plan" (Sandbox.sandboxPlan sandboxPlanInputs {Sandbox.piSandboxPaths = [Sandbox.SandboxPath "/dev" "/dev" Sandbox.RequiredPath]}) $ \plan ->
+          assertEqual "/dev binds" ["/dev"] (filter ("/dev" `BS.isPrefixOf`) (map Sandbox.bindTarget (Sandbox.planBinds plan))),
+      runTest "a sandbox-build-dir that holds the store directory is upstream's error" $
+        assertEqual "refusal" (Left "`sandbox-build-dir` must not contain the storeDir") (Sandbox.planBinds <$> Sandbox.sandboxPlan sandboxPlanInputs {Sandbox.piBuildDirSeen = "/nix"}),
+      runTestM "every plan binds each input once, no output, the build directory alone writable, and its targets in sorted order" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll genSandboxPlanInputs $ \inputs ->
+              case Sandbox.sandboxPlan inputs of
+                Left reason -> QC.counterexample (T.unpack reason) False
+                Right plan ->
+                  let binds = Sandbox.planBinds plan
+                      targets = map Sandbox.bindTarget binds
+                      kept = filter (`notElem` Sandbox.piOutputs inputs) (Sandbox.piInputs inputs)
+                      readOnlyOnce path = [Sandbox.bindAccess bind | bind <- binds, Sandbox.bindTarget bind == path] == [Sandbox.ReadOnlyBind]
+                      writableTargets = [Sandbox.bindTarget bind | bind <- binds, Sandbox.bindAccess bind == Sandbox.ReadWriteBind]
+                   in QC.counterexample (show binds) $
+                        and [readOnlyOnce path | path <- kept]
+                          && not (any (`elem` Sandbox.piOutputs inputs) targets)
+                          && writableTargets == [Sandbox.piBuildDirSeen inputs]
+                          && and (zipWith (<) targets (drop 1 targets))
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      runTest "a plan renders as the helper reads it: the version line, the length of the rest, then keys and values, each its length, a colon, its bytes and a NUL" $
+        let plan = Sandbox.SandboxPlan "/r" "/build" "50%" Sandbox.PrivateNetwork Sandbox.TolerateKeptGroups [Sandbox.Bind "/b" "/s" Sandbox.ReadOnlyBind Sandbox.OptionalPath Sandbox.SourceResolved, Sandbox.Bind "/t" "/u" Sandbox.ReadWriteBind Sandbox.RequiredPath Sandbox.SourceAsGiven] ["LD_PRELOAD=/x.so", "out=/nix/store/o"]
+            body =
+              BS.concat
+                [ "4:root\NUL2:/r\NUL9:build-dir\NUL6:/build\NUL12:dev-shm-size\NUL3:50%\NUL",
+                  "11:sandbox-uid\NUL4:1000\NUL11:sandbox-gid\NUL3:100\NUL7:network\NUL7:private\NUL11:drop-groups\NUL8:tolerate\NUL",
+                  "4:bind\NUL2:/b\NUL2:/s\NUL3:roc\NUL4:bind\NUL2:/t\NUL2:/u\NUL1:-\NUL",
+                  "3:env\NUL16:LD_PRELOAD=/x.so\NUL3:env\NUL16:out=/nix/store/o\NUL"
+                ]
+         in assertEqual "bytes" ("nova-nix-sandbox-plan 3\n" <> BS8.pack (show (BS.length body)) <> "\n" <> body) (Sandbox.renderPlan plan),
+      runTestM "a rendered plan reads back into exactly its fields, whatever bytes they hold" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll genPlanAnyBytes $
+              \plan -> readRenderedPlan (Sandbox.renderPlan plan) QC.=== Just plan
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      runTestM "the helper's parser reads a rendered plan back into exactly its fields, and refuses one it cannot use as C strings" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.checkCoverage $
+              QC.forAll genPlanAnyBytes $ \plan ->
+                QC.cover 30 (helperCanUse plan) "the helper can use it" $
+                  QC.cover 5 (not (helperCanUse plan) && helperCanUse (withoutNuls plan)) "a NUL alone keeps the helper from using it" $
+                    QC.ioProperty $ do
+                      let tokens = renderedPlanTokens plan
+                      echoed <- helperPlanEcho tokens
+                      pure (echoed QC.=== if helperCanUse plan then Right tokens else Left invalidPlan)
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      runTestM "the helper's parser takes each key once and in order, then binds, then entries, and nothing else" $ do
+        let framed = BS.concat . map planToken
+            singletons = ["root", "/r", "build-dir", "/build", "dev-shm-size", "50%", "sandbox-uid", "1000", "sandbox-gid", "100", "network", "private", "drop-groups", "tolerate"]
+            bind = ["bind", "/t", "/s", "r"]
+            entry value = ["env", value]
+            -- Entries upstream's execve passes as they are: an empty name,
+            -- no '=' at all, and nothing.
+            whole = singletons ++ bind ++ entry "=x" ++ entry "no-equals" ++ entry ""
+        accepted <- helperPlanEcho (framed whole)
+        refused <-
+          traverse
+            (helperPlanEcho . framed)
+            [ singletons ++ ["root", "/again"],
+              singletons ++ entry "a=b" ++ bind,
+              drop 2 singletons,
+              take 2 (drop 2 singletons) ++ take 2 singletons ++ drop 4 singletons,
+              singletons ++ ["mystery", "x"],
+              singletons ++ ["bind", "/t", "/s"],
+              singletons ++ ["bind", "t", "/s", "-"],
+              singletons ++ ["bind", "/t", "/s", ""],
+              singletons ++ ["env"]
+            ]
+        rawRefused <-
+          traverse
+            (helperPlanEcho . (framed singletons <>))
+            ["x", "02:ab\NUL", "3:env\NUL3:ab\NUL", "3:env\NUL2:ab", "3:env\NUL3:a\NULb\NUL", "99999999999999999999999:x\NUL"]
+        pure $
+          assertEqual "accepted" (Right (framed whole)) accepted
+            `andThen` assertEqual "refused" (replicate 9 (Left invalidPlan)) refused
+            `andThen` assertEqual "refused framing" (replicate 6 (Left invalidPlan)) rawRefused,
+      runTestM "the helper's walk of a bind's mounts finds the mount points the library reads, whatever the text" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.checkCoverage $
+              QC.forAll genMountinfo $ \(mountinfo, dir) ->
+                let expected = Spawn.mountPointsWithin mountinfo dir
+                 in QC.cover 10 (not (null expected)) "a mount point is found" $
+                      QC.ioProperty $ do
+                        found <- helperMountsWithin mountinfo dir
+                        pure (found QC.=== expected)
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      runTest "the build's /etc/passwd and /etc/group are upstream's" $
+        assertEqual "passwd" "root:x:0:0:Nix build user:/build:/noshell\nnixbld:x:1000:100:Nix build user:/build:/noshell\nnobody:x:65534:65534:Nobody:/:/noshell\n" (Sandbox.passwdFile "/build")
+          `andThen` assertEqual "group" "root:x:0:\nnixbld:!:100:\nnogroup:x:65534:\n" Sandbox.groupFile,
+      runTest "the chroot holds /etc/hosts for a build with a network of its own, nsswitch.conf for one with the host's, and no /dev of its own under a bound one" $
+        let files network paths = [path | Sandbox.SkeletonFile path _ <- Sandbox.chrootSkeleton "/nix/store" "/build" network paths]
+            devEntries paths = [entry | entry <- Sandbox.chrootSkeleton "/nix/store" "/build" Sandbox.PrivateNetwork paths, skeletonPath entry == "/dev" || "/dev/" `BS.isPrefixOf` skeletonPath entry]
+         in assertEqual "private" ["/etc/passwd", "/etc/group", "/etc/hosts"] (files Sandbox.PrivateNetwork [])
+              `andThen` assertEqual "host" ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"] (files Sandbox.HostNetwork [])
+              `andThen` assertEqual "/dev bound" [] (devEntries [Sandbox.SandboxPath "/dev" "/dev" Sandbox.RequiredPath])
+              `andThen` assertEqual "/dev entries" 7 (length (devEntries [])),
+      runTest "each stage reads back from the record the helper writes for it"
+        $ foldr andThen Pass
+        $ [assertEqual (TE.decodeLatin1 (Sandbox.setupStageName stage)) (Right (Just (Sandbox.StatusRecord stage 13 (Just 4)))) (Sandbox.parseStatus Sandbox.setupStageName (Sandbox.setupStageName stage <> " 13 4\n")) | stage <- [minBound .. maxBound]]
+          ++ [assertEqual (TE.decodeLatin1 (Sandbox.probeStageName stage)) (Right (Just (Sandbox.StatusRecord stage 0 Nothing))) (Sandbox.parseStatus Sandbox.probeStageName (Sandbox.probeStageName stage <> " 0 -1\n")) | stage <- [minBound .. maxBound]],
+      runTest "a status is nothing, which is no failure, or one whole record, and anything else is refused" $
+        let parse = Sandbox.parseStatus Sandbox.setupStageName
+         in assertEqual "nothing" (Right Nothing) (parse "")
+              `andThen` assertLeft "no newline" (parse "bind 2 0")
+              `andThen` assertLeft "two values" (parse "bind 2\n")
+              `andThen` assertLeft "two records" (parse "bind 2 0\nexec 2 -1\n")
+              `andThen` assertLeft "unknown stage" (parse "mystery 2 0\n")
+              `andThen` assertLeft "signed errno" (parse "bind -2 0\n"),
+      runTestM "reading a status is total over any bytes" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll genStatusBytes $ \bytes ->
+              case Sandbox.parseStatus Sandbox.setupStageName bytes of
+                Left reason -> QC.property (T.length reason > 0)
+                Right Nothing -> QC.property (BS.null bytes)
+                Right (Just record) -> QC.property (Sandbox.recordErrno record >= 0)
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      runTest "a failed step is upstream's words, naming the paths a bind's index points at" $
+        let plan = Sandbox.SandboxPlan "/r" "/build" "50%" Sandbox.PrivateNetwork Sandbox.TolerateKeptGroups [Sandbox.Bind "/b" "/s" Sandbox.ReadOnlyBind Sandbox.RequiredPath Sandbox.SourceAsGiven, Sandbox.Bind "/build" "/state/builds/h" Sandbox.ReadWriteBind Sandbox.RequiredPath Sandbox.SourceAsGiven, Sandbox.Bind "/t" "/u" Sandbox.ReadWriteBind Sandbox.RequiredPath Sandbox.SourceAsGiven] []
+            message stage number index = Sandbox.setupFailureMessage plan "/bin/sh" (Sandbox.StatusRecord stage number index)
+         in assertEqual "bind" "while setting up the build environment: bind mount from '/u' to '/r/t' failed: No such file or directory" (message Sandbox.StageBind 2 (Just 2))
+              `andThen` assertEqual "build directory" "while setting up the build environment: changing into '/state/builds/h': No such file or directory" (message Sandbox.StageChdir 2 Nothing)
+              `andThen` assertEqual "pipe" "while setting up the build environment: creating pipe: Too many open files" (message Sandbox.StageSync 24 Nothing)
+              `andThen` assertEqual "source" "while setting up the build environment: getting attributes of path '/s': No such file or directory" (message Sandbox.StageBindSource 2 (Just 0))
+              `andThen` assertEqual "setgroups refused" "while setting up the build environment: setgroups failed. Set the require-drop-supplementary-groups option to false to skip this step." (message Sandbox.StageSetgroups 1 Nothing)
+              `andThen` assertEqual "clone" "while setting up the build environment: unable to start build process" (message Sandbox.StageClone 1 Nothing)
+              `andThen` assertEqual "exec" "while setting up the build environment: executing '/bin/sh': No such file or directory" (message Sandbox.StageExec 2 Nothing),
+      runTest "a run of the helper is a failed step when it reports one, else the builder's exit, unless the plan never reached it" $
+        let plan = Sandbox.SandboxPlan "/r" "/build" "50%" Sandbox.PrivateNetwork Sandbox.TolerateKeptGroups [] []
+            outcome = Sandbox.helperOutcome plan "/bin/sh"
+         in assertEqual "record" (Sandbox.SetupIncomplete "while setting up the build environment: cannot set host name: Operation not permitted") (outcome (Right ()) (ExitFailure 1) "hostname 1 -1\n")
+              `andThen` assertEqual "builder" (Sandbox.BuilderRan (ExitFailure 3)) (outcome (Right ()) (ExitFailure 3) "")
+              `andThen` assertEqual "undelivered" (Sandbox.SetupIncomplete "the sandbox helper ended before it read its plan: broken pipe") (outcome (Left "broken pipe") (ExitFailure 1) ""),
+      runTest "a system without the namespaces is refused in upstream's words, and a fallback warns naming the cause" $
+        let apparmor = Sandbox.ProbeFailed (Sandbox.StatusRecord Sandbox.ProbeAppArmor 0 Nothing)
+         in assertEqual "refusal" "this system does not support the kernel namespaces that are required for sandboxing; use '--no-sandbox' to disable sandboxing" (Sandbox.unavailableMessage apparmor)
+              `andThen` assertEqual "warning" "warning: building without a sandbox, since AppArmor restricts unprivileged user namespaces ('/proc/sys/kernel/apparmor_restrict_unprivileged_userns' is 1), and no AppArmor profile lets nova-nix-sandbox use them" (Sandbox.fallbackWarning apparmor)
+              `andThen` assertEqual "no helper" "the sandbox helper 'nova-nix-sandbox' was not found beside nova-nix; use '--no-sandbox' to disable sandboxing" (Sandbox.unavailableMessage Sandbox.HelperNotFound),
+      runTest "a sandbox path that is not absolute, or leads out of the sandbox, is refused before the plan is made" $
+        let refusal target = Left ("the sandbox path '" <> target <> "' is not an absolute path without a '..' component, so it names no path in the sandbox")
+            planWith paths = Sandbox.sandboxPlan sandboxPlanInputs {Sandbox.piSandboxPaths = paths}
+            entry target = [Sandbox.SandboxPath target "/host" Sandbox.RequiredPath]
+         in assertEqual "up and out" (refusal "/a/../../etc") (planWith (entry "/a/../../etc"))
+              `andThen` assertEqual "relative" (refusal "etc") (planWith (entry "etc"))
+              `andThen` assertEqual "the build directory" (refusal "/build/..") (Sandbox.sandboxPlan sandboxPlanInputs {Sandbox.piBuildDirSeen = "/build/.."})
+              `andThen` assertRight "a name that starts with two dots" (planWith (entry "/a/..b/c")) (const Pass),
+      runTest "a sandboxed build is told upstream's HOME, and as root is refused for want of build users" $
+        assertEqual "home" "/homeless-shelter" Sandbox.sandboxHome
+          `andThen` assertEqual "root" "a sandboxed build as root needs build users, which nova-nix does not have yet; run nova-nix as a user other than root, or pass '--no-sandbox' to build without the sandbox" Sandbox.rootRefusal
+    ]
+  where
+    sandboxDrvPath = StorePath "dddddddddddddddddddddddddddddddd" "x.drv"
+    sandboxOutPath = StorePath "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" "x"
+    storeIn hash = "/nix/store/" <> BS.concat (replicate 8 hash) <> "-p"
+    skeletonPath entry = case entry of
+      Sandbox.SkeletonDir path _ -> path
+      Sandbox.SkeletonFile path _ -> path
+      Sandbox.SkeletonLink path _ -> path
+    genStatusBytes =
+      BS.concat
+        <$> QC.listOf
+          ( QC.oneof
+              [ QC.elements (map Sandbox.setupStageName [minBound .. maxBound]),
+                QC.elements [" ", "\n", "13", "-1", "0", "x", "-", "99999999999999999999"],
+                BS.pack <$> QC.listOf QC.arbitrary
+              ]
+          )
+
+-- | The device nodes a plan binds when nothing binds @\/dev@ whole.
+sandboxDeviceNodes :: [BS.ByteString]
+sandboxDeviceNodes = ["/dev/full", "/dev/null", "/dev/random", "/dev/tty", "/dev/urandom", "/dev/zero"]
+
+-- | A plan's inputs with nothing in them but a root and a build directory.
+sandboxPlanInputs :: Sandbox.PlanInputs
+sandboxPlanInputs =
+  Sandbox.PlanInputs
+    { Sandbox.piRoot = "/chroot/root",
+      Sandbox.piStoreDir = "/nix/store",
+      Sandbox.piBuildDirSeen = "/build",
+      Sandbox.piBuildDirOnDisk = "/state/builds/h",
+      Sandbox.piInputs = [],
+      Sandbox.piSandboxPaths = [],
+      Sandbox.piSandboxClosure = [],
+      Sandbox.piOutputs = [],
+      Sandbox.piEnvironment = [],
+      Sandbox.piNetwork = Sandbox.PrivateNetwork,
+      Sandbox.piCaFile = Nothing,
+      Sandbox.piDevShmSize = "50%",
+      Sandbox.piDropGroups = Sandbox.TolerateKeptGroups
+    }
+
+-- | Plan inputs drawn from a small pool of store paths, so inputs,
+-- outputs, closures and sandbox-paths targets collide.
+genSandboxPlanInputs :: QC.Gen Sandbox.PlanInputs
+genSandboxPlanInputs = do
+  let pool = ["/nix/store/" <> BS.concat (replicate 32 (BS.singleton letter)) <> "-p" | letter <- [97 .. 104]]
+      targets = pool ++ ["/dev", "/dev/null", "/bin/sh", "/etc/hosts", "/build"]
+  inputs <- QC.sublistOf pool
+  outputs <- QC.sublistOf pool
+  closure <- QC.sublistOf pool
+  paths <- QC.listOf (Sandbox.SandboxPath <$> QC.elements targets <*> QC.elements ("/host" : pool) <*> QC.elements [Sandbox.RequiredPath, Sandbox.OptionalPath])
+  network <- QC.elements [Sandbox.PrivateNetwork, Sandbox.HostNetwork]
+  caFile <- QC.elements [Nothing, Just "/ca.pem", Just ""]
+  pure sandboxPlanInputs {Sandbox.piInputs = inputs, Sandbox.piOutputs = outputs, Sandbox.piSandboxClosure = closure, Sandbox.piSandboxPaths = paths, Sandbox.piNetwork = network, Sandbox.piCaFile = caFile}
+
+-- | One token of a plan as the helper reads it: its length in decimal, a
+-- colon, its bytes and a NUL.
+planToken :: BS.ByteString -> BS.ByteString
+planToken bytes = BS8.pack (show (BS.length bytes)) <> ":" <> bytes <> "\NUL"
+
+-- | A rendered plan's tokens, past its version and length lines.
+renderedPlanTokens :: Sandbox.SandboxPlan -> BS.ByteString
+renderedPlanTokens plan = BS.drop 1 (BS8.dropWhile (/= '\n') (BS.drop (BS.length Sandbox.planVersionLine) (Sandbox.renderPlan plan)))
+
+-- | A plan read back from what 'Sandbox.renderPlan' writes, by the
+-- format's own rules, or nothing when the bytes are not one.
+readRenderedPlan :: BS.ByteString -> Maybe Sandbox.SandboxPlan
+readRenderedPlan bytes = do
+  rest <- BS.stripPrefix Sandbox.planVersionLine bytes
+  let (lengthText, afterLength) = BS8.break (== '\n') rest
+  body <- BS.stripPrefix "\n" afterLength
+  declared <- readMaybe (BS8.unpack lengthText)
+  guard (declared == BS.length body)
+  tokens <- splitTokens body
+  case tokens of
+    "root" : root : "build-dir" : buildDir : "dev-shm-size" : shm : "sandbox-uid" : uid : "sandbox-gid" : gid : "network" : network : "drop-groups" : groups : sections -> do
+      guard (uid == BS8.pack (show Sandbox.sandboxUid) && gid == BS8.pack (show Sandbox.sandboxGid))
+      networkRead <- lookup network [("private", Sandbox.PrivateNetwork), ("host", Sandbox.HostNetwork)]
+      groupsRead <- lookup groups [("require", Sandbox.RequireDropGroups), ("tolerate", Sandbox.TolerateKeptGroups)]
+      (binds, entries) <- readSections sections
+      pure (Sandbox.SandboxPlan root buildDir shm networkRead groupsRead binds entries)
+    _ -> Nothing
+  where
+    splitTokens remaining
+      | BS.null remaining = Just []
+      | otherwise = do
+          let (digits, afterDigits) = BS8.span isDigit remaining
+          size <- readMaybe (BS8.unpack digits)
+          afterColon <- BS.stripPrefix ":" afterDigits
+          let (token, afterToken) = BS.splitAt size afterColon
+          guard (BS.length token == size)
+          next <- BS.stripPrefix "\NUL" afterToken
+          (token :) <$> splitTokens next
+    readSections sections = case sections of
+      "bind" : target : source : flags : rest -> do
+        bind <- readBind target source flags
+        (binds, entries) <- readSections rest
+        Just (bind : binds, entries)
+      _ -> (,) [] <$> readEntries sections
+    readEntries sections = case sections of
+      [] -> Just []
+      "env" : entry : rest -> (entry :) <$> readEntries rest
+      _ -> Nothing
+    readBind target source flags = do
+      let letters = if flags == "-" then "" else BS8.unpack flags
+          access = if 'r' `elem` letters then Sandbox.ReadOnlyBind else Sandbox.ReadWriteBind
+          presence = if 'o' `elem` letters then Sandbox.OptionalPath else Sandbox.RequiredPath
+          resolution = if 'c' `elem` letters then Sandbox.SourceResolved else Sandbox.SourceAsGiven
+      guard (all (`elem` ("roc" :: String)) letters && flags /= "")
+      Just (Sandbox.Bind target source access presence resolution)
+
+-- | Bytes for a plan's fields, drawn to collide with the format itself:
+-- NULs, colons, digits, keys, paths and anything at all.
+genPlanBytes :: QC.Gen BS.ByteString
+genPlanBytes =
+  BS.concat
+    <$> QC.listOf
+      ( QC.oneof
+          [ QC.elements ["/", "/a", "\NUL", ":", "1:", "0", "12", "bind", "env", "root", "=", "-", " ", "\n"],
+            BS.pack <$> QC.listOf QC.arbitrary
+          ]
+      )
+
+-- | A plan with any bytes in every field: most often bytes the helper
+-- can use, an absolute path or text holding no NUL, else anything, with
+-- few enough binds and entries that a plan it can use, and one it cannot
+-- for a NUL alone, are both common ('withoutNuls').
+genPlanAnyBytes :: QC.Gen Sandbox.SandboxPlan
+genPlanAnyBytes =
+  Sandbox.SandboxPlan
+    <$> genPath
+    <*> genPath
+    <*> genText
+    <*> QC.elements [Sandbox.PrivateNetwork, Sandbox.HostNetwork]
+    <*> QC.elements [Sandbox.RequireDropGroups, Sandbox.TolerateKeptGroups]
+    <*> few
+      ( Sandbox.Bind
+          <$> genPath
+          <*> genPath
+          <*> QC.elements [Sandbox.ReadOnlyBind, Sandbox.ReadWriteBind]
+          <*> QC.elements [Sandbox.RequiredPath, Sandbox.OptionalPath]
+          <*> QC.elements [Sandbox.SourceAsGiven, Sandbox.SourceResolved]
+      )
+    <*> few genText
+  where
+    few gen = QC.choose (0, 3) >>= \count -> QC.vectorOf count gen
+    usable = BS.filter (/= 0) <$> genPlanBytes
+    genPath = QC.frequency [(12, ("/" <>) <$> usable), (1, genPlanBytes)]
+    genText = QC.frequency [(12, usable), (1, genPlanBytes)]
+
+-- | A plan with every NUL taken out of its fields.
+withoutNuls :: Sandbox.SandboxPlan -> Sandbox.SandboxPlan
+withoutNuls plan =
+  plan
+    { Sandbox.planRoot = strip (Sandbox.planRoot plan),
+      Sandbox.planBuildDir = strip (Sandbox.planBuildDir plan),
+      Sandbox.planDevShmSize = strip (Sandbox.planDevShmSize plan),
+      Sandbox.planBinds = [bind {Sandbox.bindTarget = strip (Sandbox.bindTarget bind), Sandbox.bindSource = strip (Sandbox.bindSource bind)} | bind <- Sandbox.planBinds plan],
+      Sandbox.planEnvironment = map strip (Sandbox.planEnvironment plan)
+    }
+  where
+    strip = BS.filter (/= 0)
+
+-- | Whether the helper can use a plan: no field holds a NUL, since it
+-- takes each as a C string, and its root, build directory and every
+-- bind's paths are absolute.
+helperCanUse :: Sandbox.SandboxPlan -> Bool
+helperCanUse plan =
+  all (BS.notElem 0) (fields ++ Sandbox.planEnvironment plan ++ [Sandbox.planDevShmSize plan])
+    && all ("/" `BS.isPrefixOf`) fields
+  where
+    fields = [Sandbox.planRoot plan, Sandbox.planBuildDir plan] ++ concat [[Sandbox.bindTarget bind, Sandbox.bindSource bind] | bind <- Sandbox.planBinds plan]
+
+-- | The errno the helper's parser refuses a plan with.
+invalidPlan :: CInt
+invalidPlan = case eINVAL of Errno number -> number
+
+foreign import ccall unsafe "nova_test_plan_echo"
+  c_nova_test_plan_echo :: Ptr CChar -> CSize -> Ptr (Ptr CChar) -> Ptr CSize -> IO CInt
+
+foreign import ccall unsafe "nova_test_mountinfo_within"
+  c_nova_test_mountinfo_within :: Ptr CChar -> CSize -> Ptr CChar -> CSize -> Ptr (Ptr CChar) -> Ptr CSize -> IO CInt
+
+foreign import ccall unsafe "nova_test_plant_possessed_key"
+  c_nova_test_plant_possessed_key :: Ptr CChar -> IO CLong
+
+-- | Take the bytes a test entry point wrote into a buffer of its own,
+-- freeing the buffer.
+takeCBuffer :: Ptr (Ptr CChar) -> Ptr CSize -> IO BS.ByteString
+takeCBuffer outPtr outLength = do
+  out <- peek outPtr
+  size <- peek outLength
+  bytes <- if size == 0 then pure BS.empty else BS.packCStringLen (out, fromIntegral size)
+  free out
+  pure bytes
+
+-- | The helper's plan parser (sandbox/plan.c) run on a plan's tokens: the
+-- plan it read, written back as tokens, or the errno it refused them with.
+helperPlanEcho :: BS.ByteString -> IO (Either CInt BS.ByteString)
+helperPlanEcho tokens =
+  BS.useAsCStringLen tokens $ \(bytes, size) ->
+    alloca $ \outPtr -> alloca $ \outLength -> do
+      code <- c_nova_test_plan_echo bytes (fromIntegral size) outPtr outLength
+      if code /= 0 then pure (Left code) else Right <$> takeCBuffer outPtr outLength
+
+-- | The mount points at or beneath a directory that the helper's walk
+-- (sandbox/mountinfo.c) finds in a mountinfo text.
+helperMountsWithin :: BS.ByteString -> BS.ByteString -> IO [BS.ByteString]
+helperMountsWithin mountinfo dir =
+  BS.useAsCStringLen mountinfo $ \(text, textSize) ->
+    BS.useAsCStringLen dir $ \(dirBytes, dirSize) ->
+      alloca $ \outPtr -> alloca $ \outLength -> do
+        code <- c_nova_test_mountinfo_within text (fromIntegral textSize) dirBytes (fromIntegral dirSize) outPtr outLength
+        if code /= 0 then throwIO (userError ("the mountinfo walk failed: " <> show code)) else items <$> takeCBuffer outPtr outLength
+  where
+    items bytes
+      | BS.null bytes = []
+      | otherwise =
+          let (digits, afterDigits) = BS8.span isDigit bytes
+              size = fromMaybe 0 (readMaybe (BS8.unpack digits))
+              (item, rest) = BS.splitAt size (BS.drop 1 afterDigits)
+           in item : items rest
+
+-- | A mountinfo text and a directory to look beneath: lines of fields
+-- drawn from paths, escapes, bytes other splitters take for spaces, and
+-- anything at all, and a directory that is often one of the paths.
+genMountinfo :: QC.Gen (BS.ByteString, BS.ByteString)
+genMountinfo = do
+  let pieces =
+        [ "/a",
+          "/a/b",
+          "/ab",
+          "\\040",
+          "\\134",
+          "\\0",
+          "\\777",
+          "\\",
+          "\xc3\xa0",
+          "\xa0",
+          "\t",
+          "\NUL",
+          "-",
+          "rw"
+        ]
+      genField = BS.concat <$> QC.listOf (QC.oneof [QC.elements pieces, BS.pack <$> QC.listOf QC.arbitrary])
+      genLine = do
+        fields <- QC.listOf genField
+        separator <- QC.elements [" ", "  "]
+        pure (BS.intercalate separator fields)
+  mountinfo <- BS.intercalate "\n" <$> QC.listOf genLine
+  dir <- QC.oneof [QC.elements ["", "/", "/a", "/a/b", "/a b", "/a\xc3\xa0"], genField]
+  pure (mountinfo, dir)
+
+-- | The sandbox's IO that runs anywhere POSIX ("Nix.Builder.Sandbox.Spawn"):
+-- the chroot and its removal, and the helper's protocol, run against
+-- helpers written here that speak it, since the real one runs only on
+-- Linux.
+testSandboxSpawnIO :: IO [Bool]
+testSandboxSpawnIO = do
+  putStrLn "builder/sandbox-spawn"
+  if SI.os == "mingw32"
+    then do
+      putStrLn "  SKIP  POSIX only"
+      pure []
+    else do
+      tmpBase <- getTemporaryDirectory
+      let root = tmpBase </> "nova-nix-test-sandbox-spawn"
+          buildDir = root </> "builds" </> "h"
+          storeDirPath = root </> "store"
+          helperAt name = root </> name
+          writeHelper name body = do
+            BS.writeFile (helperAt name) ("#!/bin/sh\n" <> body)
+            Dir.setPermissions (helperAt name) (Dir.setOwnerExecutable True (Dir.setOwnerReadable True Dir.emptyPermissions))
+          -- A fake helper reads the plan as the real one does, by the
+          -- length its second line gives, and leaves the pipe open.
+          readPlanInto target = "IFS= read -r version\nIFS= read -r length\nhead -c \"$length\" > " <> target <> "\n"
+          runFake name plan command = do
+            let logPath = root </> (name <> ".log")
+            run <- withBinaryFile logPath WriteMode $ \logHandle ->
+              Spawn.runHelper logHandle (helperAt name) plan root command
+            logged <- BS.readFile logPath
+            pure (run, logged)
+          framedPlan bytes = Sandbox.planVersionLine <> BS8.pack (show (BS.length bytes)) <> "\n" <> bytes
+      bracket_
+        (forceRemoveIfExists root >> createDirectoryIfMissing True (root </> "builds"))
+        (forceRemoveIfExists root)
+        ( do
+            storeBytes <- Spawn.filePathBytes storeDirPath
+            sequence
+              [ runTestM "a chroot holds its skeleton while the build runs, and is gone after" $ do
+                  createDirectoryIfMissing True buildDir
+                  inside <-
+                    Spawn.withChroot buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) $ \chrootRoot -> do
+                      passwd <- BS.readFile (chrootRoot </> "etc" </> "passwd")
+                      tmpMode <- fmap nsPermissions <$> nodeStatus (chrootRoot </> "tmp")
+                      storeMode <- fmap nsPermissions <$> nodeStatus (chrootRoot <> storeDirPath)
+                      fdLink <- Dir.getSymbolicLinkTarget (chrootRoot </> "dev" </> "fd")
+                      pure (passwd, tmpMode, storeMode, fdLink)
+                  left <- Dir.doesPathExist (Spawn.chrootDirFor buildDir)
+                  pure $
+                    assertRight "chroot" inside $ \(passwd, tmpMode, storeMode, fdLink) ->
+                      assertEqual "passwd" (Sandbox.passwdFile "/build") passwd
+                        `andThen` assertEqual "/tmp" (Just 0o1777) tmpMode
+                        `andThen` assertEqual "store" (Just 0o1775) storeMode
+                        `andThen` assertEqual "/dev/fd" "/proc/self/fd" fdLink
+                        `andThen` assertEqual "left after" False left,
+                runTestM "a chroot an earlier build left, read-only inside and linking outside, is removed before the next one is made, and what it links to stays" $ do
+                  let leftover = Spawn.chrootDirFor buildDir </> "root" </> "etc"
+                      outside = root </> "outside"
+                  createDirectoryIfMissing True leftover
+                  createDirectoryIfMissing True outside
+                  BS.writeFile (outside </> "kept") "host"
+                  Dir.createDirectoryLink outside (Spawn.chrootDirFor buildDir </> "root" </> "linked")
+                  BS.writeFile (leftover </> "stale") "x"
+                  Dir.getPermissions leftover >>= Dir.setPermissions leftover . Dir.setOwnerWritable False
+                  made <- Spawn.withChroot buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.HostNetwork []) (\chrootRoot -> Dir.doesPathExist (chrootRoot </> "etc" </> "stale"))
+                  kept <- BS.readFile (outside </> "kept")
+                  pure (assertEqual "stale file" (Right False) made `andThen` assertEqual "what the link named" "host" kept),
+                -- A real chroot's /dev/fd names /proc/self/fd; a read-only
+                -- directory of the test's own stands in for it, so a
+                -- removal that followed the link would show in it rather
+                -- than act beyond it.
+                runTestM "a chroot an earlier build left, read-only and linking to a read-only directory outside it, is removed without anything done through the link" $ do
+                  let leftover = Spawn.chrootDirFor buildDir </> "root" </> "dev"
+                      sentinel = root </> "dev-fd-sentinel"
+                  createDirectoryIfMissing True leftover
+                  createDirectoryIfMissing True sentinel
+                  BS.writeFile (sentinel </> "kept") "sentinel"
+                  Proc.callProcess "chmod" ["0555", sentinel]
+                  Dir.createDirectoryLink sentinel (leftover </> "fd")
+                  Dir.getPermissions leftover >>= Dir.setPermissions leftover . Dir.setOwnerWritable False
+                  made <- Spawn.withChroot buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) (\chrootRoot -> Dir.getSymbolicLinkTarget (chrootRoot </> "dev" </> "fd"))
+                  sentinelMode <- fmap nsPermissions <$> nodeStatus sentinel
+                  kept <- BS.readFile (sentinel </> "kept")
+                  pure $
+                    assertEqual "the chroot made in its place" (Right "/proc/self/fd") made
+                      `andThen` assertEqual "the sentinel's mode" (Just 0o555) sentinelMode
+                      `andThen` assertEqual "the sentinel's file" "sentinel" kept,
+                runTest "the mount points in a chroot are read from mountinfo, its escapes undone, its fields split at spaces alone, and no mount beside it is one" $
+                  let mountinfo =
+                        BS.intercalate
+                          "\n"
+                          [ "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw",
+                            "40 22 0:35 / /tmp/c/root/x rw - tmpfs tmpfs rw",
+                            "41 22 0:36 / /tmp/c\\040d/root rw - tmpfs tmpfs rw",
+                            "42 22 0:37 / /tmp/cc rw - tmpfs tmpfs rw",
+                            -- "voil\xc3\xa0", UTF-8 for a name ending in a-grave,
+                            -- whose second byte other splitters take for a space.
+                            "43 22 0:38 / /tmp/c/voil\xc3\xa0 rw - tmpfs tmpfs rw"
+                          ]
+                   in assertEqual "within /tmp/c" ["/tmp/c/root/x", "/tmp/c/voil\xc3\xa0"] (Spawn.mountPointsWithin mountinfo "/tmp/c")
+                        `andThen` assertEqual "within /tmp/c d" ["/tmp/c d/root"] (Spawn.mountPointsWithin mountinfo "/tmp/c d")
+                        `andThen` assertEqual "within /srv" [] (Spawn.mountPointsWithin mountinfo "/srv"),
+                runTestM "a chroot whose build has ended is closed to other users: its way to the store private, every directory in the store shut to them, parent first, what the builder left open recorded, nothing outside the store touched, no link followed" $ do
+                  let chroot = root </> "seal"
+                      store = chroot </> "nix" </> "store"
+                      out = store </> "out"
+                      shut = store </> "shut"
+                      elsewhere = root </> "seal-elsewhere"
+                      beneath = root </> "seal-beneath"
+                      closed = out </> "closed"
+                      opened = [chroot, chroot </> "nix", store, out, out </> "sub", closed </> "inside", chroot </> "tmp", chroot </> "tmp" </> "junk", elsewhere, beneath]
+                  traverse_ (createDirectoryIfMissing True) [out </> "sub", closed </> "inside", shut, chroot </> "tmp" </> "junk", elsewhere, beneath]
+                  Dir.createDirectoryLink elsewhere (out </> "linked")
+                  -- A link planted below an output, where a walk that
+                  -- followed links would reach the directory it names.
+                  Dir.createDirectoryLink beneath (out </> "sub" </> "planted")
+                  traverse_ (\dir -> Proc.callProcess "chmod" ["0777", dir]) opened
+                  Proc.callProcess "chmod" ["0000", closed]
+                  sealed <- Spawn.sealChroot chroot "/nix/store"
+                  modes <- traverse (fmap (fmap nsPermissions) . nodeStatus) (opened ++ [closed, shut])
+                  pure $
+                    assertEqual "what the builder left open" (Right (Set.fromList ["out"])) sealed
+                      `andThen` assertEqual "modes" (map Just [0o700, 0o700, 0o700, 0o700, 0o700, 0o700, 0o777, 0o777, 0o777, 0o777, 0o700, 0o700]) modes,
+                -- A file its owner may not remove stands in for a directory
+                -- another user made, which no test can make; macOS lets an
+                -- owner set one.
+                runTestM "a chroot an earlier build left that cannot be removed is moved aside, and the next is made" $
+                  if SI.os /= "darwin"
+                    then pure Pass
+                    else do
+                      let stuck = Spawn.chrootDirFor buildDir </> "root" </> "stuck"
+                          aside = Spawn.chrootDirFor buildDir <> ".leftover.1"
+                      createDirectoryIfMissing True stuck
+                      BS.writeFile (stuck </> "f") "x"
+                      Proc.callProcess "chflags" ["uchg", stuck </> "f"]
+                      -- The flag comes off whatever happens, so what is
+                      -- left can be removed.
+                      let release = for_ [Spawn.chrootDirFor buildDir, aside] $ \dir -> Proc.readProcessWithExitCode "chflags" ["-R", "nouchg", dir] ""
+                      ( do
+                          made <- Spawn.withChroot buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) (\chrootRoot -> Dir.doesDirectoryExist (chrootRoot </> "etc"))
+                          movedAside <- Dir.doesPathExist (aside </> "root" </> "stuck" </> "f")
+                          pure (assertEqual "the chroot made" (Right True) made `andThen` assertEqual "moved aside" True movedAside)
+                        )
+                        `finally` (release *> Dir.removePathForcibly aside),
+                runTestM "a chroot whose way to its store is not directories of its own is refused before anything is read there" $ do
+                  let chroot = root </> "seal-linked"
+                  createDirectoryIfMissing True (chroot </> "nix")
+                  createDirectoryIfMissing True (root </> "seal-target" </> "store")
+                  Dir.createDirectoryLink (root </> "seal-target" </> "store") (chroot </> "nix" </> "store")
+                  linked <- Spawn.sealChroot chroot "/nix/store"
+                  missing <- Spawn.sealChroot chroot "/nix/gone"
+                  let replaced path = Left ("the build replaced '" <> T.pack path <> "' in its sandbox, which holds its outputs, with something other than a directory of its own")
+                  pure $
+                    assertEqual "link" (replaced (chroot </> "nix" </> "store")) linked
+                      `andThen` assertEqual "missing" (replaced (chroot </> "nix" </> "gone")) missing,
+                runTestM "the helper gets the plan on standard input and no environment, and a builder it starts logs and exits as itself" $ do
+                  writeHelper "relay" ("[ \"$1\" = run ] || exit 64\nshift\n" <> readPlanInto "\"$(dirname \"$0\")/plan-copy\"" <> "env > \"$(dirname \"$0\")/environment\"\nexec 1>&2\nexec \"$@\"\n")
+                  let sent = framedPlan "root\0/r\0"
+                  setEnv "NOVA_NIX_TEST_AMBIENT" "inherited"
+                  (run, logged) <- runFake "relay" sent ["/bin/sh", "-c", "echo built; exit 3"]
+                  unsetEnv "NOVA_NIX_TEST_AMBIENT"
+                  delivered <- BS.readFile (root </> "plan-copy")
+                  environment <- BS.readFile (root </> "environment")
+                  pure $
+                    assertEqual "run" (Spawn.HelperRun (Right ()) (ExitFailure 3) "") run
+                      `andThen` assertEqual "plan" "root\0/r\0" delivered
+                      `andThen` assertEqual "log" "built\n" logged
+                      `andThen` assertEqual "ambient in the helper" [] (filter ("NOVA_NIX_TEST_AMBIENT=" `BS.isPrefixOf`) (BS8.lines environment)),
+                runTestM "a step the helper reports failing comes back as its record" $ do
+                  writeHelper "failing" (readPlanInto "/dev/null" <> "printf 'bind 2 0\\n'\nexit 1\n")
+                  (run, _) <- runFake "failing" (framedPlan "") ["/bin/sh"]
+                  pure (assertEqual "run" (Spawn.HelperRun (Right ()) (ExitFailure 1) "bind 2 0\n") run),
+                runTestM "a helper that ends before it reads the plan leaves the plan undelivered" $ do
+                  writeHelper "early" "exit 1\n"
+                  (run, _) <- runFake "early" (framedPlan (BS.replicate (4 * 1024 * 1024) 0x61)) ["/bin/sh"]
+                  pure $ case run of
+                    Spawn.HelperRun (Left _) (ExitFailure 1) "" -> Pass
+                    other -> Fail ("expected an undelivered plan and exit 1, got " <> T.pack (show other)),
+                runTestM "a run that is interrupted returns only once the helper has ended" $ do
+                  let started = root </> "started"
+                      stopped = root </> "stopped"
+                  writeHelper "stopping" (TE.encodeUtf8 ("trap 'sleep 1; echo stopped > " <> T.pack stopped <> "; exit 0' TERM\n" <> "IFS= read -r version\nIFS= read -r length\nhead -c \"$length\" > /dev/null\n" <> "echo started > " <> T.pack started <> "\nwhile :; do sleep 0.1; done\n"))
+                  withAsync (runFake "stopping" (framedPlan "") ["/bin/sh"]) $ \running -> do
+                    up <- waitForFile started
+                    cancel running
+                    ended <- Dir.doesPathExist stopped
+                    pure (assertEqual "started" True up `andThen` assertEqual "stopped before the run returned" True ended)
+              ]
+        )
+  where
+    -- Whether a file appears within the wait a helper's start takes.
+    waitForFile path = go (processWaitMicros `div` filePollMicros)
+      where
+        go :: Int -> IO Bool
+        go 0 = Dir.doesPathExist path
+        go remaining = do
+          present <- Dir.doesPathExist path
+          if present then pure True else threadDelay filePollMicros >> go (remaining - 1)
+        filePollMicros = 50000
+
+-- | The variable naming the sandbox helper this run's Linux sandbox tests
+-- use: one AppArmor lets make namespaces, as CI's Linux build loads a
+-- profile for.
+sandboxHelperVar :: String
+sandboxHelperVar = "NOVA_NIX_TEST_SANDBOX_HELPER"
+
+-- | The variable naming a static busybox, which the Linux sandbox tests
+-- bind as the builder's /bin/sh and /bin/busybox.
+sandboxBusyboxVar :: String
+sandboxBusyboxVar = "NOVA_NIX_TEST_BUSYBOX"
+
+-- | The variable naming a directory with a mount beneath it, at @inner@,
+-- holding a file @inner/file@ the test's user may write: CI's Linux jobs
+-- mount a tmpfs there for the test of a bind's submounts, which runs only
+-- where the variable is set.
+sandboxSubmountVar :: String
+sandboxSubmountVar = "NOVA_NIX_TEST_SANDBOX_SUBMOUNT"
+
+-- | The variable naming a file another user owns, root, in a directory
+-- the test's user may write: CI's Linux jobs make one for the test of an
+-- output holding such a node, which runs only where the variable is set
+-- and moves the file away.
+foreignFileVar :: String
+foreignFileVar = "NOVA_NIX_TEST_FOREIGN_FILE"
+
+-- | The variable naming a directory root owns at 0711, holding a
+-- directory @inner@: CI's Linux jobs make one for the test of a bind
+-- beneath a directory its user may search but not read, which runs only
+-- where the variable is set.
+searchOnlyDirVar :: String
+searchOnlyDirVar = "NOVA_NIX_TEST_SEARCH_ONLY_DIR"
+
+-- | The flag that makes the test binary a process that runs one sandboxed
+-- build, for a test to kill: the helper, the busybox, the store root and
+-- a marker the build's sleeps carry.
+sandboxBuildChildFlag :: String
+sandboxBuildChildFlag = "--sandbox-build-child"
+
+-- | Run, in a child process, a sandboxed build that sleeps until killed.
+sandboxBuildChild :: FilePath -> FilePath -> FilePath -> String -> IO ()
+sandboxBuildChild helper busybox storeRoot marker = do
+  busyboxBytes <- Spawn.filePathBytes busybox
+  let outPath = StorePath (T.replicate 31 "s" <> "e") "sandboxed"
+      config store = (defaultBuildConfig (stDir store)) {bcSandbox = linuxSandboxConfig helper busyboxBytes}
+      script = "/bin/busybox sleep " <> T.pack marker <> "; echo ran > $out"
+  bracket (openStore (StoreDir storeRoot)) closeStore $ \store ->
+    void (buildDerivation (config store) store (mkTestBuildDrv "/bin/sh" outPath script) testDrvPath)
+
+-- | The sandbox the Linux sandbox tests build in: on, with no fallback,
+-- and the static busybox as @/bin/sh@ and @/bin/busybox@.
+linuxSandboxConfig :: FilePath -> BS.ByteString -> Sandbox.SandboxConfig
+linuxSandboxConfig helper busyboxBytes =
+  Sandbox.defaultSandboxConfig
+    { Sandbox.scMode = Sandbox.SandboxEnabled,
+      Sandbox.scFallback = Sandbox.RefuseUnsandboxed,
+      Sandbox.scPaths = [Sandbox.SandboxPath "/bin/sh" busyboxBytes Sandbox.RequiredPath, Sandbox.SandboxPath "/bin/busybox" busyboxBytes Sandbox.RequiredPath],
+      Sandbox.scHelper = Just helper
+    }
+
+-- | The flag that makes the test binary a process that runs two builds
+-- under @sandbox = true@ with no helper, so each falls back.
+sandboxFallbackChildFlag :: String
+sandboxFallbackChildFlag = "--sandbox-fallback-child"
+
+-- | Run two builds that fall back to running unsandboxed, exiting 0 when
+-- both succeed.  The warnings go to standard error, which the parent
+-- reads.
+sandboxFallbackChild :: FilePath -> IO ()
+sandboxFallbackChild storeRoot = do
+  shell <- findTestShell
+  let config store = (defaultBuildConfig (stDir store)) {bcSandbox = Sandbox.defaultSandboxConfig {Sandbox.scMode = Sandbox.SandboxEnabled}, bcBuildLog = stdout}
+      outPath letter = StorePath (T.replicate 31 "f" <> T.singleton letter) "fallback"
+  results <- bracket (openStore (StoreDir storeRoot)) closeStore $ \store ->
+    traverse (\letter -> buildDerivation (config store) store (mkTestBuildDrv shell (outPath letter) "echo ran > $out") testDrvPath) ['1', '2']
+  case [() | BuildSuccess _ <- results] of
+    [_, _] -> pure ()
+    _ -> exitFailure
+
+-- | A process falls back to running its builds unsandboxed after one
+-- warning, however many builds fall back.
+testSandboxFallbackIO :: IO [Bool]
+testSandboxFallbackIO = do
+  putStrLn "builder/sandbox-fallback"
+  tmpBase <- getTemporaryDirectory
+  self <- getExecutablePath
+  let storeRoot = tmpBase </> "nova-nix-test-sandbox-fallback"
+  bracket_ (forceRemoveIfExists storeRoot) (forceRemoveIfExists storeRoot) $ do
+    (code, _, err) <- Proc.readProcessWithExitCode self [sandboxFallbackChildFlag, storeRoot] ""
+    let warnings = filter ("warning: building without a sandbox, since " `T.isPrefixOf`) (T.lines (T.pack err))
+    sequence
+      [ runTest "two builds that fall back print one warning" $
+          assertEqual "exit" ExitSuccess code `andThen` assertEqual "warnings" 1 (length warnings)
+      ]
+
+-- | Linux builds in the sandbox, with @sandbox = true@ and
+-- @sandbox-fallback = false@ and a static busybox as the builder: what a
+-- build cannot read, write or reach, what it is, and how a failed setup
+-- and an interrupt end.  The helper is the one 'sandboxHelperVar' names,
+-- which this run can use; with it unset the group skips, and a name that
+-- is set but missing fails, since the variable is how a run asserts it.
+testLinuxSandboxIO :: IO [Bool]
+testLinuxSandboxIO = do
+  putStrLn "builder/sandbox-linux"
+  named <- (,) <$> lookupEnv sandboxHelperVar <*> lookupEnv sandboxBusyboxVar
+  case named of
+    (Just helper, Just busybox) -> do
+      present <- (&&) <$> Dir.doesFileExist helper <*> Dir.doesFileExist busybox
+      if present
+        then testLinuxSandboxBody helper busybox
+        else (: []) <$> runTest (T.pack sandboxHelperVar <> " and " <> T.pack sandboxBusyboxVar <> " name files") (Fail (T.pack (helper <> ", " <> busybox)))
+    _ -> do
+      putStrLn ("  SKIP  needs " ++ sandboxHelperVar ++ " and " ++ sandboxBusyboxVar)
+      pure []
+
+testLinuxSandboxBody :: FilePath -> FilePath -> IO [Bool]
+testLinuxSandboxBody helper busybox = do
+  tmpBase <- getTemporaryDirectory
+  busyboxBytes <- Spawn.filePathBytes busybox
+  submounted <- lookupEnv sandboxSubmountVar
+  foreignFile <- lookupEnv foreignFileVar
+  searchOnly <- lookupEnv searchOnlyDirVar
+  let root = tmpBase </> "nova-nix-test-sandbox-linux"
+      storeRoot = root </> "store"
+      outside = root </> "outside"
+      sandbox = linuxSandboxConfig helper busyboxBytes
+      outputAt letter = StorePath (T.replicate 31 "s" <> T.singleton letter) "sandboxed"
+      drvFor letter = mkTestBuildDrv "/bin/sh" (outputAt letter)
+      configFor store = (defaultBuildConfig (stDir store)) {bcSandbox = sandbox}
+      outputFile store letter = storePathToFilePath (stDir store) (outputAt letter)
+      withSandboxStore = bracket (openStore (StoreDir storeRoot)) closeStore
+  bracket_
+    (forceRemoveIfExists root >> createDirectoryIfMissing True outside >> BS.writeFile (outside </> "secret") "host secret\n")
+    (forceRemoveIfExists root)
+    ( sequence $
+        [ runTestM "a sandboxed build runs as uid 1000 and gid 100, on host localhost, as PID 1, in /build, with upstream's HOME" $
+            withSandboxStore $ \store -> do
+              result <- buildDerivation (configFor store) store (drvFor '1' "echo \"$(/bin/busybox id -u) $(/bin/busybox id -g) $(/bin/busybox hostname) $$ $(/bin/busybox pwd) $NIX_BUILD_TOP $TMPDIR $HOME\" > $out") testDrvPath
+              case result of
+                BuildSuccess _ -> assertEqual "seen" "1000 100 localhost 1 /build /build /build /homeless-shelter\n" <$> BS.readFile (outputFile store '1')
+                BuildFailure msg _ -> pure (Fail msg),
+          runTestM "a sandboxed build cannot read a host path outside its inputs, which an unsandboxed one can" $
+            withSandboxStore $ \store -> do
+              let script = "/bin/busybox cat " <> T.pack (outside </> "secret") <> " > $out 2>/dev/null || echo refused > $out"
+              sandboxed <- buildDerivation (configFor store) store (drvFor '2' script) testDrvPath
+              sandboxedSaw <- BS.readFile (outputFile store '2')
+              unsandboxed <- buildDerivation ((configFor store) {bcSandbox = sandbox {Sandbox.scMode = Sandbox.SandboxDisabled}}) store (drvFor '3' script) testDrvPath
+              unsandboxedSaw <- BS.readFile (outputFile store '3')
+              pure $
+                assertEqual "sandboxed" (BuildSuccess (outputAt '2')) sandboxed
+                  `andThen` assertEqual "what the sandboxed build read" "refused\n" sandboxedSaw
+                  `andThen` assertEqual "unsandboxed" (BuildSuccess (outputAt '3')) unsandboxed
+                  `andThen` assertEqual "what the unsandboxed build read" "host secret\n" unsandboxedSaw,
+          runTestM "the helper runs with no environment, so its loader reads no variable a derivation sets, which reach the builder" $
+            withSandboxStore $ \store -> do
+              helperBytes <- Spawn.filePathBytes helper
+              let logPath = root </> "loader.log"
+                  helperLine = helperBytes <> "\0run\0"
+                  -- The builder waits for a file in its own directory, so
+                  -- nothing it does writes to the log: a child it saw
+                  -- killed, its shell would report there.
+                  release = buildDirFor (stDir store) (outputAt 'b') </> "build" </> "release"
+                  base = drvFor 'b' "while [ ! -e /build/release ]; do /bin/busybox sleep 1; done; echo \"$LD_DEBUG $LD_PRELOAD\" > $out"
+                  drv = base {drvEnv = Map.union (Map.fromList [("LD_DEBUG", "libs"), ("LD_PRELOAD", "/nonexistent-nova-nix-preload.so")]) (drvEnv base)}
+              (result, environs) <- withBinaryFile logPath WriteMode $ \logHandle ->
+                withAsync (buildDerivation (configFor store) {bcBuildLog = logHandle} store drv testDrvPath) $ \build -> do
+                  _ <- waitForProcesses helperLine (not . null)
+                  helpers <- processesWith helperLine
+                  -- Read while the helper runs, then let the build go on.
+                  environs <- traverse (\pid -> BS.readFile ("/proc" </> pid </> "environ")) helpers
+                  BS.writeFile release ""
+                  (,environs) <$> timeout processWaitMicros (wait build)
+              logged <- BS.readFile logPath
+              case result of
+                Nothing -> pure (Fail "the build did not finish once it was released")
+                Just (BuildSuccess _) -> do
+                  given <- BS.readFile (outputFile store 'b')
+                  pure $
+                    assertEqual "the helper's environment" [""] environs
+                      `andThen` assertEqual "the loader's output in the log" "" logged
+                      `andThen` assertEqual "what the builder was given" "libs /nonexistent-nova-nix-preload.so\n" given
+                Just (BuildFailure msg _) -> pure (Fail (msg <> "; log: " <> TE.decodeUtf8Lenient logged)),
+          runTestM "a NUL in a derivation's variable ends the entry its builder gets, and the bytes after it bind nothing" $
+            withSandboxStore $ \store -> do
+              outsideBytes <- Spawn.filePathBytes outside
+              -- The shape of a bind of the outside directory at /escape, as
+              -- tokens that end at a NUL would read it.
+              let smuggled = "kept\0bind\0/escape\0" <> outsideBytes <> "\0-"
+                  base = drvFor 'k' "/bin/busybox cat /escape/secret > $out 2>/dev/null || echo \"refused $smuggled\" > $out"
+                  drv = base {drvEnv = Map.insert "smuggled" smuggled (drvEnv base)}
+              result <- buildDerivation (configFor store) store drv testDrvPath
+              case result of
+                BuildSuccess _ -> assertEqual "what the builder saw" "refused kept\n" <$> BS.readFile (outputFile store 'k')
+                BuildFailure msg _ -> pure (Fail msg),
+          runTestM "a sandboxed builder that opens its build directory to everyone leaves the directory around it closed" $
+            withSandboxStore $ \store -> do
+              let marker = "987648"
+                  sleepLine = "sleep\0" <> TE.encodeUtf8 marker
+                  outer = buildDirFor (stDir store) (outputAt 'l')
+                  script = "/bin/busybox chmod 0755 /build; /bin/busybox sleep " <> marker <> "; echo ran > $out"
+              withAsync (buildDerivation (configFor store) store (drvFor 'l' script) testDrvPath) $ \build -> do
+                appeared <- waitForProcesses sleepLine (not . null)
+                outerMode <- fmap nsPermissions <$> nodeStatus outer
+                innerMode <- fmap nsPermissions <$> nodeStatus (outer </> "build")
+                sleeps <- processesWith sleepLine
+                for_ sleeps $ \pid -> Proc.readProcessWithExitCode "kill" ["-TERM", pid] ""
+                finished <- timeout processWaitMicros (wait build)
+                pure $
+                  assertEqual "started" True appeared
+                    `andThen` assertEqual "the build directory" (Just 0o700) outerMode
+                    `andThen` assertEqual "the directory the builder sees" (Just 0o755) innerMode
+                    `andThen` assertEqual "build" (Just (BuildSuccess (outputAt 'l'))) finished,
+          runTestM "a sandboxed output others could write is refused in the chroot, before it reaches the store" $
+            withSandboxStore $ \store -> do
+              result <- buildDerivation (configFor store) store (drvFor 'm' "/bin/busybox mkdir $out; /bin/busybox chmod 0777 $out") testDrvPath
+              let outPath = outputFile store 'm'
+                  inChroot = (Spawn.chrootDirFor (buildDirFor (stDir store) (outputAt 'm')) </> "root") <> outPath
+              left <- Dir.doesPathExist outPath
+              pure $
+                assertEqual "result" (BuildFailure ("suspicious ownership or permission on '" <> T.pack inChroot <> "' for output 'out'; rejecting this build output") 1) result
+                  `andThen` assertEqual "in the store" False left,
+          runTestM "a sandboxed directory output keeps its hard links through its move into the store" $
+            withSandboxStore $ \store -> do
+              result <- buildDerivation (configFor store) store (drvFor 'n' "/bin/busybox mkdir $out; echo linked > $out/a; /bin/busybox ln $out/a $out/b") testDrvPath
+              (_, links, _) <- Proc.readProcessWithExitCode "stat" ["-c", "%h", outputFile store 'n' </> "a"] ""
+              pure (assertEqual "build" (BuildSuccess (outputAt 'n')) result `andThen` assertEqual "links" "2\n" links),
+          runTestM "a sandboxed output that is a link to a sibling output is an output, though the sibling is still in the chroot" $
+            withSandboxStore $ \store -> do
+              let base = drvFor 'p' "/bin/busybox mkdir $out; /bin/busybox ln -s $out $dev"
+                  devPath = StorePath (T.replicate 31 "s" <> "q") "sandboxed-dev"
+                  drv = base {drvOutputs = drvOutputs base ++ [DerivationOutput "dev" devPath "" ""]}
+              result <- buildDerivation (configFor store) store drv testDrvPath
+              target <- Dir.getSymbolicLinkTarget (storePathToFilePath (stDir store) devPath)
+              pure (assertEqual "build" (BuildSuccess (outputAt 'p')) result `andThen` assertEqual "dev" (outputFile store 'p') target),
+          runTestM "a sandboxed check reads its rebuild in the chroot, and refuses one others could write there" $
+            withSandboxStore $ \store -> do
+              let markerDir = root </> "check-marker"
+              createDirectoryIfMissing True markerDir
+              BS.writeFile (markerDir </> "check") ""
+              markerBytes <- Spawn.filePathBytes markerDir
+              let drv = drvFor 'r' "/bin/busybox mkdir $out; if [ -e /marker/check ]; then /bin/busybox chmod 0777 $out; fi"
+                  checking = sandbox {Sandbox.scPaths = Sandbox.scPaths sandbox ++ [Sandbox.SandboxPath "/marker" markerBytes Sandbox.RequiredPath]}
+                  chrootRoot = Spawn.chrootDirFor (buildDirFor (stDir store) (outputAt 'r')) </> "root"
+              built <- buildDerivation (configFor store) store drv testDrvPath
+              checked <- checkDerivation (configFor store) {bcSandbox = checking} store drv testDrvPath
+              let reason = fromLeft "the check passed" checked
+              pure $
+                assertEqual "build" (BuildSuccess (outputAt 'r')) built
+                  `andThen` assertEqual ("refused in the chroot: " <> reason) True (T.pack chrootRoot `T.isInfixOf` reason && "suspicious ownership or permission" `T.isInfixOf` reason),
+          runTestM "a sandbox path whose target crosses a link in the chroot is refused, and nothing outside the chroot is made" $
+            withSandboxStore $ \store -> do
+              let linkSource = root </> "escape-link"
+                  escaped = root </> "escape-target"
+              createDirectoryIfMissing True escaped
+              Dir.removePathForcibly linkSource
+              Dir.createDirectoryLink escaped linkSource
+              linkBytes <- Spawn.filePathBytes linkSource
+              hostBytes <- Spawn.filePathBytes outside
+              let crossing = sandbox {Sandbox.scPaths = Sandbox.scPaths sandbox ++ [Sandbox.SandboxPath "/escape" linkBytes Sandbox.RequiredPath, Sandbox.SandboxPath "/escape/inner" hostBytes Sandbox.RequiredPath]}
+              result <- buildDerivation ((configFor store) {bcSandbox = crossing}) store (drvFor 's' "echo ran > $out") testDrvPath
+              made <- Dir.doesPathExist (escaped </> "inner")
+              let refused = case result of
+                    BuildFailure msg _ -> "Too many levels of symbolic links" `T.isInfixOf` msg
+                    BuildSuccess _ -> False
+              pure (assertEqual ("refused: " <> T.pack (show result)) True refused `andThen` assertEqual "made outside the chroot" False made),
+          runTestM "an output's extended attributes are removed as it is made canonical" $
+            withSandboxStore $ \store -> do
+              let unsandboxed = (configFor store) {bcSandbox = sandbox {Sandbox.scMode = Sandbox.SandboxDisabled}}
+                  script = "mkdir $out && echo x > $out/f && /usr/bin/python3 -c 'import os, sys; os.setxattr(sys.argv[1], \"user.nova-nix-test\", b\"1\")' $out/f"
+              result <- buildDerivation unsandboxed store (drvFor 'v' script) testDrvPath
+              (_, listed, _) <- Proc.readProcessWithExitCode "/usr/bin/python3" ["-c", "import os, sys; print(os.listxattr(sys.argv[1]))", outputFile store 'v' </> "f"] ""
+              pure (assertEqual "build" (BuildSuccess (outputAt 'v')) result `andThen` assertEqual "attributes" "[]\n" listed),
+          runTestM "a sandboxed builder gains no privileges through exec, where the process that started it could" $
+            withSandboxStore $ \store -> do
+              own <- filter ("NoNewPrivs:" `BS.isPrefixOf`) . BS8.lines <$> BS.readFile "/proc/self/status"
+              result <- buildDerivation (configFor store) store (drvFor 'f' "/bin/busybox grep NoNewPrivs: /proc/self/status > $out") testDrvPath
+              case result of
+                BuildSuccess _ -> do
+                  seen <- BS.readFile (outputFile store 'f')
+                  pure (assertEqual "this process" ["NoNewPrivs:\t0"] own `andThen` assertEqual "the builder" "NoNewPrivs:\t1\n" seen)
+                BuildFailure msg _ -> pure (Fail msg),
+          runTestM "a sandboxed build does not inherit the session keyring of the process that starts it, which an unsandboxed one does" $
+            -- A keyring belongs to an OS thread's credentials, so the key is
+            -- planted, and both builds started, on a bound thread of the
+            -- test's own.
+            flip withAsyncBound wait $
+              withSandboxStore $ \store -> do
+                serial <- withCString keyDescription c_nova_test_plant_possessed_key
+                if serial < 0
+                  then (\(Errno number) -> Fail ("planting the key: errno " <> T.pack (show number))) <$> getErrno
+                  else do
+                    let unsandboxed = (configFor store) {bcSandbox = sandbox {Sandbox.scMode = Sandbox.SandboxDisabled}}
+                        holdsKey = BS.isInfixOf (BS8.pack keyDescription)
+                    sandboxedResult <- buildDerivation (configFor store) store (drvFor 'h' "/bin/busybox cat /proc/keys > $out") testDrvPath
+                    unsandboxedResult <- buildDerivation unsandboxed store (drvFor 'i' (T.pack busybox <> " cat /proc/keys > $out")) testDrvPath
+                    sandboxedKeys <- BS.readFile (outputFile store 'h')
+                    unsandboxedKeys <- BS.readFile (outputFile store 'i')
+                    pure $
+                      assertEqual "sandboxed build" (BuildSuccess (outputAt 'h')) sandboxedResult
+                        `andThen` assertEqual "unsandboxed build" (BuildSuccess (outputAt 'i')) unsandboxedResult
+                        `andThen` assertEqual "the unsandboxed build sees the key" True (holdsKey unsandboxedKeys)
+                        `andThen` assertEqual "the sandboxed build sees the key" False (holdsKey sandboxedKeys),
+          runTestM "a helper started with SIGCHLD ignored still waits for its builder and relays its exit" $
+            withSandboxStore $ \store -> do
+              helperBytes <- Spawn.filePathBytes helper
+              let wrapper = root </> "ignoring-sigchld"
+              -- trap '' sets SIGCHLD ignored, which exec keeps.
+              BS.writeFile wrapper ("#!/bin/sh\ntrap '' CHLD\nexec '" <> helperBytes <> "' \"$@\"\n")
+              Dir.getPermissions wrapper >>= Dir.setPermissions wrapper . Dir.setOwnerExecutable True
+              let ignoring = sandbox {Sandbox.scHelper = Just wrapper}
+              result <- timeout processWaitMicros (buildDerivation (configFor store) {bcSandbox = ignoring} store (drvFor 'g' "echo ran > $out") testDrvPath)
+              pure (assertEqual "build" (Just (BuildSuccess (outputAt 'g'))) result),
+          runTestM "a sandboxed build cannot change a host file a sandbox-paths entry binds" $
+            withSandboxStore $ \store -> do
+              ownedBytes <- Spawn.filePathBytes (outside </> "owned")
+              BS.writeFile (outside </> "owned") "the user's\n"
+              let bound = sandbox {Sandbox.scPaths = Sandbox.scPaths sandbox ++ [Sandbox.SandboxPath "/owned" ownedBytes Sandbox.RequiredPath]}
+              result <- buildDerivation ((configFor store) {bcSandbox = bound}) store (drvFor 'c' "echo changed > /owned 2>/dev/null; echo ran > $out") testDrvPath
+              contents <- BS.readFile (outside </> "owned")
+              pure (assertEqual "build" (BuildSuccess (outputAt 'c')) result `andThen` assertEqual "the host file" "the user's\n" contents),
+          runTestM "a sandboxed build cannot write a host path outside its outputs and build directory" $
+            withSandboxStore $ \store -> do
+              result <- buildDerivation (configFor store) store (drvFor '4' ("echo escaped > " <> T.pack (outside </> "escaped") <> "; echo ran > $out")) testDrvPath
+              escaped <- Dir.doesPathExist (outside </> "escaped")
+              pure (assertEqual "build" (BuildSuccess (outputAt '4')) result `andThen` assertEqual "escaped" False escaped),
+          runTestM "an input a sandboxed builder tries to make writable and change keeps its bytes and mode" $
+            withSandboxStore $ \store -> do
+              dep <- buildDerivation (configFor store) store (drvFor '5' "/bin/busybox mkdir $out; echo original > $out/file") testDrvPath
+              case dep of
+                BuildFailure msg _ -> pure (Fail ("dependency: " <> msg))
+                BuildSuccess depPath -> do
+                  let depFile = storePathToFilePath (stDir store) depPath </> "file"
+                  modeBefore <- fmap nsPermissions <$> nodeStatus depFile
+                  let script = "/bin/busybox chmod u+w " <> T.pack depFile <> " 2>/dev/null; echo changed >> " <> T.pack depFile <> " 2>/dev/null; echo ran > $out"
+                  result <- buildDerivation (configFor store) store ((drvFor '6' script) {drvInputSrcs = [depPath]}) testDrvPath
+                  contents <- BS.readFile depFile
+                  modeAfter <- fmap nsPermissions <$> nodeStatus depFile
+                  pure $
+                    assertEqual "build" (BuildSuccess (outputAt '6')) result
+                      `andThen` assertEqual "contents" "original\n" contents
+                      `andThen` assertEqual "mode" modeBefore modeAfter,
+          runTestM "a sandboxed build that is not fixed-output reaches no host server, and a fixed-output one does" $
+            withHttpServer (\_ _ -> Send (httpResponse "200 OK" "payload")) $ \base requests _ ->
+              withSandboxStore $ \store -> do
+                private <- buildDerivation (configFor store) store (drvFor '7' ("/bin/busybox wget -q -O - " <> base <> "/private > $out 2>/dev/null || echo unreachable > $out")) testDrvPath
+                privateSeen <- BS.readFile (outputFile store '7')
+                beforeFixed <- requests
+                let digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" "payload")
+                    fixedPath = StorePath (T.replicate 31 "s" <> "8") "fixed"
+                fixed <- buildDerivation (configFor store) store (mkFixedOutputDrv "/bin/sh" fixedPath ("/bin/busybox wget -q -O $out " <> base <> "/fixed") "sha256" digest) testDrvPath
+                afterFixed <- requests
+                pure $
+                  assertEqual "private build" (BuildSuccess (outputAt '7')) private
+                    `andThen` assertEqual "private output" "unreachable\n" privateSeen
+                    `andThen` assertEqual "requests from the private build" [] beforeFixed
+                    `andThen` assertEqual "fixed build" (BuildSuccess fixedPath) fixed
+                    `andThen` assertEqual "requests from the fixed build" ["/fixed"] afterFixed,
+          runTestM "a setup step that fails is reported in upstream's words, and no chroot is left" $
+            withSandboxStore $ \store -> do
+              let missing = sandbox {Sandbox.scPaths = Sandbox.scPaths sandbox ++ [Sandbox.SandboxPath "/missing" "/nonexistent-nova-nix-test" Sandbox.RequiredPath]}
+              result <- buildDerivation ((configFor store) {bcSandbox = missing}) store (drvFor '9' "echo ran > $out") testDrvPath
+              left <- Dir.doesPathExist (Spawn.chrootDirFor (buildDirFor (stDir store) (outputAt '9')))
+              pure $
+                assertEqual "result" (BuildFailure "while setting up the build environment: getting attributes of path '/nonexistent-nova-nix-test': No such file or directory" 1) result
+                  `andThen` assertEqual "chroot left" False left,
+          runTestM "an interrupt returns once no process of the build, and neither its chroot nor its build directory, is left" $
+            withSandboxStore $ \store -> do
+              let marker = "987654"
+                  -- The sleep's own command line, which only the sleep
+                  -- has: the helper's holds the script, which spaces it.
+                  sleepLine = "sleep\0" <> TE.encodeUtf8 marker
+                  buildDir = buildDirFor (stDir store) (outputAt 'a')
+              withAsync (buildDerivation (configFor store) store (drvFor 'a' (sleepingScript marker)) testDrvPath) $ \build -> do
+                appeared <- waitForProcesses sleepLine (not . null)
+                cancel build
+                left <- processesWith sleepLine
+                chrootLeft <- Dir.doesPathExist (Spawn.chrootDirFor buildDir)
+                buildDirLeft <- Dir.doesPathExist buildDir
+                pure $
+                  assertEqual "started" True appeared
+                    `andThen` assertEqual "processes left" [] left
+                    `andThen` assertEqual "chroot left" False chrootLeft
+                    `andThen` assertEqual "build directory left" False buildDirLeft,
+          runTestM "killing the helper ends a build whose builder keeps its parent-death signal" $
+            withSandboxStore $ \store -> do
+              helperBytes <- Spawn.filePathBytes helper
+              let marker = "987653"
+                  sleepLine = "sleep\0" <> TE.encodeUtf8 marker
+              withAsync (buildDerivation (configFor store) store (drvFor 'd' (sleepingScript marker)) testDrvPath) $ \build -> do
+                appeared <- waitForProcesses sleepLine (not . null)
+                helpers <- processesWith (helperBytes <> "\0run\0")
+                for_ helpers $ \pid -> Proc.readProcessWithExitCode "kill" ["-KILL", pid] ""
+                ended <- waitCatch build
+                gone <- waitForProcesses sleepLine null
+                pure $
+                  assertEqual "started" True appeared
+                    `andThen` assertEqual "helpers found" 1 (length helpers)
+                    `andThen` assertEqual "the build failed" True (either (const False) (\case BuildFailure _ _ -> True; BuildSuccess _ -> False) ended)
+                    `andThen` assertEqual "the build's processes gone" True gone,
+          runTestM "killing nova-nix ends the build, whose helper sees its lifeline close" $ do
+            self <- getExecutablePath
+            let marker = "987652"
+                sleepLine = "sleep\0" <> TE.encodeUtf8 marker
+            Proc.withCreateProcess (Proc.proc self [sandboxBuildChildFlag, helper, busybox, root </> "child-store", T.unpack marker]) $ \_ _ _ child -> do
+              appeared <- waitForProcesses sleepLine (not . null)
+              childPid <- Proc.getPid child
+              for_ childPid $ \pid -> Proc.readProcessWithExitCode "kill" ["-KILL", show pid] ""
+              _ <- Proc.waitForProcess child
+              gone <- waitForProcesses sleepLine null
+              pure (assertEqual "started" True appeared `andThen` assertEqual "the build's processes gone" True gone)
+        ]
+          ++ [ runTestM "a sandboxed build cannot write through a mount beneath a host path a sandbox-paths entry binds" $
+                 withSandboxStore $ \store -> do
+                   dirBytes <- Spawn.filePathBytes dir
+                   let bound = sandbox {Sandbox.scPaths = Sandbox.scPaths sandbox ++ [Sandbox.SandboxPath "/bound" dirBytes Sandbox.RequiredPath]}
+                       beneath = dir </> "inner" </> "file"
+                   before <- BS.readFile beneath
+                   result <- buildDerivation ((configFor store) {bcSandbox = bound}) store (drvFor 'j' "echo changed > /bound/inner/file 2>/dev/null; echo ran > $out") testDrvPath
+                   after <- BS.readFile beneath
+                   pure (assertEqual "build" (BuildSuccess (outputAt 'j')) result `andThen` assertEqual "the file beneath the mount" before after)
+             | Just dir <- [submounted]
+             ]
+          ++ [ runTestM "a sandbox path is bound beneath an earlier bind of a directory its user may search but not read" $
+                 withSandboxStore $ \store -> do
+                   searchBytes <- Spawn.filePathBytes searchable
+                   hostBytes <- Spawn.filePathBytes outside
+                   let beneath = sandbox {Sandbox.scPaths = Sandbox.scPaths sandbox ++ [Sandbox.SandboxPath "/searchable" searchBytes Sandbox.RequiredPath, Sandbox.SandboxPath "/searchable/inner" hostBytes Sandbox.RequiredPath]}
+                   result <- buildDerivation ((configFor store) {bcSandbox = beneath}) store (drvFor 'w' "/bin/busybox cat /searchable/inner/secret > $out") testDrvPath
+                   case result of
+                     BuildSuccess _ -> assertEqual "what the builder read" "host secret\n" <$> BS.readFile (outputFile store 'w')
+                     BuildFailure msg _ -> pure (Fail msg)
+             | Just searchable <- [searchOnly]
+             ]
+          ++ [ runTestM "an output holding a node another user owns is refused before it is made canonical" $
+                 withSandboxStore $ \store -> do
+                   let unsandboxed = (configFor store) {bcSandbox = sandbox {Sandbox.scMode = Sandbox.SandboxDisabled}}
+                       outPath = outputFile store 't'
+                   result <- buildDerivation unsandboxed store (drvFor 't' ("mkdir $out && mv '" <> T.pack rootOwned <> "' $out/")) testDrvPath
+                   pure (assertEqual "result" (BuildFailure ("invalid ownership on file '" <> T.pack (outPath </> takeFileName rootOwned) <> "'") 1) result)
+             | Just rootOwned <- [foreignFile]
+             ]
+    )
+  where
+    keyDescription = "nova-nix-test-keyring"
+    sleepingScript marker = "/bin/busybox sleep " <> marker <> " & /bin/busybox sleep " <> marker <> "; echo ran > $out"
+    -- Whether, within the wait, the processes whose command line holds
+    -- the marker came to satisfy the condition.
+    waitForProcesses :: BS.ByteString -> ([FilePath] -> Bool) -> IO Bool
+    waitForProcesses marker satisfied = go (processWaitMicros `div` pollMicros)
+      where
+        pollMicros = 100000
+        go :: Int -> IO Bool
+        go 0 = satisfied <$> processesWith marker
+        go remaining = do
+          found <- processesWith marker
+          if satisfied found then pure True else threadDelay pollMicros >> go (remaining - 1)
+    processesWith marker = do
+      pids <- filter (all isDigit) <$> Dir.listDirectory "/proc"
+      fmap catMaybes . traverse (holds marker) $ pids
+    holds marker pid = do
+      line <- try (BS.readFile ("/proc" </> pid </> "cmdline")) :: IO (Either IOException BS.ByteString)
+      pure $ case line of
+        Right bytes | marker `BS.isInfixOf` bytes -> Just pid
+        _ -> Nothing
 
 -- ---------------------------------------------------------------------------
 -- Tests: Store.DB (Phase 2, Batch 1)
@@ -13156,8 +14343,8 @@ withTempStore action = do
 deleteNamed :: Store -> Text -> IO (Either Text DeleteOutcome)
 deleteNamed store = either (pure . Left) (deleteStorePathRaw store) . storeEntryName
 
--- | How long a test waits for a process it started to appear, to act or
--- to be gone.
+-- | How long a test waits for a process it started, or one in a build's
+-- PID namespace, to appear, to act or to be gone.
 processWaitMicros :: Int
 processWaitMicros = 10000000
 
@@ -13184,7 +14371,8 @@ forceRemoveIfExists path = do
 
 -- | Give a tree's owner write permission on everything in it, so it can be
 -- removed.  A symlink is passed over, never followed: it has no mode of
--- its own, and what it names is not the tree's to change.
+-- its own, and what it names, such as a chroot's /dev/fd naming
+-- /proc/self/fd, is not the tree's to change.
 restoreWritable :: FilePath -> IO ()
 restoreWritable path = do
   isLink <- Dir.pathIsSymbolicLink path
@@ -26455,7 +27643,7 @@ testBuildUmaskCLI = do
           expression = "derivation { name = \"umask-cli\"; system = builtins.currentSystem; builder = \"/bin/sh\"; args = [ \"-c\" \"umask > $out\" ]; }"
           started =
             (Proc.proc "/bin/sh" ["-c", "umask 077; exec cabal run -v0 exe:nova-nix -- build --expr \"$1\" --store \"$2\" --no-out-link", "sh", expression, root </> "store"])
-              { Proc.env = Just (("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n") : ("NIX_CONF_DIR", root </> "system") : ("NIX_USER_CONF_FILES", "") : filter ((`notElem` configVars) . fst) ambient)
+              { Proc.env = Just (("NIX_CONFIG", "substituters =\ntrusted-public-keys =\nsandbox = false\n") : ("NIX_CONF_DIR", root </> "system") : ("NIX_USER_CONF_FILES", "") : filter ((`notElem` configVars) . fst) ambient)
               }
       bracket_
         (forceRemoveIfExists root >> createDirectoryIfMissing True root)
@@ -26467,6 +27655,74 @@ testBuildUmaskCLI = do
               _ -> pure (Left ("exit " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err))
             sequence [runTest "a builder the CLI runs gets upstream's file-creation mask, whatever the CLI was started with" (assertEqual "umask" (Right "0022") seen)]
         )
+
+-- | Every session the CLI makes builds under the sandbox settings, an
+-- import from a derivation included: under @sandbox = true@ a derivation
+-- that sets @__noChroot@ is refused with upstream's error, which is decided
+-- before the system is probed and so holds on every platform, and under
+-- @--relaxed-sandbox@, given after the command, it builds unsandboxed.
+-- Each run has a store of its own, so none finds an output another built.
+-- A read-only session writes no @.drv@, and builds only a derivation the
+-- store holds and only an output that may not be substituted, so for
+-- @eval@ and @trust@ a read-write evaluation of the derivation's path
+-- writes it first, building nothing, and the derivation sets
+-- @allowSubstitutes = false@.
+testSandboxSessionsCLI :: IO [Bool]
+testSandboxSessionsCLI = do
+  putStrLn "cli/sandbox-sessions"
+  shell <- findTestShell
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-sandbox-sessions"
+      configVars = ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"]
+      isolatedEnv =
+        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\nsandbox = true\n")
+          : ("NIX_CONF_DIR", root </> "system")
+          : ("NIX_USER_CONF_FILES", "")
+          : ("XDG_CONFIG_HOME", root </> "config")
+          : ("XDG_CACHE_HOME", root </> "cache")
+          : filter ((`notElem` configVars) . fst) ambient
+      runCLI store args =
+        Proc.readCreateProcessWithExitCode
+          ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args ++ ["--store", root </> store])) {Proc.env = Just isolatedEnv})
+          ""
+      nixString text = "\"" <> T.replace "${" "\\${" (T.replace "\"" "\\\"" (T.replace "\\" "\\\\" text)) <> "\""
+      unsandboxable name script extra =
+        "derivation { name = " <> nixString name <> "; system = builtins.currentSystem; builder = " <> nixString shell <> "; args = [ \"-c\" " <> nixString script <> " ]; __noChroot = true; allowSubstitutes = false; " <> extra <> " }"
+      made = unsandboxable "sandbox-session-read" "printf made > $out" ""
+      reading = "builtins.readFile (" <> made <> ")"
+      top = unsandboxable "sandbox-session-top" "printf %s \"$made\" > $out" ("made = " <> reading <> ";")
+      writingDrv = ["eval", "--read-write-mode", "--expr", T.unpack ("(" <> made <> ").drvPath")]
+      sessions :: [(Text, [[String]], [String], Text)]
+      sessions =
+        [ ("eval", [writingDrv], ["eval"], reading),
+          ("eval --read-write-mode", [], ["eval", "--read-write-mode"], reading),
+          ("build", [], ["build", "--no-out-link"], top),
+          ("trust", [writingDrv], ["trust"], top)
+        ]
+      refusal = "has '__noChroot' set, but that's not allowed when 'sandbox' is 'true'"
+      outcome (code, out, err) = "exit " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err
+      runSession (index, (label, preparing, command, expression)) = do
+        let refusedStore = "refused-" <> show index
+            relaxedStore = "relaxed-" <> show index
+        refusedPrepared <- traverse (runCLI refusedStore) preparing
+        refused <- runCLI refusedStore (command ++ ["--expr", T.unpack expression])
+        relaxedPrepared <- traverse (runCLI relaxedStore) preparing
+        relaxed <- runCLI relaxedStore (take 1 command ++ ["--relaxed-sandbox"] ++ drop 1 command ++ ["--expr", T.unpack expression])
+        pure (label, refusedPrepared ++ relaxedPrepared, refused, relaxed)
+  bracket_
+    (forceRemoveIfExists root)
+    (forceRemoveIfExists root)
+    ( do
+        runs <- traverse runSession (zip [0 :: Int ..] sessions)
+        sequence
+          [ runTest (label <> " refuses a __noChroot derivation an evaluation builds under sandbox = true, and builds it under --relaxed-sandbox") $
+              case (filter (\(code, _, _) -> code /= ExitSuccess) prepared, refused, relaxed) of
+                ([], (ExitFailure _, _, refusedErr), (ExitSuccess, _, _)) | refusal `T.isInfixOf` T.pack refusedErr -> Pass
+                (failedPreparing, _, _) -> Fail ("preparing: " <> T.intercalate ", " (map outcome failedPreparing) <> "; refused: " <> outcome refused <> "; relaxed: " <> outcome relaxed)
+          | (label, prepared, refused, relaxed) <- runs
+          ]
+    )
 
 -- | nix.conf's cores reaches a builder the CLI runs, and with nothing
 -- setting it the builder is told the machine's count, a positive number.
@@ -27652,6 +28908,20 @@ testCliReference = do
               spelling <- toList (Ref.flagSpellings entry),
               let args = cliWords name ++ [T.unpack spelling] ++ cliValue entry ++ cliOperands name flagName
             ],
+        -- The other way round, so --help lists exactly what each command
+        -- takes after its words.  A global flag is answered anywhere.
+        runTest "no command takes, after its words, a flag the reference does not list for it" $
+          allPass
+            [ case Cli.parseArgs args of
+                Right opts | cliSelects name (Cli.optCommand opts) -> Fail (T.pack (unwords args))
+                _ -> Pass
+            | (flagName, entry) <- referenceFlags,
+              Ref.CommandFlag names <- [Ref.flagScope entry],
+              name <- Ref.commandNames,
+              name `notElem` names,
+              spelling <- toList (Ref.flagSpellings entry),
+              let args = cliWords name ++ [T.unpack spelling] ++ cliValue entry ++ cliOperands name flagName
+            ],
         runTest "a global flag is answered on its own" $
           allPass
             [ case Cli.parseArgs [T.unpack spelling] of
@@ -27709,11 +28979,12 @@ testCliReference = do
            in assertEqual "malformed" [] [Ref.flagLong entry | (_, entry) <- referenceFlags, not (wellFormed entry)]
                 `andThen` assertEqual "repeated" [] [spelling | (spelling, count) <- Map.toList (Map.fromListWith (+) [(spelling, 1 :: Int) | spelling <- spellings]), count > 1],
         -- A value of 1 or 0 moves each from its default, a Boolean that is
-        -- on by default by 0.
+        -- on by default by 0, and sandbox, whose values are words, by
+        -- relaxed.
         runTest "every setting is one nix.conf resolves" $
           let moves setting value = either (const False) (/= Config.defaultNixConfig) (Config.resolveConfig [Config.ConfigAssignment (TE.encodeUtf8 (Ref.settingName setting)) value])
            in allPass
-                [ if any (moves setting) ["1", "0"] then Pass else Fail (Ref.settingName setting <> ": neither 1 nor 0 moves the configuration")
+                [ if any (moves setting) ["1", "0", "relaxed"] then Pass else Fail (Ref.settingName setting <> ": none of 1, 0 and relaxed moves the configuration")
                 | setting <- toList (Ref.configSettings Ref.configuration)
                 ],
         runTest "help lists --no-allow-import-from-derivation" $
@@ -32793,6 +34064,8 @@ main = do
     [flag, source] | flag == internOrderChildFlag -> inTestSession (internOrderChild source)
     [flag] | flag == startupSymbolsChildFlag -> inTestSession startupSymbolsChild
     [flag, source] | flag == failureChildFlag -> inTestSession (failureChild source)
+    [flag, helper, busybox, storeRoot, marker] | flag == sandboxBuildChildFlag -> sandboxBuildChild helper busybox storeRoot marker
+    [flag, storeRoot] | flag == sandboxFallbackChildFlag -> sandboxFallbackChild storeRoot
     [flag, source] | flag == namesOnlyChildFlag -> inTestSession (namesOnlyChild source)
     [flag] | flag == arenaCycleChildFlag -> arenaCycleChild
     [flag] | flag == writeCliJsonFlag -> BS.writeFile cliJsonPath Ref.referenceJson
@@ -33017,6 +34290,10 @@ runSuite = do
           testBuildOrchestrator,
           testPassAsFile,
           testBuilderLayout,
+          testSandboxPure,
+          testSandboxSpawnIO,
+          testSandboxFallbackIO,
+          testLinuxSandboxIO,
           testStoreDB,
           testParseStorePath,
           testStoreMetadata,
@@ -33037,6 +34314,7 @@ runSuite = do
           testImportFromDerivationCLI,
           testBuildCoresCLI,
           testBuildUmaskCLI,
+          testSandboxSessionsCLI,
           testOutLinkCLI,
           testTargetArgs,
           testTargetArgsCLI,

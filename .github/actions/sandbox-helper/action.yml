@@ -1,0 +1,44 @@
+name: Sandbox helper
+description: >-
+  Let the sandbox helper the job built make namespaces, and give the
+  suite's Linux sandbox group what it builds with.  Ubuntu's AppArmor lets
+  an unprivileged process make a user namespace but denies it
+  capabilities there, unless a profile with a userns rule covers the
+  program; upstream's own CI turns the restriction off instead.  The
+  profile here covers the helper alone.  The step also installs a static
+  busybox for the builders' shell, mounts a tmpfs beneath a directory for
+  the test of a bind's submounts, makes a file root owns, in a directory
+  the runner's user owns on the temporary directory's filesystem, for the
+  test of an output holding another user's node, and a directory root
+  owns at 0711, for the test of a bind beneath a directory its user may
+  search but not read; it names each in the job's environment, where the
+  group finds them.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends busybox-static
+        helper=$(cabal list-bin exe:nova-nix-sandbox)
+        profile="$RUNNER_TEMP/nova-nix-sandbox.apparmor"
+        printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' \
+          "profile nova-nix-sandbox-test $helper flags=(unconfined) {" '  userns,' '}' > "$profile"
+        sudo apparmor_parser -r "$profile"
+        submount="$RUNNER_TEMP/nova-nix-sandbox-submount"
+        mkdir -p "$submount/inner"
+        sudo mount -t tmpfs -o "uid=$(id -u),gid=$(id -g),mode=0755" nova-nix-submount "$submount/inner"
+        printf 'the user'\''s\n' > "$submount/inner/file"
+        foreign=$(mktemp -d "${TMPDIR:-/tmp}/nova-nix-foreign.XXXXXX")
+        sudo touch "$foreign/owned-by-root"
+        searchable="$RUNNER_TEMP/nova-nix-search-only"
+        sudo mkdir -p "$searchable/inner"
+        sudo chmod 0711 "$searchable"
+        {
+          echo "NOVA_NIX_TEST_SANDBOX_HELPER=$helper"
+          echo "NOVA_NIX_TEST_BUSYBOX=$(command -v busybox)"
+          echo "NOVA_NIX_TEST_SANDBOX_SUBMOUNT=$submount"
+          echo "NOVA_NIX_TEST_FOREIGN_FILE=$foreign/owned-by-root"
+          echo "NOVA_NIX_TEST_SEARCH_ONLY_DIR=$searchable"
+        } >> "$GITHUB_ENV"

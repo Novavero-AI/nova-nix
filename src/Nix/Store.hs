@@ -146,9 +146,11 @@ import System.IO.Error (isAlreadyExistsError)
 import System.OsPath (OsPath)
 import qualified System.OsPath as OP
 #if !defined(mingw32_HOST_OS)
-import Data.Bits ((.|.))
+import Data.Bits ((.&.), (.|.))
 import Data.Functor (void)
-import System.Posix.Files (FileStatus, deviceID, fileID, fileMode, fileSize, getFdStatus, groupWriteMode, isRegularFile, otherWriteMode, ownerWriteMode, setFdMode, setFdSize, setFileCreationMask)
+import Foreign.C.Error (Errno (..), eXDEV)
+import GHC.IO.Exception (IOException (ioe_errno))
+import System.Posix.Files (FileStatus, deviceID, fileID, fileMode, fileSize, getFdStatus, getSymbolicLinkStatus, groupWriteMode, isDirectory, isRegularFile, otherWriteMode, ownerWriteMode, setFdMode, setFdSize, setFileCreationMask, setFileMode)
 import System.Posix.IO (OpenFileFlags (..), OpenMode (..), closeFd, defaultFileFlags, openFd)
 import qualified System.Posix.IO.ByteString as PosixBytes
 import System.Posix.Types (Fd)
@@ -267,12 +269,16 @@ registrationFor store sp deriver refs = do
         prReferences = refs
       }
 
--- | Cross-device safe move for files or directories.
--- Tries 'renamePath' first; on IOException falls back to copy + remove.
--- The fallback copies via 'copyPathInto', which preserves symlinks as
--- symlinks: a dereferencing copy here would make the stored bytes - and
--- so the NAR hash a cache signs - depend on whether the source and the
--- store share a volume.
+-- | Move a file or directory, by a rename, as upstream's @movePath@
+-- does (local-derivation-goal.cc:276-293 at 2.24.9): a directory its
+-- owner may not write, as a canonical one is, is given owner write for
+-- the rename, which needs it to change the directory's @..@, and its mode
+-- back after.  A rename that fails fails the move, so a tree keeps its
+-- inodes and hard links, except across volumes, where the move copies
+-- and removes ('copyPathInto', which keeps symlinks as symlinks: a
+-- dereferencing copy would make the stored bytes, and the NAR hash a
+-- cache signs, depend on where the source was).  On Windows every
+-- failure copies.
 moveOutput :: FilePath -> FilePath -> IO ()
 moveOutput src dest
   -- A build writes into its own output path, so the usual case is a move
@@ -281,10 +287,28 @@ moveOutput src dest
   -- IOException fallback below would then copy a tree into itself and
   -- delete the result.  Answering here settles both platforms.
   | src == dest = pure ()
+#if defined(mingw32_HOST_OS)
   | otherwise =
       renamePath src dest `catch` \(_ :: IOException) -> do
         copyPathInto src dest
         Dir.removePathForcibly src
+#else
+  | otherwise = do
+      status <- getSymbolicLinkStatus src
+      let mode = fileMode status
+      if isDirectory status && mode .&. ownerWriteMode == 0
+        then do
+          setFileMode src (mode .|. ownerWriteMode)
+          rename `onException` setFileMode src mode
+          setFileMode dest mode
+        else rename
+  where
+    rename =
+      renamePath src dest `catch` \(failure :: IOException) ->
+        if ioe_errno failure == Just (case eXDEV of Errno number -> number)
+          then copyPathInto src dest *> Dir.removePathForcibly src
+          else throwIO failure
+#endif
 
 -- | Byte-scan a tree for store path references.
 --

@@ -5,9 +5,10 @@
 -- (@always-allow-substitutes@), how many cores a builder is told it may
 -- use (@cores@), how deep function calls may nest, how far an evaluation
 -- may reach (@restrict-eval@, @pure-eval@, @allowed-uris@), whether
--- @builtins.traceVerbose@ traces (@trace-verbose@), and whether a path
+-- @builtins.traceVerbose@ traces (@trace-verbose@), whether a path
 -- reader may build what its argument's context names
--- (@allow-import-from-derivation@, @trace-import-from-derivation@).
+-- (@allow-import-from-derivation@, @trace-import-from-derivation@), and
+-- how builds are sandboxed (@sandbox@ and the settings beside it).
 --
 -- == The format
 --
@@ -91,6 +92,8 @@ module Nix.Config
   ( -- * Resolved settings
     NixConfig (..),
     defaultNixConfig,
+    PathSetValue (..),
+    DefaultUse (..),
 
     -- * Where the files are
     ConfigLocations (..),
@@ -130,9 +133,12 @@ import Data.List (dropWhileEnd, intercalate)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe (catMaybes, fromMaybe, maybeToList)
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word32)
+import Nix.Builder.Sandbox (SandboxMode, parseSandboxMode)
 import Nix.Eval.CallDepth (defaultMaxCallDepth)
 import Nix.HostPath (hostPathFromBytes, hostPathText)
 import System.OsPath (OsChar, OsPath, OsString, (</>))
@@ -174,15 +180,50 @@ data NixConfig = NixConfig
     -- | Upstream @allow-import-from-derivation@.
     ncAllowImportFromDerivation :: !Bool,
     -- | Upstream @trace-import-from-derivation@.
-    ncTraceImportFromDerivation :: !Bool
+    ncTraceImportFromDerivation :: !Bool,
+    -- | Upstream's @sandbox@, when a source sets it.  Its default is
+    -- @true@ on Linux and @false@ elsewhere, the caller's to apply.
+    ncSandbox :: !(Maybe SandboxMode),
+    -- | Upstream @sandbox-fallback@.
+    ncSandboxFallback :: !Bool,
+    -- | Upstream @sandbox-paths@, as bytes.
+    ncSandboxPaths :: !PathSetValue,
+    -- | Upstream @sandbox-build-dir@.
+    ncSandboxBuildDir :: !ByteString,
+    -- | Upstream @sandbox-dev-shm-size@.
+    ncSandboxDevShmSize :: !ByteString,
+    -- | Upstream's @require-drop-supplementary-groups@, when a source sets
+    -- it.  Its default is whether the process runs as root, which only IO
+    -- can find.
+    ncRequireDropSupplementaryGroups :: !(Maybe Bool),
+    -- | Upstream's @ssl-cert-file@, when a source sets it.  Its default
+    -- comes from the environment and the files there are, which only IO
+    -- can find.
+    ncSslCertFile :: !(Maybe ByteString)
   }
+  deriving (Eq, Show)
+
+-- | A set of paths whose default is the caller's: upstream's
+-- @sandbox-paths@ defaults to the sandbox shell a binary was built with,
+-- which is where it was installed.  An @extra-@ assignment adds to the
+-- default, and a plain one replaces it.
+data PathSetValue = PathSetValue
+  { psvDefault :: !DefaultUse,
+    psvPaths :: !(Set ByteString)
+  }
+  deriving (Eq, Show)
+
+-- | Whether a t'PathSetValue' keeps its default beside its own paths.
+data DefaultUse = KeepsDefault | ReplacesDefault
   deriving (Eq, Show)
 
 -- | The baseline the fold starts from: no substituters, no trusted keys,
 -- no fallback, @allowSubstitutes@ heeded, @cores@ unset so that the
 -- machine's default applies, upstream's call-depth ceiling, no allowed
--- URIs, both evaluation modes off, @trace-verbose@ off, and an import
--- from derivation allowed and not traced.  The empty
+-- URIs, both evaluation modes off, @trace-verbose@ off, an import from
+-- derivation allowed and not traced, and upstream's sandbox settings,
+-- those whose defaults take the platform or IO unset or kept for the
+-- caller.  The empty
 -- substituter list is nova-nix's existing default (nothing is substituted
 -- unless configured), a deliberate divergence from upstream's
 -- cache.nixos.org default: turning a cache on for every machine is the
@@ -202,7 +243,14 @@ defaultNixConfig =
       ncPureEval = False,
       ncTraceVerbose = False,
       ncAllowImportFromDerivation = True,
-      ncTraceImportFromDerivation = False
+      ncTraceImportFromDerivation = False,
+      ncSandbox = Nothing,
+      ncSandboxFallback = True,
+      ncSandboxPaths = PathSetValue KeepsDefault Set.empty,
+      ncSandboxBuildDir = "/build",
+      ncSandboxDevShmSize = "50%",
+      ncRequireDropSupplementaryGroups = Nothing,
+      ncSslCertFile = Nothing
     }
 
 -- ---------------------------------------------------------------------------
@@ -565,7 +613,9 @@ unitBase = 1024
 -- | Apply one assignment to the accumulated config.  The name is resolved
 -- through the aliases (@binary-caches@ -> @substituters@,
 -- @binary-cache-public-keys@ -> @trusted-public-keys@,
--- @build-fallback@ -> @fallback@, @build-cores@ -> @cores@) and the
+-- @build-fallback@ -> @fallback@, @build-cores@ -> @cores@,
+-- @build-use-chroot@ and @build-use-sandbox@ -> @sandbox@,
+-- @build-chroot-dirs@ and @build-sandbox-paths@ -> @sandbox-paths@) and the
 -- @extra-@ prefix (append rather than replace, list settings only).  A name
 -- outside the known set is ignored, not an error: upstream warns and
 -- continues, and refusing every unknown key would reject a config that
@@ -586,9 +636,19 @@ applyAssignment config (ConfigAssignment name value) =
       (\flag -> setBool field flag config) <$> parseBool (boolFieldKey field) value
     Just (ScalarSetting field, _) ->
       (\number -> setScalar field number config) <$> parseUnsignedSetting (scalarFieldKey field) value
+    Just (ModeSetting, _) ->
+      (\mode -> config {ncSandbox = Just mode}) <$> parseSandboxMode value
+    Just (BytesSetting field, _) -> Right (setBytes field value config)
+    Just (PathSetSetting, mode) ->
+      Right (config {ncSandboxPaths = combinePaths mode (ncSandboxPaths config) (Set.fromList (configTokens value))})
   where
     combine ReplaceMode _ new = new
     combine AppendMode old new = old ++ new
+    -- Upstream's @StringSet@ setting: a plain assignment replaces the
+    -- set, the default included, and @extra-@ adds to it
+    -- (config.cc:338-347 at 2.24.9).
+    combinePaths ReplaceMode _ new = PathSetValue ReplacesDefault new
+    combinePaths AppendMode old new = old {psvPaths = Set.union (psvPaths old) new}
 
 -- | A list value's tokens as text, split as upstream's @Strings@ setting
 -- splits it, or the refusal of a token that is not UTF-8 (see the module
@@ -610,6 +670,7 @@ resolveName name =
   case BS.stripPrefix extraPrefix name of
     Just base -> case baseSetting base of
       Just setting@(ListSetting _) -> Just (setting, AppendMode)
+      Just PathSetSetting -> Just (PathSetSetting, AppendMode)
       _ -> Nothing
     Nothing -> case baseSetting name of
       Just setting -> Just (setting, ReplaceMode)
@@ -628,10 +689,25 @@ resolveName name =
       | n == traceImportFromDerivationKey = Just (BoolSetting TraceImportFromDerivationField)
       | n == maxCallDepthKey = Just (ScalarSetting MaxCallDepthField)
       | n == coresKey || n == coresAlias = Just (ScalarSetting CoresField)
+      | n == sandboxKey || n `elem` sandboxAliases = Just ModeSetting
+      | n == sandboxFallbackKey = Just (BoolSetting SandboxFallbackField)
+      | n == sandboxPathsKey || n `elem` sandboxPathsAliases = Just PathSetSetting
+      | n == sandboxBuildDirKey = Just (BytesSetting SandboxBuildDirField)
+      | n == sandboxDevShmSizeKey = Just (BytesSetting SandboxDevShmSizeField)
+      | n == requireDropGroupsKey = Just (BoolSetting RequireDropGroupsField)
+      | n == sslCertFileKey = Just (BytesSetting SslCertFileField)
       | otherwise = Nothing
 
--- | A setting this layer resolves, by the shape of its value.
-data Setting = ListSetting !ListField | BoolSetting !BoolField | ScalarSetting !ScalarField
+-- | A setting this layer resolves, by the shape of its value: a list of
+-- text, a Boolean, an unsigned integer, @sandbox@'s mode, a string kept as
+-- bytes, or @sandbox-paths@' set of paths.
+data Setting
+  = ListSetting !ListField
+  | BoolSetting !BoolField
+  | ScalarSetting !ScalarField
+  | ModeSetting
+  | BytesSetting !BytesField
+  | PathSetSetting
   deriving (Eq, Show)
 
 -- | The list settings.
@@ -647,6 +723,12 @@ data BoolField
   | TraceVerboseField
   | AllowImportFromDerivationField
   | TraceImportFromDerivationField
+  | SandboxFallbackField
+  | RequireDropGroupsField
+  deriving (Eq, Show)
+
+-- | The settings whose value is a string, kept as bytes.
+data BytesField = SandboxBuildDirField | SandboxDevShmSizeField | SslCertFileField
   deriving (Eq, Show)
 
 -- | The scalar settings, which only ever replace.
@@ -688,6 +770,8 @@ boolFieldKey PureEvalField = pureEvalKey
 boolFieldKey TraceVerboseField = traceVerboseKey
 boolFieldKey AllowImportFromDerivationField = allowImportFromDerivationKey
 boolFieldKey TraceImportFromDerivationField = traceImportFromDerivationKey
+boolFieldKey SandboxFallbackField = sandboxFallbackKey
+boolFieldKey RequireDropGroupsField = requireDropGroupsKey
 
 setBool :: BoolField -> Bool -> NixConfig -> NixConfig
 setBool FallbackField v config = config {ncFallback = v}
@@ -697,6 +781,15 @@ setBool PureEvalField v config = config {ncPureEval = v}
 setBool TraceVerboseField v config = config {ncTraceVerbose = v}
 setBool AllowImportFromDerivationField v config = config {ncAllowImportFromDerivation = v}
 setBool TraceImportFromDerivationField v config = config {ncTraceImportFromDerivation = v}
+setBool SandboxFallbackField v config = config {ncSandboxFallback = v}
+setBool RequireDropGroupsField v config = config {ncRequireDropSupplementaryGroups = Just v}
+
+-- | Upstream's @Setting\<std::string\>@: the value as it reads, its tokens
+-- joined by single spaces.
+setBytes :: BytesField -> ByteString -> NixConfig -> NixConfig
+setBytes SandboxBuildDirField v config = config {ncSandboxBuildDir = v}
+setBytes SandboxDevShmSizeField v config = config {ncSandboxDevShmSize = v}
+setBytes SslCertFileField v config = config {ncSslCertFile = Just v}
 
 -- | Upstream's Boolean spellings (@BaseSetting\<bool\>::parse@): anything
 -- else is an error with upstream's wording, which names the setting alone,
@@ -763,6 +856,21 @@ pureEvalKey = "pure-eval"
 restrictEvalKey = "restrict-eval"
 traceImportFromDerivationKey = "trace-import-from-derivation"
 traceVerboseKey = "trace-verbose"
+
+sandboxKey, sandboxFallbackKey, sandboxPathsKey, sandboxBuildDirKey, sandboxDevShmSizeKey, requireDropGroupsKey, sslCertFileKey :: ByteString
+sandboxKey = "sandbox"
+sandboxFallbackKey = "sandbox-fallback"
+sandboxPathsKey = "sandbox-paths"
+sandboxBuildDirKey = "sandbox-build-dir"
+sandboxDevShmSizeKey = "sandbox-dev-shm-size"
+requireDropGroupsKey = "require-drop-supplementary-groups"
+sslCertFileKey = "ssl-cert-file"
+
+-- | Upstream's older names for @sandbox@ and @sandbox-paths@
+-- (globals.hh:630 and 649 at 2.24.9).
+sandboxAliases, sandboxPathsAliases :: [ByteString]
+sandboxAliases = ["build-use-chroot", "build-use-sandbox"]
+sandboxPathsAliases = ["build-chroot-dirs", "build-sandbox-paths"]
 
 extraPrefix :: ByteString
 extraPrefix = "extra-"

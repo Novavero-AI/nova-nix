@@ -113,8 +113,10 @@ import Data.Word (Word32)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder.BuildDir (withBuildDir)
+import Nix.Builder.BuildDir (createBuildDir, sandboxedBuildDir, withBuildDir)
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
+import Nix.Builder.Sandbox (HelperOutcome (..), Network, PathPresence (..), PlanInputs (..), SandboxConfig (..), SandboxFallback (..), SandboxPath (..), SandboxPlan, SandboxUse (..), chrootSkeleton, defaultSandboxConfig, helperOutcome, renderPlan, rootRefusal, sandboxHome, sandboxPlan, sandboxUse, unavailableMessage)
+import Nix.Builder.Sandbox.Spawn (HelperRun (..), bytesFilePath, filePathBytes, processIsRoot, runHelper, sandboxAvailability, sealChroot, warnFallback, withChroot)
 import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimits, runBuiltinUnpack)
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, buildDepGraphFrom, topoSort)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fixedOutput, fromATerm, platformToText)
@@ -126,7 +128,7 @@ import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, Fallback 
 import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, canonicalizeMetadata, finishNarUnpack, freshCopyPath, isValid, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, replaceWithCopy, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (foreignOwnedNode, isPlainFile, writableByOthers)
-import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText, unStoreDir)
+import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathPrefix, storePathToFilePath, storePathToText, unStoreDir)
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
 import Nix.Substituter (CacheConfig, NarInfoMemo, SubstResult (..), Substitute, emptyNarInfoMemo, fetchSubstituteWith, narStreamFailure, queryNextOfferWith, queryReferencesWith, substitutePath, withXzAttempt)
 import qualified NovaCache.Base32 as Nix32
@@ -323,7 +325,10 @@ data BuildConfig = BuildConfig
     -- completes ("Nix.Builder.Log").  Upstream's default logger prints
     -- every build-log line to standard error, which is where
     -- 'defaultBuildConfig' points this.
-    bcBuildLog :: !System.IO.Handle
+    bcBuildLog :: !System.IO.Handle,
+    -- | Whether, and how, a spawned builder runs in a sandbox
+    -- ("Nix.Builder.Sandbox").
+    bcSandbox :: !SandboxConfig
   }
   deriving (Eq, Show)
 
@@ -343,7 +348,9 @@ data SubstitutionAccess
 
 -- | Default build configuration.  A builder is told of one core
 -- ('baselineCores'), where upstream's default is the machine's count,
--- which takes IO to find ("Nix.Builder.Cores").
+-- which takes IO to find ("Nix.Builder.Cores"), and runs unsandboxed
+-- ('defaultSandboxConfig'), where upstream sandboxes on Linux, since
+-- finding the sandbox's helper takes IO too.
 defaultBuildConfig :: StoreDir -> BuildConfig
 defaultBuildConfig dir =
   BuildConfig
@@ -357,7 +364,8 @@ defaultBuildConfig dir =
       bcExecWrappers = Map.empty,
       bcUnpackLimits = defaultUnpackLimits,
       bcFetchRetry = defaultFetchRetryPolicy,
-      bcBuildLog = System.IO.stderr
+      bcBuildLog = System.IO.stderr,
+      bcSandbox = defaultSandboxConfig
     }
 
 -- | The cores 'defaultBuildConfig' tells a builder of: one, which is what
@@ -422,7 +430,7 @@ buildOutputs config store drv drvPath =
   stoppingOnException $
     withOutputLocks config store drv (maybe build (pure . Right))
   where
-    build = buildUnderLock config store drv RedirectValid (registerOutputs config store drv drvPath)
+    build = buildUnderLock config store drvPath drv RedirectValid (registerOutputs store drv drvPath)
 
 -- | Check a derivation, given its @.drv@ path: build it again beside its
 -- valid outputs and compare what comes out with what the store holds.
@@ -466,7 +474,7 @@ checkOutputs config store drv drvPath =
         -- A check that compared nothing has not passed.
         Just [] -> pure (Left (BuildStop noOutputsMessage 1))
         Just registrations ->
-          buildUnderLock config store drv RedirectAll (compareOutputs config store drv drvPath (map piNarHash registrations))
+          buildUnderLock config store drvPath drv RedirectAll (compareOutputs store drv drvPath (map piNarHash registrations))
 
 -- | Upstream's failure for a check that finds an output it was to compare
 -- with not valid (@DerivationGoal::assertPathValidity@, derivation-goal.cc
@@ -548,16 +556,27 @@ allOutputsValid store drv = case map doPath (drvOutputs drv) of
     pure (if and validity then Just firstOutput else Nothing)
 
 -- | What a build does with the outputs its builder wrote, given the
--- closure of its inputs, where each output was written, and how the step
--- that registers them runs: registers them ('registerOutputs'), or
--- compares them with the store's ('compareOutputs').
-type Finish a = Set StorePath -> [OutputPlan] -> Commit -> IO (Either BuildStop a)
+-- closure of its inputs, where each output was written, and where each is
+-- on disk once its builder has ended: registers them ('registerOutputs'),
+-- or compares them with the store's ('compareOutputs').
+type Finish a = Set StorePath -> [OutputPlan] -> Written -> Commit -> IO (Either BuildStop a)
 
 -- | How a build runs the step that registers its outputs: with the record
 -- that they are registered, which keeps the cleanup of an interrupted
 -- build from removing them, made in the same step, which no asynchronous
 -- exception can break into.
 type Commit = IO () -> IO ()
+
+-- | What a build's builder left: where each output is on disk once it has
+-- ended, at its scratch path in the store, or for a sandboxed build at
+-- that path in the chroot, where it stays until it is registered; and
+-- whether the builder left an output writable by its group or anyone else
+-- ('writableByOthers'), read for a sandboxed build before the chroot's
+-- seal changes the mode ('sealChroot').
+data Written = Written
+  { writtenPath :: OutputPlan -> FilePath,
+    writtenOpen :: OutputPlan -> IO Bool
+  }
 
 -- | Which outputs the builder is handed a scratch path for
 -- ('outputPlan').
@@ -568,9 +587,10 @@ data Redirected
     -- their registrations in hand, under the locks this runs under.
     RedirectAll
 
--- | The build itself, with every output's lock already held.
-buildUnderLock :: BuildConfig -> Store -> Derivation -> Redirected -> Finish a -> IO (Either BuildStop a)
-buildUnderLock config store drv redirected finish = do
+-- | The build itself, of the derivation at a @.drv@ path, with every
+-- output's lock already held.
+buildUnderLock :: BuildConfig -> Store -> StorePath -> Derivation -> Redirected -> Finish a -> IO (Either BuildStop a)
+buildUnderLock config store drvPath drv redirected finish = do
   -- 1. Validate inputs (sources + input-derivation outputs) exist, and
   --    take their closure: what an output may reference besides the
   --    derivation's own outputs.
@@ -598,7 +618,7 @@ buildUnderLock config store drv redirected finish = do
           RedirectAll -> pure (map (const True) (drvOutputs drv))
         case traverse outputPlan (zip (drvOutputs drv) outputValidity) of
           Left nameErr -> pure (Left (BuildStop ("output name is not a store path name: " <> T.pack (show nameErr)) 1))
-          Right plans -> runPlannedBuild config (stCaseSensitivity store) drv buildDir plans (finish inputPaths plans)
+          Right plans -> runPlannedBuild config (BuildContext store drvPath inputPaths) drv buildDir plans (finish inputPaths plans)
 
 -- | Where the builder writes each output, and where that has to end up.
 --
@@ -611,7 +631,9 @@ buildUnderLock config store drv redirected finish = do
 -- derivation whose outputs are all valid, so there every output is written
 -- to a scratch path, as upstream writes a valid output wherever it builds
 -- outside a Linux chroot (@startBuilder@, local-derivation-goal.cc:539-554
--- at 2.24.9).
+-- at 2.24.9).  nova-nix's sandbox writes one to a scratch path too, where
+-- upstream's chroot leaves the output's own path free
+-- (@needsHashRewrite@, :116-124).
 data OutputPlan = OutputPlan
   { -- | The derivation output's name, as it reaches the environment.
     opName :: !Text,
@@ -711,17 +733,23 @@ spawnFor host config drv
     platform = drvPlatform drv
     system = platformToText platform
 
+-- | What a build knows besides its configuration and derivation: the
+-- store, the @.drv@ path, and the closure of its inputs.
+data BuildContext = BuildContext
+  { bxStore :: !Store,
+    bxDrvPath :: !StorePath,
+    bxInputs :: !(Set StorePath)
+  }
+
 -- | The build, once every output knows where it is written and where it
--- belongs: run the builder, then @finish@ with what it wrote.  The store
--- volume's case sensitivity is what @builtin:fetchurl@ restores a NAR's
--- names under.
-runPlannedBuild :: BuildConfig -> CaseSensitivity -> Derivation -> FilePath -> [OutputPlan] -> (Commit -> IO (Either BuildStop a)) -> IO (Either BuildStop a)
-runPlannedBuild config sensitivity drv buildDir plans finish = do
-  let scratchDir p = storePathToFilePath (bcStoreDir config) (opScratch p)
+-- belongs: run the builder, then @finish@ with where each output it wrote
+-- is now.  The store volume's case sensitivity is what
+-- @builtin:fetchurl@ restores a NAR's names under.
+runPlannedBuild :: BuildConfig -> BuildContext -> Derivation -> FilePath -> [OutputPlan] -> (Written -> Commit -> IO (Either BuildStop a)) -> IO (Either BuildStop a)
+runPlannedBuild config context drv buildDir plans finish = do
+  let scratchDir = scratchPathOf config
       outputDirs = [(opName p, scratchDir p) | p <- plans]
-      -- The builder runs where its directory and outputs are, so it is
-      -- told of each where it is on disk.
-      layout = BuildLayout (inPlace buildDir) [(name, inPlace dir) | (name, dir) <- outputDirs]
+      sensitivity = stCaseSensitivity (bxStore context)
       -- Every scratch path is the build's to use: the ones that are final
       -- paths may hold a tree an interrupted run left behind, and the
       -- fallbacks may hold one an interrupted run failed to discard, as
@@ -741,56 +769,182 @@ runPlannedBuild config sensitivity drv buildDir plans finish = do
         done <- readIORef committed
         unless done clearScratch
       commit registration = uninterruptibleMask_ (registration *> writeIORef committed True)
+      -- 5. Success: validate that the builder created all expected
+      --    outputs, wherever they are now.  Outputs may be files or
+      --    directories - both are valid (real Nix allows $out to be a
+      --    single file, a directory tree, or a symlink).
+      afterBuilder written = do
+        missing <- filterM (nothingAt . writtenPath written) plans
+        case missing of
+          _ : _ -> do
+            let names = T.intercalate ", " (map opName missing)
+            -- The builder may have produced some outputs before omitting
+            -- another.  None were registered, so take those orphaned
+            -- trees back out of the store.
+            clearScratch
+            pure (Left (BuildStop ("builder succeeded but outputs missing: " <> names) 1))
+          [] -> do
+            finished <- finish written commit
+            case finished of
+              Right _ -> do
+                writeIORef committed True
+                -- Only the fallbacks go; the registered trees stay.
+                -- After a build they are the redirected copies of outputs
+                -- that were already valid, which upstream discards
+                -- unread.  After a check they are every output the
+                -- builder wrote, compared by now and not kept, whatever
+                -- the comparison found.  A sandboxed build's are still in
+                -- its chroot, which goes with them.
+                for_ [p | p <- plans, opValid p] (removePathForcibly . scratchDir)
+              Left _ -> clearScratch
+            pure finished
+      inStore = Written scratchDir (writableByOthers . scratchDir)
+      builtin run = run >>= either (pure . Left . uncurry BuilderRefused) (\() -> Right <$> afterBuilder inStore)
   ( do
       -- 4. Run the builder.  A builtin builder runs in this process and
-      --    writes the outputs where they are on disk; a spawned one starts
-      --    as 'builderInvocation' says.
-      exitResult <- case drvBuilder drv of
+      --    writes the outputs where they are on disk; a spawned one runs
+      --    as 'runSpawnedBuilder' decides, and what follows it runs while
+      --    its outputs are where it left them.
+      ran <- case drvBuilder drv of
         b
-          | b == builtinFetchurlBuilder -> first (uncurry BuilderRefused) <$> runBuiltinFetchurl (bcFetchRetry config) sensitivity drv outputDirs
-          | b == builtinUnpackBuilder -> first (uncurry BuilderRefused) <$> runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv outputDirs
-        _ -> case builderInvocation config drv layout of
-          Left reason -> pure (Left (BuilderRefused 1 reason))
-          Right invocation -> do
-            for_ (invFiles invocation) (uncurry BS.writeFile)
-            runBuilder (bcBuildLog config) invocation
-      case exitResult of
+          | b == builtinFetchurlBuilder -> builtin (runBuiltinFetchurl (bcFetchRetry config) sensitivity drv outputDirs)
+          | b == builtinUnpackBuilder -> builtin (runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv outputDirs)
+        _ -> runSpawnedBuilder config context drv buildDir plans afterBuilder
+      case ran of
         Left failure -> do
           -- Whatever the builder wrote is in the store now, so failure has
           -- to take it back out: an unregistered tree there is invisible to
           -- the database and would only confuse the next run.
           clearScratch
           pure (Left (builderStop failure))
-        Right () -> do
-          -- 5. Success: validate that the builder created all expected
-          --    outputs.  Outputs may be files or directories - both are
-          --    valid (real Nix allows $out to be a single file, a
-          --    directory tree, or a symlink).
-          missing <- filterM (nothingAt . snd) outputDirs
-          case missing of
-            _ : _ -> do
-              let names = T.intercalate ", " (map fst missing)
-              -- The builder may have produced some outputs before omitting
-              -- another.  None were registered, so take those orphaned
-              -- trees back out of the store.
-              clearScratch
-              pure (Left (BuildStop ("builder succeeded but outputs missing: " <> names) 1))
-            [] -> do
-              finished <- finish commit
-              case finished of
-                Right _ -> do
-                  writeIORef committed True
-                  -- Only the fallbacks go; the registered trees stay.
-                  -- After a build they are the redirected copies of
-                  -- outputs that were already valid, which upstream
-                  -- discards unread.  After a check they are every output
-                  -- the builder wrote, compared by now and not kept,
-                  -- whatever the comparison found.
-                  for_ [p | p <- plans, opValid p] (removePathForcibly . scratchDir)
-                Left _ -> clearScratch
-              pure finished
+        Right finished -> pure finished
     )
     `onException` cleanupUnlessCommitted
+
+-- | Where the builder writes an output, on disk.
+scratchPathOf :: BuildConfig -> OutputPlan -> FilePath
+scratchPathOf config p = storePathToFilePath (bcStoreDir config) (opScratch p)
+
+-- | Run a derivation's spawned builder: in the sandbox when the settings
+-- and the derivation ask for it ('sandboxUse') and this system can make
+-- one, otherwise where its directory and outputs are.  A system that
+-- cannot make the sandbox runs the build unsandboxed under
+-- @sandbox-fallback@, after one warning a process ('warnFallback'), and
+-- fails it otherwise, as upstream does (LDG 224-231).  Once the builder
+-- has succeeded, @continue@ runs with where its outputs are.
+runSpawnedBuilder :: BuildConfig -> BuildContext -> Derivation -> FilePath -> [OutputPlan] -> (Written -> IO r) -> IO (Either BuilderFailure r)
+runSpawnedBuilder config context drv buildDir plans continue =
+  case sandboxUse (scMode sandbox) (bxDrvPath context) drv of
+    Left reason -> pure (Left (BuilderSandboxFailed reason))
+    Right Unsandboxed -> unsandboxed
+    Right (Sandboxed network) -> do
+      root <- processIsRoot
+      -- Before anything is made, and whatever sandbox-fallback says.
+      if root
+        then pure (Left (BuilderSandboxFailed rootRefusal))
+        else do
+          available <- sandboxAvailability (scHelper sandbox)
+          case (available, scFallback sandbox) of
+            (Right helper, _) -> runSandboxedBuild config context drv buildDir plans helper network continue
+            (Left cause, FallBackUnsandboxed) -> warnFallback cause *> unsandboxed
+            (Left cause, RefuseUnsandboxed) -> pure (Left (BuilderSandboxFailed (unavailableMessage cause)))
+  where
+    sandbox = bcSandbox config
+    -- The builder runs where its directory and outputs are, so it is told
+    -- of each where it is on disk.
+    layout = BuildLayout (inPlace buildDir) [(opName p, inPlace (scratchPathOf config p)) | p <- plans] buildDir
+    unsandboxed = case builderInvocation config drv layout of
+      Left reason -> pure (Left (BuilderRefused 1 reason))
+      Right invocation -> do
+        for_ (invFiles invocation) (uncurry BS.writeFile)
+        ran <- runBuilder (bcBuildLog config) invocation
+        traverse (\() -> continue (Written (scratchPathOf config) (writableByOthers . scratchPathOf config))) ran
+
+-- | Run a builder in the sandbox, in a chroot beside its build directory
+-- ("Nix.Builder.Sandbox.Spawn") through the helper, then @continue@ with
+-- each output where the builder wrote it, in the chroot, which is
+-- removed once @continue@ ends: an output leaves the chroot only when it
+-- is registered, as upstream's leaves its chroot last (LDG 2685-2688), so
+-- a check or an output that was already valid never enters the store.
+-- The builder sees its build directory at @sandbox-build-dir@ and each
+-- output at its own path, which on disk is that path beneath the chroot's
+-- root, upstream's @toRealPathChroot@ (LDG 2282-2286).  The chroot is in
+-- the store's state directory, so the move into the store is a rename
+-- ('Nix.Store.placeInStore').
+-- The directory the builder sees is one inside the build directory
+-- ('sandboxedBuildDir').  An @--exec-wrapper@ launcher is bound into the
+-- chroot as a @sandbox-paths@ entry naming itself.
+runSandboxedBuild :: BuildConfig -> BuildContext -> Derivation -> FilePath -> [OutputPlan] -> FilePath -> Network -> (Written -> IO r) -> IO (Either BuilderFailure r)
+runSandboxedBuild config context drv outerBuildDir plans helper network continue = do
+  launcherPaths <- case execWrapperFor config drv of
+    SpawnThrough launcher -> (\bytes -> [SandboxPath bytes bytes RequiredPath]) <$> filePathBytes launcher
+    _ -> pure []
+  let paths = scPaths sandbox ++ launcherPaths
+  closure <- sandboxPathsClosure paths
+  case closure of
+    Left reason -> pure (Left (BuilderSandboxFailed reason))
+    Right closurePaths -> do
+      let buildDir = sandboxedBuildDir outerBuildDir
+      createBuildDir buildDir
+      storeBytes <- filePathBytes (unStoreDir (bcStoreDir config))
+      buildDirBytes <- filePathBytes buildDir
+      seenBuildDir <- bytesFilePath (scBuildDir sandbox)
+      inputBytes <- traverse (filePathBytes . storeFile) (Set.toAscList (bxInputs context))
+      closureBytes <- traverse (filePathBytes . storeFile) closurePaths
+      -- Each output's final path and the path it is written to are kept
+      -- out of the chroot, as upstream keeps every known output path out
+      -- (LDG 764-772).
+      outputBytes <- traverse filePathBytes (Set.toAscList (Set.fromList (concat [[storeFile (opFinal p), scratchPathOf config p] | p <- plans])))
+      chrooted <- withChroot outerBuildDir (chrootSkeleton storeBytes (scBuildDir sandbox) network paths) $ \root -> do
+        rootBytes <- filePathBytes root
+        let seenLayout = BuildLayout (BuildPlace seenBuildDir buildDir) [(opName p, BuildPlace (scratchPathOf config p) (root <> scratchPathOf config p)) | p <- plans] sandboxHome
+            planInputs environment =
+              PlanInputs
+                { piRoot = rootBytes,
+                  piStoreDir = storeBytes,
+                  piBuildDirSeen = scBuildDir sandbox,
+                  piBuildDirOnDisk = buildDirBytes,
+                  piInputs = inputBytes,
+                  piSandboxPaths = paths,
+                  piSandboxClosure = closureBytes,
+                  piOutputs = outputBytes,
+                  piEnvironment = environment,
+                  piNetwork = network,
+                  piCaFile = scCaFile sandbox,
+                  piDevShmSize = scDevShmSize sandbox,
+                  piDropGroups = scDropGroups sandbox
+                }
+        case builderInvocation config drv seenLayout of
+          Left reason -> pure (Left (BuilderRefused 1 reason))
+          Right invocation -> do
+            environment <- builderEnvironment invocation
+            case sandboxPlan (planInputs (map TE.encodeUtf8 environment)) of
+              Left reason -> pure (Left (BuilderSandboxFailed reason))
+              Right plan -> do
+                for_ (invFiles invocation) (uncurry BS.writeFile)
+                ran <- runSandboxedBuilder (bcBuildLog config) helper plan invocation
+                case ran of
+                  Left failure -> pure (Left failure)
+                  Right () -> do
+                    -- No process is left in the build's PID namespace;
+                    -- one outside it, handed a descriptor by a
+                    -- fixed-output builder, may be.  The chroot is closed
+                    -- to every other user before anything reads an output
+                    -- there ('sealChroot').
+                    sealed <- sealChroot root (unStoreDir (bcStoreDir config))
+                    case sealed of
+                      Left reason -> pure (Left (BuilderSandboxFailed reason))
+                      Right open -> Right <$> continue (Written (\p -> root <> scratchPathOf config p) (pure . (`Set.member` open) . takeFileName . scratchPathOf config))
+      pure (either (Left . BuilderSandboxFailed) id chrooted)
+  where
+    sandbox = bcSandbox config
+    storeFile = storePathToFilePath (bcStoreDir config)
+    -- The closures of the entries whose source is in the store, which are
+    -- bound beside them (LDG 643-657).  A source that names no store path
+    -- adds nothing.
+    sandboxPathsClosure paths = do
+      let inStore = [sp | entry <- paths, Right source <- [TE.decodeUtf8' (spSource entry)], Just sp <- [parseStorePathPrefix (bcStoreDir config) source]]
+      fmap Set.toAscList <$> inputClosure (bxStore context) inStore
 
 -- | Why the builder step of a build failed, with the exit code the
 -- build reports.
@@ -804,12 +958,16 @@ data BuilderFailure
   | -- | The builder did not run, or a builtin builder refused, for the
     -- reason given.
     BuilderRefused !Int !Text
+  | -- | The sandbox could not be made, for the reason given, in upstream's
+    -- words ("Nix.Builder.Sandbox").
+    BuilderSandboxFailed !Text
 
 -- | The stop a failed builder step reports.
 builderStop :: BuilderFailure -> BuildStop
 builderStop failure = case failure of
   BuilderExited code -> BuildStop "builder failed" code
   BuilderRefused code reason -> BuildStop ("builder failed: " <> reason) code
+  BuilderSandboxFailed reason -> BuildStop reason 1
 
 -- | Decode a derivation's builder path and arguments from their identity
 -- bytes to the 'Text' the process-spawn boundary needs.  @Left@ names the
@@ -960,7 +1118,11 @@ data BuildLayout = BuildLayout
     -- (local-derivation-goal.cc:1084-1091 at 2.24.9).
     layoutBuildDir :: !BuildPlace,
     -- | Each output by name, at the path the builder writes it to.
-    layoutOutputs :: ![(Text, BuildPlace)]
+    layoutOutputs :: ![(Text, BuildPlace)],
+    -- | The @HOME@ the builder is told of: its build directory where it
+    -- runs where its paths are, and upstream's @\/homeless-shelter@ in the
+    -- sandbox ('Nix.Builder.Sandbox.sandboxHome').
+    layoutHome :: !FilePath
   }
   deriving (Eq, Show)
 
@@ -1026,7 +1188,7 @@ builderInvocation config drv layout = case (execWrapperFor config drv, decodeBui
       BuilderInvocation
         { invProgram = spawnPath,
           invArgs = spawnArgs,
-          invEnv = buildEnvironment config (adEnv delivery) builderPath (placeSeen buildDir),
+          invEnv = buildEnvironment config (adEnv delivery) builderPath (placeSeen buildDir) (layoutHome layout),
           invImpureVars = passed,
           invFiles = [(placeOnDisk buildDir </> name, bytes) | (name, bytes) <- adFiles delivery],
           invWorkDir = placeOnDisk buildDir
@@ -1181,7 +1343,7 @@ passedFileName name = T.unpack (passedFilePrefix <> Nix32.encode (sha256Digest (
 
 -- | Build the process environment from the derivation's contribution
 -- ('adEnv') + standard vars, naming the build directory as the builder
--- sees it.
+-- sees it and its home.
 -- The builder path is used to derive PATH entries - the builder's own
 -- directory and its sibling @usr\/bin@ are included so that coreutils
 -- shipped alongside the builder (e.g. Git for Windows' MSYS2 tools)
@@ -1192,8 +1354,9 @@ buildEnvironment ::
   Map Text Text ->
   FilePath ->
   FilePath ->
+  FilePath ->
   Map Text Text
-buildEnvironment config derivationEnv builderPath buildDir =
+buildEnvironment config derivationEnv builderPath buildDir home =
   let -- Standard build variables
       standardEnv =
         Map.fromList
@@ -1202,7 +1365,7 @@ buildEnvironment config derivationEnv builderPath buildDir =
             (envTempDir, T.pack buildDir),
             (envTmp, T.pack buildDir),
             (envTemp, T.pack buildDir),
-            (homeEnvVar, T.pack buildDir),
+            (homeEnvVar, T.pack home),
             (envNixStore, T.pack (unStoreDir (bcStoreDir config))),
             (envNixBuildCores, T.pack (show (bcCores config))),
             (envPath, buildPath builderPath),
@@ -1304,8 +1467,9 @@ homeEnvVar =
 --
 -- The child's environment is exactly the build environment plus
 -- 'scrubAmbient'\'s allowance - the ambient environment does not flow
--- through ('builderProcessEnv').  Filesystem and process isolation remain
--- future work.
+-- through ('builderProcessEnv').  It runs unsandboxed, with the
+-- filesystem and the network in reach; 'runSandboxedBuilder' runs a
+-- sandboxed one.
 --
 -- 'invImpureVars' is the impureEnvVars carve-out: the names a
 -- fixed-output derivation listed (empty otherwise), each copied from
@@ -1355,9 +1519,9 @@ runBuilder buildLog invocation = do
 -- first NUL, as upstream's execve takes each argument and each
 -- @NAME=VALUE@ entry it builds (stringsToCharPtrs, util.cc:44-50 at
 -- 2.24.9, and local-derivation-goal.cc:2000-2004 and 2231).  Cut here, a
--- NUL never reaches the process library, which refuses one in an
+-- NUL reaches neither the process library, which refuses one in an
 -- environment entry and on Windows would end an entry or the command line
--- at it.
+-- at it, nor the sandbox helper's plan.
 asExecString :: Text -> Text
 asExecString = T.takeWhile (/= '\0')
 
@@ -1378,13 +1542,25 @@ builderEnvironment invocation = do
 -- | 'builderEnvironment' as the process library takes one: a name and a
 -- value, which it joins with @=@.  An entry with no @=@, which a name
 -- holding a NUL leaves, is one it cannot pass, and is left out; upstream
--- passes it, and no getenv finds a variable in it.
+-- passes it, and no getenv finds a variable in it.  The sandbox helper
+-- passes every entry as it is.
 builderProcessEnv :: BuilderInvocation -> IO [(String, String)]
 builderProcessEnv invocation = mapMaybe asPair <$> builderEnvironment invocation
   where
     asPair entry = case T.breakOn "=" entry of
       (name, rest) | Just (_, value) <- T.uncons rest -> Just (T.unpack name, T.unpack value)
       _ -> Nothing
+
+-- | Run a builder through the sandbox helper ('runHelper'), its
+-- environment in the plan ('builderEnvironment').
+runSandboxedBuilder :: System.IO.Handle -> FilePath -> SandboxPlan -> BuilderInvocation -> IO (Either BuilderFailure ())
+runSandboxedBuilder buildLog helper plan invocation = do
+  program <- filePathBytes (invProgram invocation)
+  run <- runHelper buildLog helper (renderPlan plan) (invWorkDir invocation) (invProgram invocation : invArgs invocation)
+  pure $ case helperOutcome plan program (hrDelivered run) (hrExit run) (hrStatus run) of
+    SetupIncomplete reason -> Left (BuilderSandboxFailed reason)
+    BuilderRan ExitSuccess -> Right ()
+    BuilderRan (ExitFailure code) -> Left (BuilderExited code)
 
 -- | Create the appropriate process spec for the builder.
 --
@@ -1745,16 +1921,16 @@ malformedExpectedHash url = "builtin:fetchurl: malformed expected hash for " <> 
 -- The placed outputs register together in one transaction, so a
 -- cross-output reference finds its referent's row (see 'registerPaths').
 registerOutputs ::
-  BuildConfig ->
   Store ->
   Derivation ->
   StorePath ->
   Set StorePath ->
   [OutputPlan] ->
+  Written ->
   Commit ->
   IO (Either BuildStop StorePath)
-registerOutputs config store drv drvPath inputPaths plans commit = runExceptT $ do
-  scanned <- withExceptT scanStop (traverse (scanOutput config store scan) (zip (drvOutputs drv) plans))
+registerOutputs store drv drvPath inputPaths plans written commit = runExceptT $ do
+  scanned <- withExceptT scanStop (traverse (scanOutput store scan written) (zip (drvOutputs drv) plans))
   ordered <- liftEither (orderScanned drvPath (siblingsReferenced (drvOutputs drv)) scanned)
   regs <- withExceptT scanStop (traverse (ExceptT . placeOutput store drvPath deriver . snd) ordered)
   liftIO (commit (registerPaths (stDB store) (catMaybes regs)))
@@ -1783,16 +1959,16 @@ registerOutputs config store drv drvPath inputPaths plans commit = runExceptT $ 
 -- has checked as ultimately trusted and signs it (:2717-2722); the store
 -- database here records neither.
 compareOutputs ::
-  BuildConfig ->
   Store ->
   Derivation ->
   StorePath ->
   [Text] ->
   Set StorePath ->
   [OutputPlan] ->
+  Written ->
   Commit ->
   IO (Either BuildStop CheckVerdict)
-compareOutputs config store drv drvPath recordedHashes inputPaths plans _ = runExceptT $ do
+compareOutputs store drv drvPath recordedHashes inputPaths plans written _ = runExceptT $ do
   built <- withExceptT scanStop (traverse rebuilt (zip3 (drvOutputs drv) plans recordedHashes))
   ordered <- liftEither (orderScanned drvPath (siblings . boReferences . fst) built)
   ExceptT (firstDifference (volumeCaseHack (stCaseSensitivity store)) drvPath (map snd ordered))
@@ -1800,8 +1976,9 @@ compareOutputs config store drv drvPath recordedHashes inputPaths plans _ = runE
     scan = outputScan drv inputPaths plans
     siblings = siblingNames (drvOutputs drv)
     rebuilt (output, plan, recorded) = do
-      outDir <- writtenOutput config (output, plan)
-      scanned <- preparedOutput scan output outDir
+      outDir <- writtenOutput (writtenPath written plan)
+      open <- liftIO (writtenOpen written plan)
+      scanned <- preparedOutput scan output outDir open
       pure (doName output, (scanned, recorded))
 
 -- | The stop a failed scan or placement reports.
@@ -1868,19 +2045,18 @@ data BuiltOutput = BuiltOutput
     boReferences :: ![StorePath]
   }
 
--- | Where the builder wrote an output, which has to be there (a file, a
+-- | Where the builder's output is now, which has to be there (a file, a
 -- directory, or a symlink, whatever it names).
-writtenOutput :: BuildConfig -> (DerivationOutput, OutputPlan) -> ExceptT Text IO FilePath
-writtenOutput config (_, plan) = do
-  let outDir = storePathToFilePath (bcStoreDir config) (opScratch plan)
+writtenOutput :: FilePath -> ExceptT Text IO FilePath
+writtenOutput outDir = do
   absent <- liftIO (nothingAt outDir)
   when absent (throwError ("output missing: " <> T.pack outDir))
   pure outDir
 
 -- | Whether nothing is at a path, read without following a link, as
 -- upstream reads an output (@lstat@, local-derivation-goal.cc:2326 at
--- 2.24.9): one that is a symlink is there whatever it names, nothing at
--- all among them.
+-- 2.24.9): one that is a symlink is there whatever it names, a sibling
+-- output still in the chroot, or nothing at all.
 nothingAt :: FilePath -> IO Bool
 nothingAt path = do
   node <- classifyWalkNode path
@@ -1894,20 +2070,25 @@ nothingAt path = do
 -- already valid in the DB, otherwise make ready what the builder wrote
 -- ('preparedOutput').
 scanOutput ::
-  BuildConfig ->
   Store ->
   OutputScan ->
+  Written ->
   (DerivationOutput, OutputPlan) ->
   ExceptT Text IO (Text, ScannedOutput)
-scanOutput config store scan planned@(output, _) = do
-  outDir <- writtenOutput config planned
+scanOutput store scan written (output, plan) = do
+  outDir <- writtenOutput (writtenPath written plan)
   -- Validity is a DB fact, not mere disk presence: an output left on disk
   -- by an interrupted run is NOT valid, and build outputs are not
   -- content-addressed, so a leftover cannot be verified against its path.
   -- 'runPlannedBuild' removed any leftover before the builder ran, so the
   -- tree here is this build's (upstream's delete-then-move).
   valid <- liftIO (isValid store (doPath output))
-  scanned <- if valid then pure AlreadyRegistered else NeedsRegistering <$> preparedOutput scan output outDir
+  scanned <-
+    if valid
+      then pure AlreadyRegistered
+      else do
+        open <- liftIO (writtenOpen written plan)
+        NeedsRegistering <$> preparedOutput scan output outDir open
   pure (doName output, scanned)
 
 -- | An output the builder wrote, made ready where it is to be placed or
@@ -1920,18 +2101,20 @@ scanOutput config store scan planned@(output, _) = do
 -- before it is read or changed; a fixed output is replaced with a fresh
 -- copy of itself, made canonical again, so a descriptor the builder passed
 -- out names an inode that is not registered; and its hashes are rewritten
--- and its references scanned ('scanBuilt').  A process of the same user
--- can still change an output while it is read.
-preparedOutput :: OutputScan -> DerivationOutput -> FilePath -> ExceptT Text IO BuiltOutput
-preparedOutput scan output outDir = do
-  open <- liftIO (writableByOthers outDir)
+-- and its references scanned ('scanBuilt').  Whether others could write
+-- the output is read from what the builder left, before a sandboxed
+-- build's seal changed its mode.  A sandboxed build's chroot is closed to
+-- other users before this ('Nix.Builder.Sandbox.Spawn.sealChroot'); a
+-- process of the same user can still change an output while it is read.
+preparedOutput :: OutputScan -> DerivationOutput -> FilePath -> Bool -> ExceptT Text IO BuiltOutput
+preparedOutput scan output outDir open = do
   when open (throwError ("suspicious ownership or permission on '" <> T.pack outDir <> "' for output '" <> doName output <> "'; rejecting this build output"))
   othersNode <- liftIO (foreignOwnedNode outDir)
   for_ othersNode (\node -> throwError ("invalid ownership on file '" <> T.pack node <> "'"))
   liftIO (canonicalizeMetadata outDir)
   -- The copy is made canonical in its turn, and it is the copy that is
   -- read: its inodes are new, so no descriptor another user holds
-  -- reaches what is scanned, hashed and registered.
+  -- reaches what is scanned, hashed and moved into the store.
   unless (T.null (doHashAlgo output)) (liftIO (replaceWithCopy outDir *> canonicalizeMetadata outDir))
   liftIO (scanBuilt scan output outDir)
 
@@ -1999,8 +2182,9 @@ placeOutput :: Store -> StorePath -> Maybe Text -> ScannedOutput -> IO (Either T
 placeOutput store drvPath deriver scanned = case scanned of
   AlreadyRegistered -> pure (Right Nothing)
   NeedsRegistering (BuiltOutput output outDir refs) -> do
-    -- The builder wrote straight into the store path, so outDir IS the
-    -- target and placing it moves nothing.
+    -- An unsandboxed builder wrote straight into the store path, so there
+    -- outDir IS the target and placing it moves nothing; a sandboxed one's
+    -- moves out of the chroot here.
     let targetPath = storePathToFilePath (stDir store) (doPath output)
     reg <- placeInStore store outDir (doPath output) deriver refs
     fixedCheck <- verifyFixedOutput (volumeCaseHack (stCaseSensitivity store)) drvPath output refs targetPath

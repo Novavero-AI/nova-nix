@@ -244,7 +244,7 @@ command name = case name of
                  Form "--expr 'EXPR'" "Build a derivation from an inline expression"
                ],
         commandDescription =
-          "Evaluates " <> targetSource <> ", selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. " <> targetCalls <> " A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. The outputs of a derivation whose `allowSubstitutes` attribute is false are built instead, unless `always-allow-substitutes` is on. A substituter that fails stops the build unless `fallback` is on. With `--check` the derivation is checked as `nix-build --check` checks one: an output of its that is not valid is first downloaded from a substituter that holds it, the derivations it depends on are built or downloaded as ever, and then it is built again beside its outputs, never downloaded, and each output is compared with the one in the store. The rebuild changes nothing in the store and what it wrote is discarded; the downloads and builds before it add to the store as in any build. An output that comes out different fails the command with status 104, so a path a substituter supplied can be held to a build. The output is linked from `./result`, or from the path `--out-link` gives, with `-NAME` appended for an output `NAME` other than `out`, as `nix-build` links it, and the link is a root the garbage collector keeps; it replaces a link already there that points into the store, and anything else there fails the command. With `--no-out-link` nothing is linked. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is evaluated.",
+          "Evaluates " <> targetSource <> ", selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. " <> targetCalls <> " A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. The outputs of a derivation whose `allowSubstitutes` attribute is false are built instead, unless `always-allow-substitutes` is on. A substituter that fails stops the build unless `fallback` is on. With `--check` the derivation is checked as `nix-build --check` checks one: an output of its that is not valid is first downloaded from a substituter that holds it, the derivations it depends on are built or downloaded as ever, and then it is built again beside its outputs, never downloaded, and each output is compared with the one in the store. The rebuild changes nothing in the store and what it wrote is discarded; the downloads and builds before it add to the store as in any build. An output that comes out different fails the command with status 104, so a path a substituter supplied can be held to a build. The output is linked from `./result`, or from the path `--out-link` gives, with `-NAME` appended for an output `NAME` other than `out`, as `nix-build` links it, and the link is a root the garbage collector keeps; it replaces a link already there that points into the store, and anything else there fails the command. With `--no-out-link` nothing is linked. Where `sandbox` is on, as it is by default on Linux, a builder runs in a sandbox: it sees its inputs, its build directory at `sandbox-build-dir`, the paths `sandbox-paths` names and, unless its derivation is fixed-output, no network but a loopback of its own; a system that cannot make the sandbox builds without it after a warning, or with `sandbox-fallback` off fails the build. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is evaluated.",
         commandExamples =
           Example
             "Build GNU Hello for Windows from the directory a release unpacks to, with the public cache as a substituter."
@@ -381,6 +381,9 @@ data FlagName
   | TrustedKeyFlag
   | FallbackFlag
   | CheckFlag
+  | SandboxFlag
+  | NoSandboxFlag
+  | RelaxedSandboxFlag
   | ExecWrapperFlag
   | CacheFlag
   | AllFlag
@@ -480,6 +483,12 @@ flag name = case name of
     long "fallback" Nothing "Build from source if substitution fails" evalBuildAndTrust
   CheckFlag ->
     long "check" Nothing "Build the derivation again beside its valid outputs, and fail with status 104 if an output comes out different" buildOnly
+  SandboxFlag ->
+    long "sandbox" Nothing "Enable sandboxing" evalBuildAndTrust
+  NoSandboxFlag ->
+    long "no-sandbox" Nothing "Disable sandboxing" evalBuildAndTrust
+  RelaxedSandboxFlag ->
+    long "relaxed-sandbox" Nothing "Enable sandboxing, but allow builds to disable it" evalBuildAndTrust
   ExecWrapperFlag ->
     long "exec-wrapper" (Just "S=PATH") "Run system `S`'s derivations through `PATH` (repeatable), e.g. `x86_64-windows=/usr/bin/wine`" evalAndBuild
   CacheFlag ->
@@ -551,7 +560,14 @@ configuration =
                Setting "allowed-uris" "URI prefixes a fetch may reach under `restrict-eval`" Nothing,
                Setting "trace-verbose" "Make `builtins.traceVerbose` trace" (Just TraceVerboseFlag),
                Setting "allow-import-from-derivation" "Let a builtin that reads a path build or substitute what the path's context names (default: true)" (Just NoAllowImportFromDerivationFlag),
-               Setting "trace-import-from-derivation" "Warn, naming the first output, when a builtin that reads a path realises what its context names" Nothing
+               Setting "trace-import-from-derivation" "Warn, naming the first output, when a builtin that reads a path realises what its context names" Nothing,
+               Setting "sandbox" "Whether a build runs in a sandbox: `true`, `relaxed` (a build that is fixed-output or sets `__noChroot` does not) or `false` (default: `true` on Linux, `false` elsewhere)" (Just SandboxFlag),
+               Setting "sandbox-fallback" "Build unsandboxed, after a warning, where the system cannot make the sandbox (default `true`)" Nothing,
+               Setting "sandbox-paths" "Host paths a sandboxed build sees, each `TARGET=SOURCE` or a path naming itself, with `?` after one that may be missing (default: `/bin/sh` as a release archive's bundled shell)" Nothing,
+               Setting "sandbox-build-dir" "Where a sandboxed build sees its build directory (default `/build`)" Nothing,
+               Setting "sandbox-dev-shm-size" "The size of a sandboxed build's `/dev/shm`, as `tmpfs` takes it (default `50%`)" Nothing,
+               Setting "require-drop-supplementary-groups" "Fail a sandboxed build when the user's supplementary groups cannot be dropped (default: on for root)" Nothing,
+               Setting "ssl-cert-file" "The CA bundle a sandboxed fixed-output build sees (default: `$NIX_SSL_CERT_FILE`, `$SSL_CERT_FILE`, or the first that exists of `/etc/ssl/certs/ca-certificates.crt` and `etc/ssl/certs/ca-bundle.crt` under `/nix/var/nix/profiles/default`)" Nothing
              ],
       configDescription =
         "`nix.conf` is read in upstream's order: `$NIX_CONF_DIR/nix.conf`, where `NIX_CONF_DIR` defaults to "

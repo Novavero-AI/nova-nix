@@ -191,11 +191,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The sources that build on Linux: test/cbits/nn_test_dacl.c builds on
+      # Windows alone, against headers this runner does not have.
       - name: Compile C99 with strict warnings
         run: |
-          for f in cbits/*.c; do
+          for f in cbits/*.c sandbox/*.c test/cbits/sandbox_check.c test/cbits/keyring.c; do
             echo "Checking $f ..."
-            gcc -std=c99 -Wall -Wextra -pedantic -Werror -fsyntax-only -Icbits "$f"
+            gcc -std=c99 -Wall -Wextra -pedantic -Werror -fsyntax-only -Icbits -Isandbox "$f"
           done
 
   cabal-check:
@@ -316,6 +318,12 @@ jobs:
 
       - name: Build with instrumented cbits
         run: cabal build --enable-tests
+
+      # The sandbox helper builds instrumented too, and the suite's Linux
+      # sandbox group runs it.  It runs with an empty environment, so
+      # ASAN_OPTIONS below does not reach it and LeakSanitizer checks it.
+      - name: Let the instrumented sandbox helper make namespaces
+        uses: ./.github/actions/sandbox-helper
 
       # detect_leaks=0: LeakSanitizer would report the GHC RTS's deliberate
       # process-lifetime allocations, not cbits defects - the arena's
@@ -449,6 +457,12 @@ jobs:
           hdiutil attach "$RUNNER_TEMP/nova-cs.dmg" -mountpoint "$RUNNER_TEMP/nova-cs" -nobrowse
           echo "NOVA_NIX_TEST_CASE_SENSITIVE_DIR=$RUNNER_TEMP/nova-cs" >> "$GITHUB_ENV"
 
+      # The suite's Linux sandbox group runs the helper this job built, and
+      # skips where the action has not named it.
+      - name: Let the built sandbox helper make namespaces (Linux)
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/sandbox-helper
+
       # The suite runs directly rather than through cabal test, which
       # reports a suite killed by a signal as a bare FAIL: its exit status
       # survives, so a crash names its signal (128 + the number on POSIX).
@@ -520,7 +534,7 @@ jobs:
           exe=$(cabal list-bin exe:nova-nix)
           store=$(mktemp -d)
           out=$(sudo systemd-run --quiet --scope -p CPUQuota=150% \
-            "$exe" --store "$store" build \
+            "$exe" --store "$store" build --no-sandbox \
             --expr 'derivation { name = "cores"; system = builtins.currentSystem; builder = "/bin/sh"; args = [ "-c" "echo $NIX_BUILD_CORES > $out" ]; }' |
             tail -n 1)
           got=$(cat "$out")
@@ -592,6 +606,41 @@ jobs:
           Assert-AclEntry 'the state directory' @(icacls (Join-Path $store '.nova-nix')) $storeEntries
           Assert-AclEntry 'the build directory' @(Get-Content -LiteralPath $out) @("${user}:(OI)(CI)(F)")
 
+      # An installed nova-nix finds the helper beside it, and no profile
+      # names that copy, so with the restriction on, which the step asserts,
+      # a sandboxed build runs unsandboxed after one warning naming the
+      # cause, or with sandbox-fallback off fails in upstream's words.  As
+      # root, which the restriction does not reach, a sandboxed build is
+      # refused, since nova-nix has no build users to run it as.
+      - name: Without a profile, a sandboxed build falls back, or fails with sandbox-fallback off, and as root is refused (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1 ] \
+            || { echo "::error::the runner no longer restricts unprivileged user namespaces"; exit 1; }
+          bin=$(mktemp -d)
+          cabal install exe:nova-nix exe:nova-nix-sandbox --install-method=copy --installdir="$bin" --overwrite-policy=always
+          # $out is the builder's, so the expression is quoted whole.
+          # shellcheck disable=SC2016
+          expr='derivation { name = "fallback"; system = builtins.currentSystem; builder = "/bin/sh"; args = [ "-c" "echo ok > $out" ]; }'
+          out=$(NIX_CONFIG='sandbox = true' "$bin/nova-nix" --store "$(mktemp -d)" build --no-out-link --expr "$expr" 2>fallback.txt | tail -n 1)
+          cat fallback.txt
+          grep -qF "warning: building without a sandbox, since AppArmor restricts unprivileged user namespaces" fallback.txt
+          [ "$(cat "$out")" = ok ]
+          if NIX_CONFIG=$'sandbox = true\nsandbox-fallback = false' "$bin/nova-nix" --store "$(mktemp -d)" build --no-out-link --expr "$expr" 2>refused.txt; then
+            echo "::error::a sandboxed build without the namespaces ran with sandbox-fallback off"
+            exit 1
+          fi
+          cat refused.txt
+          grep -qF "this system does not support the kernel namespaces that are required for sandboxing; use '--no-sandbox' to disable sandboxing" refused.txt
+          if sudo "$bin/nova-nix" --store "$(mktemp -d)" build --sandbox --no-out-link --expr "$expr" 2>root.txt; then
+            echo "::error::a sandboxed build ran as root"
+            exit 1
+          fi
+          cat root.txt
+          grep -qF "a sandboxed build as root needs build users, which nova-nix does not have yet" root.txt
+
       # SIGINT mid-evaluation is upstream's error, exit 1, where it once
       # ended the process by the signal with nothing said.  POSIX only:
       # Windows has no SIGINT to send.  set -m starts the job with SIGINT
@@ -662,7 +711,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cabal install exe:nova-nix --install-method=copy --installdir=staged/bin --overwrite-policy=always
+          targets=(exe:nova-nix)
+          if [ "$RUNNER_OS" = Linux ]; then targets+=(exe:nova-nix-sandbox); fi
+          cabal install "${targets[@]}" --install-method=copy --installdir=staged/bin --overwrite-policy=always
           mkdir -p staged/share/nova-nix/nix
           cp data/nix/fetchurl.nix staged/share/nova-nix/nix/
 

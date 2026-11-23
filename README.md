@@ -343,8 +343,15 @@ Hello, world!
 Not implemented yet, and on the [roadmap]: flakes, `nix-shell` and
 `nix develop`, profiles (`nix-env`, `nix profile`; run a program from its store
 path or the `result` link a build makes instead), and a daemon for a
-multi-user store. Builds are not sandboxed on any platform: a builder can read
-and write outside its build directory and reach the network.
+multi-user store. On Linux a build runs in a sandbox, as upstream's does, where
+it sees only its inputs and, unless it is fixed-output, no network; a builder
+that is a host program such as `/bin/sh` needs `sandbox-paths` to bind it, as a
+release archive binds its own shell. Ubuntu lets the sandbox in only under an
+AppArmor profile for `nova-nix-sandbox`, and without one a build runs
+unsandboxed after a warning. As root a sandboxed build is refused, since
+nova-nix has no build users yet. Builds on macOS and Windows are not sandboxed: a
+builder there can read and write outside its build directory and reach the
+network.
 
 A target is a file, a directory or a `<NAME>` the search path finds, not a
 URL, and `build` builds one derivation, where `nix-build` builds each one in a

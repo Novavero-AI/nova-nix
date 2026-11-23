@@ -48,6 +48,7 @@ module Nix.Realise
     -- * Whether a derivation may be substituted
     DerivationAttrs (..),
     derivationAttrs,
+    derivationBoolAttr,
     SubstitutesSetting (..),
     Substitutes (..),
     substitutesAllowed,
@@ -435,14 +436,29 @@ allowSubstitutesAttr = "allowSubstitutes"
 environmentTrue :: ByteString
 environmentTrue = "1"
 
+-- | Upstream's @ParsedDerivation::getBoolAttr@ at 2.24.9
+-- (parsed-derivations.cc:44-62), for the derivation at a @.drv@ path: the
+-- default when the derivation lacks the attribute.  In structured
+-- attributes it is a JSON Boolean, and any other value there is an error;
+-- in the environment only @1@ is true.  Structured attributes that are not
+-- a JSON object hold no attribute, as nlohmann's @find@ finds nothing in
+-- such a value.
+derivationBoolAttr :: StorePath -> Text -> Bool -> DerivationAttrs -> Either Text Bool
+derivationBoolAttr _ name def (AttrsInEnvironment env) =
+  Right (maybe def (== environmentTrue) (Map.lookup name env))
+derivationBoolAttr drvPath name def (AttrsInJson (JsonObject members)) =
+  maybe (Right def) fromJson (Map.lookup name members)
+  where
+    fromJson (JsonBool flag) = Right flag
+    fromJson _ =
+      Left ("attribute '" <> name <> "' of derivation '" <> storePathBasename drvPath <> "' must be a Boolean")
+derivationBoolAttr _ _ def (AttrsInJson _) = Right def
+
 -- | Upstream's @ParsedDerivation::substitutesAllowed@ at 2.24.9, for the
 -- derivation at a @.drv@ path.  Under 'AlwaysAllowSubstitutes' every
 -- derivation may be substituted and the attribute is not read.  Otherwise
--- @allowSubstitutes@ decides, and a derivation without it may be
--- substituted.  In structured attributes it is a JSON Boolean, and any
--- other value there is an error; in the environment only @1@ is true.
--- Structured attributes that are not a JSON object hold no attribute, as
--- nlohmann's @find@ finds nothing in such a value.
+-- @allowSubstitutes@ decides ('derivationBoolAttr'), and a derivation
+-- without it may be substituted.
 --
 -- The rule covers a derivation's own outputs alone.  A path that another
 -- substituted output references is substituted as a path, whichever
@@ -450,20 +466,8 @@ environmentTrue = "1"
 -- attribute.
 substitutesAllowed :: SubstitutesSetting -> StorePath -> DerivationAttrs -> Either Text Substitutes
 substitutesAllowed AlwaysAllowSubstitutes _ _ = Right MaySubstitute
-substitutesAllowed HeedAllowSubstitutes _ (AttrsInEnvironment env) =
-  Right (maybe MaySubstitute fromEnvironment (Map.lookup allowSubstitutesAttr env))
-  where
-    fromEnvironment value
-      | value == environmentTrue = MaySubstitute
-      | otherwise = MustBuild
-substitutesAllowed HeedAllowSubstitutes drvPath (AttrsInJson (JsonObject members)) =
-  maybe (Right MaySubstitute) fromJson (Map.lookup allowSubstitutesAttr members)
-  where
-    fromJson (JsonBool True) = Right MaySubstitute
-    fromJson (JsonBool False) = Right MustBuild
-    fromJson _ =
-      Left ("attribute '" <> allowSubstitutesAttr <> "' of derivation '" <> storePathBasename drvPath <> "' must be a Boolean")
-substitutesAllowed HeedAllowSubstitutes _ (AttrsInJson _) = Right MaySubstitute
+substitutesAllowed HeedAllowSubstitutes drvPath attrs =
+  (\allowed -> if allowed then MaySubstitute else MustBuild) <$> derivationBoolAttr drvPath allowSubstitutesAttr True attrs
 
 -- ---------------------------------------------------------------------------
 -- Realising a graph

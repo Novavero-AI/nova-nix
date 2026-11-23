@@ -10,8 +10,9 @@
 -- reference's 'helpLines'.
 module Main (main) where
 
+import Control.Applicative ((<|>))
 import Control.Exception (AsyncException (UserInterrupt), bracket, displayException, handle, handleJust, try)
-import Control.Monad (mfilter, void, when, (>=>))
+import Control.Monad (filterM, mfilter, void, when, (>=>))
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
@@ -21,7 +22,7 @@ import Data.Functor.Identity (Identity (..))
 import Data.IORef (readIORef)
 import Data.List (find, partition)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, isJust, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe, mapMaybe)
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -33,10 +34,12 @@ import GHC.IO.Exception (IOException (..))
 import GHC.Profiling (requestHeapCensus)
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuildStop (..), SubstitutionAccess (..), buildWithDeps, defaultBuildConfig, execWrapperConfig, substituteFromCaches)
 import qualified Nix.Builder.Cores as Cores
+import Nix.Builder.Sandbox (DropGroups (..), SandboxConfig (..), SandboxFallback (..), SandboxMode (..), parseSandboxPaths)
+import Nix.Builder.Sandbox.Spawn (filePathBytes, processIsRoot)
 import Nix.Builtins (isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
 import Nix.Cli.Args (AutoArg (..), CliOpts (..), Command (..), OutLink, PushArgs (..), Target (..), outLinkFor, parseArgs)
 import Nix.Cli.Reference (Host (..), SystemConfDirSource (..), currentHost, helpLines, systemConfDirSource)
-import Nix.Config (NixConfig (..))
+import Nix.Config (DefaultUse (..), NixConfig (..), PathSetValue (..))
 import qualified Nix.Config as Config
 import Nix.DependencyGraph (DepNode (..), buildDepGraph)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
@@ -68,7 +71,7 @@ import Nix.Substituter (CacheConfig (..))
 import Nix.Trust (ContentFacts, fetchedByBuiltin, fixedOutputInputs, renderTrustReport, trustReport)
 import Nix.Trust.Scan (scanFetched)
 import qualified NovaCache.NAR as NAR
-import Paths_nova_nix (getDataDir, version)
+import Paths_nova_nix (getBinDir, getDataDir, version)
 import System.Directory (Permissions (executable), canonicalizePath, doesDirectoryExist, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, makeAbsolute)
 import qualified System.Directory.OsPath as OsDir
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
@@ -721,19 +724,21 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
     Right _ -> toStdout (TIO.putStrLn (T.pack (storePathToFilePath storeDir outputPath)))
 
 -- | The configuration a command's builds run under: the caches, fallback,
--- substitution setting, cores and launchers its options and nix.conf
--- give.
+-- substitution setting, cores, launchers and sandbox its options and
+-- nix.conf give.
 buildConfigFor :: NixConfig -> CliOpts -> StoreDir -> IO BuildConfig
 buildConfigFor config opts storeDir = do
   wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
   cores <- buildCoresFor config
+  sandbox <- sandboxConfigFor config opts
   pure
     (defaultBuildConfig storeDir)
       { bcCaches = resolveCaches config (optSubstituter opts) (optTrustedKey opts),
         bcFallback = fallbackFor opts config,
         bcSubstitutes = substitutesFor config,
         bcCores = cores,
-        bcExecWrappers = wrappers
+        bcExecWrappers = wrappers,
+        bcSandbox = sandbox
       }
 
 -- | Run an action with a read-only session's store for the store in a
@@ -944,6 +949,98 @@ buildModeFor :: CliOpts -> BuildMode
 buildModeFor opts
   | optCheck opts = BuildCheck
   | otherwise = BuildNormal
+
+-- | How builds are sandboxed on this run: nix.conf's settings under the
+-- sandbox flag, with upstream's defaults where a setting is unset that
+-- take the platform or IO to find.  @sandbox@ is on by default on Linux
+-- alone (globals.hh:597-604 at 2.24.9).  @sandbox-paths@ keeps a
+-- release archive's bundled shell as @\/bin\/sh@ unless a plain
+-- assignment replaces it, as upstream's default names the shell a
+-- package was built with (globals.cc:89-91).
+-- @require-drop-supplementary-groups@ is on for root (globals.hh:655).
+-- @ssl-cert-file@ comes from @NIX_SSL_CERT_FILE@, else @SSL_CERT_FILE@,
+-- else the first bundle that exists (globals.cc:76-78 and 267-272).  The
+-- helper is beside the executable, as a release archive and a
+-- @cabal install@ put it, or in Cabal's install directory.
+sandboxConfigFor :: NixConfig -> CliOpts -> IO SandboxConfig
+sandboxConfigFor config opts = do
+  exeDir <- takeDirectory <$> getExecutablePath
+  binDir <- getBinDir
+  helper <- listToMaybe <$> filterM doesFileExist [exeDir </> sandboxHelperName, binDir </> sandboxHelperName]
+  shell <- bundledSandboxShell exeDir
+  root <- processIsRoot
+  caFile <- maybe defaultSslCertFile (pure . Just) (ncSslCertFile config)
+  let setPaths = ncSandboxPaths config
+      paths = case psvDefault setPaths of
+        KeepsDefault -> Set.union shell (psvPaths setPaths)
+        ReplacesDefault -> psvPaths setPaths
+  pure
+    SandboxConfig
+      { scMode = fromMaybe platformSandboxMode (optSandbox opts <|> ncSandbox config),
+        scFallback = fallbackSetting (ncSandboxFallback config),
+        scPaths = parseSandboxPaths paths,
+        scBuildDir = ncSandboxBuildDir config,
+        scDevShmSize = ncSandboxDevShmSize config,
+        scDropGroups = dropGroupsSetting (fromMaybe root (ncRequireDropSupplementaryGroups config)),
+        scCaFile = caFile,
+        scHelper = helper
+      }
+  where
+    fallbackSetting True = FallBackUnsandboxed
+    fallbackSetting False = RefuseUnsandboxed
+    dropGroupsSetting True = RequireDropGroups
+    dropGroupsSetting False = TolerateKeptGroups
+
+-- | Upstream's default for @sandbox@ on this platform.
+platformSandboxMode :: SandboxMode
+platformSandboxMode
+  | System.Info.os == "linux" = SandboxEnabled
+  | otherwise = SandboxDisabled
+
+-- | The sandbox helper's file name.
+sandboxHelperName :: FilePath
+sandboxHelperName = "nova-nix-sandbox"
+
+-- | Where a release archive keeps the shell a sandboxed build sees as
+-- @\/bin\/sh@, relative to the directory holding @bin@.
+bundledShellSubpath :: FilePath
+bundledShellSubpath = "libexec" </> "nova-nix" </> "sh"
+
+-- | The @sandbox-paths@ default: a release archive's bundled shell as
+-- @\/bin\/sh@ on Linux, where the archive carries one, and otherwise
+-- nothing, upstream's default for a Nix built without a sandbox shell.
+bundledSandboxShell :: FilePath -> IO (Set.Set BS.ByteString)
+bundledSandboxShell exeDir
+  | System.Info.os /= "linux" = pure Set.empty
+  | otherwise = do
+      let shell = takeDirectory exeDir </> bundledShellSubpath
+      present <- doesFileExist shell
+      Set.fromList <$> traverse (fmap ("/bin/sh=" <>) . filePathBytes) [shell | present]
+
+-- | Upstream's @ssl-cert-file@ default: @NIX_SSL_CERT_FILE@ when it is
+-- set, else @SSL_CERT_FILE@, when the value is not empty; else the first
+-- of upstream's bundle paths that exists.
+defaultSslCertFile :: IO (Maybe BS.ByteString)
+defaultSslCertFile = do
+  nixVariable <- lookupEnvBytes "NIX_SSL_CERT_FILE"
+  plainVariable <- lookupEnvBytes "SSL_CERT_FILE"
+  case (variableValue nixVariable, variableValue plainVariable) of
+    (Just named, _) | not (BS.null named) -> pure (Just named)
+    (Just _, _) -> firstBundle
+    (Nothing, Just named) | not (BS.null named) -> pure (Just named)
+    _ -> firstBundle
+  where
+    variableValue found = case found of
+      EnvValue value -> Just value
+      _ -> Nothing
+    firstBundle = do
+      present <- filterM doesFileExist sslCertFileDefaults
+      traverse filePathBytes (listToMaybe present)
+
+-- | Upstream's bundle paths, in the order it tries them
+-- (globals.cc:269).
+sslCertFileDefaults :: [FilePath]
+sslCertFileDefaults = ["/etc/ssl/certs/ca-certificates.crt", "/nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt"]
 
 -- | The cores a builder is told of on this run: nix.conf's @cores@, or
 -- when nothing sets it, upstream's default on this machine.
