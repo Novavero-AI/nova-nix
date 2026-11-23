@@ -9,6 +9,7 @@ module Nix.Eval.Operator
   ( evalBinary,
     evalUnary,
     evalUpdate,
+    evalUpdateChain,
     addToInteger,
     addToFloat,
     nixCompare,
@@ -22,7 +23,9 @@ module Nix.Eval.Operator
   )
 where
 
+import Control.Monad (foldM)
 import Data.Int (Int64)
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval.AllocSite (SetSite (SetUpdate))
@@ -381,20 +384,35 @@ evalConcat left right =
   throwEvalError ("cannot concatenate " <> typeName left <> " and " <> typeName right)
 
 -- | Attribute set merge (//).  Right-biased: keys in the right
--- operand shadow keys in the left.
---
--- Each operand is evaluated and checked for a set in turn, the left
--- first, as @ExprOpUpdate::eval@ calls @evalAttrs@ on each (eval.cc at
--- 2.24.9): a non-set left fails before the right is evaluated at all, and
--- the refusal is @evalAttrs@'s message.  2.33.2 checks the right first;
--- 2.24.9 is followed.  Upstream adds a trace line naming the operand ("in
--- the left operand of the update (//) operator") above the message;
--- nova-nix's errors carry no trace, so only the final line is reproduced.
+-- operand shadow keys in the left.  The chain of the two
+-- ('evalUpdateChain').
 evalUpdate :: (MonadEval m) => m NixValue -> m NixValue -> m NixValue
-evalUpdate evalLeft evalRight = do
-  leftSet <- evalLeft >>= expectSet
-  rightSet <- evalRight >>= expectSet
-  VAttrs <$> mergeAttrSets leftSet rightSet
+evalUpdate evalLeft evalRight = evalUpdateChain (evalLeft :| [evalRight])
+
+-- | A chain of @//@, given its operands first to last.
+--
+-- Each operand is evaluated and checked for a set in turn, first to last,
+-- as 2.24.9's @ExprOpUpdate::eval@ calls @evalAttrs@ on its left operand
+-- and then on its right (eval.cc at 2.24.9), which visits a right-nested
+-- chain's operands in that order: a non-set fails before an operand after
+-- it is evaluated at all, and the refusal is @evalAttrs@'s message.
+-- 2.33.2 checks the right first, and 2.34's update queue evaluates a
+-- chain's operands last to first (eval.cc:2014-2025 at 2.34.9); 2.24.9 is
+-- followed.  Upstream adds a trace line naming the operand ("in the left
+-- operand of the update (//) operator") above the message; nova-nix's
+-- errors carry no trace, so only the final line is reproduced.
+--
+-- Once every operand is a set, the sets are merged from the first, each
+-- into the result of those before it, as 2.34's update queue folds a
+-- chain from its leftmost operand once it has evaluated them all
+-- (eval.cc:1991-2005 at 2.34.9): each small operand layers on the sets
+-- before it ('mergeAttrSets'), and a chain one of whose operands fails
+-- merges none.
+evalUpdateChain :: (MonadEval m) => NonEmpty (m NixValue) -> m NixValue
+evalUpdateChain (first :| rest) = do
+  start <- first >>= expectSet
+  sets <- traverse (>>= expectSet) rest
+  VAttrs <$> foldM mergeAttrSets start sets
   where
     expectSet (VAttrs set) = pure set
     expectSet other = expectedFailure "a set" other

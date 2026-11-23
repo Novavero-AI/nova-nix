@@ -2623,6 +2623,54 @@ testRegionCensus = do
        in assertEqual "tenure collectors with no budget and with budgets of 1, 16 and 256 MiB" [0, 2 ^ (20 :: Int), 2 ^ (24 :: Int), 2 ^ (28 :: Int)] [budget | budget : _ <- tenures]
             `andThen` foldr (andThen . check) Pass tenures
 
+-- | A chain of @//@: its operands evaluated first to last, as 2.24.9's
+-- right-nested updates evaluate them, and merged from the first, as
+-- upstream 2.34's update queue folds them (eval.cc:1991-2029 at 2.34.9).
+testUpdateChains :: IO [Bool]
+testUpdateChains = do
+  putStrLn "eval/update-chains"
+  tmpBase <- getTemporaryDirectory
+  sequence
+    [ emits
+        "a chain of updates evaluates its operands first to last"
+        "builtins.trace (builtins.attrNames (builtins.trace \"a\" { za = 1; } // builtins.trace \"b\" { zb = 1; } // builtins.trace \"c\" { zc = 1; })) null"
+        ["trace: a", "trace: b", "trace: c", "trace: [ \"za\" \"zb\" \"zc\" ]"],
+      runTest "a chain of updates refuses its first operand that is not a set, and evaluates none after it" $
+        assertEvalError "update-chain-first-refusal" "{ } // 1 // throw \"later\"" "expected a set but found an integer: 1",
+      -- The flat copy is removeAttrs of nothing, which makes a set of its
+      -- own; the model merges the operands' attributes, the later winning.
+      -- Operands of up to 20 attributes cross the 16 a layer takes, and
+      -- chains of up to 12 the eight sets a chain of layers holds.
+      runTestM "a chain of updates reads as a flat copy of it and as its operands merged, its positions and printed form too" . quickCheckPasses $
+        QC.forAll genChain $ \operands -> QC.ioProperty $ do
+          let model = foldl' (flip Map.union) Map.empty operands
+              chain = T.intercalate " // " (map setSource operands)
+              withChain body = "let s = " <> chain <> "; f = builtins.removeAttrs s [ ]; names = builtins.attrNames s; in " <> body
+              agreements =
+                withChain $
+                  "builtins.all (x: x) [ (s == f) (names == builtins.attrNames f) (builtins.attrValues s == builtins.attrValues f) "
+                    <> "(builtins.toJSON s == builtins.toJSON f) (builtins.all (n: builtins.unsafeGetAttrPos n s == builtins.unsafeGetAttrPos n f) names) "
+                    <> "(s == "
+                    <> setSource model
+                    <> ") ]"
+              printedAs value = evalNixIO tmpBase (withChain ("builtins.deepSeq " <> value <> " " <> value)) >>= traverse (printValue PrintInFull)
+          printedChain <- printedAs "s"
+          printedCopy <- printedAs "f"
+          printedModel <- printedAs (setSource model)
+          pure
+            $ QC.counterexample (T.unpack chain)
+            $ (evalNixInFile agreements, printedChain, printedCopy)
+              QC.=== (Right (VBool True), printedModel, printedModel)
+    ]
+  where
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    genChain = QC.chooseInt (1, 12) >>= \n -> QC.vectorOf n genOperand
+    genOperand = QC.chooseInt (0, 20) >>= \size -> Map.fromList <$> QC.vectorOf size ((,) <$> QC.elements chainNames <*> QC.chooseInt (0, 9))
+    chainNames = [T.pack ("p" <> show i) | i <- [0 .. 23 :: Int]]
+    setSource attrs = "{ " <> T.concat [name <> " = " <> T.pack (show value) <> "; " | (name, value) <- Map.toList attrs] <> "}"
+
 testAllocSites :: IO [Bool]
 testAllocSites = do
   putStrLn "eval/alloc-sites"
@@ -2807,12 +2855,38 @@ testAllocSites = do
         "an update on a chain of eight sets copies every entry of the set it merges"
         (updateSource "{ a = 1; }" (singleRights setMaxLayers))
         (fromIntegral setMaxLayers - 1 + 9),
-      -- `a // b // c` parses as `a // (b // c)`: the right update layers
-      -- { d } on { c }, copying one entry, and the left layers that set of
-      -- two on { a, b }, copying its two.
+      -- A chain folds from its first operand, as upstream 2.34's update
+      -- queue does (eval.cc:1991-2005 at 2.34.9): { c } layers on { a, b },
+      -- and { d } on that, one entry each, as 2.34.9's
+      -- nrOpUpdateValuesCopied counts them.
       copiesTest
         "a chain of updates copies what each update layers"
         "builtins.deepSeq ({ a = 1; b = 2; } // { c = 3; } // { d = 4; }) null"
+        2,
+      -- Written without parentheses the chain nests to the right, and it
+      -- folds from its first operand as the chain of eight above does.
+      copiesTest
+        "a chain of updates copies as one folded from its first operand, however it nests"
+        ("builtins.deepSeq (" <> T.intercalate " // " ("{ a = 1; }" : singleRights setMaxLayers) <> ") null")
+        (fromIntegral setMaxLayers - 1 + 9),
+      sitesTest
+        "a chain of updates makes the sets of one folded from its first operand, however it nests"
+        ("builtins.deepSeq (" <> T.intercalate " // " ("{ a = 1; }" : singleRights setMaxLayers) <> ") null")
+        []
+        [(SetLiteral, SetSiteFigures 9 0 (9 * setBytes 1)), (SetUpdate, SetSiteFigures 8 0 (7 * setBytes 1 + setBytes 9))],
+      -- 2.34's update queue evaluates every operand before it merges any
+      -- (eval.cc:1991-2005 at 2.34.9), so a chain one of whose operands
+      -- fails merges nothing, whichever operand it is.
+      copiesTest
+        "a chain of updates one of whose operands fails copies nothing"
+        "builtins.deepSeq [ (builtins.tryEval ({ a = 1; } // { b = 2; } // throw \"x\")) (builtins.tryEval ({ a = 1; } // throw \"x\" // { b = 2; })) ] null"
+        0,
+      -- A let is not an update, so r is one operand: { c } layers on { b }
+      -- inside it, copying one entry, and then r, layered itself, is copied
+      -- flat into a layer on { a }, its two entries.
+      copiesTest
+        "an operand that is not an update is one operand of the chain, and a layered one is copied flat"
+        "builtins.deepSeq ({ a = 1; } // (let r = { b = 2; } // { c = 3; }; in r)) null"
         3,
       sitesTest
         "removeAttrs of every attribute makes an empty set of its own, and of an empty set none"
@@ -31430,6 +31504,7 @@ runSuite = do
           testCensus,
           testRegionCensus,
           testAllocSites,
+          testUpdateChains,
           testRegionCollector,
           testEnvLayout,
           testEvalLists,

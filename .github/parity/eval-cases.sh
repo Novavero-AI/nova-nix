@@ -225,6 +225,13 @@ check "with a layered set" 'let a = { x = 1; y = 2; }; v = with (a // { y = 3; }
 refusedAtPosition "an unexpected argument a layered set holds" '({ a }: a) ({ a = 1; } // { zz = 2; })' "from call site"
 refused "deepSeq forces the set under a layer by its names" 'let b = { za = throw "base"; }; l = b // { zb = throw "layer"; }; in builtins.deepSeq l null'
 refused "deepSeq forces a layer by its names" 'let early = { zg = 0; }; b = { zh = throw "base"; }; l = b // { zg = throw "layer"; }; in builtins.deepSeq l null'
+check "a chain of updates reads the same however it nests" 'let a = { x = 1; y = 1; }; v = [ (a // { y = 2; } // { z = 3; } // { x = 4; }) (((a // { y = 2; }) // { z = 3; }) // { x = 4; }) ]; in builtins.deepSeq v v'
+# 2.24.9 evaluates a chain's operands first to last and 2.34.9 last to
+# first, so each case holds one operand that fails.
+refused "a chain of updates fails at its first operand" 'throw "first" // { a = 1; } // { b = 2; }'
+refused "a chain of updates fails at a middle operand" '{ a = 1; } // throw "middle" // { b = 2; }'
+refused "a chain of updates fails at its last operand" '{ a = 1; } // { b = 2; } // throw "last"'
+refused "a chain of updates refuses an operand that is not a set" '{ a = 1; } // 1 // { b = 2; }'
 echo
 
 echo "== what a string and an attribute name print as =="
