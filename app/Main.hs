@@ -50,6 +50,7 @@ import Nix.Eval.CStats (CRoot (..), countSites, renderCensus, takeCensus, valueR
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.IO (EvalIO, EvalState (..), SessionSettings (..), SessionStore (..), allowEvalPath, evalBaseEnv, evalSearchPath, nixPathValue, readImportTarget, renderEvalFailure, resolveImportTarget, runEvalIOTraced, withEvalSession)
+import Nix.Eval.Policy (ImportFromDerivation (..))
 import Nix.Eval.Print (printAmbiguous)
 import Nix.Eval.Symbol (symbolIntern)
 import Nix.Eval.Types (mkStrBytes, mkThunkBc)
@@ -298,17 +299,28 @@ exprOrigin :: SourceOrigin
 exprOrigin = SourceText "<expr>"
 
 -- | The evaluation policy for this run: the config cascade's settings,
--- with each flag turning its setting on.  A flag only turns a setting on,
--- so a machine configured for pure evaluation stays that way whatever the
--- command line says, which is the direction a confinement should fail in.
+-- with each flag moving its setting from the default.  A flag only moves
+-- a setting that way, so a machine configured for pure evaluation, or
+-- with import from derivation off, stays that way whatever the command
+-- line says, which is the direction a confinement should fail in.
 evalPolicyFor :: CliOpts -> NixConfig -> EvalPolicy
 evalPolicyFor opts config =
   EvalPolicy
     { epRestrictEval = optRestrictEval opts || ncRestrictEval config,
       epPureEval = optPureEval opts || ncPureEval config,
       epAllowedUris = ncAllowedUris config,
-      epTraceVerbose = optTraceVerbose opts || ncTraceVerbose config
+      epTraceVerbose = optTraceVerbose opts || ncTraceVerbose config,
+      epImportFromDerivation = importFromDerivationFor opts config
     }
+
+-- | What @allow-import-from-derivation@ and @trace-import-from-derivation@
+-- say for this run.  Off, by the flag or the configuration, the trace is
+-- moot, as upstream's has no effect then (eval-settings.hh:204 at 2.34.9).
+importFromDerivationFor :: CliOpts -> NixConfig -> ImportFromDerivation
+importFromDerivationFor opts config
+  | optNoAllowImportFromDerivation opts || not (ncAllowImportFromDerivation config) = RefuseImportFromDerivation
+  | ncTraceImportFromDerivation config = TraceImportFromDerivation
+  | otherwise = AllowImportFromDerivation
 
 -- | Run an action in the evaluation session of one command
 -- ('withEvalSession'), its state's roots allowed.  Every value the

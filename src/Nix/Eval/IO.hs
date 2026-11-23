@@ -99,7 +99,7 @@ import Nix.Eval.Context (contextRequest)
 import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), allowPathIn, forbiddenPathMessage, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, noAllowedPaths, pathComponents, pathsRestricted, uriAccess)
 import Nix.Eval.RealiseContext (ContextRefusal (..), ContextRequest (..), PendingOrigin (..), Plan (..), SessionMode (..), firstInvalidPath, planRealisation, referenceClosure)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
-import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetKeys, bytesToTextLossy, evaluated, marshalLambda, pathCell, primopCell, readComputed, readPending, storePathOrThrow, stringCell, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
+import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetKeys, bytesToTextLossy, evaluated, marshalLambda, pathCell, primopCell, readComputed, readPending, storePathOrThrow, stringCell, warnMessage, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
@@ -642,7 +642,8 @@ instance MonadEval EvalIO where
   -- answer.  A path that is not valid is refused before any derivation is
   -- read; each output's path is then read from its derivation, the one
   -- this session recorded or the store's, and the plan carried out
-  -- ("Nix.Eval.RealiseContext").
+  -- ("Nix.Eval.RealiseContext"), after the warning it gives, as upstream
+  -- warns before it builds.
   realiseContext ctx = do
     st <- EvalIO ask
     pending <- pendingPaths
@@ -655,7 +656,11 @@ instance MonadEval EvalIO where
       Nothing -> do
         outputPaths <- Map.fromList . catMaybes <$> traverse outputPathOf (crOutputs request)
         validOutputs <- validAmong queries (Set.fromList (Map.elems outputPaths))
-        either (pure . Left) (realisePlan (esStore st) queries) (planRealisation mode pending (valid <> validOutputs) outputPaths request)
+        case planRealisation (epImportFromDerivation (esPolicy st)) mode pending (valid <> validOutputs) outputPaths request of
+          Left refusal -> pure (Left refusal)
+          Right plan -> do
+            mapM_ warnMessage (planWarning plan)
+            realisePlan (esStore st) queries plan
     where
       outputPathOf named@(drv, output) = do
         recorded <- lookupSessionDrv (canonicalStorePathText drv)

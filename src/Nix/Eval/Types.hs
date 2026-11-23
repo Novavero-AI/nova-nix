@@ -129,6 +129,7 @@ module Nix.Eval.Types
 
     -- * Evaluation monad
     MonadEval (..),
+    warnMessage,
     PathExistence (..),
     EvalPolicy (..),
     unrestrictedPolicy,
@@ -1408,6 +1409,11 @@ typeOfValue val = case val of
 -- ---------------------------------------------------------------------------
 -- Evaluation monad
 -- ---------------------------------------------------------------------------
+
+-- | Upstream's @warn@ from its own code rather than an expression, which
+-- its logger prefixes @warning:@ (logging.cc:34-37 at 2.24.9).
+warnMessage :: (MonadEval m) => Text -> m ()
+warnMessage = traceMessage . ("warning: " <>)
 
 -- | What @builtins.pathExists@ asks of a path, decided from the
 -- argument's spelling as upstream's @prim_pathExists@ decides it

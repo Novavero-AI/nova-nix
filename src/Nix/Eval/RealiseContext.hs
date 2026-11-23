@@ -7,8 +7,9 @@
 --
 -- Every path the context names must be valid, checked in upstream's
 -- order, and the first that is not stops the read with upstream's
--- @path \'...\' is not valid@.  Then each output the context names is
--- built or substituted.
+-- @path \'...\' is not valid@.  Then, unless @allow-import-from-derivation@
+-- refuses a context that names an output, each output it names is built or
+-- substituted (primops.cc:79-83 at 2.24.9, :108-117 at 2.34.9).
 --
 -- A read-write session, a build's, adds what evaluation has fetched,
 -- written or named and the store does not hold yet before that, so all
@@ -52,6 +53,7 @@ import Data.Maybe (mapMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import Nix.Eval.Policy (ImportFromDerivation (..))
 import Nix.Store.Path (StorePath, defaultStoreDir, storePathBasename, storePathToText)
 
 -- ---------------------------------------------------------------------------
@@ -114,7 +116,10 @@ data Plan = Plan
     -- | Every output the context names, whose closures become readable
     -- once they are realised, as upstream allows them (@allowClosure@,
     -- primops.cc:152-156 at 2.34.9).
-    planOutputs :: ![StorePath]
+    planOutputs :: ![StorePath],
+    -- | The warning @trace-import-from-derivation@ prints before anything
+    -- is realised, where it is on and an output is named.
+    planWarning :: !(Maybe Text)
   }
   deriving (Eq, Show)
 
@@ -126,24 +131,33 @@ data Plan = Plan
 -- make, a read-only one about all of them, and about the outputs.
 --
 -- A path that is not valid is refused first, in the request's order
--- ('PathNotValid').  Each derivation is then realised for its outputs
--- that are not valid, and for any output name whose path is not known,
+-- ('PathNotValid').  A request that names an output is then refused when
+-- import from derivation is off ('ImportFromDerivationOff'), whether or
+-- not the output is valid, and warned of when it is traced, each naming
+-- the first output in upstream's order.  Each derivation is then realised
+-- for its outputs that are not valid, and for any output name whose path is not known,
 -- which the realisation refuses as upstream's worker refuses an output a
 -- derivation does not have.  A read-write session adds what evaluation
 -- made first when it realises anything or the request names any of it,
 -- so the read finds it.
 planRealisation ::
+  ImportFromDerivation ->
   SessionMode ->
   Map StorePath PendingOrigin ->
   Set StorePath ->
   Map (StorePath, Text) StorePath ->
   ContextRequest ->
   Either ContextRefusal Plan
-planRealisation mode pending valid outputPaths request =
+planRealisation imports mode pending valid outputPaths request =
   case firstInvalidPath mode pending valid request of
     Just path -> Left (PathNotValid path)
-    Nothing -> Right (Plan (mode == ReadWrite && (namesPending || not (null builds))) builds known)
+    Nothing -> case (imports, crOutputs request) of
+      (_, []) -> Right (planned Nothing)
+      (RefuseImportFromDerivation, (drv, output) : _) -> Left (ImportFromDerivationOff drv output)
+      (AllowImportFromDerivation, _) -> Right (planned Nothing)
+      (TraceImportFromDerivation, (drv, output) : _) -> Right (planned (Just (importFromDerivationWarning drv output)))
   where
+    planned = Plan (mode == ReadWrite && (namesPending || not (null builds))) builds known
     readable = readableIn mode pending valid
     namesPending = any (`Map.member` pending) (crPaths request)
     resolved = [(named, Map.lookup named outputPaths) | named <- crOutputs request]
@@ -193,6 +207,9 @@ referenceClosure references = go Set.empty
 data ContextRefusal
   = -- | This path is not valid, and the session cannot make it so.
     PathNotValid !StorePath
+  | -- | This output of this derivation is the first the context names,
+    -- and @allow-import-from-derivation@ is off.
+    ImportFromDerivationOff !StorePath !Text
   | -- | Adding or realising failed, with the message the failure reports.
     RealisationFailed !Text
   deriving (Eq, Show)
@@ -203,7 +220,20 @@ data ContextRefusal
 contextRefusalMessage :: ContextRefusal -> Text
 contextRefusalMessage = \case
   PathNotValid path -> "path '" <> storePathToText defaultStoreDir path <> "' is not valid"
+  ImportFromDerivationOff drv output -> "cannot build '" <> builtText drv output <> "' during evaluation because the option 'allow-import-from-derivation' is disabled"
   RealisationFailed message -> message
+
+-- | The warning @trace-import-from-derivation@ gives, naming the first
+-- output a context names (primops.cc:115-116 at 2.34.9).
+importFromDerivationWarning :: StorePath -> Text -> Text
+importFromDerivationWarning drv output = "built '" <> builtText drv output <> "' during evaluation due to an import from derivation"
+
+-- | An output of a derivation as upstream renders a built derived path,
+-- the derivation's path, a caret and the output's name
+-- (@DerivedPath::Built::to_string@, derived-path.cc:108-113 at 2.24.9,
+-- :36-39 at 2.34.9).
+builtText :: StorePath -> Text -> Text
+builtText drv output = storePathToText defaultStoreDir drv <> "^" <> output
 
 -- | A refusal of a search path entry's context as @builtins.findFile@
 -- words it: a path that is not valid names the entry and the path's base
