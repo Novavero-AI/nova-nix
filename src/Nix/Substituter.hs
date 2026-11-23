@@ -839,27 +839,34 @@ unservedNar narUrl status = case statusError status of
   Misc -> Left (fetchStatusFailure narUrl status)
   Transient -> Left (fetchStatusFailure narUrl status)
 
--- | The byte cap on the compressed NAR body, derived from the SIGNED
--- NarSize: the Ed25519 fingerprint covers StorePath, NarHash, NarSize,
--- and references - not FileSize - so the unsigned FileSize may only
--- LOWER the cap, never raise it.  A rewritten FileSize on an otherwise
--- validly-signed narinfo must not buy an unbounded download.
+-- | The byte cap on the compressed NAR body: the 'compressedBodyCeiling'
+-- of the SIGNED NarSize.  The Ed25519 fingerprint covers StorePath,
+-- NarHash, NarSize and references, so no unsigned field moves the cap,
+-- and a narinfo whose signature verifies cannot buy a larger download.
+--
+-- FileSize takes no part.  Upstream reads it only for progress and
+-- download statistics (@build\/substitution-goal.cc@ and @misc.cc@ at
+-- 2.35.4, @build\/substitution-goal.cc@ and @store-api.cc@ at 2.24.9) and
+-- checks a substituted NAR against NarHash and NarSize alone, as
+-- 'consumeNarStream' does.  A cache that names a NAR by its NarHash, as
+-- cache.nixos.org names its zstd NARs, serves one file for every store
+-- path with the same NAR, and an upload that compresses that NAR again
+-- replaces the file whose FileSize and FileHash an earlier narinfo
+-- records.
 downloadCapFor :: NarInfo.NarInfo -> Either Text Int
 downloadCapFor narInfo
   | narSize < 0 || narSize > toInteger (maxBound :: Int) =
       Left ("narinfo declares an unusable NAR size: " <> T.pack (show narSize))
   | otherwise =
-      let signedCeiling = compressedBodyCeiling narSize
-          capped = maybe signedCeiling (min signedCeiling . max 0) (NarInfo.niFileSize narInfo)
-       in Right (fromInteger (min capped (toInteger (maxBound :: Int))))
+      Right (fromInteger (min (compressedBodyCeiling narSize) (toInteger (maxBound :: Int))))
   where
     narSize = NarInfo.niNarSize narInfo
 
 -- | The most a compressed NAR body may legitimately exceed its NarSize
 -- by: xz and zstd expand incompressible input by well under one
 -- percent of framing overhead, so a 1/64 (~1.6%) margin plus a fixed
--- floor for small NARs is generous for any real codec, while a
--- hostile FileSize claiming orders of magnitude more is refused.
+-- floor for small NARs is generous for any real codec, while a body
+-- orders of magnitude larger is refused.
 compressedBodyCeiling :: Integer -> Integer
 compressedBodyCeiling narSize =
   narSize + max compressionOverheadFloorBytes (narSize `div` compressionOverheadDivisor)
@@ -981,8 +988,8 @@ narStreamFailure failure = case failure of
   NarStreamRefused err -> FatalFailure err
   NarStreamMalformed msg -> TransientFailure ("NAR stream parse failed: " <> msg)
 
--- | Stream an HTTP body as a chunk source bounded by the download cap
--- 'downloadCapFor' derived from the signed NarSize -
+-- | Stream an HTTP body as a chunk source bounded by the download cap,
+-- which 'downloadCapFor' derives from the signed NarSize alone -
 -- 'readBodyCapped'\'s discipline without the buffering.  Exceeding the
 -- cap throws t'StreamAbort'; the attempt boundary converts it back to
 -- the pipeline's error channel.
