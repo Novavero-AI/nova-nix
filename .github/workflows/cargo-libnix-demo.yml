@@ -223,12 +223,27 @@ jobs:
           ghc-version: ${{ steps.setup.outputs.ghc-version }}
           cabal-version: ${{ steps.setup.outputs.cabal-version }}
 
+      # Laid out as a release archive is, which a sandboxed build needs:
+      # the helper beside nova-nix, and a static busybox at
+      # libexec/nova-nix/sh, which nova-nix gives a sandboxed build as
+      # /bin/sh.  Ubuntu's AppArmor denies an unprivileged user namespace
+      # its capabilities unless a profile with a userns rule covers the
+      # program, so a profile covers the helper alone.
       - name: Build nova-nix
         run: |
           set -euo pipefail
-          cabal build exe:nova-nix
-          bin=$(cabal list-bin exe:nova-nix)
-          echo "NOVA_NIX=$bin" >> "$GITHUB_ENV"
+          cabal build exe:nova-nix exe:nova-nix-sandbox
+          prefix="$RUNNER_TEMP/nova-nix"
+          mkdir -p "$prefix/bin" "$prefix/libexec/nova-nix"
+          cp "$(cabal list-bin exe:nova-nix)" "$(cabal list-bin exe:nova-nix-sandbox)" "$prefix/bin/"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends busybox-static
+          cp "$(command -v busybox)" "$prefix/libexec/nova-nix/sh"
+          profile="$RUNNER_TEMP/nova-nix-sandbox.apparmor"
+          printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' \
+            "profile nova-nix-sandbox-demo $prefix/bin/nova-nix-sandbox flags=(unconfined) {" '  userns,' '}' > "$profile"
+          sudo apparmor_parser -r "$profile"
+          echo "NOVA_NIX=$prefix/bin/nova-nix" >> "$GITHUB_ENV"
 
       # nova-nix's default store is /nix/store, which it creates when /nix
       # is the runner's.  No upstream Nix is installed here, so it is
@@ -301,10 +316,14 @@ jobs:
 
       # Runs whether or not the evaluation step succeeded: the build
       # evaluates target itself, and a failure shows where that stops.
+      # Every build is sandboxed, and one the sandbox cannot hold fails
+      # rather than falling back to an unsandboxed build.
       - name: Build target with nova-nix
         id: build
         continue-on-error: true
         timeout-minutes: 45
+        env:
+          NIX_CONFIG: sandbox-fallback = false
         run: |
           set -euo pipefail
           {
