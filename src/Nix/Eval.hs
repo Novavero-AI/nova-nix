@@ -129,7 +129,7 @@ import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import Data.Word (Word32, Word8)
 import Foreign.Ptr (Ptr)
-import Nix.Derivation (Derivation (..), DerivationOutput (..), textToPlatform, toATerm, toATermForHash)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), drvFile, drvFileATerm, drvFileDerivation, drvFilePath, inputAddressed, textToPlatform, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAttrs, structuredAttrsKey)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.Builtin (Builtin, builtinName)
@@ -233,7 +233,7 @@ import Nix.Expr.Types
     Expr (..),
     UnaryOp (..),
   )
-import Nix.Hash (FileIngestionMethod (..), base64HashLen, base64ToBytes, bytesToHexText, fileIngestionPrefix, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, makeOutputPath, makeTextPath, nix32HashLen, sha256Digest)
+import Nix.Hash (FileIngestionMethod (..), base64HashLen, base64ToBytes, bytesToHexText, fileIngestionPrefix, hashAlgoBytes, hashPlaceholder, hexHashLen, hexToBytes, makeFixedOutputPath, nix32HashLen, sha256Digest)
 import Nix.Json (IntegerRange (..), Json (..), JsonBuilder (..), parseJsonInto, renderJson)
 import Nix.Parser (ParsedSource)
 import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, isInStoreText, parseStorePath, parseStorePathBaseName, storePathBaseNameError, storePathNameErrorText, storePathNameReasonText, storePathNameUpstreamText, storePathToText)
@@ -4730,8 +4730,6 @@ builtinDerivationStrict (VAttrs attrs) = do
       inputSrcs = Set.toList (Set.fromList (extractInputSrcs fullContext) <> deepClosure)
       platform = textToPlatform system
       baseEnv = Map.fromList drvEnvPairs
-      drvRefs = inputSrcs ++ Map.keys inputDrvs
-      drvFileName = drvName <> ".drv"
       -- Build a Derivation sharing this call's inputs/platform/builder/args.
       mkDrv outs env =
         Derivation
@@ -4743,8 +4741,8 @@ builtinDerivationStrict (VAttrs attrs) = do
             drvArgs = dfArgs fields,
             drvEnv = env
           }
-      -- Output carrying only its name; the path is masked at render time.
-      maskedOutput name = DerivationOutput name maskedOutputPath "" ""
+      -- An output carrying only its name, for 'inputAddressed' to fill in.
+      pendingOutput name = DerivationOutput name maskedOutputPath "" ""
 
   -- Fixed-output derivations (fetchurl etc.) are content-addressed and hash
   -- via the @fixed:out:@ scheme; input-addressed derivations recurse through
@@ -4774,7 +4772,7 @@ builtinDerivationStrict (VAttrs attrs) = do
   -- composition (drvName <> ".drv", drvName-output past the length cap),
   -- which only the constructors see, and which they refuse in upstream's
   -- words, naming the path.
-  (outPaths, completeDrv, moduloHash) <- case mFixed of
+  (file, moduloHash) <- case mFixed of
     Just (foAlgo, foMethod, foDigest) -> do
       foPath <- storePathOrThrow (makeFixedOutputPath drvName foAlgo foMethod foDigest)
       let foPathText = storePathToText defaultStoreDir foPath
@@ -4783,49 +4781,37 @@ builtinDerivationStrict (VAttrs attrs) = do
           foModulo =
             sha256Digest
               (TE.encodeUtf8 ("fixed:out:" <> algoField <> ":" <> foHashHex <> ":" <> foPathText))
-          contents =
-            mkDrv
-              [DerivationOutput "out" foPath algoField foHashHex]
-              (Map.insert "out" (TE.encodeUtf8 foPathText) baseEnv)
-      pure ([("out", foPathText)], contents, foModulo)
+      file <-
+        storePathOrThrow . drvFile drvName $
+          mkDrv
+            [DerivationOutput "out" foPath algoField foHashHex]
+            (Map.insert "out" (TE.encodeUtf8 foPathText) baseEnv)
+      pure (file, foModulo)
     Nothing -> do
       inputSubst <- mapM resolveInputModulo (Map.toList inputDrvs)
-      let maskedEnv = foldr (`Map.insert` "") baseEnv outputNames
-          maskedDrv = mkDrv (map maskedOutput outputNames) maskedEnv
-          -- Masked modulo hash yields this derivation's own output paths.
-          moduloMasked = sha256Digest (toATermForHash True (Just inputSubst) maskedDrv)
-      -- In name order, as upstream walks its output set, so a refusal
-      -- names the output upstream's names.
-      outStorePaths <-
-        mapM
-          (\n -> (,) n <$> storePathOrThrow (makeOutputPath n moduloMasked drvName))
-          (sort outputNames)
-      let outPathTexts = [(n, storePathToText defaultStoreDir sp) | (n, sp) <- outStorePaths]
-          realEnv = foldr (\(n, t) e -> Map.insert n (TE.encodeUtf8 t) e) baseEnv outPathTexts
-          contents = mkDrv [DerivationOutput n sp "" "" | (n, sp) <- outStorePaths] realEnv
-          -- Unmasked modulo hash (real outputs, inputs substituted) cached for
-          -- when this derivation is itself an input to another.
-          moduloUnmasked = sha256Digest (toATermForHash False (Just inputSubst) contents)
-      pure (outPathTexts, contents, moduloUnmasked)
+      file <- storePathOrThrow (inputAddressed drvName inputSubst (mkDrv (map pendingOutput outputNames) baseEnv))
+      -- The unmasked modulo hash (real outputs, inputs substituted), cached
+      -- for when this derivation is itself an input to another.
+      pure (file, sha256Digest (toATermForHash False (Just inputSubst) (drvFileDerivation file)))
 
   -- The .drv's bytes are rendered once, as upstream's writeDerivation hashes
   -- and writes the one unparse.  They are recorded whole so the build driver
   -- can materialize the entire input-.drv closure before building; bottom-up
   -- eval guarantees every transitive input is recorded by the time a
   -- dependent is.
-  let aterm = toATerm completeDrv
-  drvSP <- storePathOrThrow (makeTextPath drvFileName (sha256Digest aterm) drvRefs)
-  let drvPathText = storePathToText defaultStoreDir drvSP
+  let drvSP = drvFilePath file
+      drvPathText = storePathToText defaultStoreDir drvSP
   cacheDrvHash drvPathText (bytesToHexText moduloHash)
-  recordDrvAterm drvPathText aterm
+  recordDrvAterm drvPathText (drvFileATerm file)
 
   -- drvPath carries the whole derivation (upstream's DrvDeep); an output
   -- path carries that one output of it.
   let drvPathCtx = StringContext (Set.singleton (SCAllOutputs drvSP))
       outPathCtx outName = StringContext (Set.singleton (SCDrvOutput drvSP outName))
-      outputEntry (outName, outP) = (outName, VStr (TE.encodeUtf8 outP) (outPathCtx outName))
+      outputEntry output =
+        (doName output, VStr (TE.encodeUtf8 (storePathToText defaultStoreDir (doPath output))) (outPathCtx (doName output)))
   valuesSet SetDerivationStrict . Map.fromList $
-    ("drvPath", VStr (TE.encodeUtf8 drvPathText) drvPathCtx) : map outputEntry outPaths
+    ("drvPath", VStr (TE.encodeUtf8 drvPathText) drvPathCtx) : map outputEntry (drvOutputs (drvFileDerivation file))
 builtinDerivationStrict other =
   throwEvalError ("derivation: expected a set, got " <> typeName other)
 
