@@ -3,6 +3,7 @@
 #ifdef _WIN32
 
 #include <windows.h>
+#include <sddl.h>
 #include <winternl.h>
 
 /* FileCaseSensitiveInformation and its flag are absent from older SDK and
@@ -53,6 +54,55 @@ int nn_dir_set_case_sensitive(const wchar_t *path) {
                                 NN_FILE_CASE_SENSITIVE_INFORMATION);
   CloseHandle(dir);
   return status >= 0 ? 1 : 0;
+}
+
+unsigned long nn_token_user_sid(wchar_t **sid, const char **failed) {
+  HANDLE token;
+  /* A TOKEN_USER is followed in the buffer by the SID it points at, which
+   * is at most SECURITY_MAX_SID_SIZE bytes, so one call fills it.  The
+   * union aligns the buffer for the structure. */
+  union {
+    TOKEN_USER user;
+    BYTE bytes[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+  } buffer;
+  DWORD size;
+  DWORD error = ERROR_SUCCESS;
+
+  *sid = NULL;
+  *failed = NULL;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+    *failed = "OpenProcessToken";
+    return GetLastError();
+  }
+  if (!GetTokenInformation(token, TokenUser, &buffer, sizeof buffer, &size)) {
+    *failed = "GetTokenInformation";
+    error = GetLastError();
+  } else if (!ConvertSidToStringSidW(buffer.user.User.Sid, sid)) {
+    *failed = "ConvertSidToStringSidW";
+    error = GetLastError();
+    *sid = NULL;
+  }
+  CloseHandle(token);
+  return error;
+}
+
+unsigned long nn_dir_create_sddl(const wchar_t *path, const wchar_t *sddl) {
+  PSECURITY_DESCRIPTOR descriptor = NULL;
+  SECURITY_ATTRIBUTES attributes;
+  DWORD error = ERROR_SUCCESS;
+
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+          sddl, SDDL_REVISION_1, &descriptor, NULL)) {
+    return GetLastError();
+  }
+  attributes.nLength = sizeof attributes;
+  attributes.lpSecurityDescriptor = descriptor;
+  attributes.bInheritHandle = FALSE;
+  if (!CreateDirectoryW(path, &attributes)) {
+    error = GetLastError();
+  }
+  LocalFree(descriptor);
+  return error;
 }
 
 #else /* !_WIN32 */

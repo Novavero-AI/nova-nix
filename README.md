@@ -179,9 +179,10 @@ In that case, give those commands a store in your home directory,
 `--store ~/nix/store`, as the examples below do.
 
 **Windows.** The store is `C:\nix\store`. The installer creates `C:\nix` so
-that only you, SYSTEM and Administrators can change it. A `C:\nix` that
-nova-nix creates itself inherits the drive root's permissions, so every
-signed-in user can modify it.
+that only you, SYSTEM and Administrators can change it, and nova-nix creates a
+store directory with the same permissions. A `C:\nix` that nova-nix creates
+itself grants other users nothing; the installer accepts it and gives it its
+own permissions.
 Turn on Developer Mode (Settings, For developers): nova-nix makes native
 symlinks, inside store paths and for the `result` link a build makes, and
 Windows allows them only in Developer Mode or an elevated shell. Without

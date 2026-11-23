@@ -50,6 +50,7 @@ import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Tuple (swap)
 import Data.Word (Word16, Word32, Word64, Word8)
 import qualified Database.SQLite.Simple as SQL
+import DirDacl (Dacl (..), DaclEntry (..), directoryDacl, processUserSid)
 import Foreign.C.Error (Errno (..), eACCES, eISDIR, eNOENT, eNOTDIR)
 import Foreign.C.Types (CChar, CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca)
@@ -120,6 +121,7 @@ import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), PushS
 import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), cacheInfoFileName, cacheInfoText, checkCacheInfo, ed25519SeedBytes, loadSecretKeyFile, pushTarget, pushToDirectory, signNarInfo)
 import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv, writeDrvClosure)
+import Nix.Store.Access (DirAccess (..), accessSddl, sidFromText)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
@@ -148,7 +150,7 @@ import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import qualified System.FileLock as FileLock
 import System.FilePath (dropDrive, joinPath, makeRelative, pathSeparator, searchPathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
 import System.IO (BufferMode (..), IOMode (..), hClose, hPutStrLn, hSetBuffering, stderr, stdout, withBinaryFile)
-import System.IO.Error (ioeGetErrorString, isAlreadyExistsError, mkIOError, resourceVanishedErrorType)
+import System.IO.Error (ioeGetErrorString, ioeGetFileName, isAlreadyExistsError, mkIOError, resourceVanishedErrorType)
 import qualified System.Info as SI
 import System.OsPath (OsPath)
 import qualified System.OsPath as OP
@@ -13315,6 +13317,202 @@ testBuildDirIO = do
           built result $ do
             remains <- Dir.doesPathExist (expectedDir store)
             pure (assertEqual "the directory after the build" False remains)
+    ]
+
+-- | Who a directory the store creates is open to ("Nix.Store.Access").
+-- The SDDL each is created with on Windows is checked on every
+-- platform.  On Windows a new store's directories, the parents made for
+-- them and a build directory are read back through the API: protected,
+-- with nothing inherited, and granting what install-nova-nix grants on
+-- @C:\\nix@, that less Users' entry, or the user alone, so no entry names
+-- Authenticated Users or Everyone.
+testStoreAccessIO :: IO [Bool]
+testStoreAccessIO = do
+  putStrLn "store/access"
+  tmpBase <- getTemporaryDirectory
+  let scratch label = tmpBase </> ("nova-nix-test-store-access-" <> label)
+      fresh label = bracket_ (forceRemoveIfExists (scratch label)) (forceRemoveIfExists (scratch label))
+      someUser = "S-1-5-21-1-2-3-1001"
+      -- The SDDL a directory of the access gets for the user, or the
+      -- refusal, which no expected SDDL equals.
+      sddlFor user access = maybe ("refused: " <> user) (`accessSddl` access) (sidFromText user)
+      -- An SDDL's entries, each as its fields, when it is a protected
+      -- DACL of entries and nothing else.
+      sddlEntries sddl = map (T.splitOn ";") . T.splitOn ")(" <$> (T.stripPrefix "D:P(" sddl >>= T.stripSuffix ")")
+      sddlEntry rights sid = ["A", "OICI", rights, "", "", sid]
+      trustedEntries user =
+        [sddlEntry "0x1f01ff" user | user /= localSystem]
+          <> [sddlEntry "0x1f01ff" localSystem, sddlEntry "0x1f01ff" "S-1-5-32-544"]
+      intendedEntries user access = case access of
+        StoreAccess -> trustedEntries user <> [sddlEntry "0x1200a9" "S-1-5-32-545"]
+        ParentAccess -> trustedEntries user
+        OwnerAccess -> [sddlEntry "0x1f01ff" user]
+      -- Every access renders the accepted SID as the trustee of exactly
+      -- the entries it intends, and nothing else.
+      rendersIntended user sid =
+        QC.conjoin [sddlEntries (accessSddl sid access) QC.=== Just (intendedEntries user access) | access <- [StoreAccess, ParentAccess, OwnerAccess]]
+      decimalField = T.pack . show <$> (QC.arbitrary :: QC.Gen Word32)
+      -- An authority of 2^32 or more, as ConvertSidToStringSidW writes
+      -- one: its top digit is not zero.
+      wideAuthority = do
+        top <- QC.elements "123456789abcdefABCDEF"
+        rest <- QC.vectorOf 11 (QC.elements "0123456789abcdefABCDEF")
+        pure (T.pack ("0x" <> (top : rest)))
+      genSid = do
+        authority <- QC.frequency [(8, decimalField), (1, wideAuthority), (1, pure "5")]
+        count <- QC.choose (1, 15)
+        subauthorities <- QC.vectorOf count decimalField
+        QC.frequency [(9, pure ("S-1-" <> authority <> foldMap ("-" <>) subauthorities)), (1, pure localSystem)]
+      -- A SID with something put into it: an SDDL entry, a separator,
+      -- a digit or a letter, anywhere in it.
+      genAltered = do
+        sid <- genSid
+        position <- QC.choose (0, T.length sid)
+        inserted <- QC.elements [")(A;OICI;FA;;;WD", ")", "(", ";", "-", "0", "7", "x", "S", " ", "a"]
+        pure (T.take position sid <> inserted <> T.drop position sid)
+      property prop = do
+        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} prop
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+      -- FILE_ALL_ACCESS, and FILE_GENERIC_READ | FILE_GENERIC_EXECUTE.
+      fullControl = 0x1F01FF
+      readAndExecute = 0x1200A9
+      localSystem = "S-1-5-18"
+      -- OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE, without
+      -- INHERITED_ACE: passed down to what is made below, and not taken
+      -- from the parent.
+      passedDown = 0x3
+      allow sid mask = DaclEntry 0 passedDown mask (Just sid)
+      parentEntries user =
+        [allow user fullControl | user /= localSystem]
+          <> [allow localSystem fullControl, allow "S-1-5-32-544" fullControl]
+      storeEntries user = parentEntries user <> [allow "S-1-5-32-545" readAndExecute]
+      -- Entries compare as a set: their order grants nothing.
+      carries label expected path = do
+        dacl <- directoryDacl path
+        pure $ case dacl of
+          Nothing -> Fail (label <> ": no DACL was read")
+          Just found -> assertEqual label (Dacl True (sort expected)) (Dacl (daclProtected found) (sort (daclEntries found)))
+      onWindows name check
+        | SI.os /= "mingw32" = True <$ putStrLn ("  SKIP  " <> T.unpack name <> ": a POSIX directory has no DACL")
+        | otherwise = runTestM name $ do
+            user <- processUserSid
+            maybe (pure (Fail "no user SID was read")) check user
+  sequence
+    [ runTest "a store directory's DACL is protected, with full control for the user, SYSTEM and Administrators and read and execute for Users, each passed down" $
+        assertEqual
+          "SDDL"
+          "D:P(A;OICI;0x1f01ff;;;S-1-5-21-1-2-3-1001)(A;OICI;0x1f01ff;;;S-1-5-18)(A;OICI;0x1f01ff;;;S-1-5-32-544)(A;OICI;0x1200a9;;;S-1-5-32-545)"
+          (sddlFor someUser StoreAccess),
+      runTest "a parent made for a store has a protected DACL with full control for the user, SYSTEM and Administrators alone, passed down" $
+        assertEqual
+          "SDDL"
+          "D:P(A;OICI;0x1f01ff;;;S-1-5-21-1-2-3-1001)(A;OICI;0x1f01ff;;;S-1-5-18)(A;OICI;0x1f01ff;;;S-1-5-32-544)"
+          (sddlFor someUser ParentAccess),
+      runTest "a store directory's DACL names SYSTEM once when nova-nix runs as SYSTEM" $
+        assertEqual
+          "SDDL"
+          "D:P(A;OICI;0x1f01ff;;;S-1-5-18)(A;OICI;0x1f01ff;;;S-1-5-32-544)(A;OICI;0x1200a9;;;S-1-5-32-545)"
+          (sddlFor localSystem StoreAccess),
+      runTest "a build directory's DACL is protected, with full control for the user alone, passed down" $
+        assertEqual "SDDL" "D:P(A;OICI;0x1f01ff;;;S-1-5-21-1-2-3-1001)" (sddlFor someUser OwnerAccess),
+      runTest "a SID of the form S-1-I-S... is accepted, its authority in decimal or wide hexadecimal" $
+        assertEqual
+          "refused"
+          []
+          ( filter
+              (isNothing . sidFromText)
+              [ "S-1-5-18",
+                "S-1-5-32-544",
+                "S-1-5-21-1-2-3-1001",
+                "S-1-0-0",
+                "S-1-5-4294967295",
+                "S-1-4294967295-1",
+                "S-1-0x123456789abc-1",
+                "S-1-0x123456789ABC-1",
+                "S-1-5" <> T.replicate 15 "-1"
+              ]
+          ),
+      -- The first is how a trustee would smuggle an Everyone entry into
+      -- the DACL.
+      runTest "anything else is refused as a SID, an SDDL entry put after one among them" $
+        assertEqual
+          "accepted"
+          []
+          ( filter
+              (isJust . sidFromText)
+              [ "S-1-5-21-1-2-3-1001)(A;OICI;FA;;;WD",
+                "x)(A;OICI;FA;;;WD",
+                "",
+                "S-1-5",
+                "S-1-5-",
+                "S-1-5--18",
+                "S-1-5-018",
+                "S-1-05-18",
+                "S-1-5-+18",
+                "s-1-5-18",
+                "S-2-5-18",
+                " S-1-5-18",
+                "S-1-5-18 ",
+                "S-1-4294967296-1",
+                "S-1-5-4294967296",
+                "S-1-0x000000000005-18",
+                "S-1-0x12345678abc-1",
+                "S-1-0x12345678abcg-1",
+                "S-1-5" <> T.replicate 16 "-1"
+              ]
+          ),
+      runTestM "every SID of the form S-1-I-S... is accepted and is the trustee of exactly the entries each access intends" $
+        property $
+          QC.forAll genSid $ \user ->
+            maybe (QC.counterexample ("refused " <> T.unpack user) False) (rendersIntended user) (sidFromText user),
+      runTestM "whatever is accepted as a SID, altered or arbitrary, is the trustee of exactly the entries each access intends" $
+        property $
+          QC.forAll (QC.oneof [genAltered, T.pack <$> QC.arbitrary]) $ \text ->
+            maybe (QC.property True) (rendersIntended text) (sidFromText text),
+      -- Two parents are missing, as C:\nix is at a drive root without
+      -- the installer, and one is made below the other.
+      onWindows "a new store's directories and the parents made for them carry a protected DACL with no entry for Authenticated Users or Everyone" $ \user ->
+        fresh "new" $
+          bracket (openStore (StoreDir (scratch "new" </> "nix" </> "store"))) closeStore $ \store -> do
+            let root = unStoreDir (stDir store)
+            outer <- carries "the outer parent" (parentEntries user) (scratch "new")
+            inner <- carries "the inner parent" (parentEntries user) (scratch "new" </> "nix")
+            storeDir <- carries "the store directory" (storeEntries user) root
+            stateDir <- carries "the state directory" (storeEntries user) (root </> metaDirName)
+            pure (outer `andThen` inner `andThen` storeDir `andThen` stateDir),
+      onWindows "a build directory carries a protected DACL granting the user alone" $ \user ->
+        fresh "build" $ do
+          createDirectoryIfMissing True (scratch "build")
+          let dir = scratch "build" </> "dir"
+          createBuildDir dir
+          carries "the build directory" [allow user fullControl] dir,
+      -- The open creates the store directory over the file and stops
+      -- there, the error naming the store directory.
+      onWindows "a file where the store directory would be fails the open with an already-exists error naming it" $ \_ ->
+        fresh "file" $ do
+          createDirectoryIfMissing True (scratch "file")
+          let root = scratch "file" </> "store"
+          BS.writeFile root "not a store"
+          outcome <- try (openStore (StoreDir root) >>= closeStore)
+          expected <- unStoreDir <$> canonicalStoreDir (StoreDir root)
+          pure $ case outcome of
+            Left err
+              | isAlreadyExistsError err -> assertEqual "the path the error names" (Just expected) (ioeGetFileName err)
+              | otherwise -> Fail ("expected an already-exists error, got: " <> T.pack (show (err :: IOException)))
+            Right () -> Fail "opened a store over a file",
+      -- The directory is made as the test's temporary directories are,
+      -- so it takes what its parent passes down; opening a store there
+      -- leaves that as it is.
+      onWindows "a store directory that already exists keeps its access control list" $ \_ ->
+        fresh "existing" $ do
+          let root = scratch "existing" </> "store"
+          createDirectoryIfMissing True root
+          before <- directoryDacl root
+          openStore (StoreDir root) >>= closeStore
+          after <- directoryDacl root
+          pure $
+            assertEqual "protected before the open" (Just False) (daclProtected <$> before)
+              `andThen` assertEqual "the DACL after the open" before after
     ]
 
 -- | A builder's standard output and standard error reach the build log
@@ -31430,6 +31628,7 @@ runSuite = do
           testDerivation,
           testTrivialBuildIO,
           testBuildDirIO,
+          testStoreAccessIO,
           testBuildLogIO,
           testSourceDateEpochIO,
           testBuildCoresIO,

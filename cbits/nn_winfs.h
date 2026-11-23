@@ -1,8 +1,10 @@
-/* Platform filesystem capabilities the store layer probes at runtime.
- * Windows-only functionality.  Every other platform compiles the constant
- * 0 stub because the cabal c-sources entry is unconditional and the C99
- * strict job lints every C file under cbits on Linux; the Haskell side
- * picks the platform's answer at compile time and never calls the stub. */
+/* Platform filesystem capabilities the store layer uses on Windows.
+ * The cabal c-sources entry is unconditional and the C99 strict job
+ * lints every C file under cbits on Linux, so every other platform
+ * compiles a constant 0 stub of the case-sensitivity call; the Haskell
+ * side picks the platform's answer at compile time and never calls it.
+ * The access-control calls are declared and defined on Windows alone,
+ * the only platform that calls them. */
 #ifndef NN_WINFS_H
 #define NN_WINFS_H
 
@@ -16,5 +18,24 @@
  * input (NAR trees choose which directories need it), so the failure
  * path is a live branch, never an assert. */
 int nn_dir_set_case_sensitive(const wchar_t *path);
+
+#ifdef _WIN32
+
+/* The SID of the user this process runs as, its token's user, in the
+ * string form ConvertSidToStringSidW writes ("S-1-5-21-..."), written to
+ * *sid for the caller to release with LocalFree.  Returns 0, or the
+ * Win32 error code of the call that failed, with *failed naming that
+ * call (a static string) and *sid NULL. */
+unsigned long nn_token_user_sid(wchar_t **sid, const char **failed);
+
+/* Create the directory at path with the security descriptor the SDDL
+ * string describes, in the one CreateDirectoryW call that makes it, so
+ * the directory never exists with the access control list its parent
+ * would pass down.  Returns 0, or the Win32 error code (a DWORD) of the
+ * step that failed: ERROR_ALREADY_EXISTS when anything already has the
+ * name, a file as well as a directory. */
+unsigned long nn_dir_create_sddl(const wchar_t *path, const wchar_t *sddl);
+
+#endif
 
 #endif

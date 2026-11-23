@@ -96,6 +96,7 @@ library
     Nix.Eval.CStatus
     Nix.Eval.CData
     Nix.Store
+    Nix.Store.Access
     Nix.Store.Path
     Nix.Store.Path.Internal
     Nix.Store.DB
@@ -169,17 +170,21 @@ library
   -- unpacking (Nix.Store.Exclusive), reading the environment as bytes on
   -- POSIX (Nix.Environment; getenv, as upstream reads it), where Windows
   -- reads it through base's UTF-16 API, marking a builder's log pipe
-  -- close-on-exec on POSIX (Nix.Builder.Log), creating a build
-  -- directory with mode 0700 on POSIX (Nix.Builder.BuildDir), and a
+  -- close-on-exec on POSIX (Nix.Builder.Log), creating a store or build
+  -- directory with its mode on POSIX, and on Windows raising a failure to
+  -- create one as the IOError base raises (Nix.Store.Access), and a
   -- registered path's modes, times and owner (Nix.Store.Metadata).
   -- Win32 2.12 is the first whose setFileTime leaves a time it is not
   -- given as it is; unix 2.8 is the first whose openFd takes creat and
-  -- cloexec in its flags.
+  -- cloexec in its flags.  advapi32 holds the token and
+  -- security-descriptor calls cbits/nn_winfs.c makes.
   if os(windows)
     build-depends:
         Win32             >= 2.12 && < 2.15
     other-modules:
         Nix.Store.Win32Path
+    extra-libraries:
+        advapi32
   else
     build-depends:
         unix              >= 2.8 && < 2.9
@@ -295,7 +300,7 @@ test-suite nova-nix-test
   type:             exitcode-stdio-1.0
   main-is:          Main.hs
   hs-source-dirs:   test
-  other-modules:    CacheFixture, HttpFixture, NodeStatus
+  other-modules:    CacheFixture, DirDacl, HttpFixture, NodeStatus
   default-language: Haskell2010
   default-extensions:
     OverloadedStrings
@@ -328,9 +333,17 @@ test-suite nova-nix-test
     , zlib                >= 0.7 && < 0.8
     , zstd                >= 0.1 && < 0.2
 
-  -- lstat for the store metadata tests (NodeStatus): a node's group and
-  -- other bits, and a symlink's own time.
-  if !os(windows)
+  -- On Windows the store access tests read a directory's DACL back
+  -- through advapi32 (DirDacl); elsewhere the store metadata tests read
+  -- lstat (NodeStatus): a node's group and other bits, and a symlink's
+  -- own time.
+  if os(windows)
+    c-sources:
+        test/cbits/nn_test_dacl.c
+    cc-options:       -std=c99 -Wall -Wextra -pedantic
+    extra-libraries:
+        advapi32
+  else
     build-depends:
         unix              >= 2.8 && < 2.9
 
