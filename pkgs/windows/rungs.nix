@@ -8,7 +8,7 @@
 # .github/workflows/ladder.yml).  A push to main publishes what each stage's
 # x64 job built to the public cache, and the jobs of a pull request or a
 # later push, in substitute mode (Ladder (mode) in
-# .github/workflows/ci.yml), take each rung from there.
+# .github/workflows/seed-ladder.yml), take each rung from there.
 # .github/cache/substitute-rungs.sh realises a stage's list with a cache as
 # a substituter, and fails the job when a rung the cache holds was built
 # all the same: each job's own list from the public cache in substitute

@@ -2,8 +2,9 @@ name: Cabal store
 description: >-
   Restore the Cabal store saved for a build plan, or else the newest one
   saved for the same GHC, and give the plan's key to save a store under.
-  caches.yml saves the stores, from main alone; CI's and Parity's jobs
-  restore them.  The key is haskell-actions/setup's (its
+  caches.yml saves the stores, from main alone; the jobs of CI, Parity,
+  Seed ladder and Public cache restore them.  The key is
+  haskell-actions/setup's (its
   docs/examples.md): what the store holds, the GHC and cabal versions, and
   a hash of the build plan that `cabal build --dry-run` writes to
   dist-newstyle/cache/plan.json.

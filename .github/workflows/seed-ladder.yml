@@ -1,0 +1,251 @@
+name: Seed ladder
+
+# The seed ladder, the rungs pkgs/windows builds from its 1,623-byte seed,
+# on each Windows leg Ladder (mode) names, each leg a call of ladder.yml.
+# No job here is a required check, and the merge queue runs none: the
+# queue merges without waiting for them, and the push to main that follows
+# runs the ladder on the commit the queue tested.
+on:
+  push:
+    branches: [main]
+  # No base-branch filter, as in ci.yml: a stacked pull request bases on
+  # its predecessor, not main, and runs the ladder all the same.
+  pull_request:
+  # seed.yml calls it daily and publish.yml for a release.
+  workflow_call:
+  # A from-seed run on demand, on any branch.
+  workflow_dispatch:
+
+# Drop the default GITHUB_TOKEN to read-only; nothing here writes via it.
+permissions:
+  contents: read
+
+# A newer push to a pull request supersedes the run in flight, so that one
+# is cancelled.  A run on main is not cancelled once it starts: it
+# publishes what it built to the public cache, and a cancelled publish
+# leaves the cache one run behind until the next push's run completes.
+# One still waiting when a newer push arrives is cancelled, as GitHub
+# cancels a group's pending run.  The newer run tests a tree that holds its
+# changes and, taking from the cache what it holds, builds and publishes
+# the rungs the cancelled run would have.  A dispatched run, which builds
+# every rung from the seed on ARM64 for hours, is not cancelled either, so
+# the next dispatch on its ref waits behind it.  The event is in the group
+# so that a run seed.yml calls on main neither waits behind nor cancels a
+# push's.  pr-closed.yml spells a pull request's group out to cancel its
+# run once it closes, so a change to the group changes it too.
+concurrency:
+  group: ladder-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# The public cache's address and signing key, as ci.yml and
+# public-cache.yml spell them (test/Main.hs holds the three to one of
+# each): the x64 leg on main publishes to it, every stage takes its
+# sources from it, and in substitute mode the rungs it holds.  Ladder
+# (mode) passes both to ladder.yml, which does not see this env.
+env:
+  CACHE_URL: https://cache.novavero.ai
+  CACHE_PUBLIC_KEY: cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Ladder (mode): whether and how this run builds the seed ladder.  Decided
+  # once a run by .github/cache/ladder-mode.sh, which has the rules, from
+  # the event, the ref and, for a pull request, the files it changes:
+  #
+  #   skip         a pull request that changes documentation alone.  No
+  #                ladder job runs.  None is a required check, and the
+  #                Stage0 legs in ci.yml, which are, still build their
+  #                chain from the seed.
+  #   substitute   any other pull request, and every push to main.  The
+  #                x64 leg takes each rung the public cache holds from it
+  #                and builds the ones it lacks: the ones the change alters,
+  #                and on main any that a push whose run was cancelled while
+  #                it waited never published.
+  #   seed         the daily run seed.yml calls, a dispatched run and a
+  #                release.  Both legs build every rung from the seed.
+  #
+  # A push to main publishes what its x64 leg holds, the rungs it built and
+  # the ones it took from the cache: a rung's store path, and so what the
+  # cache holds for it, is the same however it was built.  The ARM64 leg
+  # runs in seed mode alone; on every change, Stage0 (Windows ARM64) in
+  # ci.yml runs the seed chain under the x86 emulator.
+  #
+  # A pull request's changed files come from git, which needs no token and
+  # has no page limit.  A pull_request run checks out the merge commit
+  # GitHub makes of the pull request and its base, and that commit's first
+  # parent is the base, so the diff from it to the checkout is what the
+  # change does to the tree the jobs build.
+  # ---------------------------------------------------------------------------
+  ladder-mode:
+    name: Ladder (mode)
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.decide.outputs.mode }}
+      legs: ${{ steps.decide.outputs.legs }}
+      cache-url: ${{ steps.decide.outputs.cache-url }}
+      cache-public-key: ${{ steps.decide.outputs.cache-public-key }}
+    steps:
+      # Two commits deep: a pull request's merge commit and its parents.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      # A wrong skip is a run that tests nothing and stays green, so the
+      # rules are checked against their cases before they decide anything.
+      - name: The rules decide their cases
+        run: bash .github/cache/ladder-mode-cases.sh
+
+      # --no-renames lists a renamed file under both of its names.  Git's
+      # default lists the new one alone, and a source file renamed to a
+      # document would pass for documentation.  A pull request's checkout
+      # that is no merge commit is refused: its first parent is the commit
+      # before it, not the base, and the diff would be of the last commit
+      # alone.
+      #
+      # The legs are the Ladder job's matrix: the x64 leg, which publishes
+      # on a push to main, alone in substitute mode, and the ARM64 leg with
+      # it in seed mode.  The public cache's address and key go out with
+      # them, since ladder.yml takes them as inputs: a called workflow does
+      # not see its caller's env.
+      - name: Decide the mode
+        id: decide
+        env:
+          X64_LEG: '{"os":"windows-latest","name":"Windows","publish":true}'
+          ARM64_LEG: '{"os":"windows-11-arm","name":"Windows ARM64","publish":false}'
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if ! git rev-parse --verify --quiet HEAD^2 > /dev/null; then
+              echo "::error::the checkout is not a pull request's merge commit, so its first parent is not the base"
+              exit 1
+            fi
+            mode=$(git diff --name-only --no-renames -z HEAD^1 HEAD | bash .github/cache/ladder-mode.sh "$GITHUB_EVENT_NAME" "$GITHUB_REF")
+          else
+            mode=$(bash .github/cache/ladder-mode.sh "$GITHUB_EVENT_NAME" "$GITHUB_REF" < /dev/null)
+          fi
+          case $mode in
+            seed) legs="[$X64_LEG,$ARM64_LEG]" ;;
+            substitute) legs="[$X64_LEG]" ;;
+            skip) legs='[]' ;;
+            *)
+              echo "::error::ladder-mode.sh printed $mode, which is no mode"
+              exit 1
+              ;;
+          esac
+          {
+            echo "mode=$mode"
+            echo "legs=$legs"
+            echo "cache-url=$CACHE_URL"
+            echo "cache-public-key=$CACHE_PUBLIC_KEY"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Ladder (nova-nix and handoff server): the two programs every stage job
+  # runs, built on x64 Windows, since the ARM64 image has no GHC; ARM64
+  # Windows runs both through its x64 emulator.  nova-nix is built and
+  # staged as Stage0 (nova-nix) builds and stages it in ci.yml, and built
+  # again here because an artifact belongs to the run that uploads it.
+  # nova-cache-server serves each stage's handoff (ladder.yml).  cabal
+  # resolves it under this project's index-state, as nova-nix's own build
+  # resolves the nova-cache library its push is built with.
+  # ---------------------------------------------------------------------------
+  ladder-tools:
+    name: Ladder (nova-nix and handoff server)
+    needs: [ladder-mode]
+    if: needs.ladder-mode.outputs.mode != 'skip'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
+        id: setup
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      # The Windows store, which caches.yml fills with the packages the
+      # server builds with as well as nova-nix's: warp and wai-extra, which
+      # nova-nix does not need.  The store's key names nova-nix's plan
+      # (.github/actions/cabal-store).
+      - name: Plan the build
+        run: cabal build --enable-tests --dry-run
+
+      - name: Restore the Cabal store
+        uses: ./.github/actions/cabal-store
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          prefix: cabal-${{ runner.os }}
+          plan-hash: ${{ hashFiles('dist-newstyle/cache/plan.json', 'cabal.project') }}
+          ghc-version: ${{ steps.setup.outputs.ghc-version }}
+          cabal-version: ${{ steps.setup.outputs.cabal-version }}
+
+      # bin/ beside share/, the layout a release archive ships: the data dir
+      # Cabal compiles in is in this runner's Cabal store, which the stage
+      # jobs' runners do not have, and the rungs' sources are fetched
+      # through <nix/fetchurl.nix>.
+      - name: Stage nova-nix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cabal install exe:nova-nix --install-method=copy --installdir=staged/nova-nix/bin --overwrite-policy=always
+          mkdir -p staged/nova-nix/share/nova-nix/nix
+          cp data/nix/fetchurl.nix staged/nova-nix/share/nova-nix/nix/
+
+      # Kept for the 30 days a run can be re-run in: a re-run of the failed
+      # stage jobs alone does not run this job again.
+      - name: Upload nova-nix
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ladder-nova-nix
+          path: staged/nova-nix/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+      - name: Build nova-cache-server
+        run: cabal install nova-cache -f server --install-method=copy --installdir=staged/handoff-server/bin --overwrite-policy=always
+
+      # Kept for the 30 days a run can be re-run in, as nova-nix is.
+      - name: Upload nova-cache-server
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ladder-handoff-server
+          path: staged/handoff-server/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Ladder (Windows) and Ladder (Windows ARM64): the seed ladder on each leg
+  # Ladder (mode) names, each leg a call of ladder.yml, which builds it as a
+  # chain of jobs, one for each stage.  Each leg is a call of its own so that
+  # its chain runs on its own: a job that needs a matrix job waits for both
+  # of its legs, so stage jobs with a leg each would leave the x64 leg's
+  # later stages unrun, and unpublished, when a stage failed on ARM64.
+  # fail-fast is off for the same reason.
+  #
+  # The x64 leg of a push to main publishes each stage to the public cache
+  # once its checks pass.  One leg publishes: a cache holding some store
+  # paths from each leg would not hold the bytes either leg's checks ran on.
+  # The token is a secret of the `cache` environment, which the caller of a
+  # reusable workflow cannot name, so it is passed by name to ladder.yml,
+  # whose jobs name the environment.
+  # ---------------------------------------------------------------------------
+  ladder:
+    name: Ladder (${{ matrix.name }})
+    needs: [ladder-mode, ladder-tools]
+    if: needs.ladder-mode.outputs.mode != 'skip'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.ladder-mode.outputs.legs) }}
+    uses: ./.github/workflows/ladder.yml
+    with:
+      os: ${{ matrix.os }}
+      mode: ${{ needs.ladder-mode.outputs.mode }}
+      publish: ${{ matrix.publish && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      cache-url: ${{ needs.ladder-mode.outputs.cache-url }}
+      cache-public-key: ${{ needs.ladder-mode.outputs.cache-public-key }}
+    secrets:
+      NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}

@@ -1,14 +1,15 @@
 name: PR closed
 
-# Cancels a closed pull request's CI run.  Nothing pushes to a pull request
-# once it merges or closes, so ci.yml's concurrency group never cancels its
-# run, and a run keeps building the ladder on the Windows runners the merge
-# queue's runs then wait for, though the push to main that follows a merge
-# builds it again.  A run that enters a concurrency group with
-# cancel-in-progress cancels the group's run in progress, whichever workflow
-# it belongs to, so this workflow joins ci.yml's group for the pull request
-# and does nothing else.  It takes no token and checks nothing out, so a
-# pull request from a fork runs it as safely as one from a branch.
+# Cancels a closed pull request's CI and ladder runs.  Nothing pushes to a
+# pull request once it merges or closes, so the concurrency groups of
+# ci.yml and seed-ladder.yml never cancel its runs, and they keep building
+# on the runners the merge queue's runs then wait for, though the push to
+# main that follows a merge runs the ladder again.  A run or a job that
+# enters a concurrency group with cancel-in-progress cancels the group's
+# run in progress, whichever workflow it belongs to, so this workflow joins
+# ci.yml's group for the pull request, its job joins seed-ladder.yml's, and
+# neither does anything else.  It takes no token and checks nothing out,
+# so a pull request from a fork runs it as safely as one from a branch.
 on:
   pull_request:
     types: [closed]
@@ -23,10 +24,15 @@ concurrency:
 
 jobs:
   cancel:
-    name: Cancel the pull request's CI run
+    name: Cancel the pull request's CI and ladder runs
     runs-on: ubuntu-latest
+    # seed-ladder.yml's group for the same pull request, ladder-<event>-<ref>.
+    # A workflow joins one group, so the job joins the second.
+    concurrency:
+      group: ladder-pull_request-refs/pull/${{ github.event.pull_request.number }}/merge
+      cancel-in-progress: true
     steps:
-      - name: Joined ci.yml's group
+      - name: Joined the groups of ci.yml and seed-ladder.yml
         env:
           PR: ${{ github.event.pull_request.number }}
-        run: echo "pull request $PR closed; its CI run in this group is cancelled"
+        run: echo "pull request $PR closed; its CI and ladder runs in these groups are cancelled"

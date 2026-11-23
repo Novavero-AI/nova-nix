@@ -1,14 +1,14 @@
 name: Caches
 
-# The Actions caches CI and Parity restore, saved from main alone: each
-# OS's Cabal store, the sdist build's store, the macOS GHC installation, the
-# formatter binary and the nixpkgs trees Parity reads.  A cache saved by a
-# pull request's run or a merge group's run is scoped to that ref, so no
-# other run restores it, and it counts against the repository's 10 GB,
-# where GitHub evicts the entries accessed longest ago to make room, main's
-# among them.  This workflow is what saves these caches, each where main
-# lacks it, and CI's and Parity's jobs restore them, so that a run on any
-# ref finds main's.
+# The Actions caches CI, Parity, Seed ladder and Public cache restore,
+# saved from main alone: each OS's Cabal store, the sdist build's store,
+# the macOS GHC installation, the formatter binary and the nixpkgs trees
+# Parity reads.  A cache saved by a pull request's run or a merge group's
+# run is scoped to that ref, so no other run restores it, and it counts
+# against the repository's 10 GB, where GitHub evicts the entries accessed
+# longest ago to make room, main's among them.  This workflow is what
+# saves these caches, each where main lacks it, and those workflows' jobs
+# restore them, so that a run on any ref finds main's.
 #
 # Two workflows keep caches apart from these.  Scoreboard restores the
 # nixpkgs trees under the keys this workflow saves them with, and saves
@@ -61,9 +61,10 @@ jobs:
   # The store every job on an OS restores, holding the packages nova-nix,
   # its tests and its benchmark build with, and on Linux and Windows those
   # nova-cache-server builds with too: E2E (substitute loop) installs the
-  # server on Linux and Ladder (handoff server) on Windows, each in this
-  # project, so cabal resolves it under cabal.project's index-state.  On
-  # macOS, the GHC installation Build (macos-latest) restores as well.
+  # server on Linux and Ladder (nova-nix and handoff server) on Windows,
+  # each in this project, so cabal resolves it under cabal.project's
+  # index-state.  On macOS, the GHC installation Build (macos-latest)
+  # restores as well.
   cabal-store:
     name: Cabal store (${{ matrix.os }})
     if: github.ref == 'refs/heads/main'
