@@ -3752,7 +3752,7 @@ fetchAndExtractTarball url pin name = do
   checkUri url
   requireFetchPin "fetchTarball" pin
   held <- heldPinnedPath name NarIngestion pin
-  maybe (downloadAndExtractTarball url pin name) (pure . VPath) held
+  maybe (downloadAndExtractTarball url pin name) (pure . storePathString) held
 
 -- | The download and copy of 'fetchAndExtractTarball', for a fetch the
 -- store does not hold already.
@@ -3781,7 +3781,7 @@ downloadAndExtractTarball url pin name = do
           (fmap (\expected -> (expected, fetchHashMismatch url expected)) pin)
           `onEvalError` removeScratchDir extractDir
       removeScratchDir extractDir
-      pure (VPath storePath)
+      pure (storePathString storePath)
     _ -> do
       removeScratchDir extractDir
       throwEvalError ("builtins.fetchTarball: " <> errOut)
@@ -4277,7 +4277,7 @@ fetchGitResult submodules fields =
           )
    in valuesSet SetFetchGit $
         Map.fromList
-          [ ("outPath", VPath (canonPathValue (fcStorePath fields))),
+          [ ("outPath", storePathString (canonPathValue (fcStorePath fields))),
             ("rev", mkStr (fcRev fields)),
             ("shortRev", mkStr (T.take 7 (fcRev fields))),
             ("revCount", VInt (fromIntegral (fcRevCount fields))),
@@ -4419,7 +4419,7 @@ fetchUrlSimple url pin = do
   requireFetchPin "fetchurl" pin
   held <- heldPinnedPath name FlatIngestion pin
   case held of
-    Just storePath -> pure (VPath storePath)
+    Just storePath -> pure (storePathString storePath)
     Nothing -> do
       -- Download to a file, not through the text-mode stdout pipe (which
       -- mangles binary), read the raw bytes, verify the pin if one was
@@ -4433,7 +4433,7 @@ fetchUrlSimple url pin = do
         let got = sha256Digest bytes
          in when (expected /= got) $ throwEvalError (fetchHashMismatch url expected got)
       storePath <- addFixedOutputFile Fetched name bytes
-      pure (VPath storePath)
+      pure (storePathString storePath)
 
 -- | Upstream's early exit for a fetch a sha256 pins (fetchTree.cc:484-496
 -- at 2.24.9): the path the pin names, when the store holds it already,
@@ -6115,7 +6115,7 @@ builtinPath (VAttrs attrs) = do
           Just expected | expected /= sha256Digest narBytes -> throwEvalError mismatch
           _ -> pure ()
         addSourceNar name narBytes
-    pure (sourceResultString storePathText)
+    pure (storePathString storePathText)
 builtinPath other =
   throwEvalError ("builtins.path: expected an attribute set, got " <> typeName other)
 
@@ -6176,10 +6176,12 @@ flatFileCopy rawPath name pin mismatch = do
     _ -> pure ()
   addFixedOutputFile Computed name bytes
 
--- | The result value both source importers return: the store path as a
--- string carrying itself as context.
-sourceResultString :: Text -> NixValue
-sourceResultString storePathText =
+-- | A store path as upstream's @mkStorePathString@ gives it (eval.cc:927-934
+-- at 2.24.9): its text, carrying itself as context.  What the source
+-- importers and the fetchers return, so a coercion names the store path
+-- rather than copying it again as it would a path value.
+storePathString :: Text -> NixValue
+storePathString storePathText =
   case parseStorePath defaultStoreDir storePathText of
     Just sp -> VStr (TE.encodeUtf8 storePathText) (plainContext sp)
     Nothing -> VStr (TE.encodeUtf8 storePathText) emptyContext
@@ -6249,4 +6251,4 @@ filterSourceInto :: (MonadEval m) => NixValue -> Text -> m NixValue
 filterSourceInto filterFn path = do
   narBytes <- filteredSourceNar filterFn path
   storePathText <- addSourceNar (canonBaseName path) narBytes
-  pure (sourceResultString storePathText)
+  pure (storePathString storePathText)

@@ -214,6 +214,20 @@ andThen first second = case first of
 bytesText :: BS.ByteString -> Text
 bytesText = TE.decodeUtf8With lenientDecode
 
+-- | A store path as a fetcher or a source importer returns it: its text,
+-- carrying itself as context.
+storePathStringValue :: StorePath -> NixValue
+storePathStringValue sp = VStr (TE.encodeUtf8 (storePathToText defaultStoreDir sp)) (StringContext (Set.singleton (SCPlain sp)))
+
+-- | The store path a fetcher's result names, when it is the string with
+-- itself as context that upstream's fetchers return.
+fetchedStorePath :: NixValue -> Maybe StorePath
+fetchedStorePath val = case val of
+  VStr bytes _ -> do
+    sp <- parseStorePath defaultStoreDir (bytesText bytes)
+    if val == storePathStringValue sp then Just sp else Nothing
+  _ -> Nothing
+
 assertRight :: (Show e) => Text -> Either e a -> (a -> TestResult) -> TestResult
 assertRight label result check = case result of
   Left err -> Fail (label <> ": got error: " <> T.pack (show err))
@@ -17375,12 +17389,13 @@ testFetchCache = do
       -- a Right at all proves the fetch was skipped, and every field comes
       -- from the entry rather than from git.
       runTestM "a warm entry answers builtins.fetchGit without fetching" $
-        case evalWarmFetchGit sampleFetchCache (Set.singleton (fcStorePath sampleFetchCache)) of
-          Left err -> pure (Fail ("a warm cache still tried to fetch: " <> err))
-          Right val ->
+        case (evalWarmFetchGit sampleFetchCache (Set.singleton (fcStorePath sampleFetchCache)), parseStorePath defaultStoreDir (fcStorePath sampleFetchCache)) of
+          (Left err, _) -> pure (Fail ("a warm cache still tried to fetch: " <> err))
+          (Right _, Nothing) -> pure (Fail "the sample entry names no store path")
+          (Right val, Just sampleStorePath) ->
             assertEqual
               "fields"
-              [ ("outPath", VPath (fcStorePath sampleFetchCache)),
+              [ ("outPath", storePathStringValue sampleStorePath),
                 ("rev", mkStr (fcRev sampleFetchCache)),
                 ("revCount", VInt 1234),
                 ("narHash", mkStr ("sha256-" <> fcNarHash sampleFetchCache))
@@ -22658,9 +22673,10 @@ testFetchGitShallow = do
               Left err -> pure (Fail err)
               Right val ->
                 fetchGitFields val ["rev", "revCount", "outPath"] >>= \case
-                  [("rev", revVal), ("revCount", VInt 0), ("outPath", VPath outText)]
-                    | revVal == mkStr firstSha -> do
-                        let outDir = storeTextToFilePath (StoreDir tmpStore) outText
+                  [("rev", revVal), ("revCount", VInt 0), ("outPath", outVal)]
+                    | revVal == mkStr firstSha,
+                      Just outPath <- fetchedStorePath outVal -> do
+                        let outDir = storePathToFilePath (StoreDir tmpStore) outPath
                         firstThere <- Dir.doesFileExist (outDir </> "first.txt")
                         thirdThere <- Dir.doesFileExist (outDir </> "third.txt")
                         pure $
@@ -22760,7 +22776,7 @@ testFetchGitPins = do
               Left err -> pure (Fail err)
               Right val ->
                 fetchGitFields val ["outPath"] >>= \case
-                  [("outPath", VPath outPath)] | Just sp <- parseStorePath defaultStoreDir outPath -> do
+                  [("outPath", outVal)] | Just sp <- fetchedStorePath outVal -> do
                     let dest = storePathToFilePath (StoreDir tmpStore) sp
                         file = dest </> "a.txt"
                     now <- Clock.getCurrentTime
@@ -26395,7 +26411,7 @@ testE2E = do
               ExitSuccess -> do
                 fetched <- evalNixIOStore storeDir root ("builtins.fetchTarball \"file://" <> nixEscape (T.pack tarball) <> "\"")
                 case fetched of
-                  Right (VPath pathText) | Just sp <- parseStorePath defaultStoreDir pathText -> do
+                  Right val | Just sp <- fetchedStorePath val -> do
                     let dest = storePathToFilePath storeDir sp
                     foldr andThen Pass
                       <$> traverse
@@ -27171,9 +27187,9 @@ testRealiseContextIO = do
             (ops, _) <- fakeRealiseStore (const False) Nothing
             answer <- evalAt dir (readOnlyOver ops) ("builtins.fetchurl " <> nixString (fileUrl fetchedFile))
             case answer of
-              Right (VPath path) | Just sp <- parseStorePath defaultStoreDir path -> do
+              Right val | Just sp <- fetchedStorePath val -> do
                 there <- Dir.doesPathExist (storePathToFilePath (StoreDir dir) sp)
-                pure (if there then Pass else Fail ("the fetch was not written to " <> path))
+                pure (if there then Pass else Fail ("the fetch was not written to " <> storePathToText defaultStoreDir sp))
               other -> pure (Fail ("expected the fetched path, got: " <> T.pack (show other))),
           -- fetchTree.cc:484-497 at 2.24.9: the URLs name no file, so only
           -- the early exit answers.
@@ -27182,13 +27198,13 @@ testRealiseContextIO = do
             held <- either (fail . show) pure (makeFixedOutputPath "held-file" "sha256" FlatIngestion pin)
             (ops, _) <- fakeRealiseStore (== held) Nothing
             answer <- evalWith (readOnlyOver ops) ("builtins.fetchurl { url = " <> nixString (fileUrl (root </> "absent" </> "held-file")) <> "; sha256 = \"" <> Hash.bytesToHexText pin <> "\"; }")
-            pure (assertEqual "answer" (Right (VPath (storePathToText defaultStoreDir held))) (either (Left . failureMessage) Right answer)),
+            pure (assertEqual "answer" (Right (storePathStringValue held)) (either (Left . failureMessage) Right answer)),
           runTestM "a pinned fetchTarball the store holds returns its path without downloading" $ do
             let pin = sha256Digest "a tree's NAR"
             held <- either (fail . show) pure (makeFixedOutputPath "source" "sha256" NarIngestion pin)
             (ops, _) <- fakeRealiseStore (== held) Nothing
             answer <- evalWith (readOnlyOver ops) ("builtins.fetchTarball { url = " <> nixString (fileUrl (root </> "absent" </> "held.tar.gz")) <> "; sha256 = \"" <> Hash.bytesToHexText pin <> "\"; }")
-            pure (assertEqual "answer" (Right (VPath (storePathToText defaultStoreDir held))) (either (Left . failureMessage) Right answer)),
+            pure (assertEqual "answer" (Right (storePathStringValue held)) (either (Left . failureMessage) Right answer)),
           -- A flat builtins.path copy of the same bytes under the fetch's
           -- name lands at the path the pin names, computed and unwritten
           -- in a read-only session, so only a read-write one holds it and
@@ -27207,7 +27223,7 @@ testRealiseContextIO = do
             readOnly <- evalWith (readOnlyOver ro) source
             readWrite <- evalWith (ReadWriteSession rw) source
             pure $ case (readOnly, readWrite) of
-              (Left _, Right (VPath path)) | path == storePathToText defaultStoreDir expected -> Pass
+              (Left _, Right val) | fetchedStorePath val == Just expected -> Pass
               other -> Fail ("expected a download in the read-only session and the computed copy in the read-write one, got: " <> T.pack (show other)),
           runTestM "a read-only session reads a fetchurl result through its context" $
             readsAs "fetched bytes\n" ("builtins.readFile \"${builtins.fetchurl " <> nixString (fileUrl fetchedFile) <> "}\""),
@@ -34730,7 +34746,7 @@ testEvalPolicyIO = do
             -- restricted: URIs
             expectLeft "a fetch of an unlisted URI is refused before any download" "access to URI 'https://example.invalid/x' is forbidden in restricted mode" (restricted "builtins.fetchurl \"https://example.invalid/x\""),
             expectLeft "a file URL beside the root is refused as its path" (forbidden restrictedPolicy (outside </> "secret.txt")) (restricted ("builtins.fetchurl \"file://" <> pathText (outside </> "secret.txt") <> "\"")),
-            expectRightWith "a file URL under the root fetches" (\case VPath p -> assertEqual "store" True (T.isPrefixOf "/nix/store/" p); other -> Fail (T.pack (show other))) (restricted ("builtins.fetchurl { url = \"file://" <> pathText (allowed </> "data.txt") <> "\"; sha256 = \"5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03\"; }")),
+            expectRightWith "a file URL under the root fetches" (\val -> maybe (Fail (T.pack (show val))) (const Pass) (fetchedStorePath val)) (restricted ("builtins.fetchurl { url = \"file://" <> pathText (allowed </> "data.txt") <> "\"; sha256 = \"5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03\"; }")),
             expectLeft "fetchTarball of an unlisted URI is refused" "access to URI 'https://example.invalid/x.tar.gz' is forbidden in restricted mode" (restricted "builtins.fetchTarball \"https://example.invalid/x.tar.gz\""),
             expectLeft "an allowed-uris prefix admits only its subpaths" "access to URI 'https://example.invalid/dir2/x' is forbidden in restricted mode" (withUris ["https://example.invalid/dir"] "builtins.fetchurl { url = \"https://example.invalid/dir2/x\"; sha256 = \"5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03\"; }"),
             runTestM "an allowed-uris prefix lets the fetch proceed to the network" $ do
