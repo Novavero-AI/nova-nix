@@ -31,6 +31,7 @@ module Nix.Store.DB
     -- * Lifecycle
     openStoreDB,
     closeStoreDB,
+    createStoreDirectories,
 
     -- * Registration
     registerPath,
@@ -70,8 +71,8 @@ import Database.SQLite.Simple
     query,
     withTransaction,
   )
+import Nix.Store.Access (createStateDirectory)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, storePathToFilePath, storePathToText)
-import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
 
 -- ---------------------------------------------------------------------------
@@ -147,17 +148,26 @@ createRefsSQL =
 -- ---------------------------------------------------------------------------
 
 -- | Open (or create) the store database.
--- Creates the store directory, metadata subdirectory, and database
--- tables if they don't exist.  Enables WAL mode for concurrency and
--- foreign-key enforcement for referential integrity.  A statement that
--- fails closes the connection it ran on.
+-- Creates the store directory and metadata subdirectory
+-- ('createStoreDirectories') and the database tables if they don't
+-- exist.  Enables WAL mode for concurrency and foreign-key enforcement
+-- for referential integrity.  A statement that fails closes the
+-- connection it ran on.
 openStoreDB :: StoreDir -> IO StoreDB
 openStoreDB dir = do
-  let storeRoot = unStoreDir dir
-      metaDir = storeRoot </> metaDirName
-      dbPath = metaDir </> dbFileName
-  createDirectoryIfMissing True metaDir
+  createStoreDirectories dir
   bracketOnError (open dbPath) close (configureDB dir)
+  where
+    dbPath = unStoreDir dir </> metaDirName </> dbFileName
+
+-- | Create the store directory and its metadata subdirectory where
+-- they are missing, with any missing parent of the store directory, as
+-- 'createStateDirectory' creates them: on Windows the two are open to
+-- whom 'Nix.Store.Access.StoreAccess' says, and a parent this creates
+-- to whom 'Nix.Store.Access.ParentAccess' says.  A directory already
+-- there keeps the access it has.
+createStoreDirectories :: StoreDir -> IO ()
+createStoreDirectories dir = createStateDirectory (unStoreDir dir </> metaDirName)
 
 -- | Set a connection to a store's database up: its pragmas and its
 -- tables.

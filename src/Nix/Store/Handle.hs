@@ -45,10 +45,10 @@ import Control.Exception (SomeException, bracketOnError, mask, onException, thro
 import qualified Data.Text as T
 import Nix.Eval.CanonPath (canonPath)
 import Nix.Store.CaseSensitive (CaseSensitivity, probeCaseSensitivity)
-import Nix.Store.DB (StoreDB, closeStoreDB, metaDirName, openStoreDB)
+import Nix.Store.DB (StoreDB, closeStoreDB, createStoreDirectories, metaDirName, openStoreDB)
 import Nix.Store.Lock (LockMode (..), PathLock, acquireLockFileWith, releasePathLock, withLockFileWith)
 import Nix.Store.Path (StoreDir (..))
-import System.Directory (createDirectoryIfMissing, makeAbsolute)
+import System.Directory (makeAbsolute)
 import System.FilePath ((</>))
 
 -- | An open store with database and configuration.  'stDir' is the
@@ -83,21 +83,21 @@ canonicalStoreDir (StoreDir dir) = StoreDir . T.unpack . canonPath . T.pack <$> 
 
 -- | Open a Nix store at the given directory, keyed by its canonical
 -- spelling.  Creates the store directory and database if they don't
--- exist.  The shared lease is taken before the database is touched, so
--- an opener arriving during a collection reads nothing until the
--- collection is over.  It waits with the collector's own line: upstream's
--- opener never waits here (it hands its roots to the running collector
--- through a socket instead), so there is no upstream line for the wait,
--- and the collector's names what is being waited for.  A step that fails
+-- exist, the directories as 'createStoreDirectories' does.  The shared
+-- lease is taken before the database is touched, so an opener arriving
+-- during a collection reads nothing until the collection is over.  It
+-- waits with the collector's own line: upstream's opener never waits
+-- here (it hands its roots to the running collector through a socket
+-- instead), so there is no upstream line for the wait, and the
+-- collector's names what is being waited for.  A step that fails
 -- once the lease is held releases what was taken before it, the database
 -- and the lease, so a failed open holds nothing that a later collection
 -- would wait on.
 openStore :: StoreDir -> IO Store
 openStore rawDir = do
   dir <- canonicalStoreDir rawDir
-  let metaDir = unStoreDir dir </> metaDirName
-      lockPath = gcLockFilePath dir
-  createDirectoryIfMissing True metaDir
+  let lockPath = gcLockFilePath dir
+  createStoreDirectories dir
   bracketOnError (acquireLockFileWith LockShared bigGcLockMessage lockPath) releasePathLock $ \lease ->
     bracketOnError (openStoreDB dir) closeStoreDB $ \db -> do
       -- After the directory exists: the probe answers for a path on disk,

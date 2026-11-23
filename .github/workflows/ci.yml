@@ -267,7 +267,8 @@ jobs:
   # thunk, bytecode, ...) fail CI instead of lurking.  Linux is the host:
   # sanitizer support under mingw is unreliable, and the eval C layer is
   # platform-independent, so Linux execution is real coverage.  The
-  # Windows-only nn_winfs body stays compile-checked by the strict job.
+  # Windows-only nn_winfs body is compiled by the Windows build alone: the
+  # strict job's Linux gcc compiles its stub.
   # ---------------------------------------------------------------------------
 
   sanitizers:
@@ -528,6 +529,68 @@ jobs:
             exit 1
           fi
           echo "ok    a builder under a 150% CPU quota is told of 2 cores"
+
+      # A store nova-nix creates on Windows, its state directory, the
+      # parent it makes for them, and the directory a build runs in each
+      # carry a protected access control list, where a directory made
+      # under a drive root takes the root's, which lets every signed-in
+      # user modify it.  The store's grants full control to this user,
+      # SYSTEM and Administrators and read and execute to Users, as
+      # install-nova-nix's does on C:\nix; the parent's, made at the drive
+      # root as C:\nix is without the installer, grants the same less
+      # Users; and a build directory's grants full control to this user
+      # alone, each passed down (OI)(CI).  The test suite reads the lists
+      # through the API; this reads them as icacls prints them, a build
+      # directory's through a builder that runs icacls in it.  The entries
+      # must be exactly these, so an inherited one, which icacls marks
+      # (I), fails the check, as does one for Authenticated Users or
+      # Everyone.
+      - name: A new store, the parent made for it and a build directory are closed to other users (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = cabal list-bin exe:nova-nix
+          $parent = Join-Path $env:SystemDrive 'nova-nix-acl'
+          $store = Join-Path $parent 'store'
+          $drv = Join-Path $env:RUNNER_TEMP 'acl.nix'
+          Set-Content -LiteralPath $drv -Value 'derivation { name = "acl"; system = builtins.currentSystem; builder = "cmd.exe"; args = [ "/c" "icacls . >%out%" ]; }'
+          $out = (& $exe --store $store build --no-out-link $drv) | Select-Object -Last 1
+          if ($LASTEXITCODE -ne 0) { throw "the build exited $LASTEXITCODE" }
+
+          # icacls prints the path and the first entry on one line, each
+          # other entry on a line of its own, then a blank line and a
+          # count of what it processed.  No path here holds a space.
+          function Get-AclEntry([string[]]$Lines) {
+            $entries = for ($i = 0; $i -lt $Lines.Count; $i++) {
+              $line = $Lines[$i].Trim()
+              if ($i -eq 0) { $line = $line -replace '^\S+\s+', '' }
+              if ($line -match ':\(') { $line }
+            }
+            return @($entries | Sort-Object)
+          }
+          function Assert-AclEntry([string]$Label, [string[]]$Lines, [string[]]$Expected) {
+            $Lines | Write-Output
+            $found = @(Get-AclEntry $Lines) -join ', '
+            $want = @($Expected | Sort-Object) -join ', '
+            if ($found -ne $want) {
+              Write-Output "::error::$Label carries $found, not $want"
+              exit 1
+            }
+            Write-Output "ok    $Label carries exactly $want"
+          }
+
+          $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+          $parentEntries = @(
+            "${user}:(OI)(CI)(F)",
+            'NT AUTHORITY\SYSTEM:(OI)(CI)(F)',
+            'BUILTIN\Administrators:(OI)(CI)(F)'
+          )
+          $storeEntries = $parentEntries + @('BUILTIN\Users:(OI)(CI)(RX)')
+          Assert-AclEntry 'the parent made for the store' @(icacls $parent) $parentEntries
+          Assert-AclEntry 'the store' @(icacls $store) $storeEntries
+          Assert-AclEntry 'the state directory' @(icacls (Join-Path $store '.nova-nix')) $storeEntries
+          Assert-AclEntry 'the build directory' @(Get-Content -LiteralPath $out) @("${user}:(OI)(CI)(F)")
 
       # SIGINT mid-evaluation is upstream's error, exit 1, where it once
       # ended the process by the signal with nothing said.  POSIX only:
