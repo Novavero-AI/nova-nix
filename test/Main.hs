@@ -63,7 +63,7 @@ import HttpFixture (Reply (..), httpResponse, withDirectoryServer, withFetchurlS
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildLayout (..), BuildPlace (..), BuildResult (..), BuildStop (..), BuilderInvocation (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, builderInvocation, checkDerivation, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substituteFromCaches, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
-import Nix.Builder.BuildDir (buildDirFor, createBuildDir)
+import Nix.Builder.BuildDir (buildDirFor, createBuildDir, withBuildDir)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, defaultUnpackLimits, entryComponents, envSrcs, resolveLinkTarget, runBuiltinUnpack)
@@ -24548,6 +24548,30 @@ testBuilder = do
         closeStore store
         forceRemoveIfExists tmpStore
         pure (assertEqual "build" (BuildSuccess outSP) result `andThen` assertEqual "what the builder was given" "zero|one|kept|unset\n" seen),
+      -- A file its owner may not remove stands in for a directory another
+      -- user made, which no test can make; macOS lets an owner set one.
+      runTestM "a build directory an earlier build left that cannot be removed is moved aside, and the build goes on" $
+        if SI.os /= "darwin"
+          then pure Pass
+          else do
+            tmpBase <- getTemporaryDirectory
+            let storeRoot = tmpBase </> "nova-nix-test-builder-leftover"
+                storeDir = StoreDir storeRoot
+                firstOutput = StorePath (T.replicate 31 "a" <> "s") "leftover"
+                dir = buildDirFor storeDir firstOutput
+                aside = dir <> ".leftover.1"
+            _ <- Proc.readProcessWithExitCode "chflags" ["-R", "nouchg", storeRoot] ""
+            forceRemoveIfExists storeRoot
+            createDirectoryIfMissing True (dir </> "stuck")
+            BS.writeFile (dir </> "stuck" </> "f") "x"
+            Proc.callProcess "chflags" ["uchg", dir </> "stuck" </> "f"]
+            -- The flag comes off whatever happens, so the store can go.
+            ( do
+                ran <- withBuildDir storeDir firstOutput Dir.doesDirectoryExist
+                movedAside <- Dir.doesPathExist (aside </> "stuck" </> "f")
+                pure (assertEqual "the build" True ran `andThen` assertEqual "moved aside" True movedAside)
+              )
+              `finally` (Proc.readProcessWithExitCode "chflags" ["-R", "nouchg", storeRoot] "" *> forceRemoveIfExists storeRoot),
       -- The carve-out is for upstream's fixed-output type alone: one
       -- output, out, with a hash that fixes it.  Each builder only logs
       -- what it saw, so every build fails for want of its outputs, which
