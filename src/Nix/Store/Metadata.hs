@@ -19,12 +19,16 @@
 -- owner's execute bit, which the canonical mode keeps, so a path's NAR
 -- hash is the same before and after.
 --
--- Upstream also clears a node's file flags on macOS (@lchflags@) and its
--- extended attributes on Linux, other than those its @ignored-acls@
--- setting names; nova-nix does neither.  Upstream's remaining check needs
--- build users, which nova-nix does not have: it runs a build as a user
--- from a range and fails one whose output holds a node that user does not
--- own.
+-- On Linux a node's extended attributes, its ACLs among them, are removed
+-- first, as upstream removes them (posix-fs-canonicalise.cc:71-91), but
+-- for those upstream's @ignored-acls@ names by default,
+-- @security.selinux@, @system.nfs4_acl@ and @security.csm@, which nova-nix
+-- does not read as a setting: a default ACL would otherwise leave what is
+-- made beneath a directory writable by others whatever its mode says.
+-- Upstream also clears a node's file flags on macOS (@lchflags@), which
+-- nova-nix does not.  Upstream's remaining check needs build users, which
+-- nova-nix does not have: it runs a build as a user from a range and
+-- fails one whose output holds a node that user does not own.
 --
 -- On Windows, where upstream sets no times and has no modes, every file
 -- and directory is given the read-only attribute and the same
@@ -43,6 +47,8 @@ module Nix.Store.Metadata
 
     -- * Reading a node
     isPlainFile,
+    writableByOthers,
+    foreignOwnedNode,
 
     -- * The canonical form
     NodeKind (..),
@@ -86,9 +92,23 @@ import System.Win32.Time (FILETIME (..), setFileTime)
 
 #else
 
-import Data.Bits (complement, testBit, (.&.))
+import Control.Monad (when)
+import Data.Bits (complement, testBit, (.&.), (.|.))
 import Data.Foldable (traverse_)
 import Foreign.C.Types (CTime (..))
+#if defined(linux_HOST_OS)
+import Control.Monad (unless)
+import qualified Data.ByteString as BS
+import Data.Foldable (for_)
+import Foreign.C.Error (eNODATA, eNOTSUP, getErrno, throwErrnoPath, throwErrnoPathIfMinus1, throwErrnoPathIfMinus1_)
+import Foreign.C.String (CString)
+import Foreign.C.Types (CInt (..), CSize (..))
+import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.Ptr (nullPtr)
+import qualified GHC.Foreign as GHC
+import GHC.IO.Encoding (getFileSystemEncoding)
+import System.Posix.Types (CSsize (..))
+#endif
 import System.Directory (listDirectory)
 import System.FilePath ((</>))
 import System.Posix.Files
@@ -98,10 +118,14 @@ import System.Posix.Files
     fileOwner,
     fileTypeModes,
     getSymbolicLinkStatus,
+    groupWriteMode,
+    otherWriteMode,
     isDirectory,
     isRegularFile,
     isSymbolicLink,
     modificationTime,
+    ownerExecuteMode,
+    ownerReadMode,
     setFileMode,
     setSymbolicLinkOwnerAndGroup,
     setSymbolicLinkTimesHiRes,
@@ -208,7 +232,35 @@ canonicalizeMetadata :: FilePath -> IO ()
 -- not there fails with the 'Control.Exception.IOException' raised.
 isPlainFile :: FilePath -> IO Bool
 
+-- | Whether a node lets its group or anyone else write it, read without
+-- following a symlink, which is never writable: upstream's test of a
+-- build's output before it makes the output canonical, since such a node
+-- may have been changed by someone other than the build
+-- (@registerOutputs@, local-derivation-goal.cc:2333-2343 at 2.24.9).
+-- Windows has no such mode, and no node there is.
+writableByOthers :: FilePath -> IO Bool
+
+-- | The first node of a tree that the process's effective user does not
+-- own, read without following a symlink, the root first and a directory
+-- before its entries, or nothing when the user owns them all.  Upstream
+-- refuses such a node in a build's output, @invalid ownership on file@
+-- (posix-fs-canonicalise.cc:95-107 at 2.24.9), where it builds as a
+-- build user: it may be a hard link to a file the output has no business
+-- changing, which making the output canonical would change.  A directory
+-- the user owns is given read and search for its owner before it is
+-- listed, so one a builder closed is read rather than refused.  That is
+-- a divergence: upstream makes such a directory canonical first, at 0444
+-- for one its owner may not search, and a single-user build of it, not
+-- run as root, then fails to read beneath it; here it ends at 0555, since
+-- a process that is not root can read a directory only with search on it.
+-- Windows has no owner to compare, and finds none.
+foreignOwnedNode :: FilePath -> IO (Maybe FilePath)
+
 #if defined(mingw32_HOST_OS)
+
+writableByOthers _ = pure False
+
+foreignOwnedNode _ = pure Nothing
 
 isPlainFile path = do
   node <- classifyWalkNode path
@@ -276,6 +328,62 @@ isPlainFile path = do
   status <- getSymbolicLinkStatus path
   pure (isRegularFile status && not (testBit (fileMode status) ownerExecuteBit))
 
+writableByOthers path = do
+  status <- getSymbolicLinkStatus path
+  pure (not (isSymbolicLink status) && fileMode status .&. (groupWriteMode .|. otherWriteMode) /= 0)
+
+foreignOwnedNode root = do
+  user <- getEffectiveUserID
+  let walk path = getSymbolicLinkStatus path >>= visit path
+      visit path status
+        | fileOwner status /= user = pure (Just path)
+        | isDirectory status = do
+            let mode = fileMode status
+                openable = mode .|. ownerReadMode .|. ownerExecuteMode
+            when (openable /= mode) (setFileMode path openable)
+            listDirectory path >>= firstFound . map (walk . (path </>))
+        | otherwise = pure Nothing
+  walk root
+  where
+    firstFound [] = pure Nothing
+    firstFound (look : rest) = look >>= maybe (firstFound rest) (pure . Just)
+
+-- | Remove a node's extended attributes, read without following a link,
+-- but for those upstream ignores by default, as
+-- upstream removes them (posix-fs-canonicalise.cc:71-91 at 2.24.9).  A
+-- filesystem that keeps none is no error.  Linux only, as upstream's is.
+removeExtendedAttributes :: FilePath -> IO ()
+#if defined(linux_HOST_OS)
+removeExtendedAttributes path = do
+  encoding <- getFileSystemEncoding
+  GHC.withCString encoding path $ \cpath -> do
+    size <- c_llistxattr cpath nullPtr 0
+    if size < 0
+      then do
+        errno <- getErrno
+        unless (errno == eNOTSUP || errno == eNODATA) (throwErrnoPath "querying extended attributes" path)
+      else when (size > 0) $
+        allocaBytes (fromIntegral size) $ \buffer -> do
+          listed <- throwErrnoPathIfMinus1 "querying extended attributes" path (c_llistxattr cpath buffer (fromIntegral size))
+          names <- BS.split 0 <$> BS.packCStringLen (buffer, fromIntegral listed)
+          for_ [name | name <- names, not (BS.null name), name `notElem` keptAttributes] $ \name ->
+            BS.useAsCString name $ \cname ->
+              throwErrnoPathIfMinus1_ "removing extended attribute" path (c_lremovexattr cpath cname)
+
+-- | The attributes upstream's @ignored-acls@ keeps by default, which even
+-- root may be unable to remove (globals.hh:1092-1099 at 2.24.9).
+keptAttributes :: [BS.ByteString]
+keptAttributes = ["security.selinux", "system.nfs4_acl", "security.csm"]
+
+foreign import ccall unsafe "sys/xattr.h llistxattr"
+  c_llistxattr :: CString -> CString -> CSize -> IO CSsize
+
+foreign import ccall unsafe "sys/xattr.h lremovexattr"
+  c_lremovexattr :: CString -> CString -> IO CInt
+#else
+removeExtendedAttributes _ = pure ()
+#endif
+
 -- A directory is changed before its entries are read, as upstream
 -- changes it, so one its owner may execute but not read becomes
 -- readable first.
@@ -289,6 +397,7 @@ canonicalizeNode :: UserID -> GroupID -> FilePath -> IO ()
 canonicalizeNode user group path = do
   status <- getSymbolicLinkStatus path
   kind <- maybe (ioError (userError ("file '" <> path <> "' has an unsupported type"))) pure (statusKind status)
+  removeExtendedAttributes path
   traverse_ (applyChange status) (metadataChanges (statusMetadata user kind status))
   case kind of
     DirectoryNode -> listDirectory path >>= traverse_ (canonicalizeNode user group . (path </>))

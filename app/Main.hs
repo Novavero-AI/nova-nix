@@ -61,7 +61,7 @@ import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWi
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), defaultPartSize, isDerivationPath, loadKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
 import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), loadSecretKeyFile, pushTarget, pushToDirectory)
 import Nix.Realise (BuildMode (..), ClosureOutcome (..), Fallback (..), SubstitutesSetting (..))
-import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, isValid, openStore, queryAllValidPaths, resolveDeleteTarget, storeEntryNameText, upstreamManagedRefusal)
+import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, isValid, openStore, queryAllValidPaths, resolveDeleteTarget, storeEntryNameText, upstreamManagedRefusal, useStoreFileMask)
 import Nix.Store.Ops (EvalObjects (..), StoreOps (..), localQueries, withLocalStore)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
@@ -163,6 +163,7 @@ mergeSearchPaths extraPaths dataDir nixPath = do
 
 main :: IO ()
 main = do
+  useStoreFileMask
   hSetBuffering stdout LineBuffering
   -- UTF-8 on both output handles regardless of the console code page:
   -- locale encodings THROW on any character they cannot represent, so a

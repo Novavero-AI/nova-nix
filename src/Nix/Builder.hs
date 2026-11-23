@@ -86,8 +86,8 @@ module Nix.Builder
   )
 where
 
-import Control.Exception (IOException, bracket, catches, displayException, finally, onException, try)
-import Control.Monad (filterM, foldM, unless)
+import Control.Exception (IOException, bracket, catches, displayException, finally, onException, try, uninterruptibleMask_)
+import Control.Monad (filterM, foldM, unless, when)
 import Control.Monad.Except (ExceptT (..), liftEither, runExceptT, throwError, withExceptT)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.State.Strict (StateT, evalStateT)
@@ -123,9 +123,9 @@ import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWit
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Push (narHashMatches)
 import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, Fallback (..), FetchOutcome (..), Offer (QueryFailed), RealiseEffects (..), RealiseSettings (..), Realised (..), Registration (..), SubstEffects (..), SubstitutesSetting (..), Undelivered (..), noWriteAccessMessage, realise, realiseFailureMessage, realiseFailureStatus, realiseRequests, requestsFailureMessage, requestsFailureStatus, substituteClosure)
-import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, finishNarUnpack, isValid, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
+import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, canonicalizeMetadata, finishNarUnpack, freshCopyPath, isValid, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, replaceWithCopy, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Metadata (isPlainFile)
+import Nix.Store.Metadata (foreignOwnedNode, isPlainFile, writableByOthers)
 import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText, unStoreDir)
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
 import Nix.Substituter (CacheConfig, NarInfoMemo, SubstResult (..), Substitute, emptyNarInfoMemo, fetchSubstituteWith, narStreamFailure, queryNextOfferWith, queryReferencesWith, substitutePath, withXzAttempt)
@@ -133,7 +133,7 @@ import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.Xz as Xz
-import System.Directory (createDirectoryIfMissing, doesPathExist, removePathForcibly)
+import System.Directory (createDirectoryIfMissing, removePathForcibly)
 import qualified System.Environment
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, takeFileName, (</>))
@@ -548,10 +548,16 @@ allOutputsValid store drv = case map doPath (drvOutputs drv) of
     pure (if and validity then Just firstOutput else Nothing)
 
 -- | What a build does with the outputs its builder wrote, given the
--- closure of its inputs and where each output was written: registers them
--- ('registerOutputs'), or compares them with the store's
--- ('compareOutputs').
-type Finish a = Set StorePath -> [OutputPlan] -> IO (Either BuildStop a)
+-- closure of its inputs, where each output was written, and how the step
+-- that registers them runs: registers them ('registerOutputs'), or
+-- compares them with the store's ('compareOutputs').
+type Finish a = Set StorePath -> [OutputPlan] -> Commit -> IO (Either BuildStop a)
+
+-- | How a build runs the step that registers its outputs: with the record
+-- that they are registered, which keeps the cleanup of an interrupted
+-- build from removing them, made in the same step, which no asynchronous
+-- exception can break into.
+type Commit = IO () -> IO ()
 
 -- | Which outputs the builder is handed a scratch path for
 -- ('outputPlan').
@@ -709,7 +715,7 @@ spawnFor host config drv
 -- belongs: run the builder, then @finish@ with what it wrote.  The store
 -- volume's case sensitivity is what @builtin:fetchurl@ restores a NAR's
 -- names under.
-runPlannedBuild :: BuildConfig -> CaseSensitivity -> Derivation -> FilePath -> [OutputPlan] -> IO (Either BuildStop a) -> IO (Either BuildStop a)
+runPlannedBuild :: BuildConfig -> CaseSensitivity -> Derivation -> FilePath -> [OutputPlan] -> (Commit -> IO (Either BuildStop a)) -> IO (Either BuildStop a)
 runPlannedBuild config sensitivity drv buildDir plans finish = do
   let scratchDir p = storePathToFilePath (bcStoreDir config) (opScratch p)
       outputDirs = [(opName p, scratchDir p) | p <- plans]
@@ -718,8 +724,9 @@ runPlannedBuild config sensitivity drv buildDir plans finish = do
       layout = BuildLayout (inPlace buildDir) [(name, inPlace dir) | (name, dir) <- outputDirs]
       -- Every scratch path is the build's to use: the ones that are final
       -- paths may hold a tree an interrupted run left behind, and the
-      -- fallbacks may hold one an interrupted run failed to discard.
-      clearScratch = for_ plans (removePathForcibly . scratchDir)
+      -- fallbacks may hold one an interrupted run failed to discard, as
+      -- the name beside one may hold a fresh copy one left half made.
+      clearScratch = for_ plans $ \p -> removePathForcibly (scratchDir p) *> removePathForcibly (freshCopyPath (scratchDir p))
   clearScratch
   createDirectoryIfMissing True (unStoreDir (bcStoreDir config))
   -- The cleanup contract: outputs are written at their store paths, not
@@ -733,6 +740,7 @@ runPlannedBuild config sensitivity drv buildDir plans finish = do
   let cleanupUnlessCommitted = do
         done <- readIORef committed
         unless done clearScratch
+      commit registration = uninterruptibleMask_ (registration *> writeIORef committed True)
   ( do
       -- 4. Run the builder.  A builtin builder runs in this process and
       --    writes the outputs where they are on disk; a spawned one starts
@@ -758,7 +766,7 @@ runPlannedBuild config sensitivity drv buildDir plans finish = do
           --    outputs.  Outputs may be files or directories - both are
           --    valid (real Nix allows $out to be a single file, a
           --    directory tree, or a symlink).
-          missing <- filterM (fmap not . doesPathExist . snd) outputDirs
+          missing <- filterM (nothingAt . snd) outputDirs
           case missing of
             _ : _ -> do
               let names = T.intercalate ", " (map fst missing)
@@ -768,7 +776,7 @@ runPlannedBuild config sensitivity drv buildDir plans finish = do
               clearScratch
               pure (Left (BuildStop ("builder succeeded but outputs missing: " <> names) 1))
             [] -> do
-              finished <- finish
+              finished <- finish commit
               case finished of
                 Right _ -> do
                   writeIORef committed True
@@ -1743,12 +1751,13 @@ registerOutputs ::
   StorePath ->
   Set StorePath ->
   [OutputPlan] ->
+  Commit ->
   IO (Either BuildStop StorePath)
-registerOutputs config store drv drvPath inputPaths plans = runExceptT $ do
+registerOutputs config store drv drvPath inputPaths plans commit = runExceptT $ do
   scanned <- withExceptT scanStop (traverse (scanOutput config store scan) (zip (drvOutputs drv) plans))
   ordered <- liftEither (orderScanned drvPath (siblingsReferenced (drvOutputs drv)) scanned)
-  regs <- withExceptT scanStop (traverse (ExceptT . placeOutput store deriver . snd) ordered)
-  liftIO (registerPaths (stDB store) (catMaybes regs))
+  regs <- withExceptT scanStop (traverse (ExceptT . placeOutput store drvPath deriver . snd) ordered)
+  liftIO (commit (registerPaths (stDB store) (catMaybes regs)))
   case drvOutputs drv of
     (firstOut : _) -> pure (doPath firstOut)
     [] -> throwError (BuildStop noOutputsMessage 1)
@@ -1781,17 +1790,18 @@ compareOutputs ::
   [Text] ->
   Set StorePath ->
   [OutputPlan] ->
+  Commit ->
   IO (Either BuildStop CheckVerdict)
-compareOutputs config store drv drvPath recordedHashes inputPaths plans = runExceptT $ do
+compareOutputs config store drv drvPath recordedHashes inputPaths plans _ = runExceptT $ do
   built <- withExceptT scanStop (traverse rebuilt (zip3 (drvOutputs drv) plans recordedHashes))
   ordered <- liftEither (orderScanned drvPath (siblings . boReferences . fst) built)
-  ExceptT (firstDifference (volumeCaseHack (stCaseSensitivity store)) (map snd ordered))
+  ExceptT (firstDifference (volumeCaseHack (stCaseSensitivity store)) drvPath (map snd ordered))
   where
     scan = outputScan drv inputPaths plans
     siblings = siblingNames (drvOutputs drv)
     rebuilt (output, plan, recorded) = do
       outDir <- writtenOutput config (output, plan)
-      scanned <- liftIO (scanBuilt scan output outDir)
+      scanned <- preparedOutput scan output outDir
       pure (doName output, (scanned, recorded))
 
 -- | The stop a failed scan or placement reports.
@@ -1858,18 +1868,31 @@ data BuiltOutput = BuiltOutput
     boReferences :: ![StorePath]
   }
 
--- | Where the builder wrote an output, which has to be there (a file or a
--- directory).
+-- | Where the builder wrote an output, which has to be there (a file, a
+-- directory, or a symlink, whatever it names).
 writtenOutput :: BuildConfig -> (DerivationOutput, OutputPlan) -> ExceptT Text IO FilePath
 writtenOutput config (_, plan) = do
   let outDir = storePathToFilePath (bcStoreDir config) (opScratch plan)
-  exists <- liftIO (doesPathExist outDir)
-  unless exists (throwError ("output missing: " <> T.pack outDir))
+  absent <- liftIO (nothingAt outDir)
+  when absent (throwError ("output missing: " <> T.pack outDir))
   pure outDir
 
+-- | Whether nothing is at a path, read without following a link, as
+-- upstream reads an output (@lstat@, local-derivation-goal.cc:2326 at
+-- 2.24.9): one that is a symlink is there whatever it names, nothing at
+-- all among them.
+nothingAt :: FilePath -> IO Bool
+nothingAt path = do
+  node <- classifyWalkNode path
+  pure $ case node of
+    WalkAbsent -> True
+    WalkRegular -> False
+    WalkDirectory -> False
+    WalkSymlink -> False
+
 -- | Scan one output of a build, keyed by its name: skip it if it is
--- already valid in the DB, otherwise scan what the builder wrote
--- ('scanBuilt').
+-- already valid in the DB, otherwise make ready what the builder wrote
+-- ('preparedOutput').
 scanOutput ::
   BuildConfig ->
   Store ->
@@ -1884,8 +1907,33 @@ scanOutput config store scan planned@(output, _) = do
   -- 'runPlannedBuild' removed any leftover before the builder ran, so the
   -- tree here is this build's (upstream's delete-then-move).
   valid <- liftIO (isValid store (doPath output))
-  scanned <- if valid then pure AlreadyRegistered else NeedsRegistering <$> liftIO (scanBuilt scan output outDir)
+  scanned <- if valid then pure AlreadyRegistered else NeedsRegistering <$> preparedOutput scan output outDir
   pure (doName output, scanned)
+
+-- | An output the builder wrote, made ready where it is to be placed or
+-- compared, in upstream's order (@registerOutputs@,
+-- local-derivation-goal.cc:2333-2351 and 2594-2600 at 2.24.9, and
+-- posix-fs-canonicalise.cc:95-107): one that lets its group or anyone
+-- else write it is refused, since someone other than the build may have
+-- changed it, and so is one holding a node another user owns; it is made
+-- canonical, so nothing in it is setuid or writable by another user,
+-- before it is read or changed; a fixed output is replaced with a fresh
+-- copy of itself, made canonical again, so a descriptor the builder passed
+-- out names an inode that is not registered; and its hashes are rewritten
+-- and its references scanned ('scanBuilt').  A process of the same user
+-- can still change an output while it is read.
+preparedOutput :: OutputScan -> DerivationOutput -> FilePath -> ExceptT Text IO BuiltOutput
+preparedOutput scan output outDir = do
+  open <- liftIO (writableByOthers outDir)
+  when open (throwError ("suspicious ownership or permission on '" <> T.pack outDir <> "' for output '" <> doName output <> "'; rejecting this build output"))
+  othersNode <- liftIO (foreignOwnedNode outDir)
+  for_ othersNode (\node -> throwError ("invalid ownership on file '" <> T.pack node <> "'"))
+  liftIO (canonicalizeMetadata outDir)
+  -- The copy is made canonical in its turn, and it is the copy that is
+  -- read: its inodes are new, so no descriptor another user holds
+  -- reaches what is scanned, hashed and registered.
+  unless (T.null (doHashAlgo output)) (liftIO (replaceWithCopy outDir *> canonicalizeMetadata outDir))
+  liftIO (scanBuilt scan output outDir)
 
 -- | Rewrite scratch hashes in an output the builder wrote, then scan it
 -- for references to the input closure and this derivation's outputs.
@@ -1917,12 +1965,12 @@ siblingsReferenced outputs = referencedBy
 
 -- | Compare rebuilt outputs, each with the NAR hash the store recorded for
 -- it, in order, up to the first that differs or cannot be compared.
-firstDifference :: NAR.CaseHack -> [(BuiltOutput, Text)] -> IO (Either BuildStop CheckVerdict)
-firstDifference _ [] = pure (Right OutputsMatch)
-firstDifference caseHack (rebuilt : rest) = do
-  compared <- compareOutput caseHack rebuilt
+firstDifference :: NAR.CaseHack -> StorePath -> [(BuiltOutput, Text)] -> IO (Either BuildStop CheckVerdict)
+firstDifference _ _ [] = pure (Right OutputsMatch)
+firstDifference caseHack drvPath (rebuilt : rest) = do
+  compared <- compareOutput caseHack drvPath rebuilt
   case compared of
-    Right OutputsMatch -> firstDifference caseHack rest
+    Right OutputsMatch -> firstDifference caseHack drvPath rest
     ended -> pure ended
 
 -- | Compare one rebuilt output with the NAR hash the store recorded for
@@ -1935,9 +1983,9 @@ firstDifference caseHack (rebuilt : rest) = do
 -- A fixed output is held to its declared hash first, as a build holds it:
 -- upstream raises that mismatch for a checked fixed output and never
 -- reaches the comparison (:2612-2621, :2696, :2757).
-compareOutput :: NAR.CaseHack -> (BuiltOutput, Text) -> IO (Either BuildStop CheckVerdict)
-compareOutput caseHack (built, recorded) = do
-  fixedCheck <- verifyFixedOutput caseHack (boOutput built) (boDir built)
+compareOutput :: NAR.CaseHack -> StorePath -> (BuiltOutput, Text) -> IO (Either BuildStop CheckVerdict)
+compareOutput caseHack drvPath (built, recorded) = do
+  fixedCheck <- verifyFixedOutput caseHack drvPath (boOutput built) (boReferences built) (boDir built)
   case fixedCheck of
     Left err -> pure (Left (scanStop err))
     Right () -> do
@@ -1947,15 +1995,15 @@ compareOutput caseHack (built, recorded) = do
 -- | Place a scanned output in the store and check a fixed output's
 -- content, returning its 'PathRegistration'; @Nothing@ for an output
 -- registered before the build.
-placeOutput :: Store -> Maybe Text -> ScannedOutput -> IO (Either Text (Maybe PathRegistration))
-placeOutput store deriver scanned = case scanned of
+placeOutput :: Store -> StorePath -> Maybe Text -> ScannedOutput -> IO (Either Text (Maybe PathRegistration))
+placeOutput store drvPath deriver scanned = case scanned of
   AlreadyRegistered -> pure (Right Nothing)
   NeedsRegistering (BuiltOutput output outDir refs) -> do
     -- The builder wrote straight into the store path, so outDir IS the
     -- target and placing it moves nothing.
     let targetPath = storePathToFilePath (stDir store) (doPath output)
     reg <- placeInStore store outDir (doPath output) deriver refs
-    fixedCheck <- verifyFixedOutput (volumeCaseHack (stCaseSensitivity store)) output targetPath
+    fixedCheck <- verifyFixedOutput (volumeCaseHack (stCaseSensitivity store)) drvPath output refs targetPath
     case fixedCheck of
       Left err -> do
         -- Wrong bytes for a declared content address: remove the placed
@@ -2025,11 +2073,23 @@ orderByReferences references nodes =
 -- be a regular file its owner may not execute; recursive (@r:@) mode
 -- hashes the canonical NAR of the placed tree ('fixedOutputDigest').
 -- Non-fixed outputs (empty @doHashAlgo@) pass unchecked.
-verifyFixedOutput :: NAR.CaseHack -> DerivationOutput -> FilePath -> IO (Either Text ())
-verifyFixedOutput caseHack out placedPath
+--
+-- A fixed output that references any store path, itself included, is
+-- refused once its digest is taken, in upstream's order: an output its
+-- hash mode cannot take fails first, and a reference before a hash that
+-- does not match (local-derivation-goal.cc:2601-2625 at 2.24.9).  Its
+-- path comes from its content alone, which a reference would leave
+-- incomplete.  Upstream registers such an output under the path its
+-- references give it before it fails the build; nova-nix registers
+-- nothing, as for a hash that does not match.
+verifyFixedOutput :: NAR.CaseHack -> StorePath -> DerivationOutput -> [StorePath] -> FilePath -> IO (Either Text ())
+verifyFixedOutput caseHack drvPath out refs placedPath
   | T.null (doHashAlgo out) = pure (Right ())
-  | otherwise = (>>= matches) <$> fixedOutputDigest caseHack out placedPath
+  | otherwise = (>>= unreferenced) <$> fixedOutputDigest caseHack out placedPath
   where
+    unreferenced got
+      | null refs = matches got
+      | otherwise = Left ("illegal path references in fixed-output derivation '" <> storePathToText defaultStoreDir drvPath <> "'")
     subject = fixedOutputSubject out
     matches got = case hexToBytes (doHash out) of
       Nothing -> Left (subject <> ": malformed expected hash")

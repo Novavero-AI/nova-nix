@@ -14,7 +14,7 @@ import qualified Codec.Compression.GZip as GZip
 import qualified Codec.Compression.Zstd.Lazy as ZstdL
 import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
-import Control.Concurrent.Async (asyncThreadId, cancel, waitCatch, withAsync)
+import Control.Concurrent.Async (asyncThreadId, cancel, wait, waitCatch, withAsync)
 import Control.Exception (AsyncException (..), ErrorCall (..), IOException, SomeAsyncException (..), SomeException, asyncExceptionToException, bracket, bracket_, catches, displayException, evaluate, finally, fromException, throw, throwIO, throwTo, toException, try)
 import Control.Monad (filterM, foldM, forM_, guard, replicateM, replicateM_, unless, void, when, zipWithM, (>=>))
 import Control.Monad.Except (runExceptT)
@@ -122,7 +122,7 @@ import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), PushSummary (..), checkRecordedNarHash, computeClosure, defaultPartSize, isDerivationPath, loadKeyFile, mkNarInfo, mkPartSize, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, partSizeBytes, planMissing, preparePath, pushPaths, splitParts, storePathBasename, stripHashPrefix)
 import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), cacheInfoFileName, cacheInfoText, checkCacheInfo, ed25519SeedBytes, loadSecretKeyFile, pushTarget, pushToDirectory, signNarInfo)
 import qualified Nix.Realise as Realise
-import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv, writeDrvClosure)
+import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, caseHackDiskNames, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, freshCopyPath, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, onDiskNameKey, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, replaceWithCopy, resolveDeleteTarget, rewriteBytes, rewriteRegularFile, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, useStoreFileMask, withCollectorLock, writeDrv, writeDrvClosure)
 import Nix.Store.Access (DirAccess (..), accessSddl, sidFromText)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
@@ -151,7 +151,7 @@ import qualified System.Environment.Blank as Blank
 import System.Exit (ExitCode (..), exitFailure, exitSuccess, exitWith)
 import qualified System.FileLock as FileLock
 import System.FilePath (dropDrive, joinPath, makeRelative, pathSeparator, searchPathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
-import System.IO (BufferMode (..), IOMode (..), hClose, hPutStrLn, hSetBuffering, stderr, stdout, withBinaryFile)
+import System.IO (BufferMode (..), IOMode (..), hClose, hGetLine, hPutStrLn, hSetBuffering, stderr, stdout, withBinaryFile)
 import System.IO.Error (ioeGetErrorString, ioeGetFileName, isAlreadyExistsError, mkIOError, resourceVanishedErrorType)
 import qualified System.Info as SI
 import System.OsPath (OsPath)
@@ -13156,6 +13156,23 @@ withTempStore action = do
 deleteNamed :: Store -> Text -> IO (Either Text DeleteOutcome)
 deleteNamed store = either (pure . Left) (deleteStorePathRaw store) . storeEntryName
 
+-- | How long a test waits for a process it started to appear, to act or
+-- to be gone.
+processWaitMicros :: Int
+processWaitMicros = 10000000
+
+-- | Whether a condition came to hold within 'processWaitMicros', checked
+-- every tenth of a second.
+waitUntil :: IO Bool -> IO Bool
+waitUntil condition = go (processWaitMicros `div` pollMicros)
+  where
+    pollMicros = 100000
+    go :: Int -> IO Bool
+    go 0 = condition
+    go remaining = do
+      done <- condition
+      if done then pure True else threadDelay pollMicros >> go (remaining - 1)
+
 -- | Recursively restore writable permissions then remove.
 -- Needed because addToStore/canonicalizeMetadata makes paths read-only.
 forceRemoveIfExists :: FilePath -> IO ()
@@ -13165,18 +13182,24 @@ forceRemoveIfExists path = do
     restoreWritable path
     removeDirectoryRecursive path
 
+-- | Give a tree's owner write permission on everything in it, so it can be
+-- removed.  A symlink is passed over, never followed: it has no mode of
+-- its own, and what it names is not the tree's to change.
 restoreWritable :: FilePath -> IO ()
 restoreWritable path = do
-  isDir <- doesDirectoryExist path
-  when isDir $ do
-    perms <- getPermissions path
-    Dir.setPermissions path (Dir.setOwnerWritable True perms)
-    entries <- Dir.listDirectory path
-    mapM_ (restoreWritable . (path </>)) entries
-  isFile <- Dir.doesFileExist path
-  when isFile $ do
-    perms <- getPermissions path
-    Dir.setPermissions path (Dir.setOwnerWritable True perms)
+  isLink <- Dir.pathIsSymbolicLink path
+  unless isLink $ do
+    isDir <- doesDirectoryExist path
+    when isDir $ do
+      perms <- getPermissions path
+      -- Read and search too, for a directory a test left closed.
+      Dir.setPermissions path (Dir.setOwnerWritable True (Dir.setOwnerReadable True (Dir.setOwnerSearchable True perms)))
+      entries <- Dir.listDirectory path
+      mapM_ (restoreWritable . (path </>)) entries
+    isFile <- Dir.doesFileExist path
+    when isFile $ do
+      perms <- getPermissions path
+      Dir.setPermissions path (Dir.setOwnerWritable True perms)
 
 -- | Step 1 of the Windows-stdenv ladder: prove the Builder can run a
 -- trivial derivation end-to-end natively - a recipe that writes to @$out@,
@@ -24548,6 +24571,193 @@ testBuilder = do
         closeStore store
         forceRemoveIfExists tmpStore
         pure (assertEqual "build" (BuildSuccess outSP) result `andThen` assertEqual "what the builder was given" "zero|one|kept|unset\n" seen),
+      -- Upstream refuses an output its group or anyone else may write
+      -- before it reads or changes the output, since someone other than
+      -- the build may have changed it; on Windows there is no such mode.
+      runTestM "an output others could write is refused before it is made canonical, and none is registered" $
+        if SI.os == "mingw32"
+          then pure Pass
+          else do
+            tmpBase <- getTemporaryDirectory
+            let tmpStore = tmpBase </> "nova-nix-test-builder-open-output"
+            forceRemoveIfExists tmpStore
+            store <- openStore (StoreDir tmpStore)
+            let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaay" "open-output"
+                outPath = storePathToFilePath (stDir store) outSP
+            result <- buildDerivation (defaultBuildConfig (stDir store)) store (mkTestBuildDrv shell outSP "mkdir $out && chmod 0777 $out") testDrvPath
+            registered <- isValid store outSP
+            left <- Dir.doesPathExist outPath
+            closeStore store
+            forceRemoveIfExists tmpStore
+            pure $
+              assertEqual "result" (BuildFailure ("suspicious ownership or permission on '" <> T.pack outPath <> "' for output 'out'; rejecting this build output") 1) result
+                `andThen` assertEqual "registered" False registered
+                `andThen` assertEqual "left in the store" False left,
+      -- A descriptor the builder passes out names the inode it wrote,
+      -- which upstream replaces with a fresh copy before it hashes and
+      -- registers a fixed output.  A process of the test's holds one open
+      -- across the build and writes through it once the output is
+      -- registered.
+      runTestM "a descriptor held on a fixed output's file while it is built cannot change what is registered" $
+        if SI.os == "mingw32"
+          then pure Pass
+          else do
+            tmpBase <- getTemporaryDirectory
+            let tmpStore = tmpBase </> "nova-nix-test-builder-fixed-fd"
+                release = tmpBase </> "nova-nix-test-builder-fixed-fd.release"
+            forceRemoveIfExists tmpStore
+            Dir.removePathForcibly release
+            store <- openStore (StoreDir tmpStore)
+            let payload = "payload"
+                digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" payload)
+                outSP = StorePath "ffffffffffffffffffffffffffffff0y" "fixed-fd"
+                outPath = storePathToFilePath (stDir store) outSP
+                script = "printf payload > $out; while [ ! -e \"$release\" ]; do /bin/sleep 0.1; done"
+                base = mkFixedOutputDrv shell outSP script "sha256" digest
+                drv = base {drvEnv = Map.insert "release" (TE.encodeUtf8 (T.pack release)) (drvEnv base)}
+                holder = (Proc.proc "/bin/sh" ["-c", "exec 3<>\"$1\"; echo ready; read -r _; printf tampered >&3", "sh", outPath]) {Proc.std_in = Proc.CreatePipe, Proc.std_out = Proc.CreatePipe}
+            (result, seen) <- withAsync (buildDerivation (defaultBuildConfig (stDir store)) store drv testDrvPath) $ \build -> do
+              written <- waitUntil (Dir.doesPathExist outPath)
+              Proc.withCreateProcess holder $ \holderIn holderOut _ holding -> case (written, holderIn, holderOut) of
+                (True, Just toHolder, Just fromHolder) -> do
+                  _ <- hGetLine fromHolder
+                  BS.writeFile release ""
+                  finished <- timeout processWaitMicros (wait build)
+                  hPutStrLn toHolder "" >> hClose toHolder
+                  _ <- Proc.waitForProcess holding
+                  registered <- BS.readFile outPath
+                  pure (finished, registered)
+                _ -> pure (Nothing, "")
+            closeStore store
+            forceRemoveIfExists tmpStore
+            Dir.removePathForcibly release
+            pure (assertEqual "build" (Just (BuildSuccess outSP)) result `andThen` assertEqual "what is registered" payload seen),
+      -- Upstream reads an output with lstat, so one that is a symlink is
+      -- there whatever it names, nothing at all included.
+      runTestM "an output that is a symlink naming nothing is an output, as upstream reads one" $
+        if SI.os == "mingw32"
+          then pure Pass
+          else do
+            tmpBase <- getTemporaryDirectory
+            let tmpStore = tmpBase </> "nova-nix-test-builder-dangling"
+            forceRemoveIfExists tmpStore
+            store <- openStore (StoreDir tmpStore)
+            let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaax" "dangling"
+            result <- buildDerivation (defaultBuildConfig (stDir store)) store (mkTestBuildDrv shell outSP "ln -s /nonexistent-nova-nix-target $out") testDrvPath
+            target <- Dir.getSymbolicLinkTarget (storePathToFilePath (stDir store) outSP)
+            closeStore store
+            forceRemoveIfExists tmpStore
+            pure (assertEqual "build" (BuildSuccess outSP) result `andThen` assertEqual "what it names" "/nonexistent-nova-nix-target" target),
+      runTestM "a fixed output's copy an earlier run left half made is removed by the next build of it" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-builder-fresh-copy"
+        forceRemoveIfExists tmpStore
+        store <- openStore (StoreDir tmpStore)
+        let digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" "payload")
+            outSP = StorePath "ffffffffffffffffffffffffffffff0x" "fresh-copy"
+            leftover = storePathToFilePath (stDir store) outSP <> ".tmp"
+        createDirectoryIfMissing True leftover
+        BS.writeFile (leftover </> "half") "made"
+        result <- buildDerivation (defaultBuildConfig (stDir store)) store (mkFixedOutputDrv shell outSP "exit 1" "sha256" digest) testDrvPath
+        left <- Dir.doesPathExist leftover
+        closeStore store
+        forceRemoveIfExists tmpStore
+        pure (assertEqual "build" (BuildFailure "builder failed" 1) result `andThen` assertEqual "the copy left" False left),
+      -- Upstream makes an output canonical before it reads it, so a file
+      -- its builder left unreadable is read once it is 0444.
+      runTestM "an output is made canonical before it is scanned, so a file its builder left unreadable is read" $
+        if SI.os == "mingw32"
+          then pure Pass
+          else do
+            tmpBase <- getTemporaryDirectory
+            let tmpStore = tmpBase </> "nova-nix-test-builder-canonical-first"
+            forceRemoveIfExists tmpStore
+            store <- openStore (StoreDir tmpStore)
+            let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaw" "canonical-first"
+                outPath = storePathToFilePath (stDir store) outSP
+            result <- buildDerivation (defaultBuildConfig (stDir store)) store (mkTestBuildDrv shell outSP "mkdir $out && echo hidden > $out/file && chmod 0200 $out/file") testDrvPath
+            mode <- fmap nsPermissions <$> nodeStatus (outPath </> "file")
+            closeStore store
+            forceRemoveIfExists tmpStore
+            pure (assertEqual "build" (BuildSuccess outSP) result `andThen` assertEqual "the file's mode" (Just 0o444) mode),
+      -- Upstream changes each node before it reads a directory, so an
+      -- output directory its builder left unreadable is read, not refused.
+      -- A divergence: upstream would make the directory 0444 and, run as a
+      -- user other than root, fail to read beneath it.
+      runTestM "an output directory its builder left readable but not searchable is read, and made 0555" $
+        if SI.os == "mingw32"
+          then pure Pass
+          else do
+            tmpBase <- getTemporaryDirectory
+            let tmpStore = tmpBase </> "nova-nix-test-builder-unreadable-dir"
+            forceRemoveIfExists tmpStore
+            store <- openStore (StoreDir tmpStore)
+            let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaav" "unreadable-dir"
+                outPath = storePathToFilePath (stDir store) outSP
+            result <- buildDerivation (defaultBuildConfig (stDir store)) store (mkTestBuildDrv shell outSP "mkdir -p $out/d && touch $out/d/f && chmod 0644 $out/d") testDrvPath
+            mode <- fmap nsPermissions <$> nodeStatus (outPath </> "d")
+            closeStore store
+            forceRemoveIfExists tmpStore
+            pure (assertEqual "build" (BuildSuccess outSP) result `andThen` assertEqual "the directory's mode" (Just 0o555) mode),
+      runTestM "a fresh copy that fails part way is removed, and what it was copying stays as it was" $
+        if SI.os == "mingw32"
+          then pure Pass
+          else do
+            tmpBase <- getTemporaryDirectory
+            let tree = tmpBase </> "nova-nix-test-fresh-copy-fails"
+            forceRemoveIfExists tree
+            Dir.removePathForcibly (freshCopyPath tree)
+            createDirectoryIfMissing True tree
+            BS.writeFile (tree </> "a") "a"
+            BS.writeFile (tree </> "b") "b"
+            -- A file the copy cannot read fails it after it has begun.
+            Proc.callProcess "chmod" ["0000", tree </> "b"]
+            copied <- try (replaceWithCopy tree) :: IO (Either IOException ())
+            leftCopy <- Dir.doesPathExist (freshCopyPath tree)
+            Proc.callProcess "chmod" ["0644", tree </> "b"]
+            kept <- BS.readFile (tree </> "b")
+            forceRemoveIfExists tree
+            pure $
+              assertEqual "failed" True (isLeft copied)
+                `andThen` assertEqual "the copy left" False leftCopy
+                `andThen` assertEqual "the original" "b" kept,
+      -- A fixed output's path comes from its content alone, which a
+      -- reference would leave incomplete.
+      runTestM "a fixed output that references a store path is refused, as upstream refuses it" $
+        if SI.os == "mingw32"
+          then pure Pass
+          else do
+            tmpBase <- getTemporaryDirectory
+            let tmpStore = tmpBase </> "nova-nix-test-builder-fixed-references"
+            forceRemoveIfExists tmpStore
+            store <- openStore (StoreDir tmpStore)
+            let outSP = StorePath "ffffffffffffffffffffffffffffff0w" "fixed-references"
+                outPath = storePathToFilePath (stDir store) outSP
+                digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" (TE.encodeUtf8 (T.pack outPath)))
+            result <- buildDerivation (defaultBuildConfig (stDir store)) store (mkFixedOutputDrv shell outSP "printf '%s' \"$out\" > $out" "sha256" digest) testDrvPath
+            registered <- isValid store outSP
+            closeStore store
+            forceRemoveIfExists tmpStore
+            pure $
+              assertEqual "result" (BuildFailure ("illegal path references in fixed-output derivation '" <> storePathToText defaultStoreDir testDrvPath <> "'") 1) result
+                `andThen` assertEqual "registered" False registered,
+      -- The original is made canonical before it is copied, as upstream
+      -- makes it, so a file its builder left unreadable is copied.
+      runTestM "a fixed recursive output holding a file its builder left unreadable is copied, hashed and registered" $
+        if SI.os == "mingw32"
+          then pure Pass
+          else do
+            tmpBase <- getTemporaryDirectory
+            let tmpStore = tmpBase </> "nova-nix-test-builder-fixed-unreadable"
+            forceRemoveIfExists tmpStore
+            store <- openStore (StoreDir tmpStore)
+            let outSP = StorePath "ffffffffffffffffffffffffffffff0v" "fixed-unreadable"
+                tree = NAR.NarDirectory [("f", NAR.NarRegular False "x\n")]
+                digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" (NAR.serialise tree))
+            result <- buildDerivation (defaultBuildConfig (stDir store)) store (mkFixedOutputDrv shell outSP "mkdir $out && printf 'x\\n' > $out/f && chmod 0200 $out/f" "r:sha256" digest) testDrvPath
+            closeStore store
+            forceRemoveIfExists tmpStore
+            pure (assertEqual "build" (BuildSuccess outSP) result),
       -- A file its owner may not remove stands in for a directory another
       -- user made, which no test can make; macOS lets an owner set one.
       runTestM "a build directory an earlier build left that cannot be removed is moved aside, and the build goes on" $
@@ -24572,6 +24782,25 @@ testBuilder = do
                 pure (assertEqual "the build" True ran `andThen` assertEqual "moved aside" True movedAside)
               )
               `finally` (Proc.readProcessWithExitCode "chflags" ["-R", "nouchg", storeRoot] "" *> forceRemoveIfExists storeRoot),
+      -- The rewrite of a store hash in a file opens it without following
+      -- a link, so one put where the file was is refused, not followed.
+      runTestM "a file's rewrite in place does not follow a link put where the file was" $
+        if SI.os == "mingw32"
+          then pure Pass
+          else do
+            tmpBase <- getTemporaryDirectory
+            let dir = tmpBase </> "nova-nix-test-rewrite-link"
+                outside = tmpBase </> "nova-nix-test-rewrite-link-outside"
+            forceRemoveIfExists dir
+            Dir.removePathForcibly outside
+            createDirectoryIfMissing True dir
+            BS.writeFile outside "the user's"
+            Dir.createFileLink outside (dir </> "file")
+            rewritten <- try (rewriteRegularFile (const "changed") (dir </> "file")) :: IO (Either IOException ())
+            kept <- BS.readFile outside
+            forceRemoveIfExists dir
+            Dir.removePathForcibly outside
+            pure (assertEqual "refused" True (isLeft rewritten) `andThen` assertEqual "what the link names" "the user's" kept),
       -- The carve-out is for upstream's fixed-output type alone: one
       -- output, out, with a hash that fixes it.  Each builder only logs
       -- what it saw, so every build fails for want of its outputs, which
@@ -26207,6 +26436,37 @@ testCheckCLI = do
                 _ -> Fail ("build: " <> outcome differingBuilt <> "; check: " <> outcome differingChecked)
           ]
     )
+
+-- | The CLI runs with upstream's file-creation mask, 0022, whatever the one
+-- it was started with, so a builder it runs does too.  POSIX only: Windows
+-- has no such mask.
+testBuildUmaskCLI :: IO [Bool]
+testBuildUmaskCLI = do
+  putStrLn "cli/build-umask"
+  if SI.os == "mingw32"
+    then do
+      putStrLn "  SKIP  POSIX only"
+      pure []
+    else do
+      tmpBase <- getTemporaryDirectory
+      ambient <- getEnvironment
+      let root = tmpBase </> "nova-nix-test-cli-build-umask"
+          configVars = ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES"]
+          expression = "derivation { name = \"umask-cli\"; system = builtins.currentSystem; builder = \"/bin/sh\"; args = [ \"-c\" \"umask > $out\" ]; }"
+          started =
+            (Proc.proc "/bin/sh" ["-c", "umask 077; exec cabal run -v0 exe:nova-nix -- build --expr \"$1\" --store \"$2\" --no-out-link", "sh", expression, root </> "store"])
+              { Proc.env = Just (("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n") : ("NIX_CONF_DIR", root </> "system") : ("NIX_USER_CONF_FILES", "") : filter ((`notElem` configVars) . fst) ambient)
+              }
+      bracket_
+        (forceRemoveIfExists root >> createDirectoryIfMissing True root)
+        (forceRemoveIfExists root)
+        ( do
+            (code, out, err) <- Proc.readCreateProcessWithExitCode started ""
+            seen <- case (code, listToMaybe (reverse (filter (not . null) (lines out)))) of
+              (ExitSuccess, Just path) -> Right . T.strip <$> TIO.readFile path
+              _ -> pure (Left ("exit " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err))
+            sequence [runTest "a builder the CLI runs gets upstream's file-creation mask, whatever the CLI was started with" (assertEqual "umask" (Right "0022") seen)]
+        )
 
 -- | nix.conf's cores reaches a builder the CLI runs, and with nothing
 -- setting it the builder is told the machine's count, a positive number.
@@ -32523,7 +32783,10 @@ testSourceBytesIO = do
       ]
 
 main :: IO ()
-main =
+main = do
+  -- The builds here run with upstream's mask, as the CLI's do, whatever
+  -- the one the suite was started with.
+  useStoreFileMask
   getArgs >>= \case
     [flag, name] | flag == arenaGuardChildFlag -> arenaGuardChild name
     [flag, source] | flag == evalChildFlag -> inTestSession (evalChild source)
@@ -32773,6 +33036,7 @@ runSuite = do
           testCheckCLI,
           testImportFromDerivationCLI,
           testBuildCoresCLI,
+          testBuildUmaskCLI,
           testOutLinkCLI,
           testTargetArgs,
           testTargetArgsCLI,
