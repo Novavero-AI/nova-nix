@@ -86,8 +86,15 @@ jobs:
           ghc-version: "9.14.1"
           cabal-version: "latest"
 
+      # On Linux the sandbox's helper ships beside nova-nix, which finds it
+      # there.
       - name: Build the executable
-        run: cabal install exe:nova-nix --install-method=copy --installdir=staged --overwrite-policy=always
+        shell: bash
+        run: |
+          set -euo pipefail
+          targets=(exe:nova-nix)
+          if [ "$RUNNER_OS" = Linux ]; then targets+=(exe:nova-nix-sandbox); fi
+          cabal install "${targets[@]}" --install-method=copy --installdir=staged --overwrite-policy=always
 
       # bin/ beside share/ is the layout resolveDataDir looks for, so the
       # archive works unpacked anywhere with nothing set.  pkgs/ rides along
@@ -107,6 +114,24 @@ jobs:
           cp -R pkgs "$stem/"
           cp LICENSE NOTICE README.md "$stem/"
           echo "stem=$stem" >> "$GITHUB_ENV"
+
+      # A Linux archive carries a static busybox as the shell a sandboxed
+      # build sees at /bin/sh, as packaged upstream Nix carries its
+      # busybox-sandbox-shell: nova-nix defaults sandbox-paths to it when
+      # it is in libexec/, so a derivation whose builder is /bin/sh builds
+      # in the sandbox.  Its copyright file rides beside it.
+      - name: Bundle the sandbox shell (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends busybox-static
+          shell=$(command -v busybox)
+          file -L "$shell" | grep -q 'statically linked' || { echo "::error::$shell is not statically linked"; exit 1; }
+          mkdir -p "$stem/libexec/nova-nix"
+          cp -L "$shell" "$stem/libexec/nova-nix/sh"
+          cp /usr/share/doc/busybox-static/copyright "$stem/libexec/nova-nix/sh.copyright"
 
       # The asset has to work before it is published, not after someone
       # reports that it does not.  nova_nix_datadir is pointed at nothing so

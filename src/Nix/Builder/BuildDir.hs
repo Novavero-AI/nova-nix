@@ -38,7 +38,9 @@
 module Nix.Builder.BuildDir
   ( -- * The directory
     buildDirFor,
+    sandboxedBuildDir,
     withBuildDir,
+    clearLeftover,
     createBuildDir,
   )
 where
@@ -63,6 +65,15 @@ buildsDirName = "builds"
 buildDirFor :: StoreDir -> StorePath -> FilePath
 buildDirFor dir firstOutput =
   unStoreDir dir </> metaDirName </> buildsDirName </> T.unpack (spHash firstOutput)
+
+-- | Where in its build directory a sandboxed build's own directory is,
+-- the one bound where the builder sees it, as upstream puts its @tmpDir@
+-- at @topTmpDir + "/build"@ in a chroot build (local-derivation-goal.cc:
+-- 505-524 at 2.24.9).  The builder owns what it sees and can open it to
+-- anyone; the build directory above it, which it cannot reach, stays
+-- closed to every other user.
+sandboxedBuildDir :: FilePath -> FilePath
+sandboxedBuildDir dir = dir </> "build"
 
 -- | Remove what an earlier build left at a path, or where it cannot be
 -- removed, move it aside, to the first free name of the path with

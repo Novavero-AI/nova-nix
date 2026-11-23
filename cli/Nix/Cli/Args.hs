@@ -23,6 +23,7 @@ where
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
+import Nix.Builder.Sandbox (SandboxMode (..))
 
 -- | Parsed CLI options.
 data CliOpts = CliOpts
@@ -62,6 +63,9 @@ data CliOpts = CliOpts
     -- store and realises what a path's context names, as
     -- @nix-instantiate --eval --read-write-mode@ does.
     optReadWriteMode :: !Bool,
+    -- | @--sandbox@, @--no-sandbox@ or @--relaxed-sandbox@, the last given:
+    -- upstream's @sandbox@ on this run.
+    optSandbox :: !(Maybe SandboxMode),
     optCommand :: !Command
   }
   deriving (Eq, Show)
@@ -208,7 +212,7 @@ emptyPushArgs = PushArgs Nothing Nothing Nothing Nothing False []
 -- silent drop: an unknown or misspelled flag fails the parse, so nothing
 -- after it (a requested @--substituter@, say) is quietly discarded.
 parseArgs :: [String] -> Either String CliOpts
-parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] False False False False False False False CmdUsage)
+parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] False False False False False False False Nothing CmdUsage)
   where
     go opts [] = Right opts
     go opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
@@ -240,6 +244,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       go (opts {optFallback = True}) rest
     go opts ("--read-write-mode" : rest) =
       go (opts {optReadWriteMode = True}) rest
+    go opts (flag : rest)
+      | Just mode <- sandboxFlag flag = go (opts {optSandbox = Just mode}) rest
     go opts ("eval" : rest) = goEval opts rest
     go opts ("build" : rest) = goTarget BuildsTarget opts emptyBuildArgs rest
     go opts ("trust" : rest) = goTarget TrustsTarget opts emptyBuildArgs rest
@@ -282,6 +288,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       goEval (opts {optTrustedKey = Just key}) rest
     goEval opts ("--exec-wrapper" : spec : rest) =
       goEval (opts {optExecWrappers = optExecWrappers opts ++ [spec]}) rest
+    goEval opts (flag : rest)
+      | Just mode <- sandboxFlag flag = goEval (opts {optSandbox = Just mode}) rest
     goEval opts ("--expr" : expr : rest) =
       go (opts {optCommand = CmdEval (TargetExpr expr)}) rest
     goEval _ [flag]
@@ -322,6 +330,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       goTarget kind (opts {optFallback = True}) targetArgs rest
     goTarget BuildsTarget opts targetArgs ("--check" : rest) =
       goTarget BuildsTarget (opts {optCheck = True}) targetArgs rest
+    goTarget kind opts targetArgs (flag : rest)
+      | Just mode <- sandboxFlag flag = goTarget kind (opts {optSandbox = Just mode}) targetArgs rest
     goTarget kind opts targetArgs ("--expr" : expr : rest) =
       withTarget kind opts targetArgs (TargetExpr expr) rest
     goTarget kind opts targetArgs (flag : path : rest)
@@ -404,6 +414,12 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     answered "--help" = Just CmdHelp
     answered "--version" = Just CmdVersion
     answered _ = Nothing
+    -- Upstream's three flags for the @sandbox@ setting (globals.cc:303-326
+    -- at 2.24.9).
+    sandboxFlag "--sandbox" = Just SandboxEnabled
+    sandboxFlag "--no-sandbox" = Just SandboxDisabled
+    sandboxFlag "--relaxed-sandbox" = Just SandboxRelaxed
+    sandboxFlag _ = Nothing
     -- Flags that consume the following argument as their value.
     valueFlags =
       ["--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--secret-key-file", "--compression"]
