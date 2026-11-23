@@ -1,0 +1,70 @@
+{
+  "bashFunctions": {
+    "buildPhase":" \n    runHook preBuild;\n    echo \"building into $out with $NIX_CFLAGS_COMPILE\";\n    make -j\"$NIX_BUILD_CORES\" PREFIX=\"$out\";\n    runHook postBuild\n",
+    "genericBuild":" \n    for curPhase in ${phases:-buildPhase};\n    do\n        runPhase \"$curPhase\";\n    done\n",
+    "runHook":" \n    local hookName=\"$1\";\n    shift;\n    local hooksSlice=\"${hookName%Hook}Hooks[@]\";\n    local hook;\n    for hook in ${!hooksSlice+\"${!hooksSlice}\"};\n    do\n        eval \"$hook\" \"$@\";\n    done;\n    if declare -F \"$hookName\" > /dev/null; then\n        \"$hookName\" \"$@\";\n    else\n        if [ -n \"${!hookName:-}\" ]; then\n            eval \"${!hookName}\";\n        fi;\n    fi;\n    return 0\n",
+    "runPhase":" \n    local curPhase=\"$*\";\n    echo \"Running phase: $curPhase\";\n    runHook \"pre${curPhase^}\";\n    eval \"${!curPhase:-$curPhase}\"\n"
+  },
+  "variables": {
+    "BASH": {"type": "var", "value": "/nix/store/3fyf1d1h6cdg8gc7pjpnh1hxkm5a4mmv-bash-5.3p3/bin/bash"},
+    "BASHOPTS": {"type": "unknown"},
+    "BASHPID": {"type": "unknown"},
+    "HOME": {"type": "exported", "value": "/homeless-shelter"},
+    "HOSTTYPE": {"type": "var", "value": "aarch64"},
+    "IFS": {"type": "var", "value": " \t\n"},
+    "IN_NIX_SHELL": {"type": "exported", "value": "impure"},
+    "LINENO": {"type": "var", "value": "78"},
+    "MACHTYPE": {"type": "var", "value": "aarch64-apple-darwin25.4.0"},
+    "NIX_ATTRS_JSON_FILE": {"type": "exported", "value": "/build/.attrs.json"},
+    "NIX_ATTRS_SH_FILE": {"type": "exported", "value": "/build/.attrs.sh"},
+    "NIX_BUILD_CORES": {"type": "exported", "value": "4"},
+    "NIX_BUILD_TOP": {"type": "exported", "value": "/build"},
+    "NIX_CFLAGS_COMPILE": {"type": "exported", "value": "-I/nix/store/8m4pzx0c2kfr9lw1yq7d6b3hjsvgian5-structured-env/include -DGREETING=\"hello world\" -I/nix/store/9ra2kd7nm0xf1lq8w4hvy3bs6zcjgip5-structured-env-dev/include"},
+    "NIX_ENFORCE_PURITY": {"type": "exported", "value": "1"},
+    "NIX_FIXTURE_COUNT": {"type": "unknown"},
+    "NIX_LOG_FD": {"type": "exported", "value": "2"},
+    "NIX_REMOTE": {"type": "exported", "value": "daemon"},
+    "NIX_STORE": {"type": "exported", "value": "/nix/store"},
+    "OLDPWD": {"type": "exported", "value": ""},
+    "OPTERR": {"type": "var", "value": "1"},
+    "OPTIND": {"type": "unknown"},
+    "OSTYPE": {"type": "var", "value": "darwin25.4.0"},
+    "PATH": {"type": "exported", "value": "/nix/store/4zd8mb1c7r0x5jsg2dqhlf9wnv6pyk3a-hello-dep-1.0/bin:/nix/store/3fyf1d1h6cdg8gc7pjpnh1hxkm5a4mmv-bash-5.3p3/bin"},
+    "PS4": {"type": "var", "value": "+ "},
+    "SHELL": {"type": "exported", "value": "/noshell"},
+    "SHELLOPTS": {"type": "unknown"},
+    "SRANDOM": {"type": "unknown"},
+    "SSL_CERT_FILE": {"type": "exported", "value": "/no-cert-file.crt"},
+    "TEMP": {"type": "exported", "value": "/build"},
+    "TEMPDIR": {"type": "exported", "value": "/build"},
+    "TERM": {"type": "exported", "value": "xterm-256color"},
+    "TMP": {"type": "exported", "value": "/build"},
+    "TMPDIR": {"type": "exported", "value": "/build"},
+    "TZ": {"type": "exported", "value": "UTC"},
+    "buildInputs": {"type": "array", "value": ["/nix/store/4zd8mb1c7r0x5jsg2dqhlf9wnv6pyk3a-hello-dep-1.0" ]},
+    "builder": {"type": "var", "value": "/nix/store/3fyf1d1h6cdg8gc7pjpnh1hxkm5a4mmv-bash-5.3p3/bin/bash"},
+    "dev": {"type": "var", "value": "/nix/store/9ra2kd7nm0xf1lq8w4hvy3bs6zcjgip5-structured-env-dev"},
+    "dontAddDisableDepTrack": {"type": "exported", "value": "1"},
+    "envHostHostHooks": {"type": "array", "value": []},
+    "fixtureFlags": {"type": "associative", "value": {
+      "newline": "a\nb",
+      "plain": "tab\there",
+      "with space": "it's"
+    }},
+    "name": {"type": "var", "value": "structured-env"},
+    "out": {"type": "var", "value": "/nix/store/8m4pzx0c2kfr9lw1yq7d6b3hjsvgian5-structured-env"},
+    "outputs": {"type": "associative", "value": {
+      "dev": "/nix/store/9ra2kd7nm0xf1lq8w4hvy3bs6zcjgip5-structured-env-dev",
+      "out": "/nix/store/8m4pzx0c2kfr9lw1yq7d6b3hjsvgian5-structured-env"
+    }},
+    "preBuildHooks": {"type": "array", "value": ["echo \"before build\"" , "echo it's" ]},
+    "prefix": {"type": "var", "value": "/nix/store/8m4pzx0c2kfr9lw1yq7d6b3hjsvgian5-structured-env"},
+    "shellHook": {"type": "var", "value": "echo \"structured hook\""},
+    "stdenv": {"type": "var", "value": "/nix/store/2wn1qbk9i4ydbvqgmrbx3hx3k1l0vjfh-stdenv"},
+    "system": {"type": "var", "value": "x86_64-linux"}
+  },
+  "structuredAttrs": {
+    ".attrs.sh": "declare -a buildInputs=('/nix/store/4zd8mb1c7r0x5jsg2dqhlf9wnv6pyk3a-hello-dep-1.0' )\ndeclare builder='/nix/store/3fyf1d1h6cdg8gc7pjpnh1hxkm5a4mmv-bash-5.3p3/bin/bash'\ndeclare name='structured-env'\ndeclare -A outputs=(['dev']='/nix/store/9ra2kd7nm0xf1lq8w4hvy3bs6zcjgip5-structured-env-dev' ['out']='/nix/store/8m4pzx0c2kfr9lw1yq7d6b3hjsvgian5-structured-env' )\ndeclare shellHook='echo \"structured hook\"'\ndeclare stdenv='/nix/store/2wn1qbk9i4ydbvqgmrbx3hx3k1l0vjfh-stdenv'\ndeclare system='x86_64-linux'",
+    ".attrs.json": "{\"buildInputs\":[\"/nix/store/4zd8mb1c7r0x5jsg2dqhlf9wnv6pyk3a-hello-dep-1.0\"],\"builder\":\"/nix/store/3fyf1d1h6cdg8gc7pjpnh1hxkm5a4mmv-bash-5.3p3/bin/bash\",\"name\":\"structured-env\",\"outputs\":{\"dev\":\"/nix/store/9ra2kd7nm0xf1lq8w4hvy3bs6zcjgip5-structured-env-dev\",\"out\":\"/nix/store/8m4pzx0c2kfr9lw1yq7d6b3hjsvgian5-structured-env\"},\"shellHook\":\"echo \\\"structured hook\\\"\",\"stdenv\":\"/nix/store/2wn1qbk9i4ydbvqgmrbx3hx3k1l0vjfh-stdenv\",\"system\":\"x86_64-linux\"}"
+  }
+}
