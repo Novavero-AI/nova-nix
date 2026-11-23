@@ -11756,7 +11756,7 @@ testSandboxPure = do
               `andThen` assertEqual "defaults" (True, "/build", "50%", Nothing, Nothing) (fields Config.defaultNixConfig)
               `andThen` assertEqual "sandbox unset" Nothing (ncSandbox Config.defaultNixConfig)
               `andThen` assertEqual "extra- reaches no scalar" (Right Config.defaultNixConfig) (Config.resolveConfig [Config.ConfigAssignment "extra-sandbox-build-dir" "/x"]),
-      runTest "build, eval and trust take upstream's sandbox flags, the later flag winning" $
+      runTest "build, eval and trust take upstream's sandbox flags, its older names meaning --relaxed-sandbox as upstream's do, the later flag winning" $
         let mode args = Cli.optSandbox <$> Cli.parseArgs args
          in foldr
               andThen
@@ -11765,7 +11765,9 @@ testSandboxPure = do
               | (flag, expected) <-
                   [ ("--sandbox", Sandbox.SandboxEnabled),
                     ("--no-sandbox", Sandbox.SandboxDisabled),
-                    ("--relaxed-sandbox", Sandbox.SandboxRelaxed)
+                    ("--relaxed-sandbox", Sandbox.SandboxRelaxed),
+                    ("--build-use-chroot", Sandbox.SandboxRelaxed),
+                    ("--build-use-sandbox", Sandbox.SandboxRelaxed)
                   ],
                 command <- ["build", "eval", "trust"],
                 arguments <- [[flag, command, "--expr", "1"], [command, flag, "--expr", "1"], [command, "--expr", "1", flag]]
