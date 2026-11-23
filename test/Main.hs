@@ -2055,7 +2055,7 @@ testCensus = do
             target = root </> "census.txt"
             run value =
               Proc.readCreateProcessWithExitCode
-                (Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "eval", "--strict", "--expr", "builtins.genList (i: { inherit i; }) 3"])
+                (Proc.proc "cabal" ["run", "-v0", "exe:nova-nix", "--", "eval", "--strict", "--expr", "builtins.genList (i: { inherit i; }) 3"])
                   { Proc.env = Just (("NOVA_NIX_C_STATS", value) : filter ((/= "NOVA_NIX_C_STATS") . fst) ambient)
                   }
                 ""
@@ -2434,7 +2434,7 @@ testRegionCensus = do
       inRoot = bracket_ (forceRemoveIfExists root >> createDirectoryIfMissing True root) (forceRemoveIfExists root)
       evalWith value args =
         Proc.readCreateProcessWithExitCode
-          (Proc.proc "cabal" (["run", "-v0", "nova-nix", "--", "eval"] <> args))
+          (Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--", "eval"] <> args))
             { Proc.env = Just ((regionVar, value) : filter ((/= regionVar) . fst) ambient)
             }
           ""
@@ -25093,7 +25093,7 @@ testE2E = do
         -- Run nova-nix eval via Process
         (exitCode, stdoutStr, stderrStr) <-
           Proc.readCreateProcessWithExitCode
-            (Proc.proc "cabal" ["run", "nova-nix", "--", "eval", nixFile])
+            (Proc.proc "cabal" ["run", "exe:nova-nix", "--", "eval", nixFile])
             ""
         forceRemoveIfExists tmpDir
         pure $ case exitCode of
@@ -25133,7 +25133,7 @@ testExecWrapperCLI = do
           : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
       runCLI args =
         Proc.readCreateProcessWithExitCode
-          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
+          ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
           ""
       buildCases =
         [ ("before build", wrapper ++ ["build"] ++ target),
@@ -25200,7 +25200,7 @@ testUncaughtIOFailureCLI = do
     ( do
         (code, _, err) <-
           Proc.readCreateProcessWithExitCode
-            ((Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "build", "--expr", source, "--store", root </> "store"]) {Proc.env = Just isolatedEnv})
+            ((Proc.proc "cabal" ["run", "-v0", "exe:nova-nix", "--", "build", "--expr", source, "--store", root </> "store"]) {Proc.env = Just isolatedEnv})
             ""
         sequence
           [ runTest "uncaught I/O failure exits 1" (assertEqual "exit code" (ExitFailure 1) code),
@@ -25233,7 +25233,7 @@ testClosedStdoutCLI = do
         bracket Proc.createPipe (\(readEnd, writeEnd) -> hClose readEnd >> hClose writeEnd) $ \(readEnd, writeEnd) -> do
           hClose readEnd
           Proc.withCreateProcess
-            ( (Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args))
+            ( (Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args))
                 { Proc.env = Just isolatedEnv,
                   Proc.std_out = Proc.UseHandle writeEnd,
                   Proc.std_err = Proc.CreatePipe
@@ -25848,7 +25848,7 @@ testImportFromDerivationCLI = do
           : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"]) ambient
       runCLIWith extraConfig args =
         Proc.readCreateProcessWithExitCode
-          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just (isolatedEnvWith extraConfig)})
+          ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just (isolatedEnvWith extraConfig)})
           ""
       runCLI = runCLIWith ""
       nixString text = "\"" <> T.replace "${" "\\${" (T.replace "\"" "\\\"" (T.replace "\\" "\\\\" text)) <> "\""
@@ -26105,7 +26105,7 @@ testCheckCLI = do
           : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
       runCLI args =
         Proc.readCreateProcessWithExitCode
-          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
+          ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
           ""
       nixString text = "\"" <> T.replace "${" "\\${" (T.replace "\"" "\\\"" (T.replace "\\" "\\\\" text)) <> "\""
       expression name script =
@@ -26175,7 +26175,7 @@ testBuildCoresCLI = do
       -- no user file, so NIX_CONFIG alone sets cores.
       buildWith nixConfig store =
         Proc.readCreateProcessWithExitCode
-          ( (Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "build", "--expr", expression, "--store", root </> store, "--no-out-link"])
+          ( (Proc.proc "cabal" ["run", "-v0", "exe:nova-nix", "--", "build", "--expr", expression, "--store", root </> store, "--no-out-link"])
               { Proc.env =
                   Just
                     ( ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n" <> nixConfig)
@@ -26302,7 +26302,7 @@ testTargetArgsCLI = do
           : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME", "NIX_PATH"]) ambient
       runCLI args =
         Proc.readCreateProcessWithExitCode
-          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
+          ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
           ""
       build args = runCLI (["build", "--store", root </> "store", "--no-out-link"] ++ args)
       builder = nixQuotedPath (T.unpack shell)
@@ -26467,7 +26467,7 @@ testOutLinkCLI = do
       -- the directory the link is made in, so the project is named.
       runIn dir args =
         Proc.readCreateProcessWithExitCode
-          ((Proc.proc "cabal" (["run", "-v0", "--project-dir", projectDir, "nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv, Proc.cwd = Just dir})
+          ((Proc.proc "cabal" (["run", "-v0", "--project-dir", projectDir, "exe:nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv, Proc.cwd = Just dir})
           ""
       expression =
         T.unpack
@@ -27181,7 +27181,7 @@ testTrustCLI = do
       withHttpServer route $ \base requests _ -> do
         (code, out, err) <-
           Proc.readCreateProcessWithExitCode
-            ((Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "trust", "--store", root </> "store", "--substituter", T.unpack base, "--trusted-key", T.unpack trustedKey, "--expr", T.unpack (expression base)]) {Proc.env = Just isolatedEnv})
+            ((Proc.proc "cabal" ["run", "-v0", "exe:nova-nix", "--", "trust", "--store", root </> "store", "--substituter", T.unpack base, "--trusted-key", T.unpack trustedKey, "--expr", T.unpack (expression base)]) {Proc.env = Just isolatedEnv})
             ""
         (,,,) code out err <$> requests
   let path = storePathToText defaultStoreDir
@@ -27313,7 +27313,7 @@ testCliReference = do
           : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS"]) ambient
       runCLI args =
         Proc.readCreateProcessWithExitCode
-          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
+          ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
           ""
       printsHelp label args = runTestM label $ do
         (code, out, err) <- runCLI args
@@ -33258,7 +33258,7 @@ testEvalPolicyCLI = do
           : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME", "NIX_PATH"]) ambient
       runCLI extraConfig args =
         Proc.readCreateProcessWithExitCode
-          ((Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just (isolate extraConfig)})
+          ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just (isolate extraConfig)})
           ""
       expectOut label extraConfig args expected =
         runTestM ("CLI " <> label) $ do
@@ -33328,7 +33328,7 @@ testResultPrinterCLI = do
       isolated =
         ("XDG_CONFIG_HOME", root </> "config")
           : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
-      cliProcess args = (Proc.proc "cabal" (["run", "-v0", "nova-nix", "--"] ++ args)) {Proc.env = Just isolated, Proc.std_out = Proc.CreatePipe}
+      cliProcess args = (Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just isolated, Proc.std_out = Proc.CreatePipe}
       printsThrough label args expected = runTestM label (Proc.withCreateProcess (cliProcess args) (checkPrinted label expected))
       checkPrinted label expected _ stdoutPipe _ process = case stdoutPipe of
         Nothing -> pure (Fail "no stdout pipe")
@@ -33382,7 +33382,7 @@ testConfigBytesCLI = do
       -- system file under NIX_CONF_DIR and NIX_CONFIG are read.
       runCLI dir nixConfig =
         Proc.readCreateProcessWithExitCode
-          ( (Proc.proc "cabal" ["run", "-v0", "nova-nix", "--", "eval", "--expr", "builtins ? currentSystem"])
+          ( (Proc.proc "cabal" ["run", "-v0", "exe:nova-nix", "--", "eval", "--expr", "builtins ? currentSystem"])
               { Proc.env = Just (("NIX_CONF_DIR", dir) : ("NIX_USER_CONF_FILES", "") : ("NIX_CONFIG", nixConfig) : filter ((`notElem` configVars) . fst) ambient)
               }
           )
