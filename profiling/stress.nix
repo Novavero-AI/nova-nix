@@ -2,7 +2,7 @@
 #
 # Millions of each, with no file imports.
 #
-# Run: cabal run nova-nix -- eval stress.nix +RTS -s -M2G
+# Run: cabal run exe:nova-nix -- eval stress.nix +RTS -s -M2G
 
 let
   # --- Layer 1: Function call chains ---
