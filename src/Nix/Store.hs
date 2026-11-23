@@ -114,7 +114,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Derivation (Derivation (..), fromATerm, toATerm)
 import Nix.Hash (FileIngestionMethod (..), makeFixedOutputPath, makeTextPath, sha256Digest)
-import Nix.Store.CaseSensitive (CaseSensitivity (..), processCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
+import Nix.Store.CaseSensitive (CaseSensitivity (..), pathCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB
 import Nix.Store.EntryName (checkEntryName, entryNamePath, hostNameRules, linkTargetPath, shownBytes)
 import Nix.Store.Exclusive (Occupant (..), directoryTakenMessage, fileTakenMessage, openNewBinaryFile, symlinkTakenMessage)
@@ -1112,10 +1112,10 @@ sinkNarStream sink source = go Hash.hashInit 0 Stream.narStream `onException` ab
 -- ---------------------------------------------------------------------------
 
 -- | Restore eval-coerced source paths into the store and register them.
--- The evaluator's source-path cache maps each coerced filesystem path to
--- its @source@ fixed-output store path (text only - eval performs no
--- store writes).  Each entry not already valid is restored from a dump
--- of its source ('restoreSource'), its metadata made canonical
+-- The evaluator's source-path cache maps the text of each path value it
+-- coerced to the fixed-output store path of its copy (text only - eval
+-- performs no store writes).  Each entry not already valid is restored
+-- from a dump of its source ('restoreSource'), its metadata made canonical
 -- ('canonicalizeMetadata'), and registered.  A source carries no
 -- references.  A store upstream Nix's database may also manage is
 -- refused before any entry is looked at, by an
@@ -1156,7 +1156,7 @@ materializeEvalSources store sourceCache = do
                 then canonicalizeMetadata dest >> registrationFor store sp Nothing []
                 else do
                   when onDisk (Dir.removePathForcibly dest)
-                  restoreSource store (T.unpack rawPath) sp >>= either (refuse spText) pure
+                  restoreSource store rawPath sp >>= either (refuse spText) pure
             registerPath (stDB store) reg
     refuse spText reason =
       throwIO (userError (T.unpack ("refusing to register " <> spText <> ": " <> reason)))
@@ -1168,8 +1168,9 @@ materializeEvalSources store sourceCache = do
 -- the walk, through the hash and into an unpack sink in one pass, so a
 -- sibling pair the store's volume folds takes the case-hack on the way
 -- in, and no file's contents are ever held whole.  The source is read
--- as evaluation read it to name the path, under the process's
--- case-hack setting, and the restored tree as a store path, under its
+-- where its text names it, store text in this store's directory
+-- ('storeTextToFilePath'), under the case-hack its text calls for
+-- ('pathCaseHack'); the restored tree is read as a store path, under its
 -- volume's.
 --
 -- Evaluation hashed the source earlier, so the dump is held to that
@@ -1178,22 +1179,24 @@ materializeEvalSources store sourceCache = do
 -- The restored tree is then rechecked on disk, as the substituter
 -- rechecks an unpacked one, since the volume decides the final
 -- spelling of every name.  Any failure removes the tree.
-restoreSource :: Store -> FilePath -> StorePath -> IO (Either Text PathRegistration)
-restoreSource store src sp = do
+restoreSource :: Store -> Text -> StorePath -> IO (Either Text PathRegistration)
+restoreSource store srcText sp = do
   outcome <- restore `onException` Dir.removePathForcibly dest
   either (\reason -> Left reason <$ Dir.removePathForcibly dest) (pure . Right) outcome
   where
     dest = storePathToFilePath (stDir store) sp
+    src = storeTextToFilePath (stDir store) srcText
+    caseHack = pathCaseHack (stCaseSensitivity store) srcText
     restore = do
       sink <- newNarUnpackSink (stCaseSensitivity store) dest
-      streamed <- ExecBit.withNarSource processCaseHack src (sinkNarStream sink)
+      streamed <- ExecBit.withNarSource caseHack src (sinkNarStream sink)
       case streamed of
         Left (NarStreamRefused reason) -> pure (Left reason)
-        Left (NarStreamMalformed reason) -> pure (Left ("the dump of " <> T.pack src <> " does not parse: " <> reason))
+        Left (NarStreamMalformed reason) -> pure (Left ("the dump of " <> srcText <> " does not parse: " <> reason))
         Right (digest, size)
           | not (recursiveDigestNames sp digest) -> do
               abortNarUnpack sink
-              pure (Left (T.pack src <> " changed after evaluation hashed it, so it no longer reproduces its store path; re-evaluate"))
+              pure (Left (srcText <> " changed after evaluation hashed it, so it no longer reproduces its store path; re-evaluate"))
           | otherwise -> do
               finished <- finishNarUnpack sink
               either (pure . Left) (const (sealAndRecheck digest size)) finished

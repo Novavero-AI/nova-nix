@@ -21,9 +21,12 @@ module Nix.Store.CaseSensitive
     -- * Reading a tree back
     volumeCaseHack,
     processCaseHack,
+    pathCaseHack,
   )
 where
 
+import Data.Text (Text)
+import Nix.Store.Path (isCanonicalStoreText)
 import qualified NovaCache.NAR as NAR
 
 #if defined(darwin_HOST_OS)
@@ -67,6 +70,17 @@ volumeCaseHack sensitivity = case sensitivity of
 -- where nova-nix's stores fold.
 processCaseHack :: NAR.CaseHack
 processCaseHack = NAR.defaultCaseHack
+
+-- | The case-hack mode a read of path-value text runs under, given the
+-- sensitivity of the store's volume.  Store text names a tree on that
+-- volume, read back as the store reads its own paths
+-- ('volumeCaseHack'); any other path is a source ('processCaseHack').
+-- Evaluation hashes a path and the build driver restores its copy under
+-- this one rule.
+pathCaseHack :: CaseSensitivity -> Text -> NAR.CaseHack
+pathCaseHack storeVolume path
+  | isCanonicalStoreText path = volumeCaseHack storeVolume
+  | otherwise = processCaseHack
 
 #if defined(darwin_HOST_OS)
 

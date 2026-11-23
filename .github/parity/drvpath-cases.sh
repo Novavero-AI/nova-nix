@@ -5,7 +5,9 @@
 # A derivation's store path hashes the store path of every input derivation,
 # so one matching drvPath validates its whole build-time closure.  Each case
 # line is a label and an expression for a derivation; `pkgs` is bound to the
-# nixpkgs tree in NIXPKGS for x86_64-linux with no user config or overlays.
+# nixpkgs tree in NIXPKGS for x86_64-linux with no user config or overlays,
+# and <nixpkgs-in-store> names that tree added to the store, as a channel,
+# fetchTarball or a flake input leaves nixpkgs.
 # Both evaluators run from the case file's directory, so a relative path in
 # an expression names the same file for each.
 #
@@ -45,6 +47,13 @@ trap 'rm -rf "$scratch"' EXIT
 export XDG_CACHE_HOME="$scratch/cache"
 
 pkgsBinding='pkgs = import <nixpkgs> { system = "x86_64-linux"; config = { }; overlays = [ ]; };'
+
+# The tree at the same store path in each evaluator's store: upstream adds
+# it, and nova-nix reads a store path's files where its store holds them
+# without asking whether the path is valid, so a copy there serves.
+inStore=$(nix-store --add "$nixpkgs") || exit 1
+mkdir -p "$scratch/store"
+cp -R "$nixpkgs" "$scratch/store/${inStore##*/}" || exit 1
 
 TIMEFORMAT=%R
 
@@ -93,12 +102,13 @@ while read -r label expr <&3 || [ -n "$label" ]; do
   wrapped="let $pkgsBinding in ($expr).drvPath"
 
   upSecs=$(timed "$scratch/up.out" "$scratch/up.err" \
-    nix-instantiate --eval --read-write-mode -I "nixpkgs=$nixpkgs" -E "$wrapped")
+    nix-instantiate --eval --read-write-mode -I "nixpkgs=$nixpkgs" \
+    -I "nixpkgs-in-store=$inStore" -E "$wrapped")
   upStatus=$?
   novaSecs=$(timed "$scratch/nova.out" "$scratch/nova.err" \
     "$novaBin" eval --read-write-mode --store "$scratch/store" \
-    --nix-path "nixpkgs=$nixpkgs" --nix-path "nix=$repoRoot/data/nix" \
-    --expr "$wrapped")
+    --nix-path "nixpkgs=$nixpkgs" --nix-path "nixpkgs-in-store=$inStore" \
+    --nix-path "nix=$repoRoot/data/nix" --expr "$wrapped")
   novaStatus=$?
 
   upstream=$(describe "$upStatus" "$scratch/up.out" "$scratch/up.err")

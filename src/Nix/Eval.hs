@@ -2387,21 +2387,21 @@ coerceToStoreString = coerceToString True force applyValue coercePathToStore
 coerceToStringInterp :: (MonadEval m) => NixValue -> m (BS.ByteString, StringContext)
 coerceToStringInterp = coerceToString False force applyValue coercePathToStore
 
--- | The store path a source path literal coerces to, carrying its
--- SCPlain context - the copy-to-store coercion shared by interpolation,
--- derivation arguments/env values, and @builtins.toJSON@.
+-- | The store path a path value coerces to, carrying its SCPlain
+-- context - the copy-to-store coercion shared by interpolation,
+-- derivation arguments/env values, @concatStringsSep@ and
+-- @builtins.toJSON@.  Every path is copied under its base name, one
+-- inside the store too: upstream's @copyPathToStore@ has no store case
+-- (eval.cc:2381-2406 at 2.24.9), so a path that is exactly a store path
+-- is copied under its @\<hash\>-\<name\>@ base name.  A string naming a
+-- store path, as @builtins.storePath@ ('validateStorePath') and the
+-- fetchers ('storePathString') give one, coerces to itself instead.
 sourcePathWithContext :: (MonadEval m) => Text -> m (Text, StringContext)
-sourcePathWithContext p
-  -- An already-in-store path coerces to itself with an SCPlain (Opaque)
-  -- reference - never re-copied.  This is the shared choke point for
-  -- interpolation, derivation args, concatStringsSep, and toJSON, so all of
-  -- them inherit the in-store short-circuit (and the Windows re-NAR fix).
-  | Just sp <- enclosingStorePath p = pure (p, plainContext sp)
-  | otherwise = do
-      spText <- storeSourcePath p
-      case parseStorePath defaultStoreDir spText of
-        Just sp -> pure (spText, plainContext sp)
-        Nothing -> pure (spText, mempty)
+sourcePathWithContext p = do
+  spText <- storeSourcePath p
+  case parseStorePath defaultStoreDir spText of
+    Just sp -> pure (spText, plainContext sp)
+    Nothing -> pure (spText, mempty)
 
 -- | The current system platform string.
 currentSystemStr :: Text
@@ -3528,11 +3528,9 @@ builtinStorePath val = do
 
 -- | @builtins.storePath@ - mark an already-in-store path as such.  Upstream
 -- returns a STRING carrying an Opaque (SCPlain) context entry for the enclosing
--- store path, NOT a bare path: the Opaque marker is what stops a later coercion
--- from re-serialising (re-NARing) the already-present path into a new store
--- path.  A context-free path would be re-copied on coercion - a wrong
--- store path on Unix, and a file-not-found on Windows, where
--- the canonical @/nix/store@ text is not the on-disk location.
+-- store path, NOT a bare path: a string coerces to itself, so a derivation
+-- naming it depends on that store path, where a path value is copied to
+-- the store again under its base name (primops.cc:1628-1636 at 2.24.9).
 --
 -- A path outside the store is upstream's @isInStore@ refusal; one inside
 -- it whose component is no store path is its @StorePath@ constructor's
@@ -3546,17 +3544,6 @@ validateStorePath p = case T.stripPrefix storeDirPrefix p of
     where
       base = T.takeWhile (/= '/') rest
   _ -> throwEvalError ("path '" <> p <> "' is not in the Nix store")
-
--- | The store path enclosing an absolute path under the store dir, or
--- 'Nothing' if the path is not in the store.  Accepts a bare store path and a
--- subpath (@\/nix\/store\/\<hash\>-\<name\>\/sub@ resolves to its
--- @\<hash\>-\<name\>@ component), the way upstream marks the enclosing store
--- path Opaque for either.  The component passes the same charset
--- validation as every other store-path parse boundary.
-enclosingStorePath :: Text -> Maybe StorePath
-enclosingStorePath p = do
-  rest <- T.stripPrefix storeDirPrefix p
-  parseStorePathBaseName (T.takeWhile (/= '/') rest)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - Nix search path
