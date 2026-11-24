@@ -91,10 +91,12 @@ import Nix.Eval.Builtin (Builtin, builtinIndex, builtinName, builtinNamed)
 import qualified Nix.Eval.Builtin as Builtin
 import Nix.Eval.CAttrSet (CAttrSetStep (..), cattrsetFind, cattrsetFreeze, cattrsetFromNames, cattrsetIndex, cattrsetInsert, cattrsetLookup, cattrsetMember, cattrsetNew, cattrsetRemoveKeys, cattrsetSetValue, cattrsetSize, cattrsetUnion, cattrsetUpdate, cattrsetWalk, cattrsetWalkNext, flatCAttrSet)
 import Nix.Eval.CBytecode (attrkeyStatic, attrsRec, binaryAdd, bindNamed, captureNone, captureSlots, captureWithScopes, cbcArg1, cbcArg2, cbcArg3, cbcCountedPayload, cbcData, cbcDataCount, cbcEmit, cbcEmitData, cbcEmitString, cbcFlags, cbcOpCount, cbcOpcode, cbcShortArg, cbcString, cbcStringText, formalName, formalNamedSet, formalSet, formalSharedDefault, strpartInterp, strpartLit, unaryNegate, pattern OpApp, pattern OpAssert, pattern OpAttrs, pattern OpBinary, pattern OpHasAttr, pattern OpIf, pattern OpIndStr, pattern OpLambda, pattern OpLet, pattern OpList, pattern OpLitBool, pattern OpLitFloat, pattern OpLitInt, pattern OpLitNull, pattern OpLitPath, pattern OpLitUri, pattern OpResolvedVar, pattern OpSelect, pattern OpStr, pattern OpUnary, pattern OpVar, pattern OpWith, pattern OpWithVar)
+import Nix.Eval.CCtxStr (cctxstrNew)
 import Nix.Eval.CData (CData, MonadCData (..), runCDataPure)
 import Nix.Eval.CEnv (cenvNameTable, cenvParent)
 import Nix.Eval.CLambda (clambdaAllowExtra, clambdaFormalCount, clambdaFormalsType, clambdaNew, clambdaShape, clambdaShapeAllowExtra, clambdaShapeFormalCount, clambdaShapeFormalsType)
 import Nix.Eval.CList (CList (..), clistDrop, clistFromThunks, clistIndex, clistLen, clistThunks, thunkListToCList)
+import Nix.Eval.CPrimop (cprimopAppNew)
 import Nix.Eval.CRegion (Regions (..))
 import Nix.Eval.CRoots (crootsAddThunk)
 import Nix.Eval.CStats (CRoot (..), Census (..), EnvSiteFigures (..), EnvSize (..), Figures (..), PerKind (..), SetSiteFigures (..), SiteCounts (..), countSites, envSitesCounted, renderCensus, setSitesCounted, siteCounts, takeCensus, valueRoots)
@@ -31236,19 +31238,24 @@ servedLine :: String
 servedLine = "served without an exception"
 
 -- | The paths a library user reaches the C layer by.  The first C call
--- of each of the first five lands in a different sub-arena, and the
--- sixth runs a whole session first, so both ends of the window are
--- covered.  The seventh reads a symbol, which the table answers outside
--- the window as it answers an id it does not hold.  The next two read
+-- of each of the first five lands in a different sub-arena, and of each
+-- of the next four in a different tracker of the objects the arena's
+-- teardown frees one by one (cbits/nn_tracker.h), where an object made
+-- outside every session would be freed by the next session's end under
+-- whoever held it.  One runs a whole session first, so both ends of the
+-- window are covered.  One reads a symbol, which the table answers
+-- outside the window as it answers an id it does not hold.  Two read
 -- the shared @null@, @true@ and @false@ thunks, which must be valid in
 -- every window: were they arena cells behind a process-lifetime CAF,
 -- forcing one outside the window would poison it with
 -- 'ArenaNotInitialized' for every later arena, and forcing one inside a
 -- session would leave it pointing into memory the session's end frees,
--- a use-after-free the ASan job reports.  The last evaluates an empty
--- string before anything else in a fresh arena: its payload of no words
--- sits at data offset 0, which the store does not hold yet, so a read
--- there fails the store's bounds assertion.
+-- a use-after-free the ASan job reports.  One evaluates an empty string
+-- before anything else in a fresh arena: its payload of no words sits
+-- at data offset 0, which the store does not hold yet, so a read there
+-- fails the store's bounds assertion.  The last three show that a
+-- session tears the arena down as it returns and as an exception leaves
+-- it, and that a nested session leaves the arena to the one around it.
 arenaGuardPaths :: [ArenaGuardPath]
 arenaGuardPaths =
   [ noArena "compile" "nn_bc_emit" evalNamelessProgram,
@@ -31256,6 +31263,14 @@ arenaGuardPaths =
     noArena "string" "nn_str_new" (void (evaluated (mkStr "a"))),
     noArena "symbol" "nn_symbol_intern" (void (symbolIntern "a")),
     noArena "env" "nn_env_new" (void (evaluated VNull >>= \nullCell -> newEnv EnvClosure Nothing [nullCell])),
+    -- A plain lambda (formals type 0) with no env, builtin 0 applied to
+    -- the shared null cell, and a context string with no text: each
+    -- allocator stores what it is given without reading it, so the
+    -- tracker's refusal is what stops it.
+    noArena "set" "nn_attrset_new" (void (cattrsetNew SetLiteral 1)),
+    noArena "lambda" "nn_lambda_new" (void (clambdaNew nullPtr 0 0 0 0 0 0)),
+    noArena "partial-application" "nn_primop_app_new" (void (cprimopAppNew 0 0 [cthunkNull])),
+    noArena "context-string" "nn_ctxstr_new" (void (cctxstrNew nullPtr 0)),
     noArena "after-session" "nn_bc_emit" (inTestSession (pure ()) >> evalNamelessProgram),
     noArena "symbol-read" "nn_symbol_text" (void (evaluate (symbolText (Symbol 1)))),
     ArenaGuardPath

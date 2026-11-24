@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 -- | The attrset-memory benchmark: what a population of attribute sets
 -- costs held in C, as nova-nix holds them (@cbits\/nn_attrset.c@), and
 -- held in GHC's heap as flat arrays, in bytes per entry and in the time a
@@ -36,13 +38,20 @@ import qualified Data.ByteString.Char8 as BS8
 import Data.Primitive.Array (Array, newArray, sizeofArray, unsafeFreezeArray, writeArray)
 import Data.Primitive.PrimArray (PrimArray, newPrimArray, primArrayFromListN, sizeofPrimArray, unsafeFreezePrimArray, writePrimArray)
 import Data.Primitive.SmallArray (SmallArray, newSmallArray, runSmallArray)
+import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats)
+import Nix.Builder (BuildStop (..))
 import Nix.Eval.AllocSite (SetSite (SetLiteral))
 import Nix.Eval.CAttrSet (CAttrSet, cattrsetFreeze, cattrsetInsert, cattrsetNew)
+import Nix.Eval.CRegion (Regions (RegionsOff))
 import Nix.Eval.CThunk (cthunkNull)
+import Nix.Eval.IO (SessionSettings (..), SessionStore (ReadOnlySession), withEvalSession)
+import Nix.Eval.Policy (unrestrictedPolicy)
 import Nix.Eval.SourcePos (PosIdx (..))
 import Nix.Eval.Symbol (Symbol (..))
+import Nix.Store.Ops (StoreOps (..), StoreQueries (..))
+import Nix.Store.Path (defaultStoreDir)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
 import System.IO (hPutStrLn, stderr)
@@ -87,10 +96,32 @@ main = do
       sizes <- parseSizes <$> BS8.readFile sizesPath
       case (representation, sizes) of
         (_, Left problem) -> usage problem
-        ("c", Right counted) -> measure InC counted (buildC counted) sizeofPrimArray
+        ("c", Right counted) -> inSession (measure InC counted (buildC counted) sizeofPrimArray)
         ("flat", Right counted) -> measure InGhcHeap counted (buildFlat counted) sizeofArray
         _ -> usage ("no representation " <> representation)
     _ -> usage "expected a representation and a sizes file"
+
+-- | Run the C population's measure in an evaluation session, the only
+-- place the C data layer makes a set.  The session runs no regions, so
+-- the C allocator's growth is the sets' alone and none of the
+-- collector's bookkeeping, and it opens its arena before the measure
+-- takes its first figure.  Nothing is evaluated, so its store holds
+-- nothing and refuses every operation.
+inSession :: IO a -> IO a
+inSession action = withEvalSession settings (const action)
+  where
+    settings = SessionSettings unrestrictedPolicy (pure []) defaultStoreDir "/" RegionsOff (ReadOnlySession queries ops)
+    queries = StoreQueries {sqValidPaths = const (pure mempty), sqReferences = const (pure (Right mempty))}
+    ops =
+      StoreOps
+        { soQueries = queries,
+          soAddEvalObjects = const (pure (Left refusal)),
+          soBuild = const (pure (Left (BuildStop refusal 1))),
+          soCheck = const (pure (Left (BuildStop refusal 1))),
+          soAddOutLinkRoot = \_ _ -> pure (Left refusal)
+        }
+    refusal :: Text
+    refusal = "the attrset-memory benchmark evaluates nothing"
 
 usage :: String -> IO a
 usage problem = do

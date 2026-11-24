@@ -6,6 +6,8 @@
 
 #include "nn_tracker.h"
 
+#include "nn_arena.h"
+
 #include <stdlib.h>
 
 /* The first capacity of the array, which doubles from there. */
@@ -13,6 +15,7 @@
 
 int nn_tracker_add(nn_tracker_t *tracker, void *object)
 {
+    if (!nn_arena_live()) return -1;
     if (tracker->count == tracker->capacity) {
         uint32_t cap;
         void **grown;
