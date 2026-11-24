@@ -2,10 +2,9 @@
 # packages.
 #
 # Transitional.  The stage-2 stdenv (../stage2-stdenv), on the seed
-# ladder's toolchain, replaces it, and this directory and ../bootstrap are
-# deleted once that stdenv builds every package this one builds.  Until
-# then it is the package set's stdenv, which CI's E2E (Windows), publish
-# and public-cache jobs build GNU Hello with.
+# ladder's toolchain, is the package set's stdenv and builds every package
+# this one builds; this is stage1Stdenv there, which no package takes by
+# default, and this directory and ../bootstrap are deleted with it.
 #
 # Wraps the low-level `derivation` builtin so a Windows package builds with just
 #

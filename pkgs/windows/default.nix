@@ -5,14 +5,16 @@
 #   by-name/<shard>/<pname>/package.nix   one package per directory, shard =
 #                                         the first two characters of <pname>
 #   bootstrap/                            the sha256-pinned MSYS2 seeds
-#   stdenv/                               the transitional stage-1 stdenv on
-#                                         them: mkDerivation, setup.sh,
+#   stdenv/                               the stage-1 stdenv on them, which
+#                                         no package builds with by
+#                                         default (stage1Stdenv):
+#                                         mkDerivation, setup.sh,
 #                                         cc-wrapper.sh
 #   seed-stdenv/                          the seed ladder's stdenv, on tools
 #                                         built from the seed: mkDerivation,
 #                                         setup.sh
-#   stage2-stdenv/                        the stage-1 stdenv's replacement:
-#                                         the seed stdenv's tools with the
+#   stage2-stdenv/                        the package set's stdenv: the
+#                                         seed stdenv's tools with the
 #                                         ladder's native x86_64 toolchain,
 #                                         through compiler and linker
 #                                         wrappers
@@ -58,7 +60,8 @@ let
   self = byName // {
     inherit lib;
 
-    stdenv = import ./stdenv;
+    stdenv = self.stage2Stdenv;
+    stage1Stdenv = import ./stdenv;
     seedStdenv = callPackage ./seed-stdenv { };
     stage2Stdenv = callPackage ./stage2-stdenv { };
     fetchurl = import ./fetchurl.nix;

@@ -293,20 +293,18 @@ Set-Location "$env:LOCALAPPDATA\Programs\nova-nix-windows-x64"
 ```console
 > nova-nix build pkgs\windows\hello.nix --substituter https://cache.novavero.ai --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
   [subst]  hello
-C:\nix\store\78n2mrxhg3xgjganf7nfkaznh2j03z68-hello
+C:\nix\store\bdfn1xyp3x08nksgarshg5ns8x7c17vb-hello
 > .\result\bin\hello.exe
 Hello, world!
 ```
 
-The build downloads what the cache holds and builds only what it lacks. The
-first time, that includes the MinGW-w64 toolchain Hello references, about
-127 MB to download and 555 MB in the store, which prints no line of its own.
-Without a substituter it downloads the prebuilt MinGW-w64 and MSYS2 packages
-Hello's stdenv is made of, and builds Hello with them.
+The build downloads what the cache holds and builds only what it lacks.
+Without a substituter it first builds Hello's toolchain from the seed
+ladder's 1,623-byte seed, which takes hours, and then Hello with it.
 
-Build scripts run in MSYS2's bash from those packages, so nothing else needs
-installing. `pkgs\windows\default.nix` is the whole Windows package set, and
-`-A` selects one of its packages.
+Build scripts run in busybox-w32's sh, which the ladder builds too, so
+nothing else needs installing. `pkgs\windows\default.nix` is the whole
+Windows package set, and `-A` selects one of its packages.
 
 ### Get a package from cache.nixos.org on macOS or Linux
 
