@@ -82,6 +82,7 @@ import qualified Nix.Daemon.Wire as Wire
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), DrvFile, Platform (..), currentPlatform, drvFileATerm, drvFileDerivation, drvFilePath, extraPlatforms, fromATerm, inputAddressed, platformToText, textToPlatform, toATerm, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
+import Nix.Develop.Capture (CaptureFailure (..), OutputObject (..), captureDerivation, captureFailureMessage, environmentOutput, getEnvScriptPath, noEnvironmentMessage)
 import Nix.Develop.Environment (AttrsFiles (..), BuildEnvironment (..), EnvironmentScript (..), Prompt (..), ScriptDirectories (..), ScriptFile (..), Shell (..), ShellMode (..), Variable (..), buildEnvironmentJson, environmentScript, escapeShellArgAlways, ignoreVars, parseBuildEnvironment, renderRcfile)
 import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, checkGitRef, checkGitRev, checkGitUrl, currentSystemStr, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evalParsed, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, listedBuiltins, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
@@ -26735,6 +26736,161 @@ strictCaseAgrees storeDir (StrictCase name source) = case parseNix testBaseDir t
       lookupDrvHash inputText >>= maybe (throwEvalError ("no modulo hash was cached for " <> inputText)) (\hash -> pure (hash, outputs))
 
 -- ---------------------------------------------------------------------------
+-- Tests: develop's capture
+-- ---------------------------------------------------------------------------
+
+-- | The derivation develop builds to capture a target's environment
+-- ("Nix.Develop.Capture"), over fixtures and over generated derivations.
+-- The script is data/develop/get-env.sh, and its store path is the one
+-- upstream 2.34.9 and 2.35.4 add the same bytes at.
+testDevelopCapture :: IO [Bool]
+testDevelopCapture = do
+  putStrLn "develop/capture"
+  scriptPath <- getEnvScriptPath <$> BS.readFile ("data" </> "develop" </> "get-env.sh")
+  let capture name target check = assertRight "script" scriptPath $ \script -> assertRight "capture" (captureDerivation script name [] target) (check script)
+      taken target = capture "hello" target (\_ _ -> Pass)
+      refused target failure = assertRight "script" scriptPath $ \script -> assertEqual "refusal" (Left failure) (drvFilePath <$> captureDerivation script "hello" [] target)
+  sequence
+    [ runTest "get-env.sh is at the store path upstream adds it at"
+        $ assertRight "script" scriptPath
+        $ assertEqual "path" "/nix/store/hyhh9rhzxhzmfspllmpf75xzkzns109r-get-env.sh" . storePathToText defaultStoreDir,
+      runTest "the script is the builder's one argument and an input source, and the capture is named NAME-env" $
+        capture "hello" plain $ \script file ->
+          let result = drvFileDerivation file
+           in assertEqual "args" [pathBytes script] (drvArgs result)
+                `andThen` assertEqual "inputSrcs" [source, script] (drvInputSrcs result)
+                `andThen` assertEqual "name" (Just "hello-env") (Map.lookup "name" (drvEnv result))
+                `andThen` assertEqual "file" "hello-env.drv" (spName (drvFilePath file)),
+      runTest "a script already among the input sources is there once" $
+        assertRight "script" scriptPath $ \script ->
+          let target = plain {drvInputSrcs = [script, source]}
+           in assertRight "capture" (captureDerivation script "hello" [] target) $
+                assertEqual "inputSrcs" [script, source] . drvInputSrcs . drvFileDerivation,
+      runTest "the four checks on references are removed and every other variable kept" $
+        capture "hello" plain $ \_ file ->
+          let result = drvFileDerivation file
+           in assertEqual "env" (Map.fromList [("builder", "/bin/sh"), ("kept", "k"), ("name", "hello-env"), ("out", outputBytes result "out"), ("system", "x")]) (drvEnv result),
+      runTest "under structured attributes outputChecks is removed, __json written as nlohmann's dump() writes it, and name is a variable" $
+        capture "s" structured $ \_ file ->
+          let result = drvFileDerivation file
+           in assertEqual
+                "env"
+                (Map.fromList [("__json", "{\"a\":[1,2.5,\"x\"],\"name\":\"s\",\"z\":1}"), ("allowedReferences", "kept"), ("name", "s-env"), ("out", outputBytes result "out")])
+                (drvEnv result),
+      runTest "a fixed-output target's capture is input-addressed, its hash variables kept" $
+        capture "f" fixed $ \_ file ->
+          let result = drvFileDerivation file
+           in assertEqual "outputs" [("out", "", "")] [(doName output, doHashAlgo output, doHash output) | output <- drvOutputs result]
+                `andThen` assertEqual "outputHash" (Just (TE.encodeUtf8 fixedHash)) (Map.lookup "outputHash" (drvEnv result))
+                `andThen` assertEqual "out" (outputBytes result "out") (fromMaybe "" (Map.lookup "out" (drvEnv result))),
+      runTest "a builder whose base name is bash is taken, trailing slashes dropped" $
+        foldr (andThen . (\builder -> taken plain {drvBuilder = builder})) Pass ["bash", "/bin/bash", "/nix/store/x-bash/bin/bash/", "/bin/bash//"],
+      runTest "a builder of another base name is refused in upstream's words" $
+        foldr (andThen . (\builder -> refused plain {drvBuilder = builder} NotBashBuilder)) Pass ["/bin/sh", "/bin/bash5", "", "/", "///", "bash.exe", "/bin/bash/x"]
+          `andThen` assertEqual "message" "'nix develop' only works on derivations that use 'bash' as their builder" (captureFailureMessage NotBashBuilder),
+      runTest "a floating content-addressed, impure or mixed output is refused" $
+        refused plain {drvOutputs = [DerivationOutput "out" (StorePath "" "") "r:sha256" ""]} UncapturableOutputs
+          `andThen` refused plain {drvOutputs = [DerivationOutput "out" (StorePath "" "") "r:sha256" "impure"]} UncapturableOutputs
+          `andThen` refused fixed {drvOutputs = drvOutputs fixed <> [pendingOutput "dev"]} UncapturableOutputs,
+      runTest "structured attributes that are not an object are refused" $
+        foldr
+          (andThen . (\json -> assertRight "script" scriptPath $ \script -> assertLeft json (drvFilePath <$> captureDerivation script "s" [] structured {drvEnv = Map.insert "__json" (TE.encodeUtf8 json) (drvEnv structured)})))
+          Pass
+          ["null", "[1]", "{", "\"x\""],
+      runTestM "the capture keeps the builder, input derivations, platform and every variable but the checks, name and the outputs" $
+        either (pure . Fail . T.pack . show) (quickCheckPasses . QC.forAll genCaptureCase . capturedKeeps) scriptPath,
+      runTest "the environment is read from the first output in name order that is a regular file of at least one byte" $
+        assertEqual "out" (Just "out") (environmentOutput (Map.fromList [("dev", RegularFile 0), ("lib", NotRegularFile), ("out", RegularFile 10)]))
+          `andThen` assertEqual "a" (Just "a") (environmentOutput (Map.fromList [("a", RegularFile 5), ("b", RegularFile 9)])),
+      runTest "no output holding such a file is upstream's missing environment" $
+        assertEqual "none" Nothing (environmentOutput (Map.fromList [("dev", RegularFile 0), ("out", NotRegularFile)]))
+          `andThen` assertEqual "message" "get-env.sh failed to produce an environment" noEnvironmentMessage
+    ]
+  where
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    bash = "/nix/store/00000000000000000000000000000000-bash/bin/bash"
+    source = StorePath "11111111111111111111111111111111" "builder.sh"
+    pathBytes = TE.encodeUtf8 . storePathToText defaultStoreDir
+    outputBytes drv name = maybe "" (pathBytes . doPath) (find ((== name) . doName) (drvOutputs drv))
+    plain =
+      (plainDerivation "hello" [("allowedReferences", "a"), ("allowedRequisites", "b"), ("disallowedReferences", "c"), ("disallowedRequisites", "d"), ("kept", "k")])
+        { drvBuilder = bash,
+          drvInputSrcs = [source]
+        }
+    -- Upstream reads a structured derivation's name from __json; the
+    -- variable it adds is the capture's alone.
+    structured =
+      (plainDerivation "s" [])
+        { drvBuilder = bash,
+          drvEnv =
+            Map.fromList
+              [ ("__json", "{ \"z\": 1, \"outputChecks\": { \"out\": { \"allowedReferences\": [] } }, \"a\": [1, 2.5, \"x\"], \"name\": \"s\" }"),
+                ("allowedReferences", "kept"),
+                ("out", "")
+              ]
+        }
+    fixedHash = "0000000000000000000000000000000000000000000000000000000000000000" :: Text
+    fixed =
+      (plainDerivation "f" [("outputHash", TE.encodeUtf8 fixedHash), ("outputHashAlgo", "sha256"), ("outputHashMode", "recursive")])
+        { drvBuilder = bash,
+          drvOutputs = [DerivationOutput "out" (StorePath "22222222222222222222222222222222" "f") "r:sha256" fixedHash]
+        }
+
+-- | A derivation the capture takes, from 'genFillCase''s: a builder that
+-- is bash, its outputs input-addressed, no structured attributes, and
+-- some of the checks on references set.
+genCaptureCase :: QC.Gen FillCase
+genCaptureCase = do
+  FillCase name inputHashes drv <- genFillCase
+  directory <- genFieldBytes
+  checks <- QC.sublistOf ["allowedReferences", "allowedRequisites", "disallowedReferences", "disallowedRequisites"]
+  values <- traverse (const genFieldBytes) checks
+  pure
+    ( FillCase
+        name
+        inputHashes
+        drv
+          { drvBuilder = BS8.filter (/= '/') directory <> "/bash",
+            drvOutputs = [output {doHashAlgo = "", doHash = ""} | output <- drvOutputs drv],
+            drvEnv = Map.union (Map.fromList (zip checks values)) (Map.delete "__json" (drvEnv drv))
+          }
+    )
+
+-- | What a capture of a generated derivation keeps: everything but the
+-- checks on references, @name@ and the outputs and their variables, with
+-- the script its one argument and among its input sources once.
+capturedKeeps :: StorePath -> FillCase -> QC.Property
+capturedKeeps script (FillCase name inputHashes drv) =
+  case captureDerivation script name inputHashes drv of
+    Left failure -> QC.counterexample (show failure) False
+    Right file ->
+      let result = drvFileDerivation file
+          outputNames = map doName (drvOutputs drv)
+          rest d = foldr Map.delete (drvEnv d) ("name" : outputNames <> ["allowedReferences", "allowedRequisites", "disallowedReferences", "disallowedRequisites"])
+       in ( drvBuilder result,
+            drvInputDrvs result,
+            drvPlatform result,
+            sort (map doName (drvOutputs result)),
+            rest result,
+            drvArgs result,
+            Set.fromList (drvInputSrcs result),
+            length (filter (== script) (drvInputSrcs result)),
+            Map.lookup "name" (drvEnv result)
+          )
+            QC.=== ( drvBuilder drv,
+                     drvInputDrvs drv,
+                     drvPlatform drv,
+                     sort outputNames,
+                     rest drv,
+                     [TE.encodeUtf8 (storePathToText defaultStoreDir script)],
+                     Set.insert script (Set.fromList (drvInputSrcs drv)),
+                     1,
+                     Just (TE.encodeUtf8 (name <> "-env"))
+                   )
+
+-- ---------------------------------------------------------------------------
 -- Tests: develop's captured environment and rcfile
 -- ---------------------------------------------------------------------------
 
@@ -36554,6 +36710,7 @@ runSuite = do
           testLinkOrdering,
           testFromATerm,
           testInputAddressed,
+          testDevelopCapture,
           testDevelopEnvironment,
           testBuilder,
           testFlatOutputFormIO,

@@ -96,6 +96,12 @@ pkgs/windows/seed-stdenv/include
   (https://www.mingw-w64.org) v14.0.0, mingw-w64-headers, which their
   authors place in the public domain.
 
+data/develop/get-env.sh
+  Copied unchanged from src/nix/get-env.sh in Nix
+  (https://github.com/NixOS/nix) at tag 2.35.4. Licensed under the GNU
+  Lesser General Public License, version 2.1, whose text is
+  data/develop/COPYING, copied from that tag's COPYING.
+
 This product builds on other work:
 
 pkgs/windows: the seed chain, from stage0-pe32 to the seed stdenv

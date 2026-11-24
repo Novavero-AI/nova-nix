@@ -45,6 +45,8 @@ extra-source-files:
     cbits/*.h
     sandbox/*.h
 data-files:
+    develop/COPYING
+    develop/get-env.sh
     nix/fetchurl.nix
 data-dir: data
 
@@ -115,6 +117,7 @@ library
     Nix.DependencyGraph
     Nix.Derivation
     Nix.Derivation.StructuredAttrs
+    Nix.Develop.Capture
     Nix.Develop.Environment
     Nix.Builder
     Nix.Builder.BuildDir
