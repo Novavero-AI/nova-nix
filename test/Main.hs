@@ -23417,17 +23417,21 @@ testGccNativeX8664Windows = do
 
 -- | @pkgs\/windows@'s stage-2 stdenv, read back as the build driver reads
 -- it: what its wrappers and @test\/data\/stage2-stdenv.nix@'s checks, GNU
--- Hello built with it and flags, add to the closure of the tools it is
--- made of, busybox-w32, GNU make, the seed stdenv's applets and the native
--- x86_64 binutils and GCC.  The one leaf it adds is Hello's archive, every
--- derivation but that fetch is x86_64-windows, and it reads no input
--- source but the stdenv's own files, the flags check's sources and what
--- evaluation writes as text.  Its builds run the seed stdenv's
--- @setup.sh@, with the applets, GNU make and the wrappers on @PATH@ and
+-- Hello and the stage-1 stdenv's other five packages built with it and
+-- flags, add to the closure of the tools it is made of, busybox-w32, GNU
+-- make, the seed stdenv's applets and the native x86_64 binutils and GCC.
+-- The leaves it adds are the archives of Hello, sed and zlib, every
+-- derivation but those fetches is x86_64-windows, and it reads no input
+-- source but the stdenv's own files, the packages' source directories,
+-- the flags check's sources and what evaluation writes as text.  Its
+-- builds run its own @setup.sh@, which runs the seed stdenv's and then
+-- the fixup phase, with the applets, GNU make and the wrappers on @PATH@ and
 -- neither toolchain's bin directory, whose programs GNU make would run
 -- before a wrapper of the same name; @CC@, @CXX@ and @LD@ name the
 -- wrappers, @AR@ binutils' archiver, and nothing sets the
--- @C_INCLUDE_PATH@ the seed stdenv sets for TinyCC.  The wrappers are
+-- @C_INCLUDE_PATH@ the seed stdenv sets for TinyCC; @OBJDUMP@ and
+-- @STRIP@ name binutils' programs, @WINDRES@ the windres wrapper, and the
+-- fixup looks for a DLL in GCC's bin directory first.  The wrappers are
 -- written from gcc-native-x86_64's drivers and binutils-native-x86_64's
 -- linker.  Neither of the stage-1 stdenv's seeds is in Hello's closure,
 -- where both are in the closure of the same package built with the
@@ -23463,7 +23467,7 @@ testStage2StdenvWindows = do
           let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
               closureOf attrs = sessionClosure (mapMaybe (`Map.lookup` rootOf) attrs)
           tools <- closureOf toolRoots
-          stage2 <- closureOf [wrappersRoot, helloRoot, flagsRoot]
+          stage2 <- closureOf ([wrappersRoot, helloRoot, flagsRoot] ++ packageRoots)
           hello <- closureOf [helloRoot]
           stage1 <- closureOf [stage1Hello]
           full <- sessionClosure (Map.elems rootOf)
@@ -23497,6 +23501,7 @@ testStage2StdenvWindows = do
             [_, script] -> storePathIn (bytesText script)
             _ -> Nothing
           configSiteOf drv = storePathIn (variableOf "CONFIG_SITE" drv)
+          binutilsProgram program = outputOf binutilsNativeRoot <> "/bin/" <> program <> ".exe"
       sequence
         [ runTest instantiates $
             assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
@@ -23504,25 +23509,36 @@ testStage2StdenvWindows = do
             case [nameOf drv | drv <- added, not (isFetch drv), drvPlatform drv /= X86_64_Windows] of
               [] -> Pass
               named -> Fail ("not x86_64-windows: " <> T.intercalate ", " named),
-          runTest "the one leaf it adds is hello's archive, fetched fixed-output" $
+          runTest "the leaves it adds are the archives of hello, sed and zlib, each fetched fixed-output" $
             assertEqual
               "leaves added"
-              ([helloArchive], True)
-              (map nameOf addedLeaves, all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
-          runTest "it reads no input source but what evaluation writes as text, the stdenv's own files and the flags check's sources" $
+              (sort archives, True)
+              (sort (map nameOf addedLeaves), all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          -- Two scripts named setup.sh, the stage-2 stdenv's and the seed
+          -- stdenv's it runs, and the source directories of libgreet,
+          -- zdemo and greeter.
+          runTest "it reads no input source but what evaluation writes as text, the stdenv's own files, the packages' source directories and the flags check's sources" $
             assertEqual
               "input sources not written as text"
-              (sort ["cc-wrapper.sh", "config.site", "ld-wrapper.sh", "link.specs", "setup.sh", "stage2-stdenv-flags", "wrap.sh"])
+              (sort ["cc-wrapper.sh", "config.site", "ld-wrapper.sh", "link.specs", "setup.sh", "setup.sh", "src", "src", "src", "stage2-stdenv-flags", "windres-wrapper.sh", "wrap.sh"])
               (sort (map spName (nub [path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]))),
-          runTest "hello built with it runs the seed stdenv's setup.sh under busybox's sh, with a config.site that is not the seed stdenv's" $
+          runTest "hello built with it runs its own setup.sh under busybox's sh, which runs the seed stdenv's, with a config.site that is not the seed stdenv's" $
             assertEqual
-              "the builder, the script and whether it is the seed stdenv's, and CONFIG_SITE and whether it is the seed stdenv's"
-              (outputOf busyboxRoot <> "/bin/busybox.exe", Just "setup.sh", True, Just "config.site", False)
+              "the builder, the script and whether it is the seed stdenv's, whether seedSetup is the seed stdenv's script, and CONFIG_SITE and whether it is the seed stdenv's"
+              (outputOf busyboxRoot <> "/bin/busybox.exe", Just "setup.sh", False, True, Just "config.site", False)
               ( maybe "" (bytesText . drvBuilder) stage2Hello,
                 spName <$> (scriptOf =<< stage2Hello),
                 (scriptOf =<< stage2Hello) == (scriptOf =<< seedHello),
+                (storePathIn . variableOf "seedSetup" =<< stage2Hello) == (scriptOf =<< seedHello),
                 spName <$> (configSiteOf =<< stage2Hello),
                 (configSiteOf =<< stage2Hello) == (configSiteOf =<< seedHello)
+              ),
+          runTest "OBJDUMP and STRIP name binutils-native-x86_64's programs, WINDRES the windres wrapper, and the fixup looks in gcc-native-x86_64's bin directory first" $
+            assertEqual
+              "OBJDUMP, STRIP, WINDRES and dllSearchPath"
+              (Just (binutilsProgram "objdump", binutilsProgram "strip", "windres", outputOf gccNativeRoot <> "/bin"))
+              ( stage2Hello <&> \drv ->
+                  (variableOf "OBJDUMP" drv, variableOf "STRIP" drv, variableOf "WINDRES" drv, variableOf "dllSearchPath" drv)
               ),
           runTest "its builds' PATH is the seed stdenv's applets, GNU make and the wrappers, with neither toolchain's bin directory on it" $
             assertEqual
@@ -23542,11 +23558,11 @@ testStage2StdenvWindows = do
                     Map.member "C_INCLUDE_PATH" (drvEnv drv)
                   )
               ),
-          runTest "the wrappers are written from gcc-native-x86_64's drivers and binutils-native-x86_64's linker" $
+          runTest "the wrappers are written from gcc-native-x86_64's drivers and binutils-native-x86_64's linker and resource compiler" $
             assertEqual
-              "compilers and linker"
-              (Just (outputOf gccNativeRoot <> "/bin", outputOf binutilsNativeRoot <> "/bin/ld.exe"))
-              (wrappers <&> \drv -> (variableOf "compilers" drv, variableOf "linker" drv)),
+              "compilers, linker and windres"
+              (Just (outputOf gccNativeRoot <> "/bin", outputOf binutilsNativeRoot <> "/bin/ld.exe", binutilsProgram "windres"))
+              (wrappers <&> \drv -> (variableOf "compilers" drv, variableOf "linker" drv, variableOf "windres" drv)),
           runTest "both stage-1 seeds are in the closure of hello built with the stage-1 stdenv" $
             assertEqual "stage-1 seeds in it" stage1Seeds (seedsIn stage1),
           runTest "neither stage-1 seed is in the closure of hello built with the stage-2 stdenv" $
@@ -23554,7 +23570,7 @@ testStage2StdenvWindows = do
         ]
   where
     instantiates :: Text
-    instantiates = "the stage-2 stdenv and its checks instantiate, adding four to the closure of their tools"
+    instantiates = "the stage-2 stdenv and its checks instantiate, adding eleven to the closure of their tools"
     target :: Text
     target = "x86_64-w64-mingw32"
     busyboxRoot :: Text
@@ -23582,11 +23598,15 @@ testStage2StdenvWindows = do
     stage1Seeds :: [Text]
     stage1Seeds = ["pkgs.stdenv.mingwSeed", "pkgs.stdenv.msysSeed"]
     roots :: [Text]
-    roots = toolRoots ++ [wrappersRoot, helloRoot, flagsRoot, seedHelloRoot, stage1Hello] ++ stage1Seeds
-    helloArchive :: Text
-    helloArchive = "hello-2.12.3.tar.gz"
+    roots = toolRoots ++ [wrappersRoot, helloRoot, flagsRoot, seedHelloRoot, stage1Hello] ++ packageRoots ++ stage1Seeds
+    -- The stage-1 stdenv's other five packages, built with the stage-2
+    -- stdenv.
+    packageRoots :: [Text]
+    packageRoots = ["checks.sed", "checks.zlib", "checks.libgreet", "checks.zdemo", "checks.greeter"]
+    archives :: [Text]
+    archives = ["hello-2.12.3.tar.gz", "sed-4.10.tar.xz", "zlib-1.3.2.tar.gz"]
     addedNames :: [Text]
-    addedNames = [helloArchive, "gcc-wrapper-16.2.0", "hello", "stage2-stdenv-flags"]
+    addedNames = archives ++ ["gcc-wrapper-16.2.0", "hello", "stage2-stdenv-flags", "sed", "zlib", "libgreet", "zdemo", "greeter"]
 
 -- | @pkgs\/windows\/sources.nix@ against the package set whose sources it
 -- lists: the fetches in the closure of every derivation in the set are the
