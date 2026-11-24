@@ -11,7 +11,7 @@
 module Main (main) where
 
 import Control.Applicative ((<|>))
-import Control.Exception (AsyncException (UserInterrupt), bracket, displayException, handle, handleJust, try)
+import Control.Exception (AsyncException (UserInterrupt), bracket, bracketOnError, displayException, handle, handleJust, try)
 import Control.Monad (filterM, mfilter, void, when, (>=>))
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Data.Bifunctor (first)
@@ -30,6 +30,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
+import Data.Void (absurd)
 import Data.Word (Word32, Word64)
 import Foreign.C.Error (Errno (..), ePIPE)
 import GHC.IO.Exception (IOException (..))
@@ -40,14 +41,17 @@ import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Sandbox (DropGroups (..), SandboxConfig (..), SandboxFallback (..), SandboxMode (..), parseSandboxPaths)
 import Nix.Builder.Sandbox.Spawn (filePathBytes, processIsRoot)
 import Nix.Builtins (isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
-import Nix.Cli.Args (AutoArg (..), CliOpts (..), Command (..), JsonLayout (..), ListFormat (..), OutLink, ProfileSelection (..), PushArgs (..), RemoveMatcher (..), RemoveSelection (..), Target (..), outLinkFor, parseArgs)
+import Nix.Cli.Args (AutoArg (..), CliOpts (..), Command (..), DevEnvFormat (..), DevelopArgs (..), JsonLayout (..), ListFormat (..), OutLink, ProfileSelection (..), PushArgs (..), RemoveMatcher (..), RemoveSelection (..), Target (..), outLinkFor, parseArgs)
 import Nix.Cli.Reference (Host (..), SystemConfDirSource (..), currentHost, helpLines, renderIndentedJson, systemConfDirSource)
 import Nix.Config (DefaultUse (..), NixConfig (..), PathSetValue (..))
 import qualified Nix.Config as Config
 import Nix.DependencyGraph (DepNode (..), buildDepGraph)
-import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), DrvFile, drvFileATerm, drvFileDerivation, drvFilePath, fromATerm)
+import Nix.Develop.Capture (CaptureFailure, OutputObject (..), captureDerivation, captureFailureMessage, environmentOutput, getEnvScriptContents, getEnvScriptName, getEnvScriptPath, noEnvironmentMessage)
+import Nix.Develop.Environment (BuildEnvironment, EnvironmentScript (..), Prompt (..), ScriptDirectories (..), ScriptFile (..), Shell (..), buildEnvironmentJson, environmentScript, parseBuildEnvironment, renderRcfile)
+import Nix.Develop.Shell (DevelopHost (..), EnvironmentChanges (..), bashProgram, developHost, shellArguments, shellEnvironment, shellModeFor)
 import Nix.Environment (EnvLookup (..), argumentBytes, lookupEnvBytes)
-import Nix.Eval (AttrSet, Env, EvalPolicy (..), MonadEval (..), NixValue (..), Thunk (..), attrSetElems, attrSetLookup, compileSource, deepForce, evalBytecode, evalParsed, evaluated, findInSearchPath, force, readThunkValue, typeName)
+import Nix.Eval (AttrSet, Env, EvalPolicy (..), MonadEval (..), NixValue (..), Thunk (..), attrSetElems, attrSetLookup, compileSource, deepForce, evalBytecode, evalParsed, evaluated, findInSearchPath, force, inputModuloHashes, readThunkValue, typeName)
 import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.AutoCall (AutoArgs, autoCallFunction)
 import Nix.Eval.CRegion (Regions (..), regionFigures, renderRegionFigures)
@@ -63,7 +67,7 @@ import Nix.Eval.Types (clistThunks, mkStrBytes, mkThunkBc)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.HostPath (hostPathFromBytes, hostPathText)
 import Nix.Http (defaultFetchRetryPolicy)
-import Nix.Json (renderJson)
+import Nix.Json (Json, renderJson)
 import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Profile.Generation (Change (..), ProfileFailure (..), ProfileLinkPlace (..), absolutePath, checkProfileStore, readManifest, readProfileEnvironment, resolveDefaultProfile, updateProfile)
 import Nix.Profile.Manifest (Conflict (..), ConflictSide (..), Element (..), FlakeSource (..), Manifest (..), Matcher (..), Selection (..), Selector (..), addElement, defaultPriority, elementIdentifier, flakeAttribute, manifestErrorText, manifestJson, regexMatcher, selectElements)
@@ -73,13 +77,13 @@ import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), loadSecretKeyFil
 import Nix.Realise (BuildMode (..), ClosureOutcome (..), Fallback (..), SubstitutesSetting (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, isValid, openStore, queryAllValidPaths, resolveDeleteTarget, storeEntryNameText, upstreamManagedRefusal, useStoreFileMask)
 import Nix.Store.Ops (EvalObjects (..), StoreOps (..), StoreQueries (..), localQueries, withLocalStore)
-import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
+import Nix.Store.Path (StoreDir (..), StorePath (spName), badStorePathText, defaultStoreDir, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
 import Nix.Trust (ContentFacts, fetchedByBuiltin, fixedOutputInputs, renderTrustReport, trustReport)
 import Nix.Trust.Scan (scanFetched)
 import qualified NovaCache.NAR as NAR
 import Paths_nova_nix (getBinDir, getDataDir, version)
-import System.Directory (Permissions (executable), canonicalizePath, doesDirectoryExist, doesFileExist, findExecutable, getCurrentDirectory, getPermissions, makeAbsolute)
+import System.Directory (Permissions (executable), canonicalizePath, doesDirectoryExist, doesFileExist, findExecutable, getCurrentDirectory, getFileSize, getPermissions, makeAbsolute, pathIsSymbolicLink)
 import qualified System.Directory.OsPath as OsDir
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
@@ -204,6 +208,8 @@ main = do
       | optAterm opts -> evalAterm config opts storeDir dataDir target
       | otherwise -> evalCommand config opts storeDir dataDir target
     CmdBuild target attrPath outLink -> buildCommand config opts storeDir dataDir target attrPath outLink
+    CmdDevelop target attrPath developArgs -> developCommand config opts storeDir dataDir target attrPath developArgs
+    CmdPrintDevEnv target attrPath format layout -> printDevEnvCommand config opts storeDir dataDir target attrPath format layout
     CmdTrust target attrPath -> trustCommand config opts storeDir dataDir target attrPath
     CmdPush pushArgs -> pushCommand storeDir pushArgs
     CmdStoreDelete paths -> storeDeleteCommand storeDir paths
@@ -1224,6 +1230,187 @@ checkExecWrappers = Map.traverseWithKey check
                 else failWith ("--exec-wrapper " <> system <> ": " <> T.pack path <> " is not executable")
 
 -- ---------------------------------------------------------------------------
+-- Develop commands
+-- ---------------------------------------------------------------------------
+
+-- | Start @bash@ with the build environment of the target's derivation,
+-- as @nix develop@ does (@CmdDevelop::run@, develop.cc:587-722 at 2.35.4):
+-- capture the environment ('captureEnvironment'), make the script that
+-- sets it, refuse what upstream refuses only once it has, in its words
+-- and order, write the structured attributes' files and the rcfile, and
+-- replace this process with the shell ("Nix.Develop.Shell").  Upstream
+-- makes the rcfile, the files' directory and the files before its three
+-- refusals (develop.cc:591-595, then :603 and command.cc:392 and 396),
+-- and when one is made leaves the rcfile behind, empty; here the
+-- directory is removed then, and the rcfile and the files are written
+-- only once all three have passed.  The directory is removed too when
+-- there are no files to write, where upstream leaves it empty.  The
+-- files it holds under structured attributes outlive the shell, as
+-- upstream's do, since nothing is left after the exec to remove them.
+developCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> DevelopArgs -> IO ()
+developCommand config opts storeDir dataDir target attrPath args = do
+  host <- hostOrRefuse
+  command <- traverse (traverse (commandLineBytes "--command")) (daCommand args)
+  phase <- traverse (commandLineBytes "--phase") (daPhase args)
+  changes <- environmentChanges args
+  (gcroot, environment) <- captureEnvironment "develop" config opts storeDir dataDir target attrPath
+  cwd <- getCurrentDirectory >>= filePathBytes
+  bracketOnError (makeTemporaryDirectory host developDirectoryPrefix) removeHostPath $ \attrsDir -> do
+    script <- either failError pure (environmentScript (ScriptDirectories cwd attrsDir) environment)
+    mode <- either failError pure (shellModeFor command phase (promptFor config))
+    caller <- processEnvironment host
+    shellEnv <- either failError pure (shellEnvironment changes (TE.encodeUtf8 (storePathToText storeDir gcroot)) caller)
+    writeScriptFiles script
+    when (null (scriptFiles script)) (removeHostPath attrsDir)
+    bracketOnError (createRcfile host (\path -> renderRcfile (Shell path mode bashProgram) script)) removeHostPath $ \rcfile -> do
+      started <- try (replaceProcess host (shellArguments mode rcfile) shellEnv)
+      either (failWith . execFailure) absurd started
+  where
+    execFailure :: IOException -> T.Text
+    execFailure failure = "error: unable to execute '" <> TE.decodeLatin1 bashProgram <> "': " <> T.pack (ioe_description failure)
+
+-- | Print the script that sets the build environment of the target's
+-- derivation, or with @--json@ the environment, as @nix print-dev-env@
+-- does (develop.cc:725-757 at 2.35.4).  The script names the structured
+-- attributes' files in a temporary directory that is removed once it is
+-- printed, as upstream removes it.  The script is followed by a newline,
+-- as upstream's @writeToStdout@ writes it, and the JSON is printed as
+-- 'printJson' prints it.
+printDevEnvCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> DevEnvFormat -> JsonLayout -> IO ()
+printDevEnvCommand config opts storeDir dataDir target attrPath format layout = do
+  host <- hostOrRefuse
+  (_, environment) <- captureEnvironment "print-dev-env" config opts storeDir dataDir target attrPath
+  case format of
+    DevEnvJson -> printJson layout (buildEnvironmentJson environment)
+    DevEnvScript -> do
+      cwd <- getCurrentDirectory >>= filePathBytes
+      bracket (makeTemporaryDirectory host printDirectoryPrefix) removeHostPath $ \attrsDir -> do
+        script <- either failError pure (environmentScript (ScriptDirectories cwd attrsDir) environment)
+        writeScriptFiles script
+        toStdout (BS.putStr (scriptText script <> "\n"))
+
+-- | What upstream names the directories of the structured attributes'
+-- files, for @develop@ and for @print-dev-env@ (develop.cc:593 and 753).
+developDirectoryPrefix, printDirectoryPrefix :: BS.ByteString
+developDirectoryPrefix = "nix-develop"
+printDirectoryPrefix = "nix-dev-env"
+
+-- | The t'DevelopHost' for this host, the command failing where it has none.
+hostOrRefuse :: IO DevelopHost
+hostOrRefuse = either failError pure developHost
+
+promptFor :: NixConfig -> Prompt
+promptFor config = Prompt (ncBashPrompt config) (ncBashPromptPrefix config) (ncBashPromptSuffix config)
+
+-- | The environment flags' names and values as their bytes.
+environmentChanges :: DevelopArgs -> IO EnvironmentChanges
+environmentChanges args =
+  EnvironmentChanges (daEnvironmentBase args)
+    <$> names "--keep-env-var" (daKeep args)
+    <*> names "--unset-env-var" (daUnset args)
+    <*> (Map.fromList <$> traverse assignment (Map.toList (daSet args)))
+  where
+    names flagName = fmap Set.fromList . traverse (commandLineBytes flagName) . Set.toList
+    assignment (name, value) = (,) <$> commandLineBytes "--set-env-var" name <*> commandLineBytes "--set-env-var" value
+
+writeScriptFiles :: EnvironmentScript -> IO ()
+writeScriptFiles = mapM_ (\file -> bytesHostPath (scriptFilePath file) >>= (`OsFile.writeFile'` scriptFileContents file)) . scriptFiles
+
+-- | Remove a temporary file, or a directory with what it holds, passing
+-- over one already gone.
+removeHostPath :: BS.ByteString -> IO ()
+removeHostPath path = bytesHostPath path >>= OsDir.removePathForcibly
+
+-- | The host path a path's bytes name ('hostPathFromBytes').
+bytesHostPath :: BS.ByteString -> IO OsPath
+bytesHostPath path = maybe (failWith ("error: '" <> TE.decodeUtf8Lenient path <> "' is not valid UTF-8, so it names no Windows path")) pure (hostPathFromBytes path)
+
+-- | The build environment of the target's derivation, captured as
+-- upstream's @nix develop@ captures it (@getDerivationEnvironment@,
+-- develop.cc:233-311 at 2.35.4), and the store path of the output it was
+-- read from.  The target is evaluated in a read-write session as @build@
+-- evaluates it; the capture of its derivation is made in that session
+-- ('recordCapture'), and what the session made is added and every output
+-- of the capture realised, as @build@ adds and realises, so its inputs
+-- are built or substituted, and a capture already valid is not built
+-- again.  A failure stops the command as it stops @build@.  The store
+-- has closed by the time this returns.
+captureEnvironment :: T.Text -> NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> IO (StorePath, BuildEnvironment)
+captureEnvironment commandName config opts storeDir dataDir target attrPath = do
+  upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ((commandName <> ": ") <>))
+  script <- readGetEnvScript dataDir
+  scriptPath <- either (failWith . ("error: " <>) . badStorePathText) pure (getEnvScriptPath script)
+  buildConfig <- buildConfigFor config opts storeDir
+  withLocalStore buildConfig $ \ops -> do
+    (capture, evalObjects) <-
+      evalTarget config opts storeDir (ReadWriteSession ops) dataDir target attrPath $ \st val -> do
+        drvSP <- derivationPath val
+        drv <- readIORef (esDrvClosure st) >>= (`recordedDerivation` drvSP)
+        name <- maybe (failWith ("error: '" <> storePathToText defaultStoreDir drvSP <> "' is not a derivation's path")) pure (T.stripSuffix drvSuffix (spName drvSP))
+        capture <- evalOrExit st (recordCapture script scriptPath name drv) >>= either (failWith . ("error: " <>) . captureFailureMessage) pure
+        (,) capture <$> sessionObjects st
+    let captured = drvFileDerivation capture
+    outcome <- runExceptT $ do
+      ExceptT (first AddRefused <$> soAddEvalObjects ops evalObjects)
+      ExceptT (first BuildStopped <$> soBuild ops [(drvFilePath capture, Set.fromList (map doName (drvOutputs captured)))])
+    either reportStop pure outcome
+    readEnvironment storeDir captured
+  where
+    drvSuffix = ".drv"
+
+-- | The capture of a derivation whose @.drv@ is named @name.drv@
+-- ('captureDerivation'), with @get-env.sh@ written to the store and the
+-- capture's @.drv@ recorded, so that adding what the session made adds
+-- both, as upstream adds the script and writes the capture
+-- (develop.cc:241-290 at 2.35.4).  A derivation the capture refuses
+-- writes nothing, as upstream refuses its builder before adding the
+-- script.  The input derivations' modulo hashes are the session's, which
+-- evaluating the target computed.
+recordCapture :: BS.ByteString -> StorePath -> T.Text -> Derivation -> EvalIO (Either CaptureFailure DrvFile)
+recordCapture script scriptPath name drv = do
+  inputHashes <- inputModuloHashes (drvInputDrvs drv)
+  case captureDerivation scriptPath name inputHashes drv of
+    Left failure -> pure (Left failure)
+    Right capture -> do
+      void (writeToStore getEnvScriptName (getEnvScriptContents script) [])
+      recordDrvAterm (storePathToText defaultStoreDir (drvFilePath capture)) (drvFileATerm capture)
+      pure (Right capture)
+
+-- | Upstream's @get-env.sh@, from the data directory, where the package
+-- installs it and a release archive ships it.
+readGetEnvScript :: FilePath -> IO BS.ByteString
+readGetEnvScript dataDir = do
+  attempt <- try (BS.readFile (dataDir </> getEnvScriptFile))
+  case attempt of
+    Left (failure :: IOException) -> failWith ("error: cannot read get-env.sh: " <> T.pack (displayException failure))
+    Right script -> pure script
+
+-- | Where @get-env.sh@ is, relative to the data directory.
+getEnvScriptFile :: FilePath
+getEnvScriptFile = "develop" </> "get-env.sh"
+
+-- | The environment a built capture holds, and the store path of the
+-- output it is read from: the one 'environmentOutput' picks, read and
+-- parsed as upstream's @getBuildEnvironment@ reads it
+-- (develop.cc:497-509 at 2.35.4).
+readEnvironment :: StoreDir -> Derivation -> IO (StorePath, BuildEnvironment)
+readEnvironment storeDir capture = do
+  objects <- traverse (\output -> (,) (doName output) <$> outputObject (storePathToFilePath storeDir (doPath output))) (drvOutputs capture)
+  output <-
+    maybe (failWith ("error: " <> noEnvironmentMessage)) pure $
+      environmentOutput (Map.fromList objects) >>= \name -> find ((== name) . doName) (drvOutputs capture)
+  bytes <- BS.readFile (storePathToFilePath storeDir (doPath output))
+  either (failWith . ("error: " <>)) (pure . (,) (doPath output)) (parseBuildEnvironment bytes)
+
+-- | What an output's root is, as upstream's @maybeLstat@ answers: a link
+-- is not followed.
+outputObject :: FilePath -> IO OutputObject
+outputObject path = do
+  link <- pathIsSymbolicLink path
+  regular <- if link then pure False else doesFileExist path
+  if regular then RegularFile . fromIntegral <$> getFileSize path else pure NotRegularFile
+
+-- ---------------------------------------------------------------------------
 -- Push command
 -- ---------------------------------------------------------------------------
 
@@ -1585,8 +1772,7 @@ argumentText :: T.Text -> String -> IO T.Text
 argumentText what arg = commandLineBytes what arg >>= either (const (failError (what <> " is not valid UTF-8"))) pure . TE.decodeUtf8'
 
 -- | Print what a profile holds: upstream's lines, or with @--json@ its
--- manifest, indented when stdout is a terminal, as upstream's
--- @printJSON@ chooses (common-args.hh:46).
+-- manifest, as 'printJson' prints it.
 profileListCommand :: NixConfig -> StoreDir -> ProfileSelection -> ListFormat -> IO ()
 profileListCommand config storeDir selection format = do
   profile <- chosenProfile config selection
@@ -1595,14 +1781,20 @@ profileListCommand config storeDir selection format = do
   checkProfileStore storeDir profile >>= either (failError . profileFailureText storeDir) pure
   manifest <- readManifest profile >>= either (failError . profileFailureText storeDir) pure
   case format of
-    ListJson layout -> do
-      indented <- case layout of
-        IndentedOnTerminal -> hIsTerminalDevice stdout
-        Indented -> pure True
-        Compact -> pure False
-      let json = manifestJson manifest
-      toStdout (BS.putStr (if indented then renderIndentedJson json else renderJson json <> "\n"))
+    ListJson layout -> printJson layout (manifestJson manifest)
     ListText -> toStdout (mapM_ TIO.putStrLn (listLines storeDir manifest))
+
+-- | Print JSON as upstream's @printJSON@ prints it
+-- (common-args.cc:99-107 at 2.35.4): indented or on one line as the
+-- layout says, by default indented when stdout is a terminal, and
+-- followed by a newline, as @writeToStdout@ ends what it writes.
+printJson :: JsonLayout -> Json -> IO ()
+printJson layout json = do
+  indented <- case layout of
+    IndentedOnTerminal -> hIsTerminalDevice stdout
+    Indented -> pure True
+    Compact -> pure False
+  toStdout (BS.putStr (if indented then renderIndentedJson json else renderJson json <> "\n"))
 
 -- | The escapes upstream sets a name in bold, then red, and back with.
 ansiBold, ansiRed, ansiNormal :: T.Text

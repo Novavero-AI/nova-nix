@@ -3,7 +3,8 @@
 -- | Scoped loopback HTTP servers for the download tests: the mirrors
 -- @builtin:fetchurl@ tries, and the binary cache the substituter reads;
 -- and for the push tests, a server that reads each request's body, and
--- one that serves a directory's files.
+-- one that serves a directory's files, closing each connection or keeping
+-- it open for the next request.
 module HttpFixture
   ( Reply (..),
     FixtureRequest (..),
@@ -12,11 +13,12 @@ module HttpFixture
     withFetchurlServer,
     withRequestServer,
     withDirectoryServer,
+    withKeepAliveDirectoryServer,
   )
 where
 
 import Control.Concurrent (newEmptyMVar, readMVar, threadDelay, tryPutMVar)
-import Control.Concurrent.Async (race, wait, withAsync)
+import Control.Concurrent.Async (async, cancel, race, wait, withAsync)
 import Control.Exception (IOException, bracket, bracketOnError, finally, try)
 import Control.Monad (forever, void)
 import qualified Data.ByteString as BS
@@ -66,14 +68,14 @@ withHttpServer route action = do
           _ -> fail "unexpected fixture request"
         earlier <- atomicModifyIORef' requests (\seen -> (path : seen, length (filter (== path) seen)))
         answer (void (tryPutMVar requested ())) client (route path earlier)
-  withLoopbackServer serve (\base -> action base (reverse <$> readIORef requests) (readMVar requested))
+  withLoopbackServer OneAtATime serve (\base -> action base (reverse <$> readIORef requests) (readMVar requested))
 
 -- | A loopback server for requests that carry a body: each request's
 -- method, target, headers and body (read to its @Content-Length@, none
 -- without one) go to the handler, which answers it.  Requests are served
 -- one at a time, in the order they connect.
 withRequestServer :: (FixtureRequest -> IO Reply) -> (Text -> IO a) -> IO a
-withRequestServer handler = withLoopbackServer $ \client -> do
+withRequestServer handler = withLoopbackServer OneAtATime $ \client -> do
   (header, afterHeader) <- BS.breakSubstring headerEnd <$> readHeaders client BS.empty
   request <- case BSC.lines (BSC.filter (/= '\r') header) of
     requestLine : headerLines
@@ -102,34 +104,91 @@ withRequestServer handler = withLoopbackServer $ \client -> do
 -- that its target names, and a request for anything else is a 404.  The
 -- callback gets the base URL.
 withDirectoryServer :: FilePath -> (Text -> IO a) -> IO a
-withDirectoryServer root = withRequestServer serve
+withDirectoryServer root = withRequestServer (fmap (Send . uncurry httpResponse) . directoryAnswer root (,))
+
+-- | 'withDirectoryServer' over connections it keeps open, as a web server
+-- speaking HTTP/1.1 keeps them: each response leaves the connection open
+-- for the client's next request, so a client may keep it in a pool.  Each
+-- client is served on a thread of its own until it closes the
+-- connection.
+withKeepAliveDirectoryServer :: FilePath -> (Text -> IO a) -> IO a
+withKeepAliveDirectoryServer root = withLoopbackServer EachOnItsOwnThread (serveKept BS.empty)
   where
-    serve request = case (frMethod request, servedFile (frTarget request)) of
-      ("GET", Just relative) -> do
-        found <- try (BS.readFile (root </> relative)) :: IO (Either IOException BS.ByteString)
-        pure (Send (either (const notFound) (httpResponse "200 OK") found))
-      _ -> pure (Send notFound)
-    notFound = httpResponse "404 Not Found" "not found"
+    serveKept pending client = do
+      next <- nextRequest client pending
+      case next of
+        Nothing -> pure ()
+        Just (header, rest) -> do
+          answered <- case BSC.words (BSC.takeWhile (/= '\r') header) of
+            method : target : _ -> directoryAnswer root (,) (FixtureRequest method target [] BS.empty)
+            _ -> fail "unexpected fixture request"
+          Socket.sendAll client (uncurry keptResponse answered)
+          serveKept rest client
+
+-- | The status and body a directory server answers a request with: a GET
+-- the file under the directory its target names, anything else a 404.
+directoryAnswer :: FilePath -> (BS.ByteString -> BS.ByteString -> a) -> FixtureRequest -> IO a
+directoryAnswer root reply request = case (frMethod request, servedFile (frTarget request)) of
+  ("GET", Just relative) -> do
+    found <- try (BS.readFile (root </> relative)) :: IO (Either IOException BS.ByteString)
+    pure (either (const notFound) (reply "200 OK") found)
+  _ -> pure notFound
+  where
+    notFound = reply "404 Not Found" "not found"
     -- A target's path below the directory, never one that leaves it.
     servedFile target = case BSC.split '/' target of
       "" : segments@(_ : _)
         | all (`notElem` ["", ".", ".."]) segments -> Just (joinPath (map BSC.unpack segments))
       _ -> Nothing
 
+-- | The next request's headers on a kept connection, and the bytes that
+-- came after them, or 'Nothing' once the client has closed the connection
+-- between requests.
+nextRequest :: Socket.Socket -> BS.ByteString -> IO (Maybe (BS.ByteString, BS.ByteString))
+nextRequest client pending = case BS.breakSubstring headerEnd pending of
+  (header, rest)
+    | not (BS.null rest) -> pure (Just (header, BS.drop (BS.length headerEnd) rest))
+    | BS.length pending > maxHeaderBytes -> fail "fixture request headers too large"
+    | otherwise -> do
+        chunk <- Socket.recv client headerChunkBytes
+        case (BS.null chunk, BS.null pending) of
+          (True, True) -> pure Nothing
+          (True, False) -> fail "incomplete fixture request"
+          _ -> nextRequest client (pending <> chunk)
+
+-- | A whole response that leaves the connection open.
+keptResponse :: BS.ByteString -> BS.ByteString -> BS.ByteString
+keptResponse status body =
+  "HTTP/1.1 " <> status <> "\r\nContent-Length: " <> BSC.pack (show (BS.length body)) <> "\r\n\r\n" <> body
+
+-- | How a loopback server takes the clients it accepts.
+data Clients
+  = -- | Each served to the end before the next is accepted.
+    OneAtATime
+  | -- | Each served on a thread of its own, all of them stopped when the
+    -- server's scope ends.
+    EachOnItsOwnThread
+
 -- | Serve each client the listener accepts with the action, for as long
 -- as the callback runs, on a loopback port the callback gets as a base
 -- URL.
-withLoopbackServer :: (Socket.Socket -> IO ()) -> (Text -> IO a) -> IO a
-withLoopbackServer serve action = Socket.withSocketsDo $
+withLoopbackServer :: Clients -> (Socket.Socket -> IO ()) -> (Text -> IO a) -> IO a
+withLoopbackServer clients serve action = Socket.withSocketsDo $
   bracket listen Socket.close $ \listener -> do
     address <- Socket.getSocketName listener
     base <- case address of
       Socket.SockAddrInet port _ -> pure ("http://127.0.0.1:" <> T.pack (show port))
       _ -> fail "fixture did not bind IPv4"
-    withAsync (forever (bracket (fst <$> Socket.accept listener) Socket.close serve)) $ \worker -> do
+    threads <- newIORef []
+    let acceptOne = case clients of
+          OneAtATime -> bracket (fst <$> Socket.accept listener) Socket.close serve
+          EachOnItsOwnThread -> bracketOnError (fst <$> Socket.accept listener) Socket.close $ \client -> do
+            thread <- async (serve client `finally` Socket.close client)
+            atomicModifyIORef' threads (\started -> (thread : started, ()))
+    withAsync (forever acceptOne) $ \worker -> do
       -- WinSock accept is a blocking safe FFI call. Close the listener before
       -- withAsync waits for cancellation, or that wait can never finish.
-      outcome <- race (wait worker) (action base) `finally` Socket.close listener
+      outcome <- race (wait worker) (action base) `finally` (Socket.close listener >> readIORef threads >>= mapM_ cancel)
       case outcome of
         Left () -> fail "fixture server stopped unexpectedly"
         Right result -> pure result

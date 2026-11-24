@@ -1,0 +1,26 @@
+# shellcheck shell=bash disable=SC2154  # buildInputs and marker are the derivation's
+# The setup shell.nix's capture sources: its build input's bin on PATH, a
+# build phase that runs the input, the runPhase nixpkgs' setup.sh defines,
+# and a line appended to $marker for each run.  The phase removes the
+# fresh NIX_BUILD_TOP develop's shell makes, which only an empty
+# directory lets it do.  With arrayOutput set, out becomes an array
+# holding its path, which get-env.sh still writes the environment to.
+for input in $buildInputs; do
+  PATH="$input/bin${PATH:+:$PATH}"
+done
+export PATH
+echo ran >> "$marker"
+
+if [ -n "${arrayOutput-}" ]; then
+  declare +x out
+  out=("$out")
+fi
+
+buildPhase() {
+  rmdir "$NIX_BUILD_TOP"
+  echo "build phase ran: $(develop-tool)"
+}
+
+runPhase() {
+  "$1"
+}

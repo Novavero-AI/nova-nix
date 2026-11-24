@@ -8,8 +8,10 @@
 -- @builtins.traceVerbose@ traces (@trace-verbose@), whether a path
 -- reader may build what its argument's context names
 -- (@allow-import-from-derivation@, @trace-import-from-derivation@), how
--- builds are sandboxed (@sandbox@ and the settings beside it), and where
--- the link to the default profile is (@use-xdg-base-directories@).
+-- builds are sandboxed (@sandbox@ and the settings beside it), where
+-- the link to the default profile is (@use-xdg-base-directories@), and
+-- the prompt of a @develop@ shell (@bash-prompt@ and its prefix and
+-- suffix).
 --
 -- == The format
 --
@@ -203,7 +205,14 @@ data NixConfig = NixConfig
     ncSslCertFile :: !(Maybe ByteString),
     -- | Upstream @use-xdg-base-directories@: the link to the default
     -- profile is in the state directory, not the home.
-    ncUseXdgBaseDirectories :: !Bool
+    ncUseXdgBaseDirectories :: !Bool,
+    -- | Upstream's @bash-prompt@: a @develop@ shell's prompt in place of
+    -- the user's, none when empty.
+    ncBashPrompt :: !ByteString,
+    -- | Upstream's @bash-prompt-prefix@: text before that prompt.
+    ncBashPromptPrefix :: !ByteString,
+    -- | Upstream's @bash-prompt-suffix@: text after it.
+    ncBashPromptSuffix :: !ByteString
   }
   deriving (Eq, Show)
 
@@ -227,7 +236,8 @@ data DefaultUse = KeepsDefault | ReplacesDefault
 -- URIs, both evaluation modes off, @trace-verbose@ off, an import from
 -- derivation allowed and not traced, upstream's sandbox settings,
 -- those whose defaults take the platform or IO unset or kept for the
--- caller, and the default profile's link in the home.  The empty
+-- caller, the default profile's link in the home, and the three prompt
+-- settings empty, as upstream's are.  The empty
 -- substituter list is nova-nix's existing default (nothing is substituted
 -- unless configured), a deliberate divergence from upstream's
 -- cache.nixos.org default: turning a cache on for every machine is the
@@ -255,7 +265,10 @@ defaultNixConfig =
       ncSandboxDevShmSize = "50%",
       ncRequireDropSupplementaryGroups = Nothing,
       ncSslCertFile = Nothing,
-      ncUseXdgBaseDirectories = False
+      ncUseXdgBaseDirectories = False,
+      ncBashPrompt = "",
+      ncBashPromptPrefix = "",
+      ncBashPromptSuffix = ""
     }
 
 -- ---------------------------------------------------------------------------
@@ -702,6 +715,9 @@ resolveName name =
       | n == requireDropGroupsKey = Just (BoolSetting RequireDropGroupsField)
       | n == sslCertFileKey = Just (BytesSetting SslCertFileField)
       | n == useXdgBaseDirectoriesKey = Just (BoolSetting UseXdgBaseDirectoriesField)
+      | n == bashPromptKey = Just (BytesSetting BashPromptField)
+      | n == bashPromptPrefixKey = Just (BytesSetting BashPromptPrefixField)
+      | n == bashPromptSuffixKey = Just (BytesSetting BashPromptSuffixField)
       | otherwise = Nothing
 
 -- | A setting this layer resolves, by the shape of its value: a list of
@@ -735,7 +751,13 @@ data BoolField
   deriving (Eq, Show)
 
 -- | The settings whose value is a string, kept as bytes.
-data BytesField = SandboxBuildDirField | SandboxDevShmSizeField | SslCertFileField
+data BytesField
+  = SandboxBuildDirField
+  | SandboxDevShmSizeField
+  | SslCertFileField
+  | BashPromptField
+  | BashPromptPrefixField
+  | BashPromptSuffixField
   deriving (Eq, Show)
 
 -- | The scalar settings, which only ever replace.
@@ -799,6 +821,9 @@ setBytes :: BytesField -> ByteString -> NixConfig -> NixConfig
 setBytes SandboxBuildDirField v config = config {ncSandboxBuildDir = v}
 setBytes SandboxDevShmSizeField v config = config {ncSandboxDevShmSize = v}
 setBytes SslCertFileField v config = config {ncSslCertFile = Just v}
+setBytes BashPromptField v config = config {ncBashPrompt = v}
+setBytes BashPromptPrefixField v config = config {ncBashPromptPrefix = v}
+setBytes BashPromptSuffixField v config = config {ncBashPromptSuffix = v}
 
 -- | Upstream's Boolean spellings (@BaseSetting\<bool\>::parse@): anything
 -- else is an error with upstream's wording, which names the setting alone,
@@ -877,6 +902,13 @@ sslCertFileKey = "ssl-cert-file"
 
 useXdgBaseDirectoriesKey :: ByteString
 useXdgBaseDirectoriesKey = "use-xdg-base-directories"
+
+-- | The settings of a @develop@ shell's prompt (develop.cc:26-35 at
+-- 2.35.4).
+bashPromptKey, bashPromptPrefixKey, bashPromptSuffixKey :: ByteString
+bashPromptKey = "bash-prompt"
+bashPromptPrefixKey = "bash-prompt-prefix"
+bashPromptSuffixKey = "bash-prompt-suffix"
 
 -- | Upstream's older names for @sandbox@ and @sandbox-paths@
 -- (globals.hh:630 and 649 at 2.24.9).

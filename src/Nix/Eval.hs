@@ -92,6 +92,9 @@ module Nix.Eval
     -- * Search path
     findInSearchPath,
 
+    -- * Derivations
+    inputModuloHashes,
+
     -- * Platform
     currentSystemStr,
   )
@@ -4599,8 +4602,14 @@ derivationModuloHex drv = case drvOutputs drv of
             fixedForm = "fixed:out:" <> algoField <> ":" <> hashHex <> ":" <> outPathText
          in pure (bytesToHexText (sha256Digest (TE.encodeUtf8 fixedForm)))
   _ -> do
-    inputSubst <- mapM resolveInputModulo (Map.toList (drvInputDrvs drv))
+    inputSubst <- inputModuloHashes (drvInputDrvs drv)
     pure (bytesToHexText (sha256Digest (toATermForHash False (Just inputSubst) drv)))
+
+-- | The modulo hash (hex) of each input derivation, with the outputs taken
+-- from it, in path order, as 'Nix.Derivation.inputAddressed' and
+-- 'toATermForHash' take them ('resolveInputModulo').
+inputModuloHashes :: (MonadEval m) => Map StorePath [Text] -> m [(Text, [Text])]
+inputModuloHashes = mapM resolveInputModulo . Map.toList
 
 -- | The full output-name list of an all-outputs (upstream DrvDeep) reference:
 -- every output name of the referenced @.drv@, which upstream's derivationStrict
@@ -4793,7 +4802,7 @@ builtinDerivationStrict (VAttrs attrs) = do
             (Map.insert "out" (TE.encodeUtf8 foPathText) baseEnv)
       pure (file, foModulo)
     Nothing -> do
-      inputSubst <- mapM resolveInputModulo (Map.toList inputDrvs)
+      inputSubst <- inputModuloHashes inputDrvs
       file <- storePathOrThrow (inputAddressed drvName inputSubst (mkDrv (map pendingOutput outputNames) baseEnv))
       -- The unmasked modulo hash (real outputs, inputs substituted), cached
       -- for when this derivation is itself an input to another.

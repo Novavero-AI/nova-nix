@@ -340,8 +340,8 @@ Hello, world!
 
 ## Status
 
-Not implemented yet, and on the [roadmap]: flakes, `nix-shell` and
-`nix develop`, profiles (`nix-env`, `nix profile`; run a program from its store
+Not implemented yet, and on the [roadmap]: flakes, `nix-shell`, `nix develop`
+on Windows, profiles (`nix-env`, `nix profile`; run a program from its store
 path or the `result` link a build makes instead), and a daemon for a
 multi-user store. On Linux a build runs in a sandbox, as upstream's does, where
 it sees only its inputs and, unless it is fixed-output, no network; a builder

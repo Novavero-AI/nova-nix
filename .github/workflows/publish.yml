@@ -114,9 +114,10 @@ jobs:
           set -euo pipefail
           arch=$(echo "${{ runner.arch }}" | tr '[:upper:]' '[:lower:]')
           stem="nova-nix-${{ matrix.name }}-${arch}"
-          mkdir -p "$stem/bin" "$stem/share/nova-nix/nix"
+          mkdir -p "$stem/bin" "$stem/share/nova-nix/nix" "$stem/share/nova-nix/develop"
           cp staged/nova-nix* "$stem/bin/"
           cp data/nix/fetchurl.nix "$stem/share/nova-nix/nix/"
+          cp data/develop/get-env.sh data/develop/COPYING "$stem/share/nova-nix/develop/"
           cp -R pkgs "$stem/"
           cp LICENSE NOTICE README.md "$stem/"
           echo "stem=$stem" >> "$GITHUB_ENV"

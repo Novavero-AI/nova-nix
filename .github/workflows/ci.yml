@@ -749,8 +749,9 @@ jobs:
           targets=(exe:nova-nix)
           if [ "$RUNNER_OS" = Linux ]; then targets+=(exe:nova-nix-sandbox); fi
           cabal install "${targets[@]}" --install-method=copy --installdir=staged/bin --overwrite-policy=always
-          mkdir -p staged/share/nova-nix/nix
+          mkdir -p staged/share/nova-nix/nix staged/share/nova-nix/develop
           cp data/nix/fetchurl.nix staged/share/nova-nix/nix/
+          cp data/develop/get-env.sh data/develop/COPYING staged/share/nova-nix/develop/
 
       - name: Upload the executable
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
