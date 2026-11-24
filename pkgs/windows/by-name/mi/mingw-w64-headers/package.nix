@@ -16,13 +16,14 @@
 #
 # --with-default-msvcrt=msvcrt is nixpkgs' flag, with the runtime the
 # ladder links.  It writes __MSVCRT_VERSION__ 0x700 into _mingw.h, the
-# default at this release (mingw-w64-headers/configure.ac:144-175) and not
-# at v14.0.0, whose default is the UCRT.
+# default at this release (AC_ARG_WITH([default-msvcrt]) in
+# mingw-w64-headers/configure.ac) and not at v14.0.0, whose default is the
+# UCRT.
 #
 # The headers install in include under the output, configure's default:
 # the directory GCC's --with-headers is given, and the one MinGW-w64's own
 # runtime reads below the directory its --with-sysroot names
-# (mingw-w64-crt/Makefile.am:15).
+# (sysincludes in mingw-w64-crt/Makefile.am).
 #
 # The guide's --host=i686-w64-mingw32 is not passed.  The host names the
 # widl configure looks for under --with-widl and nothing else: with it and

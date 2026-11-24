@@ -23,85 +23,94 @@
 #
 # --with-headers names mingw-w64-headers' include directory, which GCC's
 # top-level configure copies into this output as
-# i686-w64-mingw32/sys-include (configure.ac:2244-2255 and 2318-2342), a
-# cross compiler's own place for its target's headers.  The build writes a
-# limits.h that goes on to MinGW-w64's only if it finds one there
-# (gcc/Makefile.in:4090-4094), and the compiler searches the directory for
-# every source, after its own headers (gcc/cppdefault.c).  Libraries it
-# takes from its own directories and those -B names, and no others
-# (gcc/gcc.c:3884-3899 and 6395): a cross driver reads no LIBRARY_PATH
-# (gcc.c:3681-3682).
+# i686-w64-mingw32/sys-include (the --with-headers case and copy_dirs in
+# configure.ac), a cross compiler's own place for its target's headers.
+# The build writes a limits.h that goes on to MinGW-w64's only if it finds
+# one there (LIMITS_H_TEST in gcc/Makefile.in's stmp-int-hdrs), and the
+# compiler searches the directory for every source, after its own headers
+# (gcc/cppdefault.c).  Libraries it takes from its own directories and
+# those -B names, and no others (tooldir_prefix in gcc/gcc.c's
+# process_command, and main's startfile prefixes for a native compiler or
+# a sysroot): a cross driver reads no LIBRARY_PATH (LIBRARY_PATH_ENV in
+# process_command).
 #
 # GCC's manual prefers --with-sysroot, which names the headers where they
 # are, and nixpkgs gives one to its cross compilers.  No store path can be
 # one here.  The top-level hands each option to every directory's
 # configure; mpc's is written by libtool 2.4, which has a --with-sysroot of
 # its own and takes a path for absolute only if it begins with '/'
-# (mpc/configure:6776-6799), and a store path on Windows begins with a
-# drive letter.  --with-headers is read by the top-level and by gcc's
-# configure alone.  nixpkgs' --with-native-system-header-dir, an option GCC
-# has from 4.7 on, its --with-build-sysroot and its no-system-headers.patch
-# point its native compiler at its C library's headers.
+# (the --with-sysroot check in mpc/configure), and a store path on Windows
+# begins with a drive letter.  --with-headers is read by the top-level and
+# by gcc's configure alone.  nixpkgs' --with-native-system-header-dir, an
+# option GCC has from 4.7 on, its --with-build-sysroot and its
+# no-system-headers.patch point its native compiler at its C library's
+# headers.
 #
 # --with-as and --with-ld name binutils' assembler and linker by their
 # files.  A cross GCC runs the as and ld in its own prefix and then any on
 # PATH, and binutils is another output, so the paths are compiled into the
-# driver and collect2 (gcc/configure.ac:193-257) and configure's tests of
-# both tools run the same files.
+# driver and collect2 (DEFAULT_LINKER and DEFAULT_ASSEMBLER in
+# gcc/configure.ac) and configure's tests of both tools run the same
+# files.
 #
 # gmp, mpfr and mpc are built in the tree, as in nixpkgs, which links each
 # under the name configure looks for; preConfigure unpacks and renames
 # them, there being no symbolic link.  GCC's Makefile has gmp configured
-# for the host none-pc-mingw32, in C alone (Makefile.def:63-71).  gmp's
-# libtool archives libgmp.a's 402 objects in one command of some 7,400
-# characters, under the 8192 it takes for the limit on a MinGW build host;
-# past that it archives in pieces, which tcc -ar, writing an archive anew
-# each time, cannot.
+# for the host none-pc-mingw32, in C alone (the gmp host module in
+# Makefile.def).  gmp's libtool archives libgmp.a's 402 objects in one
+# command of some 7,400 characters, under the 8192 it takes for the limit
+# on a MinGW build host; past that it archives in pieces, which tcc -ar,
+# writing an archive anew each time, cannot.
 #
 # GCC configures from a build directory beside its source, as its
 # installation guide recommends (INSTALL/configure.html), where nixpkgs
 # configures in the source.  In the source, the top level builds the
 # compiler a directory deeper, in host-i686-pc-mingw32/gcc, and gcc's
 # Makefile then names the build machine's fixincl by two paths that
-# differ: its rule that takes the program as built (gcc/Makefile.in:4154)
-# and the prerequisite that needs it (4160).  The program is fixincl.exe,
+# differ: its rule that takes the program as built (the
+# ../$(build_subdir)/fixincludes/fixincl rule in gcc/Makefile.in) and the
+# prerequisite that needs it (stmp-fixinc's).  The program is fixincl.exe,
 # so neither path is a file, and make links fixincl.o alone by its
 # built-in rule.
 #
 # Of nixpkgs' other flags, those passed mean here what they mean there.
 # --enable-checking=release is the default for a release
-# (gcc/configure.ac:356-374).  The --disable-lib* flags name target
-# libraries other than libgcc, which the make targets here never
-# configure, five of them later than 4.6.4.  --disable-lto-plugin follows
-# from --disable-lto for a MinGW target (the top-level configure.ac:
-# 1757-1762).  The three configure answers it exports are for link tests
-# after GCC_NO_EXECUTABLES, of which libgcc's configure makes none
-# (libgcc/configure.ac:149).  install-strip has nothing to strip: tcc
-# writes no symbol table into a program, and libgcc carries no debugging
-# information (below).  The two thread flags make libgcc's thread model
-# single; here it is win32, a MinGW target's default
-# (gcc/config.gcc:1567-1570), on the Windows API alone, as nixpkgs'
-# MinGW-w64 has it (pkgs/os-specific/windows/mingw-w64/default.nix).
-# Exceptions are SJLJ, 4.6.4's default for a 32-bit MinGW target
-# (gcc/config/i386/cygming.h:345-359).
+# (AC_ARG_ENABLE(checking) in gcc/configure.ac).  The --disable-lib* flags
+# name target libraries other than libgcc, which the make targets here
+# never configure, five of them later than 4.6.4.  --disable-lto-plugin
+# follows from --disable-lto for a MinGW target (build_lto_plugin in the
+# top-level configure.ac).  The three configure answers it exports are for
+# link tests after GCC_NO_EXECUTABLES, of which libgcc's configure makes
+# none (GCC_NO_EXECUTABLES in libgcc/configure.ac).  install-strip has
+# nothing to strip: tcc writes no symbol table into a program, and libgcc
+# carries no debugging information (below).  The two thread flags make
+# libgcc's thread model single; here it is win32, a MinGW target's default
+# (thread_file in gcc/config.gcc's i[34567]86-*-mingw* case), on the
+# Windows API alone, as nixpkgs' MinGW-w64 has it
+# (pkgs/os-specific/windows/mingw-w64/default.nix).  Exceptions are SJLJ,
+# 4.6.4's default for a 32-bit MinGW target (DWARF2_UNWIND_INFO in
+# gcc/config/i386/cygming.h).
 # --disable-win32-registry is not nixpkgs': a GCC on Windows takes its
 # directories from the registry wherever its configure can link advapi32
-# (gcc/configure.ac:1572-1600), which under tcc it cannot only because
-# TinyCC ships no import library for it.
+# (AC_ARG_ENABLE(win32-registry) in gcc/configure.ac), which under tcc it
+# cannot only because TinyCC ships no import library for it.
 #
 # libgcc is compiled by the xgcc the same make links, from the gcc
-# directory's generated headers and variables (libgcc/Makefile.in:156).
-# Static, as --disable-shared has it, it links nothing: its configure's one
-# link test fails for want of the runtime, after which a link test would
-# be an error (config/no-executables.m4), and its later tests compile
-# (libgcc/configure.ac:154-251), so it needs MinGW-w64's headers alone.  The guide builds it after the runtime for --enable-shared, under
-# which it also links libgcc's DLL.  The top level runs xgcc with -B on
-# the gcc directory and -isystem on the copy of MinGW-w64's headers
-# (configure.ac:3335 and 3134-3137), and the driver turns the -B into an
-# -isystem for GCC's own headers (gcc/gcc.c:4906-4913): GCC searches both
-# before the directories the seed stdenv's C_INCLUDE_PATH names for tcc
-# (gcc/incpath.c:455-462), and every system header libgcc's sources
-# include for this target is GCC's or MinGW-w64's.
+# directory's generated headers and variables (libgcc/Makefile.in's
+# include of libgcc.mvars).  Static, as --disable-shared has it, it links
+# nothing: its configure's one link test fails for want of the runtime,
+# after which a link test would be an error (config/no-executables.m4),
+# and its later tests compile (the tests after AC_PROG_CC in
+# libgcc/configure.ac), so it needs MinGW-w64's headers alone.  The guide
+# builds it after the runtime for --enable-shared, under which it also
+# links libgcc's DLL.  The top level runs xgcc with -B on the gcc
+# directory and -isystem on the copy of MinGW-w64's headers
+# (GCC_FOR_TARGET, and FLAGS_FOR_TARGET's build_tooldir directories, in
+# configure.ac), and the driver turns the -B into an -isystem for GCC's
+# own headers (%I in gcc/gcc.c's do_spec_1): GCC searches both before the
+# directories the seed stdenv's C_INCLUDE_PATH names for tcc
+# (register_include_chains in gcc/incpath.c), and every system header
+# libgcc's sources include for this target is GCC's or MinGW-w64's.
 #
 # libgcc carries no debugging information, which would name the build
 # directory and the store paths it read.  -g reaches its compiles from two
@@ -109,16 +118,17 @@
 #
 #   CFLAGS_FOR_TARGET=-O2: the target libraries' CFLAGS, which the top
 #   level's configure takes from CFLAGS with -g added unless it is given,
-#   -g -Dalloca=alloca here (configure.ac:2218-2228).  -O2 is the
-#   optimization that default means to add, and the alloca macro is for
-#   tcc alone.
+#   -g -Dalloca=alloca here (CFLAGS_FOR_TARGET in configure.ac).  -O2 is
+#   the optimization that default means to add, and the alloca macro is
+#   for tcc alone.
 #
 #   LIBGCC2_DEBUG_CFLAGS=-g0: gcc's Makefile adds this variable, -g, to
-#   every libgcc compile (gcc/Makefile.in:662-667); -g0 is the value
-#   GCC's own picochip and arm/netbsd fragments give it.  It is a make
-#   variable, which the top level passes on to the gcc directory only when
-#   it is not empty (Makefile.tpl:670-676).  Only the build reads it, when
-#   the gcc directory writes libgcc.mvars (gcc/Makefile.in:1892); makeFlags
+#   every libgcc compile (LIBGCC2_DEBUG_CFLAGS and LIBGCC2_CFLAGS in
+#   gcc/Makefile.in); -g0 is the value GCC's own picochip and arm/netbsd
+#   fragments give it.  It is a make variable, which the top level passes
+#   on to the gcc directory only when it is not empty (EXTRA_GCC_FLAGS in
+#   Makefile.tpl).  Only the build reads it, when the gcc directory writes
+#   libgcc.mvars (the libgcc.mvars rule in gcc/Makefile.in); makeFlags
 #   reaches the install phase too, as nixpkgs' installPhase passes it.
 #
 # What follows is for TinyCC and its headers:
@@ -136,24 +146,28 @@
 #   malloc.h, which the two libraries' headers never read.  A macro that
 #   names itself leaves their calls to tcc's alloca; GCC's own sources take
 #   libiberty's C_alloca, which libiberty.h gives every compiler that is
-#   not GCC (include/libiberty.h:649-663).
+#   not GCC (the alloca macro in include/libiberty.h).
 #
 #   LDFLAGS=-luser32: libiberty's lrealpath.c calls CharLowerBuff, in
 #   user32.dll.  GCC built for MinGW links user32 into every program
-#   (gcc/config/i386/mingw32.h:78-80); tcc links msvcrt and kernel32.
+#   (LIB_SPEC in gcc/config/i386/mingw32.h); tcc links msvcrt and
+#   kernel32.
 #
 #   --with-stage1-libs: libcpp reads a directory of precompiled headers
-#   with opendir (libcpp/files.c:305-330), which msvcrt.dll lacks and
-#   mingw-w64-dirent supplies, with the dirent.h that buildInputs puts
-#   before TinyCC's.  The flag's value ends each link line GCC's Makefile
-#   writes (gcc/Makefile.in:1053-1055); the stdenv splits configureFlags at
-#   spaces, so it carries the one library and LDFLAGS the other.
+#   with opendir (pch_open_file in libcpp/files.c), which msvcrt.dll lacks
+#   and mingw-w64-dirent supplies, with the dirent.h that buildInputs puts
+#   before TinyCC's.  The flag's value reaches gcc's configure as HOST_LIBS
+#   (HOST_EXPORTS in Makefile.tpl), which ends LIBS, after libcpp, and
+#   comes before only zlib in BACKENDLIBS (gcc/Makefile.in), so it follows
+#   libcpp on each link line there that names libcpp; the stdenv splits
+#   configureFlags at spaces, so it carries the one library and LDFLAGS
+#   the other.
 #
 # GCC's own makefile fragment for a MinGW host (config/mh-mingw) adds
 # -D__USE_MINGW_ACCESS, under which TinyCC's io.h drops the X_OK that
-# msvcrt.dll's access rejects (win32/include/io.h:396-404), and a 12 MB
-# stack, which tcc's linker reserves.  -march=native is not available:
-# the driver's processor detection is compiled for GCC alone
+# msvcrt.dll's access rejects (__mingw_access in win32/include/io.h), and
+# a 12 MB stack, which tcc's linker reserves.  -march=native is not
+# available: the driver's processor detection is compiled for GCC alone
 # (gcc/config/i386/driver-i386.c).
 #
 # The programs import from msvcrt.dll, kernel32.dll and user32.dll alone,

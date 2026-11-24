@@ -18,9 +18,10 @@
 # library nixpkgs names msvcrt (lib/systems/examples.nix,
 # mingw-msvcrt-i686), and the runtime the ladder links.  At this release
 # the flag writes __MSVCRT_VERSION__ 0x600 into _mingw.h, and the default
-# is the UCRT (mingw-w64-headers/configure.ac:138-183).  _WIN32_WINNT is
-# configure's default, 0xa00, Windows 10 (configure.ac:127-135), as in
-# nixpkgs, which passes no --with-default-win32-winnt.
+# is the UCRT (AC_ARG_WITH([default-msvcrt]) in
+# mingw-w64-headers/configure.ac).  _WIN32_WINNT is configure's default,
+# 0xa00, Windows 10 (AC_ARG_WITH([default-win32-winnt]) in configure.ac),
+# as in nixpkgs, which passes no --with-default-win32-winnt.
 {
   seedStdenv,
   fetchurl,

@@ -11,13 +11,13 @@
 # Upstream compiles against MinGW-w64's headers and links its runtime.
 # This compiles against TinyCC's own headers, as gnumake does, with compat/
 # adding the MinGW-w64 declarations busybox-w32 reads and TinyCC's headers
-# lack, each file naming the lines it follows, and links five mingw-w64-crt
-# sources, as they are, for functions busybox-w32 takes from that runtime:
-# getopt.c is under the ISC and 2-clause BSD licences, strtok_r.c under
-# the 3-clause BSD licence, and the others are in the public domain.  What
-# else busybox-w32 takes from that runtime, edits to its own sources
-# supply, so no file of nova-nix's is linked into the GPL-2.0-only
-# busybox.exe.
+# lack, each file naming the declarations it follows, and links five
+# mingw-w64-crt sources, as they are, for functions busybox-w32 takes from
+# that runtime: getopt.c is under the ISC and 2-clause BSD licences,
+# strtok_r.c under the 3-clause BSD licence, and the others are in the
+# public domain.  What else busybox-w32 takes from that runtime, edits to
+# its own sources supply, so no file of nova-nix's is linked into the
+# GPL-2.0-only busybox.exe.
 #
 # The configuration differs from mingw32_defconfig in three settings, for
 # what this toolchain lacks: FEATURE_COMPRESS_USAGE packs the usage text
@@ -26,10 +26,11 @@
 # startup code expand wildcards in the arguments, which TinyCC's crt1.c
 # does not, so busybox --help says noglob.  time_t is 32 bits, as TinyCC's
 # headers define it for i386, since busybox-w32 takes 64-bit time from
-# MinGW-w64 10 on alone (include/mingw.h:5-14).  busybox.exe needs the
-# msvcrt.dll of Windows Vista or later, for _chsize_s, _set_fmode,
-# getenv_s and strnlen, which MinGW-w64's runtime supplies on older ones
-# (mingw-w64-crt/lib-common/msvcrt.def.in:1285-1826).
+# MinGW-w64 10 on alone (the block of include/mingw.h that defines time_t
+# as __time64_t).  busybox.exe needs the msvcrt.dll of Windows Vista or
+# later, for _chsize_s, _set_fmode, getenv_s and strnlen, which MinGW-w64's
+# runtime supplies on older ones (the symbols added in Windows Vista's
+# msvcrt.dll, in mingw-w64-crt/lib-common/msvcrt.def.in).
 {
   fetchurl,
   stage0-pe32,
