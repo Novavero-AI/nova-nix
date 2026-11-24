@@ -1,8 +1,7 @@
 /*
- * The control-message macros and WSARecvMsg's type from MinGW-w64's
- * mswsock.h (mingw-w64-headers/include/mswsock.h:175-190, 207-212),
- * which busybox-w32's include/mingw_ip.h maps the POSIX cmsg API onto:
- * TinyCC has no mswsock.h.
+ * The control-message macros and WSARecvMsg's type, as MinGW-w64's headers
+ * declare them, which busybox-w32 maps the POSIX cmsg API onto: TinyCC has
+ * no mswsock.h.
  */
 #ifndef BUSYBOX_W32_COMPAT_MSWSOCK_H
 #define BUSYBOX_W32_COMPAT_MSWSOCK_H

@@ -1,7 +1,7 @@
 /*
- * TinyCC's errno.h, and those of the POSIX values MinGW-w64's adds past
- * msvcrt's (mingw-w64-headers/crt/errno.h:74-221), numbered as Visual
- * C++ 10's errno.h numbers them, that busybox-w32 sets and tests.
+ * TinyCC's errno.h, and those of the POSIX values MinGW-w64's headers add
+ * past msvcrt's, numbered as Visual C++'s headers number them, that
+ * busybox-w32 sets and tests.
  */
 #include_next <errno.h>
 

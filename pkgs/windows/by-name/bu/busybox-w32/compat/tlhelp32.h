@@ -1,7 +1,6 @@
 /*
- * The process walk busybox-w32's win32/process.c takes from MinGW-w64's
- * tlhelp32.h (mingw-w64-headers/include/tlhelp32.h:15-18, 80-96): TinyCC
- * has no tlhelp32.h.  kernel32.dll exports the calls.
+ * The process walk busybox-w32 takes from MinGW-w64's headers: TinyCC has
+ * no tlhelp32.h.  kernel32.dll exports the calls.
  */
 #ifndef BUSYBOX_W32_COMPAT_TLHELP32_H
 #define BUSYBOX_W32_COMPAT_TLHELP32_H

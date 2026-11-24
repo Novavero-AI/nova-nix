@@ -1,16 +1,14 @@
 # nova-nix seed stdenv: the Windows genericBuild, in POSIX sh.
 #
 # Run by busybox-w32's sh as a derivation's builder.  mkDerivation
-# (seed-stdenv/default.nix) passes the package through the environment as
-# the stage-1 stdenv's does:
+# (seed-stdenv/default.nix) passes the package through the environment:
 #   $src           source tarball or directory
 #   $out           install prefix (the output store path)
 #   $buildInputs   dependency store paths
-# plus the same optional knobs:
+# plus optional knobs:
 #   $configureFlags / $makeFlags  extra flags for the default phases
 #   $dontConfigure                skip ./configure
 #   $buildPhase / $installPhase   replace the default build / install commands
-# three more, which no package of that stdenv's needs:
 #   $patches                      patch files applied to the unpacked source
 #   $preConfigure                 commands run in the source tree before
 #                                 configure
@@ -31,12 +29,11 @@
 #   $buildTriple     the platform configure is told it builds on
 #
 # It is POSIX sh, since busybox's ash is the shell the seed provides, and
-# its phases are the stage-1 stdenv's with a patch phase after unpack and
-# without the last.  That stdenv's fixup phase copies each DLL an output
-# imports from a build input beside the binary, reading the imports with
-# objdump; none of this stdenv's tools reads a PE import table, so it has
-# no fixup phase, and an output that links a DLL from a build input does
-# not carry it.
+# its phases are unpack, patch, configure, build and install.  The package
+# set's stdenv's setup.sh adds a fixup phase that copies each DLL an output
+# imports beside it, reading the imports with objdump; none of this
+# stdenv's tools reads a PE import table, so it has no fixup phase, and an
+# output that links a DLL from a build input does not carry it.
 set -e
 
 # The builder spells the store C:\nix\store, so every store path in the
@@ -49,11 +46,11 @@ set -e
 # them: configure writes a path it is given into Makefiles and C strings,
 # as GCC's does the --with-as and --with-ld it is built with.  A store
 # path a package writes into makeFlags or a phase keeps the builder's
-# spelling, as it does in the stage-1 stdenv.
+# spelling.
 # busybox's sh respells imported variables itself only when its
 # environment spells PATH, COMSPEC or PROGRAMDATA in mixed case, as Windows
-# does (win32/mingw.c's windows_env), and a builder's has PATH and COMSPEC
-# in upper case and no PROGRAMDATA.
+# does, and a builder's has PATH and COMSPEC in upper case and no
+# PROGRAMDATA.
 toSlashes() {
   eval "rest=\${$1}"
   slashed=
@@ -83,25 +80,24 @@ for dir in $initialPath; do
 done
 
 # What configure cannot detect about this PATH.  configure picks PATH's
-# separator by running sh under a PATH split each way (its "The user is
-# always right" block); busybox's sh runs its own sh applet whatever PATH
-# holds, so both runs succeed and ':' wins, which splits every C: directory
-# in two.  And configure takes a program it searches PATH for only if
-# test -x passes, trying each name as it is and then with each suffix in
-# ac_executable_extensions; the commands on PATH are .exe files, and
-# busybox's test, unlike Cygwin's, does not add the suffix itself.  Both
-# are in the environment, which every configure reads, and not in
-# config.site: GCC's top level runs the configure of each directory it
-# builds for the build machine, and of each target library, with
-# CONFIG_SITE=no-such-file (its Makefile.in), and in a native build the
-# build machine is this one.
+# separator by running sh under a PATH split each way; busybox's sh runs
+# its own sh applet whatever PATH holds, so both runs succeed and ':' wins,
+# which splits every C: directory in two.  And configure takes a program it
+# searches PATH for only if test -x passes, trying each name as it is and
+# then with each suffix in ac_executable_extensions; the commands on PATH
+# are .exe files, and busybox's test, unlike Cygwin's, does not add the
+# suffix itself.  Both are in the environment, which every configure reads,
+# and not in config.site: GCC's top level runs the configure of each
+# directory it builds for the build machine, and of each target library,
+# with CONFIG_SITE=no-such-file, and in a native build the build machine is
+# this one.
 export PATH_SEPARATOR=';' ac_executable_extensions=.exe
 
 # busybox's sh runs its own applet for a command that names one before it
 # searches PATH, and busybox has a make; the build's make is GNU make.
 export BB_OVERRIDE_APPLETS=make
 
-# NIX_BUILD_CORES as nixpkgs' setup.sh leaves it for make -j: 1 when the
+# NIX_BUILD_CORES as nixpkgs' stdenv leaves it for make -j: 1 when the
 # builder sets none, and for 0 what nproc counts, or 1 if it counts none.
 NIX_BUILD_CORES=${NIX_BUILD_CORES:-1}
 if [ "$NIX_BUILD_CORES" -le 0 ]; then
@@ -117,9 +113,8 @@ export TMPDIR="$builddir/tmp" TEMPDIR="$builddir/tmp" TMP="$builddir/tmp" TEMP="
 
 # --- dependency flags ---
 # For each buildInput, make its headers and libraries visible to the
-# compiler and its programs to the build.  Start from EMPTY flag sets, as
-# the stage-1 stdenv does, so nothing but the declared buildInputs reaches
-# a configure or make line.
+# compiler and its programs to the build.  Start from EMPTY flag sets, so
+# nothing but the declared buildInputs reaches a configure or make line.
 CPPFLAGS=""
 LDFLAGS=""
 for dep in $buildInputs; do
@@ -151,7 +146,7 @@ else
 fi
 
 # --- patch phase ---
-# nixpkgs' patchPhase with its default flags: each patch applies from the
+# nixpkgs' patch phase with its default flags: each patch applies from the
 # top of the source tree, less the first component of the paths it names.
 # busybox's patch exits non-zero on a hunk it cannot place.
 for patchFile in $patches; do
@@ -159,11 +154,11 @@ for patchFile in $patches; do
 done
 
 # --- configure phase (autotools packages only) ---
-# $preConfigure first, as nixpkgs' configurePhase runs it: it may move to
+# $preConfigure first, as nixpkgs' configure phase runs it: it may move to
 # the directory whose configure is the package's, add to the tree what
 # configure looks for there, or move to a build directory of its own and
 # name the source tree's script in $configureScript, as nixpkgs' does.
-# --build, since config.guess cannot name this platform (see default.nix).
+# --build, as configure cannot name this platform (see default.nix).
 # CONFIG_SHELL runs configure, which writes it into the Makefiles as SHELL;
 # their default, /bin/sh, names a file on the current drive.
 if [ -n "$preConfigure" ]; then
@@ -182,7 +177,7 @@ else
 fi
 
 # --- install phase ---
-# $makeFlags again, as nixpkgs' installPhase passes them: a variable a
+# $makeFlags again, as nixpkgs' install phase passes them: a variable a
 # package sets for make, as binutils sets MAKEINFO, holds for the rules
 # install runs too.
 if [ -n "$installPhase" ]; then

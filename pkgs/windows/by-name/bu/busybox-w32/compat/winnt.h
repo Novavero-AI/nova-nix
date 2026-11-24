@@ -1,9 +1,7 @@
 /*
- * TinyCC's winnt.h, and what MinGW-w64's declares that busybox-w32 reads
- * and TinyCC's predates: IO_REPARSE_TAG_SYMLINK
- * (mingw-w64-headers/include/winnt.h:6431), the NTSTATUS type
- * (include/ntdef.h:348), and the __MSABI_LONG macro their constants are
- * written with (crt/_mingw_mac.h:219).
+ * TinyCC's winnt.h, and what MinGW-w64's headers declare that busybox-w32
+ * reads and TinyCC's predate: IO_REPARSE_TAG_SYMLINK, the NTSTATUS type,
+ * and the __MSABI_LONG macro their constants are written with.
  */
 #include_next <winnt.h>
 

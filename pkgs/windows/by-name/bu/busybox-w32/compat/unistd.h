@@ -1,10 +1,10 @@
 /*
- * TinyCC's unistd.h, and what MinGW-w64's adds to it
- * (mingw-w64-headers/crt/unistd.h:6-71): process.h and getopt.h, usleep,
- * and ftruncate.  busybox compiles with _FILE_OFFSET_BITS=64, under which
- * MinGW-w64 renames ftruncate to ftruncate64, which takes a 64-bit length,
- * with an asm label; a macro renames it here.  TinyCC's off_t stays 32
- * bits whatever _FILE_OFFSET_BITS says, so the length is _off64_t.
+ * TinyCC's unistd.h, and what MinGW-w64's adds to it: process.h and
+ * getopt.h, usleep, and ftruncate.  busybox compiles with
+ * _FILE_OFFSET_BITS=64, under which MinGW-w64 renames ftruncate to
+ * ftruncate64, which takes a 64-bit length, with an asm label; a macro
+ * renames it here.  TinyCC's off_t stays 32 bits whatever _FILE_OFFSET_BITS
+ * says, so the length is _off64_t.
  */
 #include_next <unistd.h>
 

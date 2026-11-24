@@ -3,9 +3,9 @@
  * program named for an applet starts the busybox.exe beside it with the
  * command line it was given, unchanged, so busybox runs the applet that
  * line's first word names, and exits with busybox's status.  w64devkit
- * installs busybox-w32's applets the same way (src/busybox-alias.c at
- * 667d0d3); busybox --install makes hard links instead, which a store
- * path's NAR holds as one copy of busybox.exe each.
+ * installs busybox-w32's applets the same way; busybox --install makes hard
+ * links instead, which a store path's NAR holds as one copy of busybox.exe
+ * each.
  */
 #include <string.h>
 #include <windows.h>

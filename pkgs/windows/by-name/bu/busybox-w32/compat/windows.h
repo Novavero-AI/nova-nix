@@ -1,15 +1,12 @@
 /*
- * TinyCC's windows.h, and what MinGW-w64's brings in that busybox-w32
- * reads and TinyCC's lacks.  MinGW-w64's windows.h includes shellapi.h
- * unless WIN32_LEAN_AND_MEAN is defined
- * (mingw-w64-headers/include/windows.h:80-89), where TinyCC's never does.
- * The rest are items TinyCC's winbase.h and winnt.h predate:
- * VOLUME_NAME_DOS and FILE_NAME_NORMALIZED (include/winbase.h:461-466);
- * TokenElevation and TokenIntegrityLevel, past TokenOrigin, the last value
- * of TinyCC's TOKEN_INFORMATION_CLASS, with the structures they return
- * (include/winnt.h:4132-4157, 4260-4266); and the file system controls of
- * MinGW-w64's winioctl.h, which TinyCC has no counterpart of
- * (include/winioctl.h:86-182, 1501-1510, 1909-1912).
+ * TinyCC's windows.h, and what MinGW-w64's brings in that busybox-w32 reads
+ * and TinyCC's lacks.  MinGW-w64's windows.h includes shellapi.h unless
+ * WIN32_LEAN_AND_MEAN is defined, where TinyCC's never does.  The rest are
+ * items TinyCC's headers predate, as MinGW-w64's headers define them:
+ * VOLUME_NAME_DOS and FILE_NAME_NORMALIZED; TokenElevation and
+ * TokenIntegrityLevel, past TokenOrigin, the last value of TinyCC's
+ * TOKEN_INFORMATION_CLASS, with the structures they return; and the file
+ * system controls, which TinyCC's headers have no counterpart of.
  */
 #include_next <windows.h>
 

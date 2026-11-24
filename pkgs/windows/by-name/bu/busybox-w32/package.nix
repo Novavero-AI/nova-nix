@@ -1,36 +1,35 @@
 # busybox-w32, the shell and tools the native rungs run configure under,
 # compiled by tinycc-native in one kaem script with no shell: upstream's
-# mingw32_defconfig build, from Kbuild's sources for that configuration
-# with Makefile.flags' flags.  The headers upstream's build generates are
-# written as it writes them.  Its host programs in C, kconfig's conf,
-# applet_tables and usage, are compiled by tinycc-native and run; its shell
-# scripts are C here, gen_build_files.c and usage_compressed.c, which runs
-# usage; and what scripts/embedded_scripts, scripts/generate_BUFSIZ.sh and
-# the Makefile's BB_VER.h rule write for this configuration is text here.
+# build of its MinGW configuration, from the sources its build files name
+# for that configuration, with the flags they give.  The headers upstream's
+# build generates are written as it writes them.  Its host programs in C,
+# the configuration tool and the generators of the applet table and the
+# usage text, are compiled by tinycc-native and run; its shell scripts are
+# C here, gen_build_files.c and usage_compressed.c, which runs the usage
+# generator; and what its other scripts and its version rule write for
+# this configuration is text here.
 #
 # Upstream compiles against MinGW-w64's headers and links its runtime.
 # This compiles against TinyCC's own headers, as gnumake does, with compat/
 # adding the MinGW-w64 declarations busybox-w32 reads and TinyCC's headers
-# lack, each file naming the declarations it follows, and links five
-# mingw-w64-crt sources, as they are, for functions busybox-w32 takes from
-# that runtime: getopt.c is under the ISC and 2-clause BSD licences,
-# strtok_r.c under the 3-clause BSD licence, and the others are in the
-# public domain.  What else busybox-w32 takes from that runtime, edits to
-# its own sources supply, so no file of nova-nix's is linked into the
-# GPL-2.0-only busybox.exe.
+# lack, each file saying what it takes from MinGW-w64's headers, and links
+# five of MinGW-w64's runtime sources, as they are, for functions
+# busybox-w32 takes from that runtime: getopt's source is under the ISC and
+# 2-clause BSD licences, strtok_r's under the 3-clause BSD licence, and the
+# others are in the public domain.  What else busybox-w32 takes from that
+# runtime, edits to its own sources supply, so no file of nova-nix's is
+# linked into the GPL-2.0-only busybox.exe.
 #
-# The configuration differs from mingw32_defconfig in three settings, for
-# what this toolchain lacks: FEATURE_COMPRESS_USAGE packs the usage text
-# with bzip2 at build time; FEATURE_RESOURCES's version information,
-# manifest and icon take a resource compiler; and GLOBBING has MinGW-w64's
-# startup code expand wildcards in the arguments, which TinyCC's crt1.c
-# does not, so busybox --help says noglob.  time_t is 32 bits, as TinyCC's
-# headers define it for i386, since busybox-w32 takes 64-bit time from
-# MinGW-w64 10 on alone (the block of include/mingw.h that defines time_t
-# as __time64_t).  busybox.exe needs the msvcrt.dll of Windows Vista or
-# later, for _chsize_s, _set_fmode, getenv_s and strnlen, which MinGW-w64's
-# runtime supplies on older ones (the symbols added in Windows Vista's
-# msvcrt.dll, in mingw-w64-crt/lib-common/msvcrt.def.in).
+# The configuration differs from upstream's MinGW configuration in three
+# settings, for what this toolchain lacks: FEATURE_COMPRESS_USAGE packs the
+# usage text with bzip2 at build time; FEATURE_RESOURCES's version
+# information, manifest and icon take a resource compiler; and GLOBBING has
+# MinGW-w64's startup code expand wildcards in the arguments, which
+# TinyCC's startup code does not, so busybox --help says noglob.  time_t is
+# 32 bits, as TinyCC's headers define it for i386, since busybox-w32 takes
+# 64-bit time from recent MinGW-w64 headers alone.  busybox.exe needs the
+# msvcrt.dll of Windows Vista or later, for _chsize_s, _set_fmode, getenv_s
+# and strnlen, which MinGW-w64's runtime supplies on older ones.
 {
   fetchurl,
   stage0-pe32,
@@ -42,10 +41,9 @@ let
   pname = "busybox-w32";
   version = "FRP-6354-g5f09fb446";
 
-  # The version busybox reports: the Makefile's VERSION, PATCHLEVEL and
-  # SUBLEVEL, then the release name with FRP read as git, as the Makefile
-  # spells it for a source tree carrying .frp_describe, as the release
-  # archive does.
+  # The version busybox reports, as upstream's build spells it for a release
+  # archive: its version number, then the release name with FRP read as
+  # git.
   bbVersion = "1.39.0.git-6354-g5f09fb446";
 
   tarball = fetchurl {
@@ -53,11 +51,12 @@ let
     hash = "sha256-lQ0sc+l55Uxlx3I2aEBtHW50D8R09BUWqC3a6AX78ks=";
   };
 
-  # mingw-w64-crt's sources at the v14.0.0 release's commit, from the
-  # GitHub mirror of its repository: what busybox-w32 links from
-  # MinGW-w64's runtime and msvcrt.dll lacks.  msvcr80plus_ftruncate64.c
-  # is the ftruncate64 MinGW-w64 links for a runtime whose _chsize_s is
-  # always there, as msvcrt.dll's is from Windows Vista on.
+  # MinGW-w64's runtime sources at the commit of the release
+  # mingw-w64-headers-latest packages, from the GitHub mirror of its
+  # repository: what busybox-w32 links from MinGW-w64's runtime and
+  # msvcrt.dll lacks.  The last is the ftruncate64 MinGW-w64 links for a
+  # runtime whose _chsize_s is always there, as msvcrt.dll's is from
+  # Windows Vista on.
   mingwRev = "9b3dd0125792fe94d16cacdc596dbd42fca1b369";
   mingwCrt = [
     {
@@ -91,7 +90,7 @@ let
 
   # TinyCC's import library format, with the calls busybox-w32 makes into
   # advapi32.dll, for which TinyCC ships no .def, and into kernel32.dll
-  # that its kernel32.def predates.
+  # that TinyCC's own .def for it predates.
   advapi32 = builtins.toFile "advapi32.def" ''
     LIBRARY advapi32.dll
 
@@ -122,9 +121,9 @@ let
     IsWow64Process
   '';
 
-  # What the Makefile's filechk_BB_VER.h, scripts/embedded_scripts and
-  # scripts/generate_BUFSIZ.sh write for this configuration: no scripted
-  # applet is configured and the tree has no embed/ directory, and
+  # What upstream's build writes for this configuration into its version,
+  # embedded-scripts and buffer-size headers: no scripted applet is
+  # configured and the tree has no directory of scripts to embed, and
   # FEATURE_USE_BSS_TAIL is off.
   bbVerHeader = builtins.toFile "BB_VER.h" ''
     #define BB_VER "${bbVersion}"
@@ -150,11 +149,11 @@ let
     33b148b9dd17340c641c85f827093c3d4f01b934fdfa82b3752a4586c17a7a9e  win32/winansi.c
   '';
 
-  # The objects Kbuild builds for this configuration, from each directory's
-  # Kbuild as scripts/gen_build_files.sh writes it from Kbuild.src, in
-  # Kbuild's directory order.  The .S files assemble to nothing on i386
-  # without GCC.  Objects are named for their sources' paths, which share
-  # base names across directories.
+  # The objects upstream's build builds for this configuration, from each
+  # directory's list of objects as upstream's build generates it, in
+  # upstream's directory order.  The assembly sources assemble to nothing on
+  # i386 without GCC.  Objects are named for their sources' paths, which
+  # share base names across directories.
   sources = [
     "applets/applets.c"
     "archival/ar.c"
@@ -499,15 +498,15 @@ let
   libs = "${tinycc-native.libs}/lib";
   compat = ./compat;
 
-  # The programs the build runs, compiled with the -Wall of the Makefile's
-  # HOSTCFLAGS and linked from the -B directory.
+  # The programs the build runs, compiled with the -Wall upstream's build
+  # gives its host programs and linked from the -B directory.
   hostFlags = "-B ${libs} -Wall -I ${compat}";
 
-  # Makefile.flags' CPPFLAGS and the CFLAGS TinyCC reads, with the
-  # compatibility headers.  include/platform.h defines __attribute__ away
-  # for a compiler that is not GCC 2.7 or later unless it is already a
-  # macro; TinyCC honours the packed, aligned and noreturn attributes
-  # busybox-w32 declares, so the macro keeps them.
+  # Upstream's preprocessor flags and the compiler flags TinyCC reads, with
+  # the compatibility headers.  busybox-w32 defines __attribute__ away for a
+  # compiler it does not take for GCC unless it is already a macro; TinyCC
+  # honours the packed, aligned and noreturn attributes busybox-w32
+  # declares, so the macro keeps them.
   cflags = builtins.concatStringsSep " " [
     "-std=gnu99"
     "-Wall"
@@ -538,8 +537,9 @@ kaem.runCommand "${pname}-${version}"
     tinycc-native.env
     // {
       # KCONFIG_NOTIMESTAMP keeps the build time, which busybox prints in
-      # its banner, out of autoconf.h; KERNELVERSION is the version the
-      # Makefile exports for conf to write there.
+      # its banner, out of the configuration header; KERNELVERSION is the
+      # version upstream's build exports for its configuration tool to
+      # write there.
       KCONFIG_NOTIMESTAMP = "1";
       KERNELVERSION = bbVersion;
     }
@@ -555,7 +555,8 @@ kaem.runCommand "${pname}-${version}"
     replace --file configs/mingw32_defconfig --output configs/mingw32_defconfig --match-on "CONFIG_GLOBBING=y" --replace-with "# CONFIG_GLOBBING is not set"
 
     # GCC takes a string literal in parentheses as an array's initializer,
-    # as conf.c's N_ writes one; TinyCC does not.
+    # as the configuration tool's translation macro writes one; TinyCC does
+    # not.
     replace --file scripts/kconfig/lkc.h --output scripts/kconfig/lkc.h --match-on "#define N_(text) (text)" --replace-with "#define N_(text) text"
 
     # TinyCC's assembler knows bswapl as bswap.
@@ -566,19 +567,20 @@ kaem.runCommand "${pname}-${version}"
     # drops the block, and TinyCC compiles it, since it holds a loop.
     replace --file libbb/lineedit.c --output libbb/lineedit.c --match-on "adjust_width_and_validate_wc(&num, command_ps[cursor + n]);" --replace-with "IF_UNICODE_SUPPORT(adjust_width_and_validate_wc(&num, command_ps[cursor + n]));"
 
-    # busybox-w32 carries a dirname from mingw-w64's runtime, which it
-    # compiles in place of the runtime's own from MinGW-w64 12 on;
-    # msvcrt.dll has none.
+    # busybox-w32 carries a dirname from MinGW-w64's runtime, which it
+    # compiles in place of the runtime's own for recent MinGW-w64 releases
+    # alone; msvcrt.dll has none.
     replace --file win32/dirname.c --output win32/dirname.c --match-on "#if defined(__MINGW64_VERSION_MAJOR) && __MINGW64_VERSION_MAJOR > 11" --replace-with "#if 1"
 
-    # MinGW-w64's startup code applies the binary _fmode win32/mingw.c
-    # defines, and appletlib.c then makes stdin, stdout and stderr binary
-    # under MinGW-w64 alone; TinyCC's crt1.c does neither.
+    # MinGW-w64's startup code applies the binary _fmode busybox-w32
+    # defines, and busybox's applet startup then makes stdin, stdout and
+    # stderr binary under MinGW-w64 alone; TinyCC's startup code does
+    # neither.
     replace --file libbb/appletlib.c --output libbb/appletlib.c --match-on "#if defined(__MINGW64_VERSION_MAJOR)" --replace-with "#if 1\n_set_fmode(_O_BINARY);"
 
-    # include/mingw.h declares ffs for a compiler other than GCC, whose
-    # builtin it takes otherwise, and msvcrt.dll has none; win32/mingw.c
-    # holds the C library functions busybox-w32 supplies itself.
+    # busybox-w32 declares ffs for a compiler other than GCC, whose builtin
+    # it takes otherwise, and msvcrt.dll has none; the edit defines it with
+    # the C library functions busybox-w32 supplies itself.
     replace --file win32/mingw.c --output win32/mingw.c --match-on "smallint bb_got_signal;" --replace-with "#if !defined(__GNUC__)
     int ffs(int i)
     {
@@ -597,19 +599,18 @@ kaem.runCommand "${pname}-${version}"
 
     smallint bb_got_signal;"
 
-    # printf clears errno before each directive and exits 1 if the
-    # directive leaves it set, taking it for a conversion's error
-    # (coreutils/printf.c:268-269 and 448-450).  On MinGW it formats each
-    # directive with libbb's vasprintf (my_printf, printf.c:195-217), which
-    # tries a 128-byte buffer first (libbb/platform.c:37-60), through
-    # winansi_vsnprintf (win32/winansi.c:951-971), which fills the buffer
-    # with msvcrt.dll's _vsnprintf, and that sets errno to ERANGE when the
-    # output fills the buffer or overflows it.  Unedited, a printf of an
-    # argument of 128 bytes or more writes it whole and exits 1, and so
-    # does GMP 6.2.1's configure, whose last command writes a summary that
-    # long.  winansi_vsnprintf reports the truncation in what it returns,
-    # and the edit leaves errno as the call found it, so a directive's
-    # errno is its conversion's alone.
+    # printf clears errno before each directive and exits 1 if the directive
+    # leaves it set, taking it for a conversion's error.  On MinGW it
+    # formats each directive into an allocated string, which busybox makes
+    # by trying a 128-byte buffer first, through busybox-w32's replacement
+    # for vsnprintf, which fills the buffer with msvcrt.dll's _vsnprintf,
+    # and that sets errno to ERANGE when the output fills the buffer or
+    # overflows it.  Unedited, a printf of an argument of 128 bytes or more
+    # writes it whole and exits 1, and so does the configure of the GMP
+    # gcc10 builds, whose last command writes a summary that long.  The
+    # replacement reports the truncation in what it returns, and the edit
+    # leaves errno as the call found it, so a directive's errno is its
+    # conversion's alone.
     replace --file win32/winansi.c --output win32/winansi.c --match-on "_vsnprintf(buf, size, format, list);" --replace-with "{ int saved_errno = errno; _vsnprintf(buf, size, format, list); errno = saved_errno; }"
     sha256sum --check ${editedFiles}
 

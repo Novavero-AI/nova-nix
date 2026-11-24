@@ -1,15 +1,15 @@
 /*
- * usage_compressed.c - applets/usage piped through
- * applets/usage_compressed, for a tree with no shell, od, sed or bzip2.
+ * usage_compressed.c - busybox's usage generator piped through its
+ * compression script, for a tree with no shell, od, sed or bzip2.
  *
- * It compiles applets/usage.c into itself and runs that program's main
+ * It compiles the usage generator into itself and runs that program's main
  * with stdout on the file its first argument names, where the script
  * reads it through a pipe.  It then writes the header its second argument
  * names as the script writes it, up to PACKED_USAGE: UNPACKED_USAGE, those
  * bytes as octal escapes sixteen to a line, and UNPACKED_USAGE_LENGTH.
- * PACKED_USAGE, the script's bzip2 -1 stream, is left out, since
- * libbb/appletlib.c reads it only with FEATURE_COMPRESS_USAGE, which the
- * package turns off for want of bzip2.
+ * PACKED_USAGE, the script's bzip2 -1 stream, is left out, since busybox
+ * reads it only with FEATURE_COMPRESS_USAGE, which the package turns off
+ * for want of bzip2.
  *
  * Compiled from the top of the tree, with -I . -I include.
  */

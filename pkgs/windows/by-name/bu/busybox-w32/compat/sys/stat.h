@@ -1,6 +1,6 @@
 /*
  * TinyCC's sys/stat.h, with _fstati64 calling msvcrt.dll's _fstati64.
- * TinyCC's maps it to _fstat32i64, the name Visual C++ 2005's runtime gives
+ * TinyCC's maps it to _fstat32i64, the name later Visual C++ runtimes give
  * the same call, which msvcrt.dll does not export; MinGW-w64's maps it to
  * _fstati64 itself for msvcrt.  The struct, _stat32i64 by either name, has
  * the layout msvcrt.dll's _stati64 has.

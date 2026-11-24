@@ -1,11 +1,11 @@
 /*
  * MinGW-w64's sdkddkver.h, which TinyCC's headers lack: the _WIN32_WINNT
- * value of each Windows release, and the default when none is chosen
- * (mingw-w64-headers/include/sdkddkver.h:14-26 and 171-173).  gnulib's
- * stat-w32.c compares _WIN32_WINNT with _WIN32_WINNT_VISTA to decide
- * whether it may call GetFinalPathNameByHandle directly, and includes this
- * header where configure finds it; with the name undefined, the comparison
- * is against 0, and it calls a function TinyCC's headers do not declare.
+ * value of each Windows release, and the default when none is chosen, as
+ * MinGW-w64's headers define them.  gnulib's stat replacement for Windows
+ * compares _WIN32_WINNT with _WIN32_WINNT_VISTA to decide whether it may
+ * call GetFinalPathNameByHandle directly, and includes this header where
+ * configure finds it; with the name undefined, the comparison is against 0,
+ * and it calls a function TinyCC's headers do not declare.
  */
 #ifndef _INC_SDKDDKVER
 #define _INC_SDKDDKVER

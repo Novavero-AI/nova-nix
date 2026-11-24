@@ -1,8 +1,7 @@
 /*
- * GetSecurityInfo, which busybox-w32's win32/mingw.c calls, and its object
- * type, from MinGW-w64's aclapi.h and accctrl.h
- * (mingw-w64-headers/include/aclapi.h:103, include/accctrl.h:22-36):
- * TinyCC has neither.  advapi32.dll exports it.
+ * GetSecurityInfo, which busybox-w32 calls, and its object type, as
+ * MinGW-w64's headers declare them: TinyCC's headers have neither.
+ * advapi32.dll exports it.
  */
 #ifndef BUSYBOX_W32_COMPAT_ACLAPI_H
 #define BUSYBOX_W32_COMPAT_ACLAPI_H

@@ -1,12 +1,12 @@
 /*
- * MinGW-w64's dirent.h (mingw-w64-headers/crt/dirent.h:18-66 at v8.0.3),
- * for the functions libdirent.a holds, MinGW-w64's own
- * mingw-w64-crt/misc/dirent.c.  TinyCC's dirent.h declares an older struct
- * dirent, whose d_name points into the DIR, and that file fills an array:
- * compiled against TinyCC's, it writes through a pointer nothing sets.  The
+ * MinGW-w64's declarations of struct dirent, DIR and their functions, from
+ * the release of the functions libdirent.a holds, which are MinGW-w64's
+ * own.  TinyCC's dirent.h declares an older struct dirent, whose d_name
+ * points into the DIR, and MinGW-w64's functions fill an array: compiled
+ * against TinyCC's, they write through a pointer nothing sets.  The
  * wide-character half of the header is left out with the functions it
- * declares, which mingw-w64-crt/misc/wdirent.c defines, and so is
- * __MINGW_NOTHROW, an attribute GCC alone reads.
+ * declares, which libdirent.a does not hold, and so is the nothrow
+ * attribute MinGW-w64 marks the declarations with, which GCC alone reads.
  */
 #ifndef _DIRENT_H_
 #define _DIRENT_H_

@@ -1,9 +1,7 @@
 /*
  * TinyCC's shellapi.h, and the ShellExecuteEx structure, by its ANSI name
- * and the one MinGW-w64's gives it without UNICODE, and the flags
- * busybox-w32's win32/process.c and loginutils/suw32.c use, from
- * MinGW-w64's (mingw-w64-headers/include/shellapi.h:265, 272, 301-320,
- * 343).
+ * and the one MinGW-w64's headers give it without UNICODE, and the flags
+ * busybox-w32 uses, as MinGW-w64's headers define them.
  * ShellExecuteExA itself is loaded from shell32.dll at run time.
  */
 #include_next <shellapi.h>
