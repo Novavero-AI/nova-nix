@@ -1,7 +1,8 @@
-# GNU sed through the stage-1 stdenv -- the generalization proof.  A second,
-# different package (and a .tar.xz, exercising the seed's xz decompression),
-# built with the same two-line mkDerivation as hello.  If this works with no new
-# machinery, nova-nix has a real stdenv, not a hello special-case.
+# GNU sed through the stdenv -- the generalization proof.  A second,
+# different package (and a .tar.xz, exercising the xz decompression of
+# busybox's tar), built with the same two-line mkDerivation as hello.  If
+# this works with no new machinery, nova-nix has a real stdenv, not a hello
+# special-case.
 { stdenv, fetchurl }:
 stdenv.mkDerivation {
   name = "sed";

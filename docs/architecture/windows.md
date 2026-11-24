@@ -76,13 +76,15 @@ opens.
 
 A builder gets its derivation's strings with `/nix/store/` rewritten to
 the store directory followed by `/` ([`storeRewrite`][builder]), so it
-sees `C:\nix\store/<hash>-<name>`. The stage-1 stdenv's `setup.sh` turns
-that into what its tools take: `/cygdrive/c/...` for MSYS2's bash and
-`C:/...` for MinGW-w64's compilers. A backslash starts an
-escape in a C or Scheme string, so the bootstrap recipes hand store paths
-to Mes and TinyCC in environment variables instead of compiling them into
-strings. An output's references are found by the 32-character hash alone
-([`scanReferences`][store]), whichever spelling the build wrote.
+sees `C:\nix\store/<hash>-<name>`. The seed stdenv's `setup.sh` respells
+the paths it hands to configure and make with forward slashes,
+`C:/nix/store/...`, since a backslash starts an escape in a sed script, a
+C string and a word `sh` reads twice, and busybox and every Windows API
+take `/` as well. For the same reason the bootstrap recipes hand store
+paths to Mes and TinyCC in environment variables instead of compiling
+them into strings. An output's references are found by the 32-character
+hash alone ([`scanReferences`][store]), whichever spelling the build
+wrote.
 
 The store's own Win32 calls use the `\\?\` form, so a path longer than
 `MAX_PATH` opens there as it does through GHC's I/O
@@ -150,29 +152,26 @@ user can and reach the network. Which builds may reach the network is
 [`pkgs/windows/default.nix`](../../pkgs/windows/default.nix) is a package
 set laid out as nixpkgs' is: a `by-name/<shard>/<name>/package.nix` per
 package, each called with its dependencies from the set itself. It has
-three stdenvs with one `mkDerivation` interface:
+two stdenvs with one `mkDerivation` interface, both made only of tools
+built from the seed:
 
-- `stdenv`, the stage-1 stdenv ([`pkgs/windows/stdenv`]), on prebuilt
-  MSYS2 and MinGW-w64 packages pinned by SHA-256
-  ([`pkgs/windows/bootstrap`]). MSYS2's bash runs its `setup.sh` with
-  MinGW-w64's GCC. It is the set's `stdenv`, and
-  [`hello.nix`](../../pkgs/windows/hello.nix) builds with it.
-- `seedStdenv`, the seed stdenv ([`pkgs/windows/seed-stdenv`]), on tools
-  built from the seed alone: busybox-w32's `sh` and applets, GNU make and
-  TinyCC. The ladder's rungs from binutils on build with it, as
-  `i686-windows` derivations.
-- `stage2Stdenv`, the stage-2 stdenv ([`pkgs/windows/stage2-stdenv`]): the
-  seed stdenv's shell and tools with the ladder's native x86_64 GCC and
-  binutils behind compiler and linker wrappers, building for
-  `x86_64-windows` as the stage-1 stdenv does.
+- `stdenv`, the stage-2 stdenv ([`pkgs/windows/stage2-stdenv`]), also
+  named `stage2Stdenv`: the seed stdenv's shell and tools with the
+  ladder's native x86_64 GCC and binutils behind compiler and linker
+  wrappers, building for `x86_64-windows`. Its fixup phase copies each
+  DLL an output's programs and libraries import, and Windows does not
+  provide, beside them. [`hello.nix`](../../pkgs/windows/hello.nix) and
+  the set's other packages build with it.
+- `seedStdenv`, the seed stdenv ([`pkgs/windows/seed-stdenv`]):
+  busybox-w32's `sh` and applets, GNU make and TinyCC. The ladder's rungs
+  from binutils on build with it, as `i686-windows` derivations.
 
 Sources are fetched by `builtin:fetchurl`, which runs inside nova-nix.
-The archives stage0-pe32's chain reads, and the stage-1 stdenv's seeds,
-are unpacked by `builtin:unpack`, inside nova-nix too: nothing in the
-store can unpack an archive before the ladder has built a tool that can,
-and the system's `tar.exe` is not pinned ([`src/Nix/Builder/Unpack.hs`]).
-From Mes on, each rung unpacks its source with tools the rungs below it
-built.
+The archives stage0-pe32's chain reads are unpacked by `builtin:unpack`,
+inside nova-nix too: nothing in the store can unpack an archive before
+the ladder has built a tool that can, and the system's `tar.exe` is not
+pinned ([`src/Nix/Builder/Unpack.hs`]). From Mes on, each rung unpacks
+its source with tools the rungs below it built.
 
 ## The bootstrap from the seed
 
@@ -230,9 +229,6 @@ on ARM64 is [#698].
 Among what remains toward [#453], a Windows stdenv bootstrapped from
 source that builds unmodified nixpkgs:
 
-- the stage-1 stdenv's packages building on the stage-2 stdenv ([#630]),
-  the stage-2 stdenv as the set's `stdenv` ([#631]), and the MSYS2 and
-  MinGW-w64 seeds removed ([#632]);
 - a bash built from source, since nixpkgs' `setup.sh` needs bash and
   busybox-w32's `sh` is not one ([#697]);
 - packages from an unpatched nixpkgs on that stdenv ([#454]);
@@ -271,9 +267,6 @@ Neither is built. Each is designed in its issue, and this is the design.
 [#430]: https://github.com/Novavero-AI/nova-nix/issues/430
 [#453]: https://github.com/Novavero-AI/nova-nix/issues/453
 [#454]: https://github.com/Novavero-AI/nova-nix/issues/454
-[#630]: https://github.com/Novavero-AI/nova-nix/issues/630
-[#631]: https://github.com/Novavero-AI/nova-nix/issues/631
-[#632]: https://github.com/Novavero-AI/nova-nix/issues/632
 [#633]: https://github.com/Novavero-AI/nova-nix/issues/633
 [#634]: https://github.com/Novavero-AI/nova-nix/issues/634
 [#660]: https://github.com/Novavero-AI/nova-nix/issues/660
@@ -286,10 +279,8 @@ Neither is built. Each is designed in its issue, and this is the design.
 [mes]: ../../pkgs/windows/by-name/me/mes/package.nix
 [tinycc]: ../../pkgs/windows/by-name/ti/tinycc/package.nix
 [`cbits/nn_winfs.c`]: ../../cbits/nn_winfs.c
-[`pkgs/windows/bootstrap`]: ../../pkgs/windows/bootstrap
 [`pkgs/windows/seed-stdenv`]: ../../pkgs/windows/seed-stdenv
 [`pkgs/windows/stage2-stdenv`]: ../../pkgs/windows/stage2-stdenv
-[`pkgs/windows/stdenv`]: ../../pkgs/windows/stdenv
 [`src/Nix/Builder/Unpack.hs`]: ../../src/Nix/Builder/Unpack.hs
 [`src/Nix/Environment.hs`]: ../../src/Nix/Environment.hs
 [`src/Nix/Profile/Generation.hs`]: ../../src/Nix/Profile/Generation.hs

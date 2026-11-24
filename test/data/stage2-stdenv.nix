@@ -3,8 +3,7 @@
 # (see check.nix), so the stdenv builds it on every run.
 #
 # hello and the five packages after it are pkgs/windows' own, each called
-# with the stage-2 stdenv in place of the stage-1 one, so that one recipe
-# builds with either, and with each other where one is another's
+# with that stdenv, and with each other where one is another's
 # buildInputs.  flags has the stdenv's commands build the programs of
 # stage2-stdenv-flags and writes what flags.sh there says, which CI
 # compares with stage2-stdenv-flags-answer.txt.

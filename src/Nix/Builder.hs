@@ -40,9 +40,6 @@
 -- builder exit reaps grandchildren instead of orphaning them.  Filesystem
 -- and privilege isolation are still future work: a restricted token with a
 -- store-granting ACL (the security boundary), then AppContainer for more.
---
--- We ship @bash.exe@ (from MSYS2) as the default builder on Windows.
--- Same approach as Git for Windows.
 module Nix.Builder
   ( -- * Build execution
     BuildResult (..),
@@ -1450,7 +1447,7 @@ buildPath :: FilePath -> Text
 buildPath builderPath =
   let builderDir = takeDirectory builderPath
       parentDir = takeDirectory builderDir
-      -- Builder's own dir + coreutils sibling (MSYS2 layout)
+      -- Builder's own dir + coreutils sibling (Git for Windows' layout)
       builderDirs
         | builderDir == "." = []
         | otherwise = [builderDir, parentDir </> "usr" </> "bin"]

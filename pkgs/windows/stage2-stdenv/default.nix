@@ -1,8 +1,7 @@
 # nova-nix stage-2 stdenv: mkDerivation for x86_64 Windows on the seed
-# ladder's native x86_64 toolchain, the package set's stdenv, in the stage-1
-# stdenv's (../stdenv) place.
+# ladder's native x86_64 toolchain, the package set's stdenv.
 #
-# The stage-1 stdenv's interface, so a package builds with either:
+# The seed stdenv's interface, so a package builds with either:
 #
 #   { stdenv }:
 #   stdenv.mkDerivation { name = "foo"; src = ...; }
@@ -13,20 +12,19 @@
 # coreutils, sed, grep and awk and gnumake as make.  The compilers and the
 # linker are gcc-native-x86_64's and binutils-native-x86_64's, which run on
 # x86_64 Windows and write x86_64-w64-mingw32, so this stdenv's system is
-# x86_64-windows, as the stage-1 stdenv's is, and everything it builds is
-# x86_64.  setup.sh's header lists what it reads, the seed stdenv's tools
-# among them; here CC, CXX, LD, AR, CONFIG_SITE and buildTriple name this
-# stdenv's, and nothing sets C_INCLUDE_PATH, which TinyCC alone needs.
+# x86_64-windows, and everything it builds is x86_64.  setup.sh's header
+# lists what it reads, the seed stdenv's tools among them; here CC, CXX,
+# LD, AR, CONFIG_SITE and buildTriple name this stdenv's, and nothing sets
+# C_INCLUDE_PATH, which TinyCC alone needs.
 #
 # A build reaches the compilers and the linker through cc, nixpkgs'
-# stdenv.cc: gcc, cc, g++, c++, ld and windres, scripts that give every build what
-# the stage-1 stdenv's cc-wrapper.sh gives its builds, C at -std=gnu17,
-# links with no time stamp and no include or library directory from the
-# environment (cc-wrapper.sh, link.specs and ld-wrapper.sh say how).  They
-# have no extension: busybox takes a file that begins with #! for a
-# program, and its sh and GNU make each run one through the sh that line
-# names (win32/mingw.c:559-562 and 822-827, shell/ash.c:7161-7188 and
-# win32/process.c:300-350 in busybox-w32 5f09fb446,
+# stdenv.cc: gcc, cc, g++, c++, ld and windres, scripts that give every
+# build C at -std=gnu17, links with no time stamp and no include or library
+# directory from the environment (cc-wrapper.sh, link.specs and
+# ld-wrapper.sh say how).  They have no extension: busybox takes a file
+# that begins with #! for a program, and its sh and GNU make each run one
+# through the sh that line names (win32/mingw.c:559-562 and 822-827,
+# shell/ash.c:7161-7188 and win32/process.c:300-350 in busybox-w32 5f09fb446,
 # src/w32/subproc/sub_proc.c:652-683 and 753-757 in make 4.4.1).  GNU make
 # looks for a command with .exe in every directory of PATH before it
 # looks for it with no extension in any (sub_proc.c:479-527), so it runs a
@@ -121,8 +119,8 @@ in
       )
     )
     // {
-      # What the package fetches, as the stage-1 stdenv states it: its
-      # src, unless that is a path in the tree.
+      # What the package fetches, which ../sources.nix collects: its src,
+      # unless that is a path in the tree.
       srcs = if (attrs.src or null) ? outputHash then [ attrs.src ] else [ ];
     };
 }

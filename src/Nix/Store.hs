@@ -317,9 +317,9 @@ moveOutput src dest
 -- 32-character hash - the same needle upstream Nix scans for.  Matching
 -- the hash rather than a store-dir-prefixed path keeps the scan
 -- independent of the spelling the builder embedded (canonical
--- @\/nix\/store\/...@, @C:\\nix\\store\\...@, MSYS2 forms): eval injects
--- canonical forward-slash text into builder environments, which a
--- platform-store-dir prefix never matches on Windows.
+-- @\/nix\/store\/...@, @C:\\nix\\store\\...@, @C:\/nix\/store\/...@):
+-- eval injects canonical forward-slash text into builder environments,
+-- which a platform-store-dir prefix never matches on Windows.
 scanReferences :: [StorePath] -> FilePath -> IO [StorePath]
 scanReferences candidates dir = do
   let candidateSet = Set.fromList [(spHash sp, sp) | sp <- candidates]

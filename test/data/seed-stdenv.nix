@@ -1,6 +1,6 @@
 # pkgs/windows' seed stdenv, as the TinyCC (Windows) CI jobs build it:
 # hello, pkgs/windows' own GNU Hello package called with the seed stdenv in
-# place of the stage-1 one, so that the one recipe builds with either.  It
+# place of the set's, so that the one recipe builds with either.  It
 # forbids substitutes, as the checks kaem builds do (see check.nix), so the
 # stdenv configures, compiles and installs it on every run.
 let

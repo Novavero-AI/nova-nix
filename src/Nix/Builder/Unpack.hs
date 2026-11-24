@@ -1,15 +1,14 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | __builtin:unpack__ - in-process archive extraction for the bootstrap seed.
+-- | __builtin:unpack__ - in-process archive extraction for the Windows
+-- bootstrap.
 --
 -- == Why this is a builtin
 --
--- The Windows bootstrap fetches archives into the store before any tool
--- exists there: pre-built toolchain tarballs (MSYS2 @.pkg.tar.zst@
--- packages) for the stdenv, and GitHub's @.tar.gz@ archives of the sources
--- the full-source chain assembles.  Nothing in the store can unpack them -
--- the unpacker is the thing being bootstrapped - and ambient @tar.exe@ is
--- unpinned and may lack zstd support.  So, like
+-- Before any tool exists in the store, the Windows bootstrap fetches
+-- GitHub's @.tar.gz@ archives of the sources stage0-pe32's chain
+-- assembles.  Nothing in the store can unpack them - the unpacker is the
+-- thing being bootstrapped - and ambient @tar.exe@ is unpinned.  So, like
 -- 'Nix.Builder.runBuiltinFetchurl', extraction runs in-process: a
 -- derivation whose @builder@ is @builtin:unpack@ is handled by this module
 -- instead of being spawned as a subprocess.
@@ -17,18 +16,14 @@
 -- == Derivation interface
 --
 -- * @srcs@ - whitespace-separated archive store paths, extracted in order
---   into the single @out@ output.  MSYS2 packages share a top-level
---   @mingw64\/@ prefix, so extracting a package set into one output yields a
---   working toolchain root directly (no separate union step).
+--   into the single @out@ output.
 -- * @out@ - the merged tree.
 --
 -- == Determinism
 --
 -- Extraction is a pure function of the archive bytes: entries are written in
--- archive order, a file appearing in two archives is an error (pacman
--- enforces the same no-conflict invariant), and pacman's per-package
--- metadata entries (@.PKGINFO@, @.MTREE@, ...) are skipped - they are not part
--- of the installed tree and would otherwise collide across packages.
+-- archive order, and a file appearing in two archives is an error, since
+-- which one the tree kept would depend on their order in @srcs@.
 --
 -- Symlink and hardlink entries are materialized by __copying__ their target:
 -- symlinks on Windows require elevation or Developer Mode, so a link in the
@@ -57,15 +52,14 @@ where
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.GZip as GZip
-import qualified Codec.Compression.Zstd.Lazy as Zstd
-import Control.Exception (ErrorCall, Handler (..), IOException, catches)
+import Control.Exception (Handler (..), IOException, catches)
 import Control.Monad (when)
 import Data.Bits ((.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (toLower)
 import Data.Int (Int64)
-import Data.List (isPrefixOf, isSuffixOf)
+import Data.List (isSuffixOf)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -116,9 +110,8 @@ data UnpackLimits = UnpackLimits
   }
   deriving (Eq, Show)
 
--- | Default extraction budget: 4 GiB and one million entries.  The
--- MSYS2 toolchain seed decompresses to well under half of either, and
--- 4 GiB matches the largest NAR nova-cache's server accepts.
+-- | Default extraction budget: 4 GiB, the largest NAR nova-cache's
+-- server accepts, and one million entries.
 defaultUnpackLimits :: UnpackLimits
 defaultUnpackLimits =
   UnpackLimits
@@ -220,15 +213,13 @@ unpackAll outDir budget (archive : rest) = do
 -- entry.  The archive is read lazily and decoded as the entries are
 -- forced, so a failure surfaces mid-extraction as an exception, and the
 -- whole extraction is wrapped to turn each kind into a clean failure: an
--- 'IOException' reading the archive or writing the tree, the 'ErrorCall'
--- the zstd decoder raises for a corrupt frame (its lazy API reports every
--- decoding error with 'error'), or the 'GZip.DecompressError' the gzip
--- decoder throws for a corrupt or truncated stream.
+-- 'IOException' reading the archive or writing the tree, or the
+-- 'GZip.DecompressError' the gzip decoder throws for a corrupt or
+-- truncated stream.
 unpackArchive :: FilePath -> UnpackLimits -> FilePath -> IO (Either Text UnpackLimits)
 unpackArchive outDir budget archivePath =
   run
     `catches` [ Handler (\(e :: IOException) -> failed e),
-                Handler (\(e :: ErrorCall) -> failed e),
                 Handler (\(e :: GZip.DecompressError) -> failed e)
               ]
   where
@@ -239,14 +230,10 @@ unpackArchive outDir budget archivePath =
         raw <- BL.readFile archivePath
         extractEntries outDir budget (Tar.decodeLongNames (Tar.read (decoder raw)))
 
--- | Choose a decompressor from the archive file name.  @.tar.zst@ (MSYS2
--- packages), @.tar.gz@ (GitHub's archive of a commit) and plain @.tar@ are
--- supported.  MSYS2's zstd frames do not pledge a content size, so the lazy
--- (streaming) zstd decoder is required - the strict single-shot API rejects
--- them.
+-- | Choose a decompressor from the archive file name: @.tar.gz@ (GitHub's
+-- archive of a commit) and plain @.tar@ are supported.
 decoderFor :: FilePath -> Maybe (BL.ByteString -> BL.ByteString)
 decoderFor path
-  | ".tar.zst" `isSuffixOf` lowered = Just Zstd.decompress
   | ".tar.gz" `isSuffixOf` lowered = Just GZip.decompress
   | ".tar" `isSuffixOf` lowered = Just id
   | otherwise = Nothing
@@ -272,16 +259,14 @@ extractEntries outDir = go
           Right remaining -> go remaining rest
 
 -- | Extract a single entry, after validating its path stays inside the
--- archive root and skipping pacman package metadata.
+-- archive root.
 extractEntry :: FilePath -> UnpackLimits -> DecodedEntry -> IO (Either Text UnpackLimits)
 extractEntry outDir budget entry =
   case entryComponents (TarEntry.entryTarPath entry) of
     Left err -> pure (Left err)
     -- The archive root itself (an entry for "." or "./").
     Right [] -> pure (Right budget)
-    Right comps
-      | isPackageMetadata comps -> pure (Right budget)
-      | otherwise -> extractContent outDir budget comps entry
+    Right comps -> extractContent outDir budget comps entry
 
 -- | Extract a path-validated entry's content, charging every created
 -- entry and its bytes against the budget.  @comps@ is non-empty (the
@@ -380,7 +365,7 @@ extractContent outDir budget comps entry =
 -- | Split a tar entry path into validated components: relative, no @..@, no
 -- @:@ (drive letters, NTFS alternate data streams).  Tar paths use @/@;
 -- 'splitDirectories' accepts both separators on Windows.  @.@ components are
--- dropped, so @./mingw64@ and @mingw64@ agree.
+-- dropped, so @./src@ and @src@ agree.
 entryComponents :: FilePath -> Either Text [FilePath]
 entryComponents raw
   | isAbsolute raw = Left ("absolute entry path: " <> T.pack raw)
@@ -423,22 +408,13 @@ startsAtRoot comps = case comps of
   (comp : _) -> not (null comp) && all isPathSeparator comp
   [] -> False
 
--- | pacman package metadata at the archive root (@.PKGINFO@, @.BUILDINFO@,
--- @.MTREE@, @.INSTALL@): describes the package to pacman, is not part of the
--- installed tree, and collides across packages when several archives merge
--- into one output - so root-level dotfile entries are skipped.
-isPackageMetadata :: [FilePath] -> Bool
-isPackageMetadata comps = case comps of
-  [name] -> "." `isPrefixOf` name
-  _ -> False
-
 -- ---------------------------------------------------------------------------
 -- Filesystem helpers
 -- ---------------------------------------------------------------------------
 
--- | Guard that nothing was already extracted at @dest@.  Two archives in one
--- seed providing the same file is a packaging error worth failing loudly on
--- (pacman enforces the same no-conflict invariant between its packages).
+-- | Guard that nothing was already extracted at @dest@: an entry whose
+-- path another archive, or an earlier entry, already extracted fails the
+-- build rather than leaving whichever came last.
 freshDestination :: FilePath -> IO (Either Text ())
 freshDestination dest = do
   exists <- doesPathExist dest

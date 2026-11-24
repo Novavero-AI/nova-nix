@@ -2514,12 +2514,12 @@ jobs:
         run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
   # ---------------------------------------------------------------------------
-  # Stage-2 stdenv: the stdenv the stage-1 one is to give way to, the seed
-  # stdenv's builder and tools with the native x86_64 toolchain, whose
-  # compilers and linker its builds run through the wrappers
-  # stage2Stdenv.cc writes, and GNU Hello built with it, which runs here
-  # and names neither the store directory nor its build directory, and
-  # the stage-1 stdenv's other five packages built with it, which work.
+  # Stage-2 stdenv: the package set's stdenv, the seed stdenv's builder
+  # and tools with the native x86_64 toolchain, whose compilers and linker
+  # its builds run through the wrappers stage2Stdenv.cc writes, and GNU
+  # Hello built with it, which runs here and names neither the store
+  # directory nor its build directory, and the set's other five packages
+  # built with it, which work.
   # test/data/stage2-stdenv.nix's flags has the stdenv's commands compile
   # and link programs, and finds C compiled at -std=gnu17 and C++ at the
   # compiler's default, no time stamp in a program any of them links, and
@@ -2527,12 +2527,9 @@ jobs:
   # compiler searches.
   #
   # The timeout is twice an estimate of this stage on the ARM64 leg, about
-  # 22 minutes: the stage-1 stdenv builds Hello with GCC in under 2 minutes
-  # on x64, the seed stdenv's Hello takes three times as long on ARM64 as on
-  # x64, and the stage's other steps, the native toolchain taken from the
-  # handoff among them, take about 6; GNU sed, whose configure is Hello's
-  # size, as long again as Hello; and zlib and the three small packages a
-  # few minutes together.
+  # 22 minutes: on x64 the stage takes about 7 minutes, Hello 2 of them and
+  # the five other packages 4, and the seed stdenv's Hello takes three
+  # times as long on ARM64 as on x64.
   # ---------------------------------------------------------------------------
   stage2-stdenv-windows:
     name: Stage-2 stdenv
@@ -2704,12 +2701,12 @@ jobs:
             exit 1
           fi
 
-      # The five other packages the stage-1 stdenv builds, each with the
-      # stage-2 stdenv: GNU sed, from a .tar.xz; zlib, through its own
-      # win32 makefile, as a DLL with its import library; libgreet, a
-      # static library from a directory; and zdemo and greeter, programs
-      # linking zlib and libgreet as buildInputs.  Each is timed.
-      - name: Build the stage-1 stdenv's other packages with the stage-2 stdenv
+      # The set's five other packages, each with the stage-2 stdenv: GNU
+      # sed, from a .tar.xz; zlib, through its own win32 makefile, as a DLL
+      # with its import library; libgreet, a static library from a
+      # directory; and zdemo and greeter, programs linking zlib and
+      # libgreet as buildInputs.  Each is timed.
+      - name: Build the set's other packages with the stage-2 stdenv
         shell: bash
         run: |
           set -euo pipefail
@@ -2729,7 +2726,7 @@ jobs:
       # line is compared.  Each check reads its program's output through a
       # pipe into the step's own shell (lastpipe), so a failure reaches
       # the step's exit status.
-      - name: The stage-1 stdenv's other packages built with the stage-2 stdenv work
+      - name: The set's other packages built with the stage-2 stdenv work
         shell: bash
         run: |
           set -uo pipefail

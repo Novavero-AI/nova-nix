@@ -11,10 +11,9 @@ description:
 
   On the derivations its CI checks, over pinned pairs of Nix and nixpkgs,
   the derivation paths it computes match upstream's.  On Windows it builds
-  packages from source through a stage-1 stdenv over prebuilt MinGW-w64
-  and MSYS2 packages pinned by SHA-256, and builds a toolchain from a
-  1,623-byte seed, through GNU Mes and TinyCC, to GCC with C++.  The
-  project is experimental; see the README for what is not implemented.
+  a toolchain from a 1,623-byte seed, through GNU Mes and TinyCC, to GCC
+  with C++, and builds packages from source with it.  The project is
+  experimental; see the README for what is not implemented.
 
   Evaluation runs in a session (@Nix.Eval.IO.withEvalSession@), which sets
   up the C data layer it needs and tears it down as the session ends.
