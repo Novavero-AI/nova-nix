@@ -133,8 +133,8 @@ data EvalErrorKind = ErrorThrown | ErrorUncatchable
   deriving (Eq, Show)
 
 -- | A failure's message and the lines of context it gathered unwinding
--- ('addErrorTrace'), outermost first: upstream's @ErrorInfo@ message and
--- traces, without positions.
+-- ('Nix.Eval.Types.addErrorTrace'), outermost first: upstream's
+-- @ErrorInfo@ message and traces, without positions.
 data EvalFailure = EvalFailure
   { failureTrace :: ![Text],
     failureMessage :: !Text
@@ -529,16 +529,20 @@ instance MonadEval EvalIO where
 
   -- The line is made after the failure is caught, not in a handler,
   -- which would run it with asynchronous exceptions masked.
-  addErrorTrace (EvalIO line) (EvalIO action) = EvalIO $ do
+  addEvaluatedTrace onFailedLine (EvalIO line) (EvalIO action) = EvalIO $ do
     st <- ask
     result <- liftIO (try (try (runReaderT action st)))
     case result of
       Right (Right val) -> pure val
-      Right (Left (NixAbortError failure)) -> retrace (throwIO . NixAbortError) failure
-      Left (NixEvalError kind failure) -> retrace (throwIO . NixEvalError kind) failure
+      Right (Left (NixAbortError failure)) -> retrace st (throwIO . NixAbortError) failure
+      Left (NixEvalError kind failure) -> retrace st (throwIO . NixEvalError kind) failure
     where
-      retrace rethrow (EvalFailure trace msg) = do
-        !context <- line
+      retrace st rethrow (EvalFailure trace msg) = do
+        made <- liftIO (try (try (runReaderT line st)))
+        let !context = case made of
+              Right (Right text) -> text
+              Right (Left (NixAbortError (EvalFailure _ failed))) -> onFailedLine failed
+              Left (NixEvalError _ (EvalFailure _ failed)) -> onFailedLine failed
         liftIO (rethrow (EvalFailure (context : trace) msg))
 
   withCallFrame (EvalIO action) = EvalIO $ do
