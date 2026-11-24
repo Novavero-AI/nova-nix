@@ -17,9 +17,9 @@
 #
 # The links are 32-bit PE, which x64 Windows runs through WoW64, so every
 # derivation that runs one is i686-windows.  Nothing else runs: no cmd.exe,
-# no shell but kaem, and nothing from the MSYS2 seed.  The set is the seed,
-# the ten links, the bin directories kaem, mescc-tools and mescc-tools-extra,
-# each with the programs it holds as attributes, and writeText.
+# and no shell but kaem.  The set is the seed, the ten links, the bin
+# directories kaem, mescc-tools and mescc-tools-extra, each with the
+# programs it holds as attributes, and writeText.
 { fetchurl }:
 let
   sources = import ./sources.nix { inherit fetchurl; };

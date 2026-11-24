@@ -58,7 +58,8 @@
 # --no-insert-timestamp (ld/emultempl/pe.em:162 and 1616-1619,
 # bfd/peXXigen.c:838-843), which GCC's link spec for MinGW never passes
 # (gcc/config/i386/mingw32.h:99-105), and the seed stdenv has no compiler
-# wrapper to add it, as the stage-1 stdenv's cc-wrapper.sh does.  LDFLAGS
+# wrapper to add it, as the stage-2 stdenv's wrappers do
+# (pkgs/windows/stage2-stdenv/link.specs).  LDFLAGS
 # passes it to every link gcc46 makes here: the host's programs take
 # LDFLAGS, and so do the build machine's, the build being the host
 # (configure.ac:3124-3128, gcc/configure.ac:1798-1801).  It replaces the

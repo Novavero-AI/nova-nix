@@ -1,18 +1,16 @@
 # nova-nix seed stdenv: mkDerivation on tools built from the seed, which
 # the seed ladder's rungs build with.  The stage-2 stdenv
-# (../stage2-stdenv), which replaces the stage-1 stdenv (../stdenv), is its
-# builder and tools with the ladder's native x86_64 toolchain.
+# (../stage2-stdenv), the package set's stdenv, is its builder and tools
+# with the ladder's native x86_64 toolchain.
 #
-# The stage-1 stdenv's interface, so a package builds with either:
+# The stage-2 stdenv's interface, so a package builds with either:
 #
 #   { stdenv }:
 #   stdenv.mkDerivation { name = "foo"; src = ...; }
 #
-# with every tool it runs built from stage0-pe32's seed and nothing from the
-# MSYS2 or MinGW-w64 packages the stage-1 stdenv is made of: busybox-w32's
-# sh is the builder, its applets are the coreutils, sed, grep and awk, GNU
+# with every tool it runs built from stage0-pe32's seed: busybox-w32's sh
+# is the builder, its applets are the coreutils, sed, grep and awk, GNU
 # make is gnumake, and the C compiler is tinycc-native, on msvcrt.dll.
-# setup.sh says where its genericBuild differs from the stage-1 stdenv's.
 #
 # Its tools are i686 programs, and so are the programs it builds but the
 # native x86_64 rungs', which its x86_64 cross compiler links.
@@ -105,8 +103,8 @@ in
       )
     )
     // {
-      # What the package fetches, as the stage-1 stdenv states it: its
-      # src, unless that is a path in the tree.
+      # What the package fetches, which ../sources.nix collects: its src,
+      # unless that is a path in the tree.
       srcs = if (attrs.src or null) ? outputHash then [ attrs.src ] else [ ];
     };
 }

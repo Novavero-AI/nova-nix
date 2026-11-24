@@ -16092,9 +16092,13 @@ testScrubbedBuildEnvIO = do
 testZstdCompressionLevel :: Int
 testZstdCompressionLevel = 3
 
--- | Build a @.tar.zst@ archive from tar entries, MSYS2-package style.
-compressArchive :: [TarEntry.Entry] -> BL.ByteString
-compressArchive = ZstdL.compress testZstdCompressionLevel . Tar.write
+-- | A zstd-compressed tar archive of these entries.
+zstdArchive :: [TarEntry.Entry] -> BL.ByteString
+zstdArchive = ZstdL.compress testZstdCompressionLevel . Tar.write
+
+-- | A gzip-compressed tar archive of these entries.
+gzipArchive :: [TarEntry.Entry] -> BL.ByteString
+gzipArchive = GZip.compress . Tar.write
 
 -- | Test-setup helpers: the paths and link targets below are short literals,
 -- so encoding them cannot fail; 'error' marks setup bugs, not test failures.
@@ -16130,13 +16134,13 @@ tarPaxGlobalHeader records =
   TarEntry.simpleEntry (tarPathOrDie False "pax_global_header") (Tar.OtherEntryType 'g' records (BL.length records))
 
 -- | Step 3 of the ladder: @builtin:unpack@, the stage-0 seed extractor.
--- Two zstd-compressed tar archives sharing a top-level prefix (the MSYS2
--- @mingw64\/@ shape) are extracted into ONE output: regular files, an
--- executable, a hardlink and a relative symlink (both materialized as
--- copies), with pacman metadata (@.PKGINFO@\/@.MTREE@) skipped.  A second
--- build proves cross-archive file collisions fail loudly, and further builds
--- that a parent-climbing (..) entry and drive-rooted file, symlink, and
--- hardlink paths are all rejected.
+-- Two gzip-compressed tar archives sharing a top-level directory are
+-- extracted into ONE output: regular files, an executable, a hardlink and
+-- a relative symlink (both materialized as copies), and a file at the
+-- archive root whose name begins with a dot.  A second build proves
+-- cross-archive file collisions fail loudly, and further builds that a
+-- parent-climbing (..) entry and drive-rooted file, symlink, and hardlink
+-- paths are all rejected.
 testUnpackBuildIO :: IO [Bool]
 testUnpackBuildIO = do
   putStrLn "builder/unpack-seed-archives"
@@ -16155,56 +16159,55 @@ testUnpackBuildIO = do
       -- that - each entry is parsed and rendered through the
       -- build's store dir, which for these builds is the temp store.
       let archiveFile name = storePathToFilePath storeDir (StorePath (T.replicate 32 "0") name)
-          archiveTools = archiveFile "pkg-tools.tar.zst"
-          archiveData = archiveFile "pkg-data.tar.zst"
-          archiveCollide = archiveFile "pkg-collide.tar.zst"
-          archiveEscape = archiveFile "pkg-escape.tar.zst"
-          archiveRootFile = archiveFile "pkg-root-file.tar.zst"
-          archiveEscapeSymlink = archiveFile "pkg-escape-symlink.tar.zst"
-          archiveEscapeHardlink = archiveFile "pkg-escape-hardlink.tar.zst"
-          archiveDirLink = archiveFile "pkg-dirlink.tar.zst"
-          archiveDirLinkBase = archiveFile "pkg-dirlink-base.tar.zst"
-          archiveDirLinkCollide = archiveFile "pkg-dirlink-collide.tar.zst"
-          archiveHardLinkCollide = archiveFile "pkg-hardlink-collide.tar.zst"
-          archiveManyEntries = archiveFile "pkg-many-entries.tar.zst"
-          archiveBigFile = archiveFile "pkg-big-file.tar.zst"
-          archiveAmplify = archiveFile "pkg-amplify.tar.zst"
+          archiveTools = archiveFile "pkg-tools.tar.gz"
+          archiveData = archiveFile "pkg-data.tar.gz"
+          archiveCollide = archiveFile "pkg-collide.tar.gz"
+          archiveEscape = archiveFile "pkg-escape.tar.gz"
+          archiveRootFile = archiveFile "pkg-root-file.tar.gz"
+          archiveEscapeSymlink = archiveFile "pkg-escape-symlink.tar.gz"
+          archiveEscapeHardlink = archiveFile "pkg-escape-hardlink.tar.gz"
+          archiveDirLink = archiveFile "pkg-dirlink.tar.gz"
+          archiveDirLinkBase = archiveFile "pkg-dirlink-base.tar.gz"
+          archiveDirLinkCollide = archiveFile "pkg-dirlink-collide.tar.gz"
+          archiveHardLinkCollide = archiveFile "pkg-hardlink-collide.tar.gz"
+          archiveManyEntries = archiveFile "pkg-many-entries.tar.gz"
+          archiveBigFile = archiveFile "pkg-big-file.tar.gz"
+          archiveAmplify = archiveFile "pkg-amplify.tar.gz"
           archiveGitHub = archiveFile "repo-0123456.tar.gz"
       BL.writeFile archiveTools $
-        compressArchive
+        gzipArchive
           [ tarDir "pkg",
             tarDir "pkg/bin",
             tarExecFile "pkg/bin/tool.exe" "tool-payload",
             tarHardLink "pkg/bin/tool-link.exe" "pkg/bin/tool.exe",
-            tarSymLink "pkg/bin/sh.exe" "tool.exe",
-            tarFile ".PKGINFO" "pkgname = tools"
+            tarSymLink "pkg/bin/sh.exe" "tool.exe"
           ]
       BL.writeFile archiveData $
-        compressArchive
+        gzipArchive
           [ tarDir "pkg",
             tarDir "pkg/share",
             tarFile "pkg/share/data.txt" "shared-data",
-            tarFile ".MTREE" "mtree-bytes"
+            tarFile ".hidden" "dot-file"
           ]
       BL.writeFile archiveCollide $
-        compressArchive [tarFile "pkg/bin/tool.exe" "conflicting"]
+        gzipArchive [tarFile "pkg/bin/tool.exe" "conflicting"]
       BL.writeFile archiveEscape $
-        compressArchive [tarFile "../evil.txt" "escape"]
+        gzipArchive [tarFile "../evil.txt" "escape"]
       -- A leading '/' entry: rooted at the current drive.  tar stores paths with
       -- '/', so this is the on-disk form even of a Windows-native "\..." name.
       BL.writeFile archiveRootFile $
-        compressArchive [tarFile "/planted-abs.txt" "rooted-file"]
+        gzipArchive [tarFile "/planted-abs.txt" "rooted-file"]
       -- Escaping link targets: '..' climbs above the archive root.  Unlike a
       -- rooted ('/') target, this builds portably - tar's toLinkTarget accepts a
       -- relative path on every host - so the real unpacker is exercised end to end.
       BL.writeFile archiveEscapeSymlink $
-        compressArchive [tarSymLink "sneaky-link.txt" "../escape-link-target.txt"]
+        gzipArchive [tarSymLink "sneaky-link.txt" "../escape-link-target.txt"]
       BL.writeFile archiveEscapeHardlink $
-        compressArchive [tarHardLink "sneaky-hardlink.txt" "../escape-hardlink-target.txt"]
+        gzipArchive [tarHardLink "sneaky-hardlink.txt" "../escape-hardlink-target.txt"]
       -- A directory symlink entry with a fresh destination: materialized
       -- by copying its target tree.
       BL.writeFile archiveDirLink $
-        compressArchive
+        gzipArchive
           [ tarDir "realdir",
             tarFile "realdir/g.txt" "dir-link-payload",
             tarSymLink "dirlink" "realdir"
@@ -16215,28 +16218,28 @@ testUnpackBuildIO = do
       -- not silently merge - the merged result would depend on entry
       -- order.
       BL.writeFile archiveDirLinkBase $
-        compressArchive [tarDir "pkg", tarFile "pkg/original.txt" "original"]
+        gzipArchive [tarDir "pkg", tarFile "pkg/original.txt" "original"]
       BL.writeFile archiveDirLinkCollide $
-        compressArchive
+        gzipArchive
           [ tarDir "smuggle",
             tarFile "smuggle/extra.txt" "smuggled",
             tarSymLink "pkg" "smuggle"
           ]
       BL.writeFile archiveHardLinkCollide $
-        compressArchive
+        gzipArchive
           [ tarDir "smuggle",
             tarFile "smuggle/extra.txt" "smuggled",
             tarHardLink "pkg" "smuggle"
           ]
       -- Budget probes, built against tiny caps injected via BuildConfig.
       BL.writeFile archiveManyEntries $
-        compressArchive [tarFile ("e" <> show i <> ".txt") "x" | i <- [1 :: Int .. 6]]
+        gzipArchive [tarFile ("e" <> show i <> ".txt") "x" | i <- [1 :: Int .. 6]]
       BL.writeFile archiveBigFile $
-        compressArchive [tarFile "big.bin" (BL.replicate 100 55)]
+        gzipArchive [tarFile "big.bin" (BL.replicate 100 55)]
       -- Two directory symlinks each re-copy the 40-byte payload: the
       -- copies must charge the budget like first-class content.
       BL.writeFile archiveAmplify $
-        compressArchive
+        gzipArchive
           [ tarDir "base",
             tarFile "base/blob.bin" (BL.replicate 40 55),
             tarSymLink "dup1" "base",
@@ -16245,12 +16248,13 @@ testUnpackBuildIO = do
       -- GitHub's archive of a commit: gzip over a tar that opens with a pax
       -- global header naming the commit, then one directory named for the
       -- repository and the commit.
-      BL.writeFile archiveGitHub . GZip.compress . Tar.write $
-        [ tarPaxGlobalHeader "52 comment=0123456789abcdef0123456789abcdef01234567\n",
-          tarDir "repo-0123456",
-          tarDir "repo-0123456/src",
-          tarFile "repo-0123456/src/main.c" "int main;"
-        ]
+      BL.writeFile archiveGitHub $
+        gzipArchive
+          [ tarPaxGlobalHeader "52 comment=0123456789abcdef0123456789abcdef01234567\n",
+            tarDir "repo-0123456",
+            tarDir "repo-0123456/src",
+            tarFile "repo-0123456/src/main.c" "int main;"
+          ]
       let -- srcs carries the canonical /nix/store spelling, as eval writes
           -- it; the physical archives live under the temp store dir.
           canonicalSrc file = case parseStorePath storeDir (T.pack file) of
@@ -16320,8 +16324,7 @@ testUnpackBuildIO = do
           toolLink <- readOut ("pkg" </> "bin" </> "tool-link.exe")
           shLink <- readOut ("pkg" </> "bin" </> "sh.exe")
           dataFile <- readOut ("pkg" </> "share" </> "data.txt")
-          pkgInfo <- Dir.doesFileExist (outRoot </> ".PKGINFO")
-          mtree <- Dir.doesFileExist (outRoot </> ".MTREE")
+          dotFile <- readOut ".hidden"
           execBitOk <-
             if SI.os == "mingw32"
               then pure True -- NTFS has no exec bit; PATHEXT decides
@@ -16341,10 +16344,8 @@ testUnpackBuildIO = do
                 assertEqual "sh.exe" (Just "tool-payload") shLink,
               runTest "unpack: second archive merged into shared prefix" $
                 assertEqual "data.txt" (Just "shared-data") dataFile,
-              runTest "unpack: pacman metadata skipped" $
-                if pkgInfo || mtree
-                  then Fail ".PKGINFO/.MTREE leaked into the output"
-                  else Pass,
+              runTest "unpack: a dot file at the archive root extracted" $
+                assertEqual ".hidden" (Just "dot-file") dotFile,
               runTest "unpack: executable bit materialized (unix)" $
                 if execBitOk then Pass else Fail "tool.exe not executable",
               runTest "unpack: real NAR hash registered" $
@@ -21805,13 +21806,9 @@ testChecksForbidSubstitutes = do
 -- make and tinycc-native.  The one leaf it adds is hello's archive, and it
 -- reads no input source but the stdenv's own files and what evaluation
 -- writes as text.  The leaves of hello's whole closure are the seed and
--- the sources the ladder fetches, so no MSYS2 or MinGW-w64 package is in
--- it; MinGW-w64's files there are the five mingw-w64-crt sources
--- busybox-w32 compiles and the declarations its compat headers and the
--- stdenv's sdkddkver.h transcribe.  Neither of the stage-1 stdenv's seeds is in it,
--- where both are in the closure of the same hello package built with the
--- stage-1 stdenv, which the test reads too, so that the check is known to
--- find them.
+-- the sources the ladder fetches; MinGW-w64's files there are the five
+-- mingw-w64-crt sources busybox-w32 compiles and the declarations its
+-- compat headers and the stdenv's sdkddkver.h transcribe.
 testSeedStdenvWindows :: IO [Bool]
 testSeedStdenvWindows = do
   putStrLn "pkgs/seed-stdenv"
@@ -21841,13 +21838,12 @@ testSeedStdenvWindows = do
               closureOf attrs = sessionClosure (mapMaybe (`Map.lookup` rootOf) attrs)
           tools <- closureOf toolRoots
           seed <- closureOf [seedHello]
-          stage1 <- closureOf [stage1Hello]
-          pure (rootOf, tools, seed, stage1)
+          pure (tools, seed)
         other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
   writes <- readIORef (esStoreWriteCache st)
   case outcome of
     Left err -> sequence [runTest instantiates (Fail err)]
-    Right (rootOf, tools, seed, stage1) -> do
+    Right (tools, seed) -> do
       let added = Map.elems (Map.difference seed tools)
           nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
           isFetch drv = drvBuilder drv == "builtin:fetchurl"
@@ -21856,7 +21852,6 @@ testSeedStdenvWindows = do
           addedLeaves = leavesOf added
           seedLeaves = leavesOf (Map.elems seed)
           wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
-          seedsIn closure = [attr | attr <- stage1Seeds, Just path <- [Map.lookup attr rootOf], Map.member path closure]
       sequence
         [ runTest instantiates $
             assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
@@ -21878,11 +21873,7 @@ testSeedStdenvWindows = do
             assertEqual
               "leaves"
               (sort closureLeaves, True)
-              (sort (map nameOf seedLeaves), all (\drv -> isFetch drv && isFixedOutput drv) seedLeaves),
-          runTest "both stage-1 seeds are in the closure of hello built with the stage-1 stdenv" $
-            assertEqual "stage-1 seeds in it" stage1Seeds (seedsIn stage1),
-          runTest "neither stage-1 seed is in the closure of hello built with the seed stdenv" $
-            assertEqual "stage-1 seeds in it" [] (seedsIn seed)
+              (sort (map nameOf seedLeaves), all (\drv -> isFetch drv && isFixedOutput drv) seedLeaves)
         ]
   where
     instantiates :: Text
@@ -21891,12 +21882,8 @@ testSeedStdenvWindows = do
     toolRoots = ["pkgs.busybox-w32", "pkgs.gnumake", "pkgs.tinycc-native.compiler", "pkgs.tinycc-native.libs"]
     seedHello :: Text
     seedHello = "checks.hello"
-    stage1Hello :: Text
-    stage1Hello = "(pkgs.lib.callPackageWith pkgs ./pkgs/windows/by-name/he/hello/package.nix { stdenv = pkgs.stage1Stdenv; })"
-    stage1Seeds :: [Text]
-    stage1Seeds = ["pkgs.stage1Stdenv.mingwSeed", "pkgs.stage1Stdenv.msysSeed"]
     roots :: [Text]
-    roots = toolRoots ++ [seedHello, stage1Hello] ++ stage1Seeds
+    roots = toolRoots ++ [seedHello]
     helloArchive :: Text
     helloArchive = "hello-2.12.3.tar.gz"
     addedNames :: [Text]
@@ -24071,9 +24058,9 @@ testGccNativeX8664Windows = do
 
 -- | @pkgs\/windows@'s stage-2 stdenv, read back as the build driver reads
 -- it: what its wrappers and @test\/data\/stage2-stdenv.nix@'s checks, GNU
--- Hello and the stage-1 stdenv's other five packages built with it and
--- flags, add to the closure of the tools it is made of, busybox-w32, GNU
--- make, the seed stdenv's applets and the native x86_64 binutils and GCC.
+-- Hello and the set's other five packages built with it and flags, add
+-- to the closure of the tools it is made of, busybox-w32, GNU make, the
+-- seed stdenv's applets and the native x86_64 binutils and GCC.
 -- The leaves it adds are the archives of Hello, sed and zlib, every
 -- derivation but those fetches is x86_64-windows, and it reads no input
 -- source but the stdenv's own files, the packages' source directories,
@@ -24087,10 +24074,7 @@ testGccNativeX8664Windows = do
 -- @STRIP@ name binutils' programs, @WINDRES@ the windres wrapper, and the
 -- fixup looks for a DLL in GCC's bin directory first.  The wrappers are
 -- written from gcc-native-x86_64's drivers and binutils-native-x86_64's
--- linker.  Neither of the stage-1 stdenv's seeds is in Hello's closure,
--- where both are in the closure of the same package built with the
--- stage-1 stdenv, which the test reads too, so that the check is known
--- to find them.
+-- linker.
 testStage2StdenvWindows :: IO [Bool]
 testStage2StdenvWindows = do
   putStrLn "pkgs/stage2-stdenv"
@@ -24122,15 +24106,13 @@ testStage2StdenvWindows = do
               closureOf attrs = sessionClosure (mapMaybe (`Map.lookup` rootOf) attrs)
           tools <- closureOf toolRoots
           stage2 <- closureOf ([wrappersRoot, helloRoot, flagsRoot] ++ packageRoots)
-          hello <- closureOf [helloRoot]
-          stage1 <- closureOf [stage1Hello]
           full <- sessionClosure (Map.elems rootOf)
-          pure (rootOf, tools, stage2, hello, stage1, full)
+          pure (rootOf, tools, stage2, full)
         other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
   writes <- readIORef (esStoreWriteCache st)
   case outcome of
     Left err -> sequence [runTest instantiates (Fail err)]
-    Right (rootOf, tools, stage2, hello, stage1, full) -> do
+    Right (rootOf, tools, stage2, full) -> do
       let added = Map.elems (Map.difference stage2 tools)
           nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
           variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
@@ -24138,7 +24120,6 @@ testStage2StdenvWindows = do
           isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
           addedLeaves = filter (Map.null . drvInputDrvs) added
           wroteAsText path = fmap snd (Map.lookup (storePathToText defaultStoreDir path) writes) == Just WriteText
-          seedsIn closure = [attr | attr <- stage1Seeds, Just path <- [Map.lookup attr rootOf], Map.member path closure]
           derivationAt root = Map.lookup root rootOf >>= (`Map.lookup` full)
           -- The output of a root's derivation, as a variable spells a
           -- store path, or a word no variable holds where the root is
@@ -24216,11 +24197,7 @@ testStage2StdenvWindows = do
             assertEqual
               "compilers, linker and windres"
               (Just (outputOf gccNativeRoot <> "/bin", outputOf binutilsNativeRoot <> "/bin/ld.exe", binutilsProgram "windres"))
-              (wrappers <&> \drv -> (variableOf "compilers" drv, variableOf "linker" drv, variableOf "windres" drv)),
-          runTest "both stage-1 seeds are in the closure of hello built with the stage-1 stdenv" $
-            assertEqual "stage-1 seeds in it" stage1Seeds (seedsIn stage1),
-          runTest "neither stage-1 seed is in the closure of hello built with the stage-2 stdenv" $
-            assertEqual "stage-1 seeds in it" [] (seedsIn hello)
+              (wrappers <&> \drv -> (variableOf "compilers" drv, variableOf "linker" drv, variableOf "windres" drv))
         ]
   where
     instantiates :: Text
@@ -24247,14 +24224,9 @@ testStage2StdenvWindows = do
     flagsRoot = "checks.flags"
     seedHelloRoot :: Text
     seedHelloRoot = "seedChecks.hello"
-    stage1Hello :: Text
-    stage1Hello = "(pkgs.lib.callPackageWith pkgs ./pkgs/windows/by-name/he/hello/package.nix { stdenv = pkgs.stage1Stdenv; })"
-    stage1Seeds :: [Text]
-    stage1Seeds = ["pkgs.stage1Stdenv.mingwSeed", "pkgs.stage1Stdenv.msysSeed"]
     roots :: [Text]
-    roots = toolRoots ++ [wrappersRoot, helloRoot, flagsRoot, seedHelloRoot, stage1Hello] ++ packageRoots ++ stage1Seeds
-    -- The stage-1 stdenv's other five packages, built with the stage-2
-    -- stdenv.
+    roots = toolRoots ++ [wrappersRoot, helloRoot, flagsRoot, seedHelloRoot] ++ packageRoots
+    -- The set's other five packages, built with the stage-2 stdenv.
     packageRoots :: [Text]
     packageRoots = ["checks.sed", "checks.zlib", "checks.libgreet", "checks.zdemo", "checks.greeter"]
     archives :: [Text]
@@ -24318,7 +24290,7 @@ testWindowsSources = do
             assertEqual "derivations" (Map.keys fetches) (sort listed),
           runTest "every source is fixed-output" $
             assertEqual "not fixed-output" [] [nameOf path | (path, drv) <- Map.toList fetches, not (isFixedOutput drv)],
-          runTest "the set fetches the ladder's sources and the stage-1 seeds' packages" $
+          runTest "the set fetches the seed, the ladder's sources and its packages' sources" $
             assertEqual "sources missing" [] [name | name <- knownSources, name `notElem` map nameOf listed]
         ]
   where
@@ -24331,9 +24303,9 @@ testWindowsSources = do
     packageDepth :: Int
     packageDepth = 3
     -- One source of each kind, so that an empty closure does not pass as an
-    -- empty list: the seed, a rung's archive and a stage-1 seed's package.
+    -- empty list: the seed, a rung's archive and a package's archive.
     knownSources :: [Text]
-    knownSources = ["hex0-seed.exe", "busybox-w32-FRP-6354-g5f09fb446.tgz", "bash-5.3.015-1-x86_64.pkg.tar.zst"]
+    knownSources = ["hex0-seed.exe", "busybox-w32-FRP-6354-g5f09fb446.tgz", "hello-2.12.3.tar.gz"]
 
 -- | The workflow whose jobs build one leg of the seed ladder, a job for each
 -- stage, from the repository root.
@@ -31344,12 +31316,12 @@ noCode :: Trust.ContentFacts
 noCode = Trust.ContentFacts [] []
 
 -- | The header scanner over byte strings, the parser's trust command, and
--- the classification over hand built graphs named for the closures of
--- @pkgs/windows@: hex0's builder is the flat seed it fetches, and hex0
--- is pinned to the seed's hash; stage0-pe32's source archive holds a copy
--- of that seed; hello's builder is bash in the MSYS2 packages
--- builtin:unpack makes one tree of; and MinGW-w64's packages hold its
--- toolchain.
+-- the classification over hand built graphs.  As in @pkgs/windows@,
+-- hex0's builder is the flat seed it fetches, hex0 is pinned to the
+-- seed's hash, and stage0-pe32's source archive holds a copy of that
+-- seed.  As in a stdenv made of binary packages, hello's builder is bash
+-- in prebuilt packages builtin:unpack makes one tree of, and prebuilt
+-- packages hold its toolchain.
 testTrust :: IO [Bool]
 testTrust = do
   putStrLn "trust"
@@ -31363,18 +31335,18 @@ testTrust = do
       stage0ArchiveOut = trustPath 'i' "stage0-pe32-a81c837.tar.gz"
       stage0Tree = trustPath 'j' "stage0-pe32-a81c837.drv"
       stage0TreeOut = trustPath 'k' "stage0-pe32-a81c837"
-      bash = trustPath 'l' "bash-5.3.015-1-x86_64.pkg.tar.zst.drv"
-      bashOut = trustPath 'm' "bash-5.3.015-1-x86_64.pkg.tar.zst"
-      runtime = trustPath 'n' "msys2-runtime-3.6.9-2-x86_64.pkg.tar.zst.drv"
-      runtimeOut = trustPath 'p' "msys2-runtime-3.6.9-2-x86_64.pkg.tar.zst"
-      msysSeed = trustPath 'q' "msys-seed.drv"
-      msysSeedOut = trustPath 'r' "msys-seed"
-      gcc = trustPath 's' "mingw-w64-x86_64-gcc-16.1.0-5-any.pkg.tar.zst.drv"
-      gccOut = trustPath 'v' "mingw-w64-x86_64-gcc-16.1.0-5-any.pkg.tar.zst"
-      crt = trustPath 'w' "mingw-w64-x86_64-crt-14.0.0.r59.g93753750c-1-any.pkg.tar.zst.drv"
-      crtOut = trustPath 'x' "mingw-w64-x86_64-crt-14.0.0.r59.g93753750c-1-any.pkg.tar.zst"
-      mingwSeed = trustPath 'y' "mingw-w64-seed.drv"
-      mingwSeedOut = trustPath 'z' "mingw-w64-seed"
+      bash = trustPath 'l' "bash.tar.zst.drv"
+      bashOut = trustPath 'm' "bash.tar.zst"
+      runtime = trustPath 'n' "runtime.tar.zst.drv"
+      runtimeOut = trustPath 'p' "runtime.tar.zst"
+      tools = trustPath 'q' "tools.drv"
+      toolsOut = trustPath 'r' "tools"
+      gcc = trustPath 's' "gcc.tar.zst.drv"
+      gccOut = trustPath 'v' "gcc.tar.zst"
+      crt = trustPath 'w' "crt.tar.zst.drv"
+      crtOut = trustPath 'x' "crt.tar.zst"
+      toolchain = trustPath 'y' "toolchain.drv"
+      toolchainOut = trustPath 'z' "toolchain"
       helloSrc = trustPath '0' "hello-2.12.3.tar.gz.drv"
       helloSrcOut = trustPath '1' "hello-2.12.3.tar.gz"
       hello = trustPath '2' "hello.drv"
@@ -31387,7 +31359,7 @@ testTrust = do
       fetched output = trustDrv output (Just (trustHashOf output)) "builtin:fetchurl" [] []
       unpacked output inputs = trustDrv output Nothing "builtin:unpack" inputs []
       hex0Drv = trustDrv hex0Out (Just (trustHashOf seedOut)) (trustText seedOut) [seed, stage0Archive] []
-      bashExe = trustText msysSeedOut <> "/usr/bin/bash.exe"
+      bashExe = trustText toolsOut <> "/bin/bash.exe"
       graph =
         trustGraph
           [ (seed, fetched seedOut),
@@ -31397,12 +31369,12 @@ testTrust = do
             (stage0Tree, unpacked stage0TreeOut [stage0Archive]),
             (bash, fetched bashOut),
             (runtime, fetched runtimeOut),
-            (msysSeed, unpacked msysSeedOut [bash, runtime]),
+            (tools, unpacked toolsOut [bash, runtime]),
             (gcc, fetched gccOut),
             (crt, fetched crtOut),
-            (mingwSeed, unpacked mingwSeedOut [gcc, crt]),
+            (toolchain, unpacked toolchainOut [gcc, crt]),
             (helloSrc, fetched helloSrcOut),
-            (hello, trustDrv helloOut Nothing bashExe [msysSeed, mingwSeed, helloSrc] [setup]),
+            (hello, trustDrv helloOut Nothing bashExe [tools, toolchain, helloSrc] [setup]),
             (greeting, trustDrv greetingOut Nothing "/bin/sh" [] []),
             (root, trustDrv rootOut Nothing "/bin/sh" [hello, hex1, greeting] [])
           ]
@@ -31410,9 +31382,9 @@ testTrust = do
         Map.fromList
           [ (seedOut, oneCode Trust.PeImage Trust.FetchedFile),
             (stage0ArchiveOut, oneCode Trust.PeImage (Trust.ArchiveMember "stage0-pe32-a81c8374592e8e897c0863d31c6480ea69669009/bootstrap-seeds/PE32/i386/hex0-seed.exe")),
-            (bashOut, oneCode Trust.PeImage (Trust.ArchiveMember "usr/bin/bash.exe")),
-            (runtimeOut, oneCode Trust.PeImage (Trust.ArchiveMember "usr/bin/msys-2.0.dll")),
-            (gccOut, Trust.ContentFacts [Trust.FoundCode Trust.PeImage (Trust.ArchiveMember "mingw64/bin/gcc.exe")] [Trust.UnreadFile Nothing "tar archive stops reading: truncated"]),
+            (bashOut, oneCode Trust.PeImage (Trust.ArchiveMember "bin/bash.exe")),
+            (runtimeOut, oneCode Trust.PeImage (Trust.ArchiveMember "bin/runtime.dll")),
+            (gccOut, Trust.ContentFacts [Trust.FoundCode Trust.PeImage (Trust.ArchiveMember "bin/gcc.exe")] [Trust.UnreadFile Nothing "tar archive stops reading: truncated"]),
             (helloSrcOut, noCode)
           ]
       report = Trust.trustReport facts graph root
@@ -31483,13 +31455,13 @@ testTrust = do
       runTest "each fixed-output input lands in the class its facts give it" $
         assertEqual
           "classes"
-          [ ("bash-5.3.015-1-x86_64.pkg.tar.zst", Trust.RunAsBuilder),
+          [ ("bash.tar.zst", Trust.RunAsBuilder),
+            ("crt.tar.zst", Trust.NotFullyRead),
+            ("gcc.tar.zst", Trust.HoldsPrebuiltCode),
             ("hello-2.12.3.tar.gz", Trust.HoldsNoPrebuiltCode),
             ("hex0-seed.exe", Trust.RunAsBuilder),
             ("hex0.exe", Trust.RunAsBuilder),
-            ("mingw-w64-x86_64-crt-14.0.0.r59.g93753750c-1-any.pkg.tar.zst", Trust.NotFullyRead),
-            ("mingw-w64-x86_64-gcc-16.1.0-5-any.pkg.tar.zst", Trust.HoldsPrebuiltCode),
-            ("msys2-runtime-3.6.9-2-x86_64.pkg.tar.zst", Trust.RunAsBuilder),
+            ("runtime.tar.zst", Trust.RunAsBuilder),
             ("stage0-pe32-a81c837.tar.gz", Trust.HoldsPrebuiltCode)
           ]
           (trustClasses report),
@@ -31550,8 +31522,8 @@ testTrust = do
                   (stage0Archive, fetched stage0ArchiveOut),
                   (helloSrc, fetched helloSrcOut),
                   (bash, fetched bashOut),
-                  (msysSeed, unpacked msysSeedOut [bash]),
-                  (shell, trustDrv greetingOut Nothing bashExe [msysSeed] []),
+                  (tools, unpacked toolsOut [bash]),
+                  (shell, trustDrv greetingOut Nothing bashExe [tools] []),
                   (script, trustDrv helloOut Nothing (trustText setup) [] [setup]),
                   (root, trustDrv rootOut Nothing "/bin/sh" [hex1, helloSrc, shell, script] [setup])
                 ]
@@ -31560,7 +31532,7 @@ testTrust = do
                 [ (seedOut, oneCode Trust.PeImage Trust.FetchedFile),
                   (stage0ArchiveOut, codeOnly [Trust.FoundCode Trust.PeImage (Trust.ArchiveMember "stage0-pe32/bootstrap-seeds/PE32/i386/hex0-seed.exe"), Trust.FoundCode Trust.ArArchive (Trust.ArchiveMember "stage0-pe32/lib/libc.a")]),
                   (helloSrcOut, Trust.ContentFacts [] [Trust.UnreadFile Nothing "gzip stream error: truncated"]),
-                  (bashOut, oneCode Trust.PeImage (Trust.ArchiveMember "usr/bin/bash.exe"))
+                  (bashOut, oneCode Trust.PeImage (Trust.ArchiveMember "bin/bash.exe"))
                 ]
             path = storePathToText defaultStoreDir
          in assertEqual
@@ -31569,7 +31541,7 @@ testTrust = do
                 "  " <> path bashOut,
                 "    fetched by builtin:fetchurl",
                 "    in the tree of the builder of 1 derivation: " <> bytesText bashExe,
-                "    PE image: usr/bin/bash.exe",
+                "    PE image: bin/bash.exe",
                 "  " <> path seedOut,
                 "    fetched by builtin:fetchurl",
                 "    same hash as " <> path hex0Out,
@@ -31702,17 +31674,17 @@ testTrustScanIO = do
       elf = trustElf 1 3
       machO = BS.pack [0xCF, 0xFA, 0xED, 0xFE, 7, 0, 0, 1]
       nested = GZip.compress (Tar.write [tarFile "inner/x.exe" (BL.fromStrict trustPe)])
-      zstdTar = BL.toStrict (compressArchive [tarFile "usr/bin/tool" (BL.fromStrict elf)])
+      zstdTar = BL.toStrict (zstdArchive [tarFile "usr/bin/tool" (BL.fromStrict elf)])
       objectCode =
-        compressArchive
-          [ tarFile "mingw64/include/stdio.h" "int printf(const char *, ...);\n",
-            tarFile "mingw64/lib/crt2.o" (BL.fromStrict (trustCoff 0x8664)),
-            tarFile "mingw64/lib/libmingw32.a" (BL.fromStrict trustAr)
+        zstdArchive
+          [ tarFile "include/stdio.h" "int printf(const char *, ...);\n",
+            tarFile "lib/crt2.o" (BL.fromStrict (trustCoff 0x8664)),
+            tarFile "lib/libmingw32.a" (BL.fromStrict trustAr)
           ]
       skippable = BS.pack [0x50, 0x2A, 0x4D, 0x18, 4, 0, 0, 0] <> "pzst"
       write name bytes = createDirectoryIfMissing True (takeDirectory (at name)) >> BS.writeFile (at name) bytes
-      crtOut = trustPath 'x' "mingw-w64-x86_64-crt-14.0.0.r59.g93753750c-1-any.pkg.tar.zst"
-      crtDrv = trustPath 'w' "mingw-w64-x86_64-crt-14.0.0.r59.g93753750c-1-any.pkg.tar.zst.drv"
+      crtOut = trustPath 'x' "crt.tar.zst"
+      crtDrv = trustPath 'w' "crt.tar.zst.drv"
       crtGraph = trustGraph [(crtDrv, trustDrv crtOut (Just (trustHashOf crtOut)) "builtin:fetchurl" [] [])]
   bracket_
     ( do
@@ -31725,7 +31697,7 @@ testTrustScanIO = do
         write "package.tar.xz" trustXzArchive
         write "package.tar.bz2" trustBzip2Archive
         write "plain.tar" (BL.toStrict archive)
-        write "crt.pkg.tar.zst" (BL.toStrict objectCode)
+        write "crt.tar.zst" (BL.toStrict objectCode)
         write "library.txt" trustAr
         write "nested.tar.gz" (BL.toStrict (GZip.compress (Tar.write [tarFile "outer/inner.tar.gz" nested])))
         write "corrupt.tar.gz" (BS.pack [0x1F, 0x8B, 0x08] <> "not a deflate stream")
@@ -31741,7 +31713,7 @@ testTrustScanIO = do
     )
     (forceRemoveIfExists root)
     $ do
-      results <- traverse (scanFetched . at) ["seed.txt", "script.exe", "source.exe", "package.tar.gz", "skippable.tar.zst", "package.tar.xz", "package.tar.bz2", "plain.tar", "crt.pkg.tar.zst", "library.txt", "nested.tar.gz", "corrupt.tar.gz", "notes.bz2", "tools.tar", "tree", "linked"]
+      results <- traverse (scanFetched . at) ["seed.txt", "script.exe", "source.exe", "package.tar.gz", "skippable.tar.zst", "package.tar.xz", "package.tar.bz2", "plain.tar", "crt.tar.zst", "library.txt", "nested.tar.gz", "corrupt.tar.gz", "notes.bz2", "tools.tar", "tree", "linked"]
       case results of
         [seedFacts, scriptFacts, sourceFacts, zstdFacts, skippableFacts, xzFacts, bzip2Facts, plainFacts, crtFacts, libraryFacts, nestedFacts, corruptFacts, notesFacts, zipFacts, treeFacts, linkedFacts] ->
           sequence
@@ -31760,7 +31732,7 @@ testTrustScanIO = do
               runTest "an uncompressed tar archive is opened" $
                 assertEqual "plain" (oneCode Trust.PeImage (member "pkg/bin/tool.exe")) plainFacts,
               runTest "a package of an object and a static library holds prebuilt code, both named" $
-                assertEqual "crt" (codeOnly [Trust.FoundCode Trust.CoffObject (member "mingw64/lib/crt2.o"), Trust.FoundCode Trust.ArArchive (member "mingw64/lib/libmingw32.a")]) crtFacts
+                assertEqual "crt" (codeOnly [Trust.FoundCode Trust.CoffObject (member "lib/crt2.o"), Trust.FoundCode Trust.ArArchive (member "lib/libmingw32.a")]) crtFacts
                   `andThen` assertEqual
                     "class"
                     [Trust.HoldsPrebuiltCode]
@@ -38743,27 +38715,22 @@ testInterruptsPropagate = do
               config = defaultBuildConfig storeDir
           outcome <- withStalledFifo (inStore input) (interruptedAfterStall (buildWithDeps config store rootDrv (StorePath (T.replicate 32 "h") "root.drv")))
           pure (interruptPropagated outcome),
-        -- The failures the unpacker does catch: the zstd decoder reports a
-        -- corrupt frame with 'error', the gzip decoder throws a
+        -- The failures the unpacker does catch: the gzip decoder throws a
         -- DecompressError, and a missing archive is an IOException.  Each
         -- is the archive's failure, not an escape.
-        runTestM "a corrupt zstd or gzip archive and a missing one fail the unpack" $ do
-          let corrupt = StorePath (T.replicate 32 "i") "corrupt.tar.zst"
-              corruptGzip = StorePath (T.replicate 32 "k") "corrupt.tar.gz"
+        runTestM "a corrupt gzip archive and a missing one fail the unpack" $ do
+          let corruptGzip = StorePath (T.replicate 32 "k") "corrupt.tar.gz"
               missing = StorePath (T.replicate 32 "j") "missing.tar"
-          BS.writeFile (inStore corrupt) "not a zstd frame"
           BS.writeFile (inStore corruptGzip) "not a gzip stream"
-          corruptOutcome <- runBuiltinUnpack storeDir defaultUnpackLimits (unpacking corrupt) [("out", root </> "corrupt-out")]
           corruptGzipOutcome <- runBuiltinUnpack storeDir defaultUnpackLimits (unpacking corruptGzip) [("out", root </> "corrupt-gzip-out")]
           missingOutcome <- runBuiltinUnpack storeDir defaultUnpackLimits (unpacking missing) [("out", root </> "missing-out")]
-          pure $ case (corruptOutcome, corruptGzipOutcome, missingOutcome) of
-            (Left (1, corruptMsg), Left (1, corruptGzipMsg), Left (1, missingMsg))
-              | "corrupt.tar.zst" `T.isInfixOf` corruptMsg
-                  && "corrupt.tar.gz" `T.isInfixOf` corruptGzipMsg
+          pure $ case (corruptGzipOutcome, missingOutcome) of
+            (Left (1, corruptGzipMsg), Left (1, missingMsg))
+              | "corrupt.tar.gz" `T.isInfixOf` corruptGzipMsg
                   && not ("unsupported archive format" `T.isInfixOf` corruptGzipMsg)
                   && "missing.tar" `T.isInfixOf` missingMsg ->
                   Pass
-            other -> Fail ("expected all three unpacks to fail: " <> T.pack (show other))
+            other -> Fail ("expected both unpacks to fail: " <> T.pack (show other))
       ]
   forceRemoveIfExists root
   pure results

@@ -7,10 +7,10 @@
 # libstdc++, configured, compiled and installed in the seed stdenv by
 # gcc-x86_64 and binutils-x86_64, with the programs the build runs itself
 # compiled by gcc-latest, against MinGW-w64 v14.0.0's headers and the
-# runtime gcc-core-x86_64 compiled.  It runs as gcc and g++, as the GCC
-# from MSYS2 that the stage-1 stdenv runs does (pkgs/windows/bootstrap/
-# seed.nix, pkgs/windows/stdenv/cc-wrapper.sh), and its assembler and
-# linker are binutils-native-x86_64's.
+# runtime gcc-core-x86_64 compiled.  It runs as gcc and g++, the drivers
+# the stage-2 stdenv's compiler wrappers run
+# (pkgs/windows/stage2-stdenv/wrap.sh), and its assembler and linker are
+# binutils-native-x86_64's.
 #
 # The build is a Canadian cross, as binutils-native-x86_64's is: the
 # stdenv's i686-pc-mingw32 is the build, and x86_64-w64-mingw32 the host
@@ -88,28 +88,17 @@
 # binutils 2.46).
 #
 # The thread model is win32 and libgcc and libstdc++ are static, as in
-# gcc-x86_64, decided from what the stage-1 stdenv's toolchain provides,
-# what its packages rely on and what nixpkgs does.  The GCC MSYS2 builds,
-# which that
-# stdenv runs, has the posix thread model and shared runtime libraries:
-# gcc -v of mingw-w64-x86_64-gcc-16.1.0-5 prints --enable-threads=posix
-# --enable-shared --enable-static, and its libstdc++-6.dll and
-# libgcc_s_seh-1.dll import libwinpthread-1.dll, as do its gcc.exe and
-# cc1.exe.  The stdenv puts that toolchain's bin on PATH and copies each
-# DLL an output imports from it beside the output
-# (pkgs/windows/stdenv/setup.sh).  Its packages rely on neither the model
-# nor the DLLs: hello, sed, zlib, libgreet, greeter and zdemo are C, which
-# the driver links with the static libgcc even where a shared one exists
-# (gcc/config/mingw/mingw32.h:183-197), and of the DLLs that are not
-# Windows' own, GNU Hello, which CI's E2E (Windows) job builds with that
-# stdenv, imports libiconv-2.dll and libintl-8.dll alone, the two its
-# fixup copies, though its configure finds winpthreads' pthread.h.
-# nixpkgs passes a thread model only to a GCC whose host is not its target
-# (configure-flags.nix:110-117, applied at 252), so its GCC whose host is
-# its target takes the target's default, win32 (gcc/config.gcc:2360-2366),
-# though the thread library it gives a MinGW-w64 target is mcfgthreads
-# (all-packages.nix:5371-5379); and it makes libgcc and libstdc++ shared
-# on a target with shared libraries (default.nix:21).
+# gcc-x86_64, decided from what the package set's packages rely on and
+# what nixpkgs does.  The packages need neither the posix thread model
+# nor a DLL of GCC's: hello, sed, zlib, libgreet, greeter and zdemo are C,
+# which the driver links with the static libgcc even where a shared one
+# exists (gcc/config/mingw/mingw32.h:183-197).  nixpkgs passes a thread model
+# only to a GCC whose host is not its target (configure-flags.nix:110-117,
+# applied at 252), so its GCC whose host is its target takes the target's
+# default, win32 (gcc/config.gcc:2360-2366), though the thread library it
+# gives a MinGW-w64 target is mcfgthreads (all-packages.nix:5371-5379);
+# and it makes libgcc and libstdc++ shared on a target with shared
+# libraries (default.nix:21).
 # --enable-threads=win32 names that model, which needs no library the
 # ladder does not build, and under which libstdc++ has std::thread since
 # mingw-w64-headers-latest names Windows 10
