@@ -4,31 +4,30 @@
 -- store.
 --
 -- Upstream gives every file of a path it adds one form
--- (@canonicalisePathMetaData@, posix-fs-canonicalise.cc:17-174 at
--- 2.24.9, and @setWriteTime@, file-system.cc:571-625): a
--- file or directory whose mode is anything but @0444@ or @0555@ is set
--- to @0444@, or @0555@ when its owner may execute it, which drops the
--- write, setuid, setgid and sticky bits; every node's modification time
--- is set to 1, a second past the epoch, a symlink's own included,
--- through @lutimes@, while its access time keeps its whole seconds; and
--- a node another user owns is given to the process's effective user and
--- group.  A symlink's mode is never changed, and a node that is not a
--- regular file, a directory or a symlink fails the path.  A builder
--- reading the path, and every user on the machine, then sees the same
--- tree whatever wrote it.  The executable flag a NAR records is the
--- owner's execute bit, which the canonical mode keeps, so a path's NAR
--- hash is the same before and after.
+-- (@canonicalisePathMetaData@ in posix-fs-canonicalise.cc and
+-- @setWriteTime@ in file-system.cc, at 2.24.9): a file or directory whose
+-- mode is anything but @0444@ or @0555@ is set to @0444@, or @0555@ when
+-- its owner may execute it, which drops the write, setuid, setgid and
+-- sticky bits; every node's modification time is set to 1, a second past
+-- the epoch, a symlink's own included, through @lutimes@, while its access
+-- time keeps its whole seconds; and a node another user owns is given to
+-- the process's effective user and group.  A symlink's mode is never
+-- changed, and a node that is not a regular file, a directory or a symlink
+-- fails the path.  A builder reading the path, and every user on the
+-- machine, then sees the same tree whatever wrote it.  The executable flag
+-- a NAR records is the owner's execute bit, which the canonical mode
+-- keeps, so a path's NAR hash is the same before and after.
 --
 -- On Linux a node's extended attributes, its ACLs among them, are removed
--- first, as upstream removes them (posix-fs-canonicalise.cc:71-91), but
--- for those upstream's @ignored-acls@ names by default,
--- @security.selinux@, @system.nfs4_acl@ and @security.csm@, which nova-nix
--- does not read as a setting: a default ACL would otherwise leave what is
--- made beneath a directory writable by others whatever its mode says.
+-- first, as upstream removes them (@canonicalisePathMetaData_@ in
+-- posix-fs-canonicalise.cc), but for those upstream's @ignored-acls@ names by
+-- default, @security.selinux@, @system.nfs4_acl@ and @security.csm@, which
+-- nova-nix does not read as a setting: a default ACL would otherwise leave
+-- what is made beneath a directory writable by others whatever its mode says.
 -- Upstream also clears a node's file flags on macOS (@lchflags@), which
 -- nova-nix does not.  Upstream's remaining check needs build users, which
--- nova-nix does not have: it runs a build as a user from a range and
--- fails one whose output holds a node that user does not own.
+-- nova-nix does not have: it runs a build as a user from a range and fails
+-- one whose output holds a node that user does not own.
 --
 -- On Windows, where upstream sets no times and has no modes, every file
 -- and directory is given the read-only attribute and the same
@@ -175,8 +174,7 @@ data MetadataChange
 
 -- | The changes that make one node canonical, none for a node that
 -- already is (@canonicalisePathMetaData_@ and
--- @canonicaliseTimestampAndPermissions@, posix-fs-canonicalise.cc:17-41
--- and :112-133 at 2.24.9).
+-- @canonicaliseTimestampAndPermissions@ in posix-fs-canonicalise.cc).
 metadataChanges :: NodeMetadata -> [MetadataChange]
 metadataChanges node = permissions <> time <> ownership
   where
@@ -210,7 +208,7 @@ ownerExecuteBit :: Int
 ownerExecuteBit = 6
 
 -- | Every store node's modification time, in seconds since the epoch:
--- upstream's @mtimeStore@ (posix-fs-canonicalise.cc:14 at 2.24.9).
+-- upstream's @mtimeStore@ in posix-fs-canonicalise.cc.
 storeModificationTime :: Int64
 storeModificationTime = 1
 
@@ -226,34 +224,36 @@ canonicalizeMetadata :: FilePath -> IO ()
 -- | Whether a node is a regular file its owner may not execute, read
 -- without following a symlink: what upstream requires of an output with
 -- a flat hash, a node whose @lstat@ has @S_ISREG@ and no @S_IXUSR@
--- (@registerOutputs@, local-derivation-goal.cc:2326 and :2501-2507 at
--- 2.24.9).  On Windows, which has no mode, the owner may execute a file
--- that carries the exec stream ("Nix.Store.ExecBit").  A node that is
--- not there fails with the 'Control.Exception.IOException' raised.
+-- (@registerOutputs@ in local-derivation-goal.cc at 2.24.9,
+-- derivation-builder-impl.cc at 2.36.0).  On Windows, which has no mode, the
+-- owner may execute a file that carries the exec stream
+-- ("Nix.Store.ExecBit").  A node that is not there fails with the
+-- 'Control.Exception.IOException' raised.
 isPlainFile :: FilePath -> IO Bool
 
 -- | Whether a node lets its group or anyone else write it, read without
 -- following a symlink, which is never writable: upstream's test of a
 -- build's output before it makes the output canonical, since such a node
 -- may have been changed by someone other than the build
--- (@registerOutputs@, local-derivation-goal.cc:2333-2343 at 2.24.9).
--- Windows has no such mode, and no node there is.
+-- (@registerOutputs@ in local-derivation-goal.cc at 2.24.9,
+-- derivation-builder-impl.cc at 2.36.0).  Windows has no such mode, and no
+-- node there is.
 writableByOthers :: FilePath -> IO Bool
 
 -- | The first node of a tree that the process's effective user does not
 -- own, read without following a symlink, the root first and a directory
 -- before its entries, or nothing when the user owns them all.  Upstream
 -- refuses such a node in a build's output, @invalid ownership on file@
--- (posix-fs-canonicalise.cc:95-107 at 2.24.9), where it builds as a
--- build user: it may be a hard link to a file the output has no business
--- changing, which making the output canonical would change.  A directory
--- the user owns is given read and search for its owner before it is
--- listed, so one a builder closed is read rather than refused.  That is
--- a divergence: upstream makes such a directory canonical first, at 0444
--- for one its owner may not search, and a single-user build of it, not
--- run as root, then fails to read beneath it; here it ends at 0555, since
--- a process that is not root can read a directory only with search on it.
--- Windows has no owner to compare, and finds none.
+-- (@canonicalisePathMetaData_@ in posix-fs-canonicalise.cc), where it builds
+-- as a build user: it may be a hard link to a file the output has no business
+-- changing, which making the output canonical would change.  A directory the
+-- user owns is given read and search for its owner before it is listed, so
+-- one a builder closed is read rather than refused.  That is a divergence:
+-- upstream makes such a directory canonical first, at 0444 for one its owner
+-- may not search, and a single-user build of it, not run as root, then fails
+-- to read beneath it; here it ends at 0555, since a process that is not root
+-- can read a directory only with search on it.  Windows has no owner to
+-- compare, and finds none.
 foreignOwnedNode :: FilePath -> IO (Maybe FilePath)
 
 #if defined(mingw32_HOST_OS)
@@ -350,8 +350,9 @@ foreignOwnedNode root = do
 
 -- | Remove a node's extended attributes, read without following a link,
 -- but for those upstream ignores by default, as
--- upstream removes them (posix-fs-canonicalise.cc:71-91 at 2.24.9).  A
--- filesystem that keeps none is no error.  Linux only, as upstream's is.
+-- upstream removes them (@canonicalisePathMetaData_@ in
+-- posix-fs-canonicalise.cc).  A filesystem that keeps none is no error.
+-- Linux only, as upstream's is.
 removeExtendedAttributes :: FilePath -> IO ()
 #if defined(linux_HOST_OS)
 removeExtendedAttributes path = do
@@ -371,7 +372,8 @@ removeExtendedAttributes path = do
               throwErrnoPathIfMinus1_ "removing extended attribute" path (c_lremovexattr cpath cname)
 
 -- | The attributes upstream's @ignored-acls@ keeps by default, which even
--- root may be unable to remove (globals.hh:1092-1099 at 2.24.9).
+-- root may be unable to remove (@ignoredAcls@ in globals.hh at 2.24.9,
+-- local-settings.hh from 2.34.9).
 keptAttributes :: [BS.ByteString]
 keptAttributes = ["security.selinux", "system.nfs4_acl", "security.csm"]
 

@@ -100,7 +100,7 @@ data EvalPolicy = EvalPolicy
 
 -- | What upstream's @allow-import-from-derivation@ and
 -- @trace-import-from-derivation@ settings say together
--- (eval-settings.hh:196-218 at 2.34.9): the second has no effect when the
+-- (eval-settings.hh at 2.34.9): the second has no effect when the
 -- first is off, so the three cases are all there are.
 data ImportFromDerivation
   = -- | @allow-import-from-derivation = false@: a context that names an

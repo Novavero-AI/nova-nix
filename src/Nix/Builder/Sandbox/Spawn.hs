@@ -25,11 +25,13 @@
 -- == Process state
 --
 -- Upstream probes the namespaces once per process and keeps the answer
--- (namespaces.cc:18 and 63 at 2.24.9, function statics).  The answer here
--- is kept in one process-wide cell ('probeCache'), with whether the
--- fallback warning was printed: both describe this process and this
--- system, not a build, and asking again for every derivation of a closure
--- would run the probe and print the warning once per derivation.
+-- (function statics in @userNamespacesSupported@ and
+-- @mountAndPidNamespacesSupported@, namespaces.cc at 2.24.9 and
+-- linux-namespaces.cc at 2.36.0).  The answer here is kept in one
+-- process-wide cell ('probeCache'), with whether the fallback warning was
+-- printed: both describe this process and this system, not a build, and
+-- asking again for every derivation of a closure would run the probe and
+-- print the warning once per derivation.
 module Nix.Builder.Sandbox.Spawn
   ( -- * Availability
     sandboxSupported,
@@ -244,7 +246,7 @@ helperProbeVerb = "probe"
 -- | Where the chroot of a build whose directory is given lives: beside it,
 -- in the store's state directory, so the outputs written inside move into
 -- the store by a rename, as upstream's chroot sits in the store
--- (LDG 692).
+-- (@startBuilder@ in local-derivation-goal.cc at 2.24.9).
 chrootDirFor :: FilePath -> FilePath
 chrootDirFor buildDir = buildDir <> ".chroot"
 

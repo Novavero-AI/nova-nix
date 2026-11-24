@@ -3,7 +3,7 @@
 
 -- | The tree a user environment is: every package's files linked into one
 -- directory, as upstream's @buildProfile@ makes it
--- (builtins\/buildenv.cc:31-171 at 2.35.4), the output of
+-- (builtins\/buildenv.cc), the output of
 -- @builtin:buildenv@ ("Nix.Builder.Buildenv").
 --
 -- Packages are taken in order of priority, where a lower number wins,
@@ -182,7 +182,8 @@ storePackagePath storeDir bytes = case TE.decodeUtf8' bytes of
 
 -- | The tokens of a @propagated-user-env-packages@ file: what lies between
 -- spaces and newlines, with the empty ones dropped, as upstream's
--- @tokenizeString(contents, " \\n")@ gives them (buildenv.cc:136-137).
+-- @tokenizeString(contents, " \\n")@ gives them (@buildProfile@ in
+-- buildenv.cc).
 propagatedTokens :: ByteString -> [ByteString]
 propagatedTokens = filter (not . BS.null) . BS8.splitWith (\c -> c == ' ' || c == '\n')
 
@@ -296,10 +297,10 @@ data Built = Built
 
 -- | Something left out of the tree, with a warning.
 data Warning
-  = -- | A package that is not a directory (buildenv.cc:40-42).
+  = -- | A package that is not a directory (@createLinks@ in buildenv.cc).
     NotIncluded !OsPath
   | -- | An entry whose link leads nowhere, by the path it would have had
-    -- in the tree (buildenv.cc:56-60).
+    -- in the tree (@createLinks@ in buildenv.cc).
     DanglingLink !OsPath
   deriving (Eq, Show)
 
@@ -307,25 +308,27 @@ data Warning
 data BuildEnvFailure
   = -- | Two files at one path with the same priority: what the link there
     -- already names, the file that came second, and their priority
-    -- (buildenv.hh:36-48).
+    -- (@BuildEnvFileConflictError@ in buildenv.hh).
     FileConflict !OsPath !OsPath !Int
   | -- | A directory where a link to something other than a directory
     -- stands: the directory and what the link resolves to
-    -- (buildenv.cc:82-84).
+    -- (@createLinks@ in buildenv.cc).
     LinkToNonDirectory !OsPath !OsPath
   | -- | A file where a directory of the tree's own stands: the file and the
-    -- directory's path in the tree (buildenv.cc:113-114).
+    -- directory's path in the tree (@createLinks@ in buildenv.cc).
     FileOverDirectory !OsPath !OsPath
   | -- | A package could not be read.
     ReadFailed !ReadFailure
   deriving (Eq, Show)
 
--- | The first priority a propagated package takes (buildenv.cc:162).
+-- | The first priority a propagated package takes (@buildProfile@ in
+-- buildenv.cc).
 firstPropagatedPriority :: Int
 firstPropagatedPriority = 1000
 
 -- | The names upstream keeps out of profiles wherever they are, as useless
--- or as files every package of a kind brings (buildenv.cc:63-72).
+-- or as files every package of a kind brings (@createLinks@ in
+-- buildenv.cc).
 leftOutNames :: [OsPath]
 leftOutNames =
   map
@@ -378,7 +381,8 @@ pathKey :: OsPath -> [OsPath]
 pathKey = OP.splitDirectories
 
 -- | Add a package not added already: link its entries in, then queue the
--- packages it propagates that are not added (buildenv.cc:130-144).
+-- packages it propagates that are not added (@buildProfile@ in
+-- buildenv.cc).
 addPackage :: (Monad m) => TreeReader m -> OsPath -> Progress -> OsPath -> Int -> Building m Progress
 addPackage reader out progress path priority
   | Set.member key (progressDone progress) = pure progress
@@ -397,7 +401,7 @@ addPackage reader out progress path priority
 -- | Add the queued propagated packages, round by round, each at the next
 -- priority in path order.  A package added since it was queued is passed
 -- over but still takes its number, as upstream's counter counts it
--- (buildenv.cc:162-168).
+-- (@buildProfile@ in buildenv.cc).
 propagate :: (Monad m) => TreeReader m -> OsPath -> Int -> Progress -> Building m Tree
 propagate reader out priority progress
   | Map.null (progressQueued progress) = pure (progressTree progress)
@@ -408,8 +412,8 @@ propagate reader out priority progress
     step (current, !numbered) path = (,numbered + 1) <$> addPackage reader out current path numbered
 
 -- | Link the entries of the directory @srcDir@ into the tree's directory
--- @tree@, which is at @dstDir@ (upstream's @createLinks@,
--- buildenv.cc:31-122).
+-- @tree@, which is at @dstDir@ (upstream's @createLinks@ in
+-- buildenv.cc).
 linkInto :: (Monad m) => TreeReader m -> OsPath -> OsPath -> Int -> Tree -> Building m Tree
 linkInto reader srcDir dstDir priority tree = do
   listing <- readStep (trEntries reader srcDir)
@@ -459,7 +463,8 @@ isHidden name = case OP.unpack name of
   [] -> False
 
 -- | Whether upstream keeps an entry of @srcDir@ out of profiles: its path
--- ends in one of 'leftOutNames', or in @info\/dir@ (buildenv.cc:69-72).
+-- ends in one of 'leftOutNames', or in @info\/dir@ (@createLinks@ in
+-- buildenv.cc).
 isLeftOut :: OsPath -> OsPath -> Bool
 isLeftOut srcDir name =
   name `elem` leftOutNames
@@ -492,7 +497,7 @@ buildEnvFailureText failure = case failure of
   ReadFailed (ReadFailure reason) -> reason
 
 -- | A path as upstream's @PathFmt@ prints it, in double quotes
--- (fmt.hh:135-138 at 2.35.4).
+-- (its @operator\<\<@ in fmt.hh).
 quoted :: OsPath -> Text
 quoted path = "\"" <> hostPathText path <> "\""
 

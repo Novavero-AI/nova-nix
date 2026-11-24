@@ -240,7 +240,7 @@ nixCompare _ left right
 -- | Lexicographic comparison of two thunk lists for the @<@ operator:
 -- the first NON-EQUAL element pair decides via @<@ on that pair, as
 -- upstream does (eqValues, then CompareValues on the first difference,
--- primops.cc:617 at 2.24.9).  An unequal pair where @<@ holds in neither
+-- in primops.cc).  An unequal pair where @<@ holds in neither
 -- direction (NaN) therefore decides False rather than being skipped as
 -- equal.  A proper prefix is less than the longer list.  Mirrors
 -- 'listEqual'.
@@ -277,9 +277,9 @@ nixEqual forceFn (VList clA) (VList clB) = do
       as <- map Thunk <$> clistThunks clA
       bs <- map Thunk <$> clistThunks clB
       listEqual forceFn as bs
--- Upstream's @eqValues@ on two sets (eval.cc:2763-2782 at 2.24.9): two
--- derivations by their outPaths, then sets of different sizes unequal
--- with no value forced, then 'attrsEqual'.
+-- Upstream's @eqValues@ on two sets (eval.cc): two derivations by their
+-- outPaths, then sets of different sizes unequal with no value forced, then
+-- 'attrsEqual'.
 nixEqual forceFn (VAttrs as) (VAttrs bs) = do
   drvOutPaths <- derivationOutPathPair forceFn as bs
   case drvOutPaths of
@@ -290,8 +290,8 @@ nixEqual forceFn (VAttrs as) (VAttrs bs) = do
       if sizeA /= sizeB then pure False else attrsEqual forceFn as bs
 nixEqual _ _ _ = pure False
 
--- | Upstream's walk over two sets of one size (eval.cc:2776-2781 at
--- 2.24.9): both in symbol order, each pair's names compared and then its
+-- | Upstream's walk over two sets of one size (@eqValues@ in eval.cc):
+-- both in symbol order, each pair's names compared and then its
 -- values, stopping at the first difference, so no value past it is forced
 -- ('attrSetAllPairs').  Upstream's @Bindings@ are sorted by @Symbol@,
 -- whose id is the order its table interned the name in (attr-set.hh and
@@ -353,9 +353,9 @@ listEqual forceFn (a : as) (b : bs) = do
   if eq then listEqual forceFn as bs else pure False
 listEqual _ _ _ = pure False
 
--- | Upstream's @eqValues@ on two thunks (eval.cc:2719-2727 at 2.24.9):
--- both are forced, the left first, before one is taken as equal to
--- itself, so an error in a value both sides share surfaces.
+-- | Upstream's @eqValues@ on two thunks (eval.cc): both are forced, the left
+-- first, before one is taken as equal to itself, so an error in a value both
+-- sides share surfaces.
 thunkPairEqual :: (MonadEval m) => Force m -> (Thunk, Thunk) -> m Bool
 thunkPairEqual forceFn (a, b) = do
   va <- forceFn a
@@ -395,18 +395,18 @@ evalUpdate evalLeft evalRight = evalUpdateChain (evalLeft :| [evalRight])
 -- Each operand is evaluated and checked for a set in turn, last to
 -- first, as the update queue of 2.34 and later gathers a chain: each
 -- update evaluates its right operand and then its left, through
--- @evalAttrs@ (@evalForUpdate@, eval.cc:2014-2025 at 2.34.9, the same at
--- 2.35.4).  A non-set fails before an operand before it is evaluated at
--- all, and the refusal is @evalAttrs@'s message.  2.24.9 evaluates and
--- checks the left operand first; the newest pinned release is followed.
--- Upstream adds a trace line naming the operand ("in the left operand of
--- the update (//) operator") above the message; nova-nix's errors carry
--- no trace, so only the final line is reproduced.
+-- @evalAttrs@ (@ExprOpUpdate::evalForUpdate@ in eval.cc at 2.34.9).  A
+-- non-set fails before an operand before it is evaluated at all, and the
+-- refusal is @evalAttrs@'s message.  2.24.9 evaluates and checks the left
+-- operand first; the newest pinned release is followed.  Upstream adds a
+-- trace line naming the operand ("in the left operand of the update (//)
+-- operator") above the message; nova-nix's errors carry no trace, so only
+-- the final line is reproduced.
 --
 -- Once every operand is a set, the sets are merged from the first, each
 -- into the result of those before it, as the update queue folds a chain
 -- from its leftmost operand once it has evaluated them all
--- (eval.cc:1991-2005 at 2.34.9): each small operand layers on the sets
+-- (@ExprOpUpdate::eval@ in eval.cc): each small operand layers on the sets
 -- before it ('mergeAttrSets'), and a chain one of whose operands fails
 -- merges none.
 evalUpdateChain :: (MonadEval m) => NonEmpty (m NixValue) -> m NixValue
@@ -420,16 +420,16 @@ evalUpdateChain operands = do
 
 -- | Merge two t'AttrSet's, right-biased (@//@).  An empty operand gives
 -- the other operand's set itself, the left checked first, as upstream's
--- @ExprOpUpdate::eval@ copies the other operand's @Value@ (eval.cc:1908-1909
--- at 2.24.9): no set is made, and a printer, which enters a set by its
--- bindings, finds the operand's.  Otherwise C-side @nn_attrset_update@
--- makes the set as upstream 2.34 does: a layer on the left holding the
--- right's entries alone when the right is small and the left's chain of
--- layers short, else a merge of the two into a new set, O(n+m)
+-- @ExprOpUpdate::eval@ copies the other operand's @Value@ (eval.cc): no set
+-- is made, and a printer, which enters a set by its bindings, finds the
+-- operand's.  Otherwise C-side @nn_attrset_update@ makes the set as
+-- upstream 2.34 does: a layer on the left holding the right's entries alone
+-- when the right is small and the left's chain of layers short, else a
+-- merge of the two into a new set, O(n+m)
 -- ('Nix.Eval.CAttrSet.cattrsetUpdate').  The census counts the entries
 -- either copies, as upstream adds them to @nrOpUpdateValuesCopied@
--- (eval.cc:1944-1988 at 2.34.9).  An empty operand copies and counts
--- nothing in either.
+-- (@ExprOpUpdate::eval@ in eval.cc at 2.34.9).  An empty operand copies and
+-- counts nothing in either.
 mergeAttrSets :: (MonadCData m) => AttrSet -> AttrSet -> m AttrSet
 mergeAttrSets left@(AttrSet a) right@(AttrSet b) = do
   leftSize <- attrSetSize left

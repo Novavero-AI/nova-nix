@@ -7,8 +7,8 @@
 -- A build directory is under the store's state directory, in
 -- @.nova-nix\/builds@, where upstream's has been by default since 2.30.0
 -- (@stateDir + "\/builds"@ in @LocalBuildStoreConfig::getBuildDir@,
--- local-store.cc:80-88).  At 2.24.9 upstream roots it at @TMPDIR@, which
--- on Linux is usually @\/tmp@, where any local user can create the name a
+-- local-store.cc).  At 2.24.9 upstream roots it at @TMPDIR@, which on
+-- Linux is usually @\/tmp@, where any local user can create the name a
 -- build is about to take.  Whoever can write the state directory can
 -- already rewrite the store's database there, so a build directory under
 -- it is open to no one the store is not.  A store has its own state
@@ -32,9 +32,9 @@
 -- ('OwnerAccess'), so other users can neither read what the build
 -- unpacks nor change it while it runs.  On POSIX it is created with mode
 -- 0700, as upstream's @createTempDir@ makes its build directories
--- (file-system.cc:499-531 at 2.24.9).  On Windows it is created with a
--- protected access control list granting that user alone full control,
--- which what the build makes in it inherits ("Nix.Store.Access").
+-- (file-system.cc).  On Windows it is created with a protected access control
+-- list granting that user alone full control, which what the build makes in
+-- it inherits ("Nix.Store.Access").
 module Nix.Builder.BuildDir
   ( -- * The directory
     buildDirFor,
@@ -68,10 +68,10 @@ buildDirFor dir firstOutput =
 
 -- | Where in its build directory a sandboxed build's own directory is,
 -- the one bound where the builder sees it, as upstream puts its @tmpDir@
--- at @topTmpDir + "/build"@ in a chroot build (local-derivation-goal.cc:
--- 505-524 at 2.24.9).  The builder owns what it sees and can open it to
--- anyone; the build directory above it, which it cannot reach, stays
--- closed to every other user.
+-- at @topTmpDir + "/build"@ in a chroot build (@startBuilder@ in
+-- local-derivation-goal.cc at 2.24.9).  The builder owns what it sees and can
+-- open it to anyone; the build directory above it, which it cannot reach,
+-- stays closed to every other user.
 sandboxedBuildDir :: FilePath -> FilePath
 sandboxedBuildDir dir = dir </> "build"
 

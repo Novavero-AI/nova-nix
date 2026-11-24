@@ -3,9 +3,9 @@
 -- | The default of upstream's @cores@ setting, which a builder's
 -- @NIX_BUILD_CORES@ carries when no source sets it: the CPU limit of the
 -- process's cgroup on Linux, otherwise the machine's hardware threads
--- (@Settings::getDefaultCores@, globals.cc:172 at Nix 2.24.9).
+-- (@Settings::getDefaultCores@ in globals.cc).
 --
--- The limit is upstream's @getMaxCPU@ (current-process.cc:28): the
+-- The limit is upstream's @getMaxCPU@ in current-process.cc: the
 -- @cpu.max@ of the process's cgroup v2 group, under the first @cgroup2@
 -- mount, as its quota over its period rounded up.  A file upstream cannot
 -- read, or a line it cannot parse, gives 0 there, which is no limit, and

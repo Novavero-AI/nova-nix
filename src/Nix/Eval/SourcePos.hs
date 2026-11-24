@@ -7,12 +7,11 @@
 -- index of its path among the code's strings ('noFile' for text with no
 -- file behind it), its line and its column.  The path is a string and not
 -- a symbol, as upstream keeps a file in a position's origin and not in its
--- symbol table (@PosTable::Origin@, pos-table.hh:15-38 at 2.24.9).
--- Its index is one past the record's offset, so 0 is free to mean no
--- position, the bias upstream's @PosIdx@ carries for the same reason
--- (@noPos@ in pos-idx.hh, @PosTable::add@ in pos-table.hh, at 2.24.9).
--- The record lives as long as the bytecode that refers to it, and is
--- never written again.
+-- symbol table (@PosTable::Origin@ in pos-table.hh).  Its index is one
+-- past the record's offset, so 0 is free to mean no position, the bias
+-- upstream's @PosIdx@ carries for the same reason (@noPos@ in pos-idx.hh,
+-- @PosTable::add@ in pos-table.hh, at 2.24.9).  The record lives as long
+-- as the bytecode that refers to it, and is never written again.
 module Nix.Eval.SourcePos
   ( -- * Indices
     PosIdx (..),
@@ -115,13 +114,12 @@ lookupPos (PosIdx idx) = do
       else (\path -> PosInFile path line column) <$> cbcStringText (file - 1)
 
 -- | A position as upstream's messages write one, @Pos::print@ with its
--- origin (position.cc:69-83 at 2.24.9): its origin, then a colon and its
--- line, then a colon and its column unless that is 0.  The origin of a
--- position in a file is the file's path, as upstream shows a file it
--- reads from the filesystem, and of one in text with no file behind it,
--- such as an @--expr@ string, @string@ in guillemets, upstream's
--- @Pos::String@.  'noPos' is upstream's empty @Pos@, at line 0 of @none@
--- in guillemets.
+-- origin (position.cc): its origin, then a colon and its line, then a
+-- colon and its column unless that is 0.  The origin of a position in a
+-- file is the file's path, as upstream shows a file it reads from the
+-- filesystem, and of one in text with no file behind it, such as an
+-- @--expr@ string, @string@ in guillemets, upstream's @Pos::String@.
+-- 'noPos' is upstream's empty @Pos@, at line 0 of @none@ in guillemets.
 printPos :: (MonadCData m) => PosIdx -> m Text
 printPos idx = written <$> lookupPos idx
   where
@@ -134,13 +132,13 @@ printPos idx = written <$> lookupPos idx
     columnPart column = ":" <> T.pack (show column)
 
 -- | The origin upstream writes for a position in text with no file behind
--- it, such as an @--expr@ string (@Pos::String@, position.cc:75 at
--- 2.24.9), in guillemets (U+00AB, U+00BB) written as escapes to keep the
--- source ASCII.
+-- it, such as an @--expr@ string (@Pos::String@ in @Pos::print@,
+-- position.cc), in guillemets (U+00AB, U+00BB) written as escapes to keep
+-- the source ASCII.
 stringOrigin :: Text
 stringOrigin = "\x00ABstring\x00BB"
 
--- | The origin upstream writes for a position with none (position.cc:73
--- at 2.24.9), escaped as 'stringOrigin' is.
+-- | The origin upstream writes for a position with none (@Pos::print@ in
+-- position.cc), escaped as 'stringOrigin' is.
 noOrigin :: Text
 noOrigin = "\x00ABnone\x00BB"

@@ -42,7 +42,8 @@ data CliOpts = CliOpts
     -- | @--arg@ and @--argstr@: what a function the target evaluates to
     -- is called with, by name as the command line spells it.  A later
     -- flag for a name replaces an earlier one, as upstream's
-    -- @insert_or_assign@ does (common-eval-args.cc:62 and 70 at 2.24.9).
+    -- @insert_or_assign@ does (in the @--arg@ and @--argstr@ handlers of the
+    -- @MixEvalArgs@ constructor, common-eval-args.cc).
     optAutoArgs :: !(Map String AutoArg),
     optStrict :: !Bool,
     optAterm :: !Bool,
@@ -123,8 +124,8 @@ data Command
 -- the bytes it was given.
 data Target
   = -- | A @.nix@ file, or a directory standing for its @default.nix@, as
-    -- upstream's @resolveExprPath@ reads one (eval.cc:2968-2985 at
-    -- 2.24.9).  Relative paths inside it resolve beside the file.
+    -- upstream's @resolveExprPath@ reads one (eval.cc).  Relative paths
+    -- inside it resolve beside the file.
     TargetFile !FilePath
   | -- | @\<NAME\>@: the file the search path finds for the name, as
     -- @\<NAME\>@ in an expression finds it, read as 'TargetFile' reads
@@ -137,8 +138,8 @@ data Target
 
 -- | The target a file argument names: a search path lookup when it is
 -- longer than two characters and written in angle brackets, as upstream's
--- @lookupFileArg@ reads one (common-eval-args.cc:188-191 at 2.24.9), and
--- otherwise a file or directory.
+-- @lookupFileArg@ reads one (common-eval-args.cc), and otherwise a file or
+-- directory.
 fileTarget :: String -> Target
 fileTarget arg = case arg of
   '<' : rest
@@ -163,15 +164,15 @@ data OutLink
     -- register the link as a GC root.
     OutLinkAt !FilePath
   | -- | @--no-out-link@: link nothing.  nix-build links into a temporary
-    -- directory it deletes on exit (nix-build.cc:143 and 203-204 at
-    -- 2.24.9), which leaves a dangling record that its next collection
-    -- removes (gc.cc:246-249); linking nothing leaves the same, less the
-    -- record.
+    -- directory it deletes on exit (@main_nix_build@ in nix-build.cc), which
+    -- leaves a dangling record that its next collection removes
+    -- (@LocalStore::findRoots@ in gc.cc); linking nothing leaves the same,
+    -- less the record.
     NoOutLink
   deriving (Eq, Show)
 
 -- | What a build links its output from until a flag says otherwise:
--- nix-build's @.\/result@ (nix-build.cc:145 at 2.24.9).
+-- nix-build's @.\/result@ (@main_nix_build@ in nix-build.cc).
 defaultOutLink :: OutLink
 defaultOutLink = OutLinkAt "result"
 
@@ -181,7 +182,7 @@ unsuffixedOutput = "out"
 
 -- | The link a build of the named output creates, if any: the out-link's
 -- path for the output @out@, and the path with @-NAME@ appended for any
--- other, as nix-build names its links (nix-build.cc:701-720 at 2.24.9).
+-- other, as nix-build names its links (@main_nix_build@ in nix-build.cc).
 -- nix-build also appends @-2@, @-3@ and so on for the second and later
 -- derivations it builds; a build here builds one.
 outLinkFor :: OutLink -> T.Text -> Maybe FilePath
@@ -201,7 +202,8 @@ data ProfileSelection
 
 -- | What @profile remove@ takes off.  Upstream refuses a line that
 -- selects nothing, and @--all@ beside any other selector, as usage errors
--- (profile.cc:617-628), so neither is a selection.
+-- (@MixProfileElementMatchers::getMatchingElementNames@ in profile.cc), so
+-- neither is a selection.
 data RemoveSelection
   = -- | @--all@: every element.
     RemoveAll
@@ -226,9 +228,8 @@ data ListFormat
   deriving (Eq, Show)
 
 -- | How @profile list --json@ and @print-dev-env --json@ lay out their
--- JSON, as upstream's @MixPrintJSON@ chooses (common-args.hh:46-72 at
--- 2.35.4): @--pretty@ and @--no-pretty@ set it, the last one given
--- winning.
+-- JSON, as upstream's @MixPrintJSON@ chooses (common-args.hh, from 2.34.9):
+-- @--pretty@ and @--no-pretty@ set it, the last one given winning.
 data JsonLayout
   = -- | Indented when stdout is a terminal, on one line otherwise:
     -- upstream's default.
@@ -495,7 +496,7 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
           Nothing -> goTarget kind opts (targetArgs {baAttrPath = Just (T.pack path)}) rest
     -- Each link flag replaces what the flags before it said, so the
     -- later one wins, as nix-build assigns its outLink as it reads each
-    -- (nix-build.cc:203-204 and 212-213 at 2.24.9).
+    -- (main_nix_build in nix-build.cc).
     goTarget BuildsTarget opts targetArgs (flag : path : rest)
       | flag `elem` outLinkFlags = goTarget BuildsTarget opts (targetArgs {baOutLink = OutLinkAt path}) rest
     goTarget BuildsTarget opts targetArgs (flag : rest)
@@ -506,7 +507,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       goTarget AddsToProfile opts (targetArgs {baPriority = Just priority}) rest
     -- Every argument after --command is the command's, a flag or --help
     -- included, as upstream's flag of any arity takes them
-    -- (args.cc:398-418 at 2.35.4), and one is needed (develop.cc:525-526).
+    -- (Args::processFlag in args.cc), and one is needed (the --command
+    -- handler in CmdDevelop's constructor, develop.cc).
     goTarget DevelopsTarget opts targetArgs (flag : rest)
       | flag `elem` commandFlags = case rest of
           [] -> Left "error: --command requires at least one argument"
@@ -517,8 +519,9 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       | Just phase <- lookup flag phaseFlags = goTarget DevelopsTarget opts (developing targetArgs (\args -> args {daPhase = Just phase})) rest
       | flag `elem` ignoreEnvFlags = goTarget DevelopsTarget opts (developing targetArgs (\args -> args {daEnvironmentBase = EmptyEnvironment})) rest
     -- The refusals upstream's flag handlers make as they read
-    -- --unset-env-var and --set-env-var (command.cc:362-386 at 2.35.4),
-    -- each after error:, as nova-nix reports upstream's errors.
+    -- --unset-env-var and --set-env-var (the MixEnvironment constructor in
+    -- command.cc, from 2.34.9), each after error:, as nova-nix reports
+    -- upstream's errors.
     goTarget DevelopsTarget opts targetArgs (flag : name : rest)
       | flag `elem` keepFlags = goTarget DevelopsTarget opts (developing targetArgs (\args -> args {daKeep = Set.insert name (daKeep args)})) rest
       | flag `elem` unsetFlags,
@@ -641,7 +644,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       goProfileList opts (ProfileAt path) output layout rest
     goProfileList opts profile _ layout ("--json" : rest) = goProfileList opts profile JsonOutput layout rest
     -- Each sets the layout, the later winning, and has no effect without
-    -- --json, as upstream's flags of these names (common-args.hh:46-72).
+    -- --json, as upstream's flags of these names (MixPrintJSON in
+    -- common-args.hh, from 2.34.9).
     goProfileList opts profile output _ ("--pretty" : rest) = goProfileList opts profile output Indented rest
     goProfileList opts profile output _ ("--no-pretty" : rest) = goProfileList opts profile output Compact rest
     goProfileList _ _ _ _ [flag]
@@ -668,12 +672,13 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     answered "--help" = Just CmdHelp
     answered "--version" = Just CmdVersion
     answered _ = Nothing
-    -- Upstream's three flags for the @sandbox@ setting (globals.cc:303-326
-    -- at 2.24.9).  Each is registered under the setting's older names too,
-    -- and a later registration of a name replaces an earlier one
-    -- (args.cc:24-26), so upstream's @--build-use-chroot@ and
-    -- @--build-use-sandbox@ are @--relaxed-sandbox@.  Upstream lists no
-    -- alias among its flags (args.cc:507), and the reference lists none.
+    -- Upstream's three flags for the @sandbox@ setting
+    -- (@BaseSetting<SandboxMode>::convertToArg@ in globals.cc).  Each is
+    -- registered under the setting's older names too, and a later
+    -- registration of a name replaces an earlier one (@Args::addFlag@ in
+    -- args.cc), so upstream's @--build-use-chroot@ and @--build-use-sandbox@
+    -- are @--relaxed-sandbox@.  Upstream lists no alias among its flags
+    -- (@Args::toJSON@ in args.cc), and the reference lists none.
     sandboxFlag "--sandbox" = Just SandboxEnabled
     sandboxFlag "--no-sandbox" = Just SandboxDisabled
     sandboxFlag "--relaxed-sandbox" = Just SandboxRelaxed
@@ -692,8 +697,9 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     -- No result link, under both of nix-build's spellings.
     noOutLinkFlags = ["--no-out-link", "--no-link"]
     -- develop's flags, under each of upstream's spellings: the short one,
-    -- the long one and the name 2.24.9 gave it (command.cc:333-388 and
-    -- develop.cc:519-572 at 2.35.4).
+    -- the long one and the name 2.24.9 gave it (the MixEnvironment
+    -- constructor in command.cc and the CmdDevelop constructor in develop.cc,
+    -- from 2.34.9).
     commandFlags = ["-c", "--command"]
     phaseFlags = [("--unpack", "unpack"), ("--configure", "configure"), ("--build", "build"), ("--check", "check"), ("--install", "install"), ("--installcheck", "installCheck")]
     ignoreEnvFlags = ["-i", "--ignore-env", "--ignore-environment"]

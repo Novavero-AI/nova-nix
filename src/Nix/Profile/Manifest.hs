@@ -1,7 +1,7 @@
 -- | A profile's manifest, the @manifest.json@ every generation holds:
 -- each element of the profile by its name, with the store paths it adds,
 -- whether it is active and its priority, as upstream's @nix profile@
--- keeps it (@ProfileManifest@, src\/nix\/profile.cc:115-314 at 2.35.4).
+-- keeps it (@ProfileManifest@ in src\/nix\/profile.cc).
 --
 -- Versions 1 to 3 are read and version 3 is written, through
 -- 'renderJson', which is nlohmann's @dump()@: members in name order,
@@ -117,11 +117,12 @@ emptyManifest :: Manifest
 emptyManifest = Manifest Map.empty
 
 -- | The priority an element has when nothing gives it another
--- (profile.cc:47).
+-- (@defaultPriority@ in profile.cc).
 defaultPriority :: Int
 defaultPriority = 5
 
--- | The version 'renderManifest' writes (profile.cc:231).
+-- | The version 'renderManifest' writes (@ProfileManifest::toJSON@ in
+-- profile.cc).
 writtenVersion :: Integer
 writtenVersion = 3
 
@@ -133,23 +134,25 @@ writtenVersion = 3
 data ManifestError
   = -- | The file is not JSON, or not a JSON object.
     ManifestNotJson !Text
-  | -- | A version other than 1, 2 and 3 (profile.cc:143-144).
+  | -- | A version other than 1, 2 and 3 (the @ProfileManifest@ constructor
+    -- in profile.cc).
     UnsupportedVersion !Integer
   | -- | An element, by the key or index it was read under, that is not
     -- what upstream reads, and why.
     MalformedElement !Text !Text
   | -- | An element of a version 1 or 2 manifest that a flake made, which
-    -- upstream names from its flake reference's URL (profile.cc:165-173)
-    -- and which is not read here, by its index.
+    -- upstream names from its flake reference's URL (the @ProfileManifest@
+    -- constructor in profile.cc) and which is not read here, by its index.
     UnnamedFlakeElement !Text
   deriving (Eq, Show)
 
 -- | The members a manifest's version names a flake element's references
--- under: version 1's, then those of versions 2 and 3 (profile.cc:133-145).
+-- under: version 1's, then those of versions 2 and 3 (the
+-- @ProfileManifest@ constructor in profile.cc).
 data UrlKeys = UrlKeys !Text !Text
 
 -- | Read a manifest's bytes, as upstream's @ProfileManifest@ constructor
--- reads @manifest.json@ (profile.cc:123-177): the version, 0 when it is
+-- in profile.cc reads @manifest.json@: the version, 0 when it is
 -- missing, then each element, by its key in an object or its index in
 -- the array versions 1 and 2 hold.  A missing @elements@ or @storePaths@
 -- is empty, @active@ is required, and @priority@ defaults to
@@ -235,7 +238,8 @@ parseElement (UrlKeys urlKey originalUrlKey) label value = case value of
       JsonString text -> Right (OutputName text)
       _ -> malformed "an output name is not a string"
 
--- | A manifest as version 3 holds it (profile.cc:209-234).
+-- | A manifest as version 3 holds it (@ProfileManifest::toJSON@ in
+-- profile.cc).
 manifestJson :: Manifest -> Json
 manifestJson (Manifest elements) =
   JsonObject
@@ -264,7 +268,8 @@ manifestJson (Manifest elements) =
     outputsJson = maybe JsonNull (JsonArray . map JsonString . outputsSpelled)
 
 -- | The bytes of @manifest.json@: 'manifestJson' as nlohmann's @dump()@
--- writes it, with no newline after (profile.cc:253).
+-- writes it, with no newline after (@ProfileManifest::build@ in
+-- profile.cc).
 renderManifest :: Manifest -> ByteString
 renderManifest = renderJson . manifestJson
 
@@ -284,18 +289,18 @@ manifestErrorText path failure = case failure of
 -- ---------------------------------------------------------------------------
 
 -- | What identifies an element in messages and in what @--regex@ matches
--- (profile.cc:56-64): for an element a flake made, its flake reference,
--- @#@ and its attribute, then its outputs after @^@; otherwise the name
--- part of each path's name ('drvNameName'), each once, in byte order,
--- joined by a comma and a space, an empty one left out.
+-- (@ProfileElement::identifier@ in profile.cc): for an element a flake made,
+-- its flake reference, @#@ and its attribute, then its outputs after @^@;
+-- otherwise the name part of each path's name ('drvNameName'), each once, in
+-- byte order, joined by a comma and a space, an empty one left out.
 elementIdentifier :: Element -> Text
 elementIdentifier element = case elementSource element of
   Just source -> sourceOriginalUrl source <> "#" <> flakeAttribute source
   Nothing -> T.intercalate ", " (filter (not . T.null) (Set.toAscList (Set.map (drvNameName . spName) (elementPaths element))))
 
 -- | An element's flake attribute and the outputs it was asked for, after
--- @^@ when it was asked for some (profile.cc:43): what @profile list@
--- prints as its flake attribute.
+-- @^@ when it was asked for some (@ProfileElementSource::to_string@ in
+-- profile.cc): what @profile list@ prints as its flake attribute.
 flakeAttribute :: FlakeSource -> Text
 flakeAttribute source = sourceAttrPath source <> maybe "" (("^" <>) . T.intercalate "," . outputsSpelled) (sourceOutputs source)
 
@@ -306,7 +311,7 @@ outputsSpelled spec = maybe ["*"] (\names -> [name | OutputName name <- Set.toAs
 
 -- | The name part of a derivation name: everything before the first dash
 -- that something other than a letter follows, as upstream's @DrvName@
--- splits one (names.cc:23-35 at 2.35.4); the whole name when there is no
+-- constructor in names.cc splits one; the whole name when there is no
 -- such dash.
 drvNameName :: Text -> Text
 drvNameName name = go 0 name
@@ -321,7 +326,8 @@ drvNameName name = go 0 name
     isAsciiLetter c = isAsciiLower c || isAsciiUpper c
 
 -- | Add an element under a name, or under the name with @-1@, @-2@ and
--- on appended when it is taken (profile.cc:194-201).
+-- on appended when it is taken (@ProfileManifest::addElement@ in
+-- profile.cc).
 addElement :: Text -> Element -> Manifest -> Manifest
 addElement candidate element (Manifest elements) = Manifest (Map.insert (free candidates) element elements)
   where
@@ -335,13 +341,13 @@ addElement candidate element (Manifest elements) = Manifest (Map.insert (free ca
 -- ---------------------------------------------------------------------------
 
 -- | Each active element's paths with its priority, the packages of the
--- generation's tree (profile.cc:242-249).
+-- generation's tree (@ProfileManifest::build@ in profile.cc).
 manifestPackages :: Manifest -> [(StorePath, Int)]
 manifestPackages (Manifest elements) =
   [(path, elementPriority element) | element <- Map.elems elements, elementActivity element == Active, path <- Set.toAscList (elementPaths element)]
 
 -- | Every element's paths, the inactive ones' too: the generation's
--- references (profile.cc:247).
+-- references (@ProfileManifest::build@ in profile.cc).
 manifestReferences :: Manifest -> Set StorePath
 manifestReferences (Manifest elements) = foldMap elementPaths elements
 
@@ -350,8 +356,10 @@ manifestReferences (Manifest elements) = foldMap elementPaths elements
 -- ---------------------------------------------------------------------------
 
 -- | What selects elements, as @profile remove@ names them
--- (profile.cc:477-559).  Upstream refuses none at all and @--all@ beside
--- anything (profile.cc:617-628); neither is a selector here.
+-- (@Matcher@ and its four kinds in profile.cc).  Upstream refuses none at
+-- all and @--all@ beside anything
+-- (@MixProfileElementMatchers::getMatchingElementNames@); neither is a
+-- selector here.
 data Selector
   = -- | @--all@: every element.
     SelectAll
@@ -370,14 +378,16 @@ data Matcher
 
 -- | A @--regex@ pattern: a POSIX extended regular expression that
 -- ignores case, as upstream compiles one (@std::regex::extended |
--- std::regex::icase@, profile.cc:489-493), over the pattern's bytes, as
--- @builtins.match@ compiles one.  'Nothing' when it does not compile.
+-- std::regex::icase@ in @RegexMatcher@, profile.cc), over the pattern's
+-- bytes, as @builtins.match@ compiles one.  'Nothing' when it does not
+-- compile.
 regexMatcher :: Text -> Maybe Matcher
 regexMatcher given = MatchRegex given <$> RE.makeRegexOptsM options RE.defaultExecOpt (TE.encodeUtf8 given)
   where
     options = RE.defaultCompOpt {RE.multiline = False, RE.caseSensitive = False}
 
--- | How a warning names a matcher (profile.cc:494-551).
+-- | How a warning names a matcher (each matcher's @getTitle@ in
+-- profile.cc).
 matcherTitle :: Matcher -> Text
 matcherTitle matcher = case matcher of
   MatchName name -> "Package name '" <> name <> "'"
@@ -408,9 +418,10 @@ data Selection = Selection
   }
   deriving (Eq, Show)
 
--- | The elements a selector selects (profile.cc:630-650): a profile with
--- no elements selects nothing, with upstream's warning, and a matcher
--- that selects nothing is warned of.
+-- | The elements a selector selects
+-- (@MixProfileElementMatchers::getMatchingElementNames@ in profile.cc): a
+-- profile with no elements selects nothing, with upstream's warning, and a
+-- matcher that selects nothing is warned of.
 selectElements :: Selector -> Manifest -> Selection
 selectElements selector (Manifest elements)
   | Map.null elements = Selection Set.empty ["There are no packages in the profile."]
@@ -442,14 +453,14 @@ data Conflict = Conflict
   deriving (Eq, Show)
 
 -- | The elements two conflicting files came from, as upstream finds them
--- (profile.cc:417-442): searching the elements in name order, the first
--- holding a path either file lies in is the existing one, and searching
--- them the other way, the first is the new one.  'Nothing' when no
--- element holds either, where upstream reports the tree's own conflict.
--- The files are the tree's: one it links directly is under the store
--- directory as the store spells it, the first directory given, and one
--- inside a directory it expanded under the second, the store directory
--- resolved through its links as the tree resolves a link it expands
+-- (@CmdProfileAdd::run@ in profile.cc): searching the elements in name order,
+-- the first holding a path either file lies in is the existing one, and
+-- searching them the other way, the first is the new one.  'Nothing' when no
+-- element holds either, where upstream reports the tree's own conflict.  The
+-- files are the tree's: one it links directly is under the store directory as
+-- the store spells it, the first directory given, and one inside a directory
+-- it expanded under the second, the store directory resolved through its
+-- links as the tree resolves a link it expands
 -- ('Nix.Profile.Tree.trResolve').  A path is looked for under both, so a
 -- store reached through a linked directory names the right elements; an
 -- element's paths are shown in the store's spelling.

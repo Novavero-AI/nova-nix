@@ -115,8 +115,8 @@ builtinFunction = fmap Thunk . cthunkPrimop . builtinIndex
 -- | A base environment with a set's names bound over it, each to its
 -- value in the set, as @scopedImport@ binds its scope.  The set is the
 -- environment's name table, as upstream binds the scope's own values in
--- the environment it evaluates the file in (primops.cc:227-236 at
--- 2.24.9).
+-- the environment it evaluates the file in (@import@ in primops.cc at
+-- 2.24.9, @scopedImport@ there at 2.36.0).
 builtinEnvWithScope :: (MonadCData m) => Env -> AttrSet -> m Env
 builtinEnvWithScope base = newScopeEnv EnvRoot (Just base)
 

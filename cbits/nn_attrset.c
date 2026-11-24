@@ -374,7 +374,7 @@ const nn_attrset_t *nn_attrset_base(const nn_attrset_t *set)
  * chain, top first, at the next entry of that set's own arrays.  Each
  * step takes the least name at any head, from the topmost head that has
  * it, and moves every head at that name past it, as upstream's iterator
- * merges a set's layers (attr-set.hh:241-258 at 2.34.9). */
+ * merges a set's layers (Bindings::iterator in attr-set.hh at 2.34.9). */
 typedef struct {
     const nn_attrset_t *layer[NN_ATTRSET_MAX_LAYERS];
     uint32_t            next[NN_ATTRSET_MAX_LAYERS];
@@ -496,10 +496,10 @@ nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b,
 
 /* `b` layered on `a`: a set at `site` holding b's entries alone, with a
  * as its base, as upstream's ExprOpUpdate::eval builds one
- * (eval.cc:1944-1953 at 2.34.9).  Its size counts each name of b that
- * a's chain already binds once, as upstream's finishSizeIfNecessary
- * does (attr-set.hh:478-511), in 64 bits, and a layer past
- * NN_ATTRSET_MAX_ENTRIES is refused. */
+ * (eval.cc at 2.34.9).  Its size counts each name of b that a's chain
+ * already binds once, as upstream's finishSizeIfNecessary does
+ * (attr-set.hh), in 64 bits, and a layer past NN_ATTRSET_MAX_ENTRIES is
+ * refused. */
 static nn_attrset_t *layer_on(const nn_attrset_t *a, const nn_attrset_t *b, uint32_t site)
 {
     cursor_t cursor;

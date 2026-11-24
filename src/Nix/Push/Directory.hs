@@ -12,51 +12,54 @@
 --
 -- * @nix-cache-info@, holding @StoreDir: \/nix\/store@ alone, written when
 --   the directory has none, and refused when it names another store
---   directory (@BinaryCacheStore::init@, binary-cache-store.cc:40-64).  An
+--   directory (@BinaryCacheStore::init@ in binary-cache-store.cc).  An
 --   upstream HTTP substituter reads no cache without one
---   (http-binary-cache-store.cc:70-84).
--- * @\<hash\>.narinfo@ for each path (binary-cache-store.cc:106-109), its
---   fields in the order @NarInfo::to_string@ writes them
---   (nar-info.cc:101-127).
+--   (@HttpBinaryCacheStore::init@ in http-binary-cache-store.cc).
+-- * @\<hash\>.narinfo@ for each path (@BinaryCacheStore::narInfoFileFor@
+--   in binary-cache-store.cc), its fields in the order
+--   @NarInfo::to_string@ in nar-info.cc writes them.
 -- * The NAR at the narinfo's @URL@, @nar\/\<filehash\>.nar@, or @.nar.zst@
 --   compressed with zstd, named by the nix-base32 hash of the file
---   (binary-cache-store.cc:163-170).
+--   (@BinaryCacheStore::addToStoreCommon@ in binary-cache-store.cc).
 -- * The empty @realisations@, @build-trace-v2@ and @log@ directories
 --   beside @nar@, where content-addressed derivations and
 --   @nix store copy-log@ write.  A push writes into none of them, but
 --   upstream's @file:\/\/@ store creates @nar@, its realisations
 --   directory and @log@ whenever it opens a cache, to read it as well as
---   to write (local-binary-cache-store.cc:107-115, run by
---   store-api.cc:1334), and creating a directory that is there needs no
---   write access (file-system.cc:427-434).  A reader that cannot create a
---   missing one drops the cache with only a warning
---   (store-api.cc:1345-1352), so a push creates them for a reader without
---   write access to the directory.  The realisations directory is
---   @realisations@ through Nix 2.34.9 and @build-trace-v2@ from 2.35.4, so
---   a push makes both, for a reader of either.
+--   to write (@LocalBinaryCacheStore::init@ in local-binary-cache-store.cc,
+--   run by @openStore@ in store-api.cc at 2.24.9 and in store-registration.cc
+--   at 2.36.0), and creating a directory that is there needs no write access
+--   (@createDirs@ in file-system.cc).  A reader that cannot create a missing
+--   one drops the cache with only a warning (@getDefaultSubstituters@, beside
+--   @openStore@), so a push creates them for a reader without write access to
+--   the directory.  The realisations directory is @realisations@ through Nix
+--   2.34.9 and @build-trace-v2@ from 2.35.4, so a push makes both, for a
+--   reader of either.
 --
 -- Each narinfo carries an Ed25519 signature by the secret key, as
 -- upstream's binary cache store signs every narinfo it writes with the
--- key its @secret-key@ setting names (binary-cache-store.hh:32-33,
--- binary-cache-store.cc:31-33 and 271): over upstream's fingerprint
--- (@ValidPathInfo::fingerprint@, path-info.cc:25-35), as @name:base64@
--- (local-keys.cc:50-57).  nova-cache computes both.  Its verification of
--- that fingerprint accepts cache.nixos.org's signatures, and Ed25519
--- signing is deterministic, so with a key whose second half is the
--- public key of its seed, the only keys 'loadSecretKeyFile' accepts, a
--- signature here is the one upstream's signer makes.
+-- key its @secret-key@ setting names (@BinaryCacheStoreConfig@ in
+-- binary-cache-store.hh, the @BinaryCacheStore@ constructor and
+-- @BinaryCacheStore::addToStoreCommon@ in binary-cache-store.cc): over
+-- upstream's fingerprint (@ValidPathInfo::fingerprint@ in path-info.cc), as
+-- @name:base64@ (@SecretKey::signDetached@ in local-keys.cc).  nova-cache
+-- computes both.  Its verification of that fingerprint accepts
+-- cache.nixos.org's signatures, and Ed25519 signing is deterministic, so with
+-- a key whose second half is the public key of its seed, the only keys
+-- 'loadSecretKeyFile' accepts, a signature here is the one upstream's signer
+-- makes.
 --
 -- == Writes
 --
 -- A path whose narinfo is in the directory is skipped, as upstream takes
--- it to be in the cache (binary-cache-store.cc:371-377), and a NAR whose
--- file is there is not written again (binary-cache-store.cc:258-264).
--- Every NAR is written before any narinfo, and the narinfos in the
--- closure's order, as "Nix.Push" uploads them, so no narinfo names a NAR
--- or a reference that is not there yet.  Each file is written whole
--- beside its name and renamed onto it, as upstream's @upsertFile@ writes
--- it (local-binary-cache-store.cc:58-70), so a reader never meets a torn
--- one.
+-- it to be in the cache (@BinaryCacheStore::isValidPathUncached@ in
+-- binary-cache-store.cc), and a NAR whose file is there is not written again
+-- (@BinaryCacheStore::addToStoreCommon@).  Every NAR is written before any
+-- narinfo, and the narinfos in the closure's order, as "Nix.Push" uploads
+-- them, so no narinfo names a NAR or a reference that is not there yet.  Each
+-- file is written whole beside its name and renamed onto it, as upstream's
+-- @upsertFile@ writes it (local-binary-cache-store.cc), so a reader never
+-- meets a torn one.
 module Nix.Push.Directory
   ( -- * Where a push writes
     PushTarget (..),
@@ -146,18 +149,19 @@ pushTarget url apiKeyFile secretKeyFile
 
 -- | The directory named by what follows @file:\/\/@ in a URL: an empty
 -- host and an absolute path, the form upstream's grammar gives a
--- @file:\/\/@ URL (url.cc:15-20), which refuses any host (url.cc:35-37).
--- Upstream reads @file:\/\/@ alone as the root directory (url.cc:39-40).
--- A URL naming a filesystem root, that one or @file:\/\/\/@ or a drive's
--- root, is refused here, as a cache in a root is a variable that expanded
--- to nothing.  A query, a fragment or a percent-escape is refused rather
--- than read: upstream takes the query as the store's settings and decodes
--- escapes (url.cc:42-50, store-reference.cc:48-51), so each would name
--- another cache there.  A URL without them that upstream parses names
--- the same directory in both.  A Windows drive path is written with a
--- slash before the drive, @file:\/\/\/C:\/cache@ (RFC 8089, appendix
--- E.2), so where that names no absolute path and the drive path does, on
--- Windows, the slash is dropped.
+-- @file:\/\/@ URL (@parseURL@ in url.cc), which refuses any host (there at
+-- 2.24.9, in its @fromBoostUrlView@ from 2.34.9).  Upstream reads
+-- @file:\/\/@ alone as the root directory (the same function).  A URL naming
+-- a filesystem root, that one or @file:\/\/\/@ or a drive's root, is refused
+-- here, as a cache in a root is a variable that expanded to nothing.  A
+-- query, a fragment or a percent-escape is refused rather than read: upstream
+-- takes the query as the store's settings and decodes escapes (@parseURL@ in
+-- url.cc, @StoreReference::parse@ in store-reference.cc), so each would name
+-- another cache there.  A URL without them that upstream parses names the
+-- same directory in both.  A Windows drive path is written with a slash
+-- before the drive, @file:\/\/\/C:\/cache@ (RFC 8089, appendix E.2), so where
+-- that names no absolute path and the drive path does, on Windows, the slash
+-- is dropped.
 fileUrlDirectory :: String -> Either Text FilePath
 fileUrlDirectory path
   | any (`elem` unreadUrlCharacters) path =
@@ -238,24 +242,25 @@ pushToDirectory cfg store roots =
       pure PushSummary {psPushed = length written, psSkipped = skipped}
 
 -- | The directories upstream's @file:\/\/@ store creates in every cache it
--- opens (local-binary-cache-store.cc:109-113): the NARs', and those a
--- push leaves empty, the realisations directory under both of its names.
+-- opens (@LocalBinaryCacheStore::init@ in local-binary-cache-store.cc): the
+-- NARs', and those a push leaves empty, the realisations directory under
+-- both of its names.
 cacheDirectories :: [FilePath]
 cacheDirectories = [T.unpack narDirSegment, realisationsDirName, buildTraceDirName, logDirName]
 
 -- | The directory of content-addressed derivations' realisations,
--- upstream's @realisationsPrefix@ through Nix 2.34.9
--- (binary-cache-store.hh:65 at 2.24.9,
--- include/nix/store/binary-cache-store.hh:95 at 2.34.9).
+-- upstream's @realisationsPrefix@ through Nix 2.34.9, a member of
+-- @BinaryCacheStore@ in binary-cache-store.hh.
 realisationsDirName :: FilePath
 realisationsDirName = "realisations"
 
 -- | The same directory as upstream's @realisationsPrefix@ names it from
--- Nix 2.35.4 (include/nix/store/binary-cache-store.hh:118 at 2.35.4).
+-- Nix 2.35.4 (binary-cache-store.hh).
 buildTraceDirName :: FilePath
 buildTraceDirName = "build-trace-v2"
 
--- | The directory of build logs (local-binary-cache-store.cc:113).
+-- | The directory of build logs (@LocalBinaryCacheStore::init@ in
+-- local-binary-cache-store.cc).
 logDirName :: FilePath
 logDirName = "log"
 
@@ -278,13 +283,13 @@ loadSecretKeyFile path = (>>= parse) <$> loadKeyFile path
     refused err = "secret key file " <> T.pack path <> ": " <> T.pack err
 
 -- | The bytes of an Ed25519 seed, the first half of a secret key: the
--- @ed25519SeedSize@ of nova-cache 0.13.0.0 (NovaCache/Signing.hs:77-78),
--- which it does not export.
+-- @ed25519SeedSize@ of nova-cache 0.13.0.0's @NovaCache.Signing@, which it
+-- does not export.
 ed25519SeedBytes :: Int
 ed25519SeedBytes = 32
 
 -- | The narinfo with the key's signature added to those it carries, which
--- upstream keeps as a sorted set (path-info.cc:38-41).
+-- upstream keeps as a sorted set (@ValidPathInfo::sign@ in path-info.cc).
 signNarInfo :: SecretKey -> NarInfo -> Either Text NarInfo
 signNarInfo key narInfo = do
   sig <- first (\err -> "cannot sign the narinfo of " <> niStorePath narInfo <> ": " <> T.pack err) (Signing.sign key narInfo)
@@ -305,18 +310,18 @@ storeDirField = "StoreDir"
 
 -- | What a push writes as @nix-cache-info@ in a directory that has none:
 -- the store directory alone, as upstream writes it
--- (binary-cache-store.cc:46).  The narinfos name paths in the canonical
--- store directory whatever directory the local store is in, so this is
--- @\/nix\/store@ on every host.
+-- (@BinaryCacheStore::init@ in binary-cache-store.cc).  The narinfos name
+-- paths in the canonical store directory whatever directory the local
+-- store is in, so this is @\/nix\/store@ on every host.
 cacheInfoText :: BS.ByteString
 cacheInfoText = storeDirField <> ": " <> TE.encodeUtf8 defaultStoreDirText <> "\n"
 
 -- | Refuse a @nix-cache-info@ that names a store directory other than
 -- @\/nix\/store@, as upstream refuses it, in its words
--- (binary-cache-store.cc:48-63): each line with a colon is a field, its
--- name what comes before the first colon and its value the rest trimmed of
--- spaces, tabs, carriage returns and newlines.  Other fields are not
--- read; a push writes nothing they describe.
+-- (@BinaryCacheStore::init@ in binary-cache-store.cc): each line with a colon
+-- is a field, its name what comes before the first colon and its value the
+-- rest trimmed of spaces, tabs, carriage returns and newlines.  Other fields
+-- are not read; a push writes nothing they describe.
 checkCacheInfo :: FilePath -> BS.ByteString -> Either Text ()
 checkCacheInfo dir contents = case find (/= canonical) storeDirs of
   Nothing -> Right ()
@@ -365,11 +370,10 @@ writeUnlessPresent target bytes = do
 
 -- | Write a file of the cache: whole, into a new file beside it, which is
 -- then renamed onto it.  The new file has the permissions the umask
--- leaves, as upstream's @writeFile@ creates one (0666, file-system.hh:134
--- at 2.24.9), where @openBinaryTempFile@ would leave it
--- readable by its owner alone and so unreadable to a web server running
--- as another user.  Its name starts with a dot, which static servers
--- commonly hide.
+-- leaves, as upstream's @writeFile@ creates one (0666, its default mode in
+-- file-system.hh), where @openBinaryTempFile@ would leave it readable by its
+-- owner alone and so unreadable to a web server running as another user.  Its
+-- name starts with a dot, which static servers commonly hide.
 writeCacheFile :: FilePath -> BS.ByteString -> IO ()
 writeCacheFile target bytes =
   bracketOnError

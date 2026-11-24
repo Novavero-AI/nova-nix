@@ -7,10 +7,9 @@
 -- import this leaf module.
 --
 -- Every name here is the t'Symbol' the bytecode and a C lambda hold, as
--- upstream's @Formal@ and @ExprLambda@ hold theirs (nixexpr.hh:294-299
--- and :326-332 at 2.24.9): a call finds its formals in its argument by
--- symbol, and a name becomes text only where a message or a printed
--- value spells it.
+-- upstream's @Formal@ and @ExprLambda@ hold theirs (nixexpr.hh): a call
+-- finds its formals in its argument by symbol, and a name becomes text only
+-- where a message or a printed value spells it.
 module Nix.Eval.EvalFormals
   ( EvalFormals (..),
     EvalFormal (..),
@@ -43,8 +42,8 @@ data FormalDefault
   | -- | A variable naming a slot of the call's frame, the code at a
     -- bytecode index, whose cell the formal's slot shares once the frame
     -- is filled, as upstream's @maybeThunk@ shares the cell of a slot it
-    -- has filled before the formal's (eval.cc:1014-1021 and :1539-1563 at
-    -- 2.24.9).
+    -- has filled before the formal's (@ExprVar::maybeThunk@ and
+    -- @callFunction@ in eval.cc).
     SharedDefault !Word32
   deriving (Eq, Show)
 
@@ -56,9 +55,9 @@ hasDefault (SharedDefault _) = True
 
 -- | The name a function's call errors give it.  Upstream names a function
 -- after the attribute a set or @let@ binds it to, and names a function
--- that is its body the same (@addAttr@, parser-state.hh:176-177, and
--- @ExprLambda::setName@, nixexpr.cc:573-577 at 2.24.9).  Only a set
--- pattern raises such an error, so only its formals carry the name.
+-- that is its body the same (@addAttr@ in parser-state.hh, and
+-- @ExprLambda::setName@ in nixexpr.cc).  Only a set pattern raises such an
+-- error, so only its formals carry the name.
 data LambdaName
   = -- | Bound to no static attribute name.
     AnonymousLambda
@@ -66,7 +65,7 @@ data LambdaName
     NamedLambda !Symbol
   deriving (Eq, Show)
 
--- | The name as a call error spells it (eval.cc:1550-1551 at 2.24.9).
+-- | The name as a call error spells it (@callFunction@ in eval.cc).
 lambdaNameText :: LambdaName -> Text
 lambdaNameText AnonymousLambda = "anonymous lambda"
 lambdaNameText (NamedLambda name) = symbolText name

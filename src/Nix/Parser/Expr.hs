@@ -100,7 +100,7 @@ parseLambdaOrIdent = do
 
 -- | The header of @x: body@; on success, returns the committed body parse.
 -- The argument's name is noted after the body's names, as upstream's
--- rule interns it (parser.y:179 at 2.24.9).
+-- rule interns it (@expr_function@ in parser.y).
 trySimpleLambdaHeader :: Parser (Parser Expr)
 trySimpleLambdaHeader = do
   name <- expectIdent
@@ -109,7 +109,8 @@ trySimpleLambdaHeader = do
 
 -- | The header of @name\@{ formals }: body@; on success, returns the
 -- committed body parse.  The name is noted after the formals' and the
--- body's names, as upstream's rule interns it (parser.y:197).
+-- body's names, as upstream's rule interns it (@expr_function@ in
+-- parser.y).
 tryNamedSetLambdaHeader :: Parser (Parser Expr)
 tryNamedSetLambdaHeader = do
   name <- expectIdent
@@ -141,7 +142,7 @@ parseLambdaOrAttrSet = do
 -- | The header of @{ a, b ? default, ... }: body@ or
 -- @{ a, b }\@name: body@; on success, returns the committed body parse.
 -- An \@-name is noted after the formals' and the body's names, as
--- upstream's rule interns it (parser.y:190).
+-- upstream's rule interns it (@expr_function@ in parser.y).
 trySetLambdaHeader :: Parser (Parser Expr)
 trySetLambdaHeader = do
   expect TokLBrace
@@ -187,7 +188,7 @@ parseFormalsList acc = do
       then Just <$> parseExpr
       else pure Nothing
   -- Upstream interns a formal's name once the formal, its default
-  -- included, is parsed (parser.y:482-483).
+  -- included, is parsed (the formal rule of parser.y).
   recordName name
   let formal = Formal {fName = name, fDefault = defVal}
       newAcc = formal : acc
@@ -442,7 +443,7 @@ parseAtom = do
     TokIdent name
       | name == curPosIdentifier -> EPos <$> currentPos <* advance
       -- Upstream interns a variable's name where it reads it
-      -- (parser.y:280), however the variable is later bound.
+      -- (expr_simple in parser.y), however the variable is later bound.
       | otherwise -> advance >> EVar name <$ recordName name
     TokStringOpen -> parseString
     TokIndStringOpen -> parseIndString
@@ -727,7 +728,7 @@ parseInherit = do
       pure [Inherit pos name (EVar name) | InheritedName pos name <- names]
 
 -- | The names of an @inherit@, each noted as upstream's parser interns it
--- (parser.y:416 and :421).
+-- (the @attrs@ rule of parser.y).
 parseInheritNames :: Parser [InheritedName]
 parseInheritNames = go []
   where
@@ -744,7 +745,7 @@ parseInheritNames = go []
               case key of
                 StaticKey name -> inherited name
                 -- Upstream refuses the key once it is parsed, at its
-                -- start (parser.y:417-428).
+                -- start (the attrs rule of parser.y).
                 DynamicKey _ -> failAt pos "dynamic attributes not allowed in inherit"
         _ -> pure (reverse acc)
 
@@ -771,7 +772,7 @@ dottedKeys = go []
         else pure (reverse acc)
 
 -- | One key of an attribute path, a static one's name noted as upstream's
--- parser interns it (parser.y:433-452).
+-- parser interns it (the @attrpath@ rule of parser.y).
 parseAttrKey :: Parser AttrKey
 parseAttrKey = do
   tok <- peek
@@ -790,17 +791,17 @@ startsStringAttr TokStringOpen = True
 startsStringAttr TokInterpOpen = True
 startsStringAttr _ = False
 
--- | A key written as a string or as @${ expr }@ (upstream's @string_attr@,
--- parser.y:460-463 at 2.24.9).  Upstream's @attrpath@ and @attrs@ rules
--- make such a key a name when its expression is an @ExprString@, and
--- dynamic otherwise (parser.y:416-452), so @let ${\"x\"} = 1; in x@ and
--- @inherit ${\"x\"};@ are legal.  A double-quoted string with no
--- interpolation is one, and so is a URI (parser.y:301-326), parentheses
--- around either included, since upstream's parser and this one both make
--- a parenthesized expression the expression itself (parser.y:310).  An
--- indented string is one when @stripIndentation@ (parser-state.hh)
--- leaves it a single piece; such a key stays dynamic here, since an
--- indented string is held as its unstripped pieces until it is evaluated.
+-- | A key written as a string or as @${ expr }@ (upstream's @string_attr@
+-- in parser.y).  Upstream's @attrpath@ and @attrs@ rules make such a key a
+-- name when its expression is an @ExprString@, and dynamic otherwise
+-- (parser.y), so @let ${\"x\"} = 1; in x@ and @inherit ${\"x\"};@ are legal.
+-- A double-quoted string with no interpolation is one, and so is a URI
+-- (@string_parts@ and @expr_simple@ in parser.y), parentheses around either
+-- included, since upstream's parser and this one both make a parenthesized
+-- expression the expression itself (@expr_simple@ in parser.y).  An indented
+-- string is one when @stripIndentation@ (parser-state.hh) leaves it a single
+-- piece; such a key stays dynamic here, since an indented string is held as
+-- its unstripped pieces until it is evaluated.
 parseStringAttr :: Parser AttrKey
 parseStringAttr = do
   pos <- currentPos
@@ -821,7 +822,8 @@ parseStringAttr = do
 
 -- | The bytes of an expression upstream's parser builds as a plain string
 -- (an @ExprString@): a double-quoted string with no interpolation, whose
--- parts become one string (parser.y:322-326), or a URI (parser.y:301-309).
+-- parts become one string (@string_parts@ in parser.y), or a URI
+-- (@expr_simple@ in parser.y).
 plainStringBytes :: Expr -> Maybe ByteString
 plainStringBytes (EStr parts) = mconcat <$> traverse literalPart parts
   where
@@ -852,13 +854,12 @@ failAt (SrcPos origin line col) message =
       }
 
 -- | The name of a token this lexer reads as a keyword and upstream's as
--- an identifier (its @ID@ rule, lexer.l:137 at 2.24.9): @true@, @false@
--- and @null@, which upstream binds as names in its base environment.  An
--- attribute name is an identifier, @or@ among them here, or one of
--- these, as upstream's @attr@ rule takes an @ID@ or @or@
--- (parser.y:455-458); every other keyword is upstream's own token
--- (lexer.l:109-117) and no attribute name, so an attribute named like
--- one is written as a string, @{ \"if\" = 1; }@.
+-- an identifier (its @ID@ rule in lexer.l): @true@, @false@ and @null@, which
+-- upstream binds as names in its base environment.  An attribute name is an
+-- identifier, @or@ among them here, or one of these, as upstream's @attr@
+-- rule takes an @ID@ or @or@ (parser.y); every other keyword is upstream's
+-- own token (lexer.l's keyword rules) and no attribute name, so an attribute
+-- named like one is written as a string, @{ \"if\" = 1; }@.
 identifierKeywordText :: Token -> Maybe Text
 identifierKeywordText TokTrue = Just "true"
 identifierKeywordText TokFalse = Just "false"

@@ -1,6 +1,6 @@
 -- | The derivation @nix develop@ builds to capture a target's build
 -- environment, as upstream Nix 2.35.4 makes it
--- (@getDerivationEnvironment@, @src\/nix\/develop.cc@:232-311).
+-- (@getDerivationEnvironment@ in @src\/nix\/develop.cc@).
 --
 -- The capture is the target's derivation with upstream's @get-env.sh@ as
 -- its builder's one argument.  Its builder sources the stdenv's setup as
@@ -59,15 +59,16 @@ getEnvScriptName = "get-env.sh"
 
 -- | What upstream stores for @get-env.sh@, given the file's bytes: a
 -- newline, then the file.  Upstream's build embeds the file in a raw
--- string literal its generator opens with @R"__NIX_STR(@ and a newline
--- (@nix-meson-build-support\/generate-header\/meson.build@:7 at 2.35.4),
--- so the string, and the store object made from it, starts with that
--- newline.
+-- string literal its generator opens with @R"__NIX_STR(@ and a newline (the
+-- @gen_header@ generator in
+-- @nix-meson-build-support\/generate-header\/meson.build@, from 2.34.9), so
+-- the string, and the store object made from it, starts with that newline.
 getEnvScriptContents :: ByteString -> ByteString
 getEnvScriptContents = BC.cons '\n'
 
 -- | The store path of @get-env.sh@, given the file's bytes: a text object
--- with no references, as upstream adds it (develop.cc:241-250).
+-- with no references, as upstream adds it (@getDerivationEnvironment@ in
+-- develop.cc).
 getEnvScriptPath :: ByteString -> Either BadStorePath StorePath
 getEnvScriptPath file = makeTextPath getEnvScriptName (sha256Digest (getEnvScriptContents file)) []
 
@@ -99,14 +100,14 @@ captureFailureMessage failure = case failure of
 -- | The capture of the derivation whose @.drv@ is named @NAME.drv@, given
 -- @get-env.sh@'s store path and the modulo hashes of its input
 -- derivations as 'inputAddressed' takes them.  Upstream's steps
--- (develop.cc:236-288 at 2.35.4):
+-- (@getDerivationEnvironment@ in develop.cc):
 --
 -- * a builder whose base name is not @bash@ is refused;
 -- * the script is the one argument, and an input source;
 -- * the checks on what the outputs refer to are removed: the four
 --   variables, or under structured attributes their @outputChecks@, with
 --   @__json@ written again as nlohmann's @dump()@ writes it
---   (parsed-derivations.cc:34-38);
+--   (@StructuredAttrs::unparse@ in parsed-derivations.cc);
 -- * @name@ is @NAME-env@, the capture's name, and a variable even under
 --   structured attributes;
 -- * each input-addressed or fixed output is deferred and then filled in
@@ -140,8 +141,8 @@ captureSuffix = "-env"
 bashBuilder :: ByteString
 bashBuilder = "bash"
 
--- | Upstream's @baseNameOf@ (file-system.cc:137-153 at 2.35.4): what
--- follows the last @/@, once trailing ones but the first byte are dropped.
+-- | Upstream's @baseNameOf@ (file-system.cc): what follows the last @/@, once
+-- trailing ones but the first byte are dropped.
 builderBaseName :: ByteString -> ByteString
 builderBaseName path = case BS.uncons path of
   Nothing -> BS.empty
@@ -149,18 +150,19 @@ builderBaseName path = case BS.uncons path of
 
 -- | Whether every output is one upstream defers: all input-addressed, or
 -- the derivation fixed-output.  Upstream refuses a fixed output beside
--- others as it reads the derivation (derivations.cc:740-744 at 2.24.9).
+-- others as it reads the derivation (@BasicDerivation::type@ in
+-- derivations.cc at 2.24.9, @derivation::type@ there at 2.36.0).
 capturable :: Derivation -> Bool
 capturable drv = all (T.null . doHashAlgo) (drvOutputs drv) || isJust (fixedOutput drv)
 
 -- | The environment less the checks on what the outputs refer to
--- (develop.cc:254-262 at 2.35.4).  A derivation is structured when it
--- has @__json@, as upstream's @StructuredAttrs::tryExtract@ decides
--- (parsed-derivations.cc:22-32), and its @__json@ is read as
--- @StructuredAttrs::parse@ reads it (:10-20), into an object
--- (parsed-derivations.hh:22): @null@ is refused there, where
--- 'Nix.Derivation.StructuredAttrs.decodeStructuredAttrs', which reads the
--- entry for a build as 2.24.9 does, takes it as an empty object.
+-- (@getDerivationEnvironment@ in develop.cc).  A derivation is structured
+-- when it has @__json@, as upstream's @StructuredAttrs::tryExtract@ in
+-- parsed-derivations.cc decides, and its @__json@ is read as
+-- @StructuredAttrs::parse@ there reads it, into an object (the
+-- @structuredAttrs@ field in parsed-derivations.hh): @null@ is refused there,
+-- where 'Nix.Derivation.StructuredAttrs.decodeStructuredAttrs', which reads
+-- the entry for a build as 2.24.9 does, takes it as an empty object.
 withoutChecks :: Map Text ByteString -> Either CaptureFailure (Map Text ByteString)
 withoutChecks env = case Map.lookup structuredAttrsKey env of
   Nothing -> Right (foldr Map.delete env referenceChecks)
@@ -194,8 +196,8 @@ data OutputObject
 
 -- | The output the environment is read from: the first, in name order,
 -- that is a regular file of at least one byte, as upstream reads the
--- outputs (develop.cc:303-310 at 2.35.4).  'Nothing' when none is, where
--- upstream fails with 'noEnvironmentMessage'.
+-- outputs (@getDerivationEnvironment@ in develop.cc).  'Nothing' when none
+-- is, where upstream fails with 'noEnvironmentMessage'.
 environmentOutput :: Map Text OutputObject -> Maybe Text
 environmentOutput outputs = listToMaybe [name | (name, RegularFile size) <- Map.toAscList outputs, size > 0]
 

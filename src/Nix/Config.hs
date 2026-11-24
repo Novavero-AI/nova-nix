@@ -304,16 +304,15 @@ data ConfigLocations = ConfigLocations
 -- platform's machine-wide directory (no file at all when the platform has
 -- none); then the user files in reverse of the order upstream lists them,
 -- since @loadConfFile@ walks @nixUserConfFiles@ back to front
--- (globals.cc:139) so that the first listed, the config home, wins.
--- The system directory goes through 'canonicalAbsolutePath', as upstream's
--- @Settings@ constructor runs it through @canonPath@ (globals.cc:65): a
--- relative one is refused, and @.@ and @..@ in it collapse, so the file
--- is named canonically wherever it is reported and its includes resolve
--- against the collapsed directory.  The user files are read as named;
--- upstream canonicalizes none of them.
--- @NIX_USER_CONF_FILES@ replaces the XDG list outright, in its own order.
--- It is split on the platform's list separator with empty entries dropped
--- as upstream's tokenizer drops them; upstream splits on @:@ on every
+-- (globals.cc) so that the first listed, the config home, wins.  The system
+-- directory goes through 'canonicalAbsolutePath', as upstream's @Settings@
+-- constructor runs it through @canonPath@ (globals.cc): a relative one is
+-- refused, and @.@ and @..@ in it collapse, so the file is named canonically
+-- wherever it is reported and its includes resolve against the collapsed
+-- directory.  The user files are read as named; upstream canonicalizes none
+-- of them.  @NIX_USER_CONF_FILES@ replaces the XDG list outright, in its own
+-- order.  It is split on the platform's list separator with empty entries
+-- dropped as upstream's tokenizer drops them; upstream splits on @:@ on every
 -- platform, which cannot carry a Windows drive letter, so @;@ is honoured
 -- there as it is for @PATH@ and @XDG_CONFIG_DIRS@.
 configFilePaths :: ConfigLocations -> Either Text [OsPath]
@@ -664,7 +663,8 @@ applyAssignment config (ConfigAssignment name value) =
     combine AppendMode old new = old ++ new
     -- Upstream's @StringSet@ setting: a plain assignment replaces the
     -- set, the default included, and @extra-@ adds to it
-    -- (config.cc:338-347 at 2.24.9).
+    -- (its @parse@ and @appendOrSet@ in config.cc at 2.24.9,
+    -- configuration.cc at 2.36.0).
     combinePaths ReplaceMode _ new = PathSetValue ReplacesDefault new
     combinePaths AppendMode old new = old {psvPaths = Set.union (psvPaths old) new}
 
@@ -903,15 +903,16 @@ sslCertFileKey = "ssl-cert-file"
 useXdgBaseDirectoriesKey :: ByteString
 useXdgBaseDirectoriesKey = "use-xdg-base-directories"
 
--- | The settings of a @develop@ shell's prompt (develop.cc:26-35 at
--- 2.35.4).
+-- | The settings of a @develop@ shell's prompt (@DevelopSettings@ in
+-- develop.cc).
 bashPromptKey, bashPromptPrefixKey, bashPromptSuffixKey :: ByteString
 bashPromptKey = "bash-prompt"
 bashPromptPrefixKey = "bash-prompt-prefix"
 bashPromptSuffixKey = "bash-prompt-suffix"
 
 -- | Upstream's older names for @sandbox@ and @sandbox-paths@
--- (globals.hh:630 and 649 at 2.24.9).
+-- (the aliases of @sandboxMode@ and @sandboxPaths@ in globals.hh at
+-- 2.24.9, local-settings.hh from 2.34.9).
 sandboxAliases, sandboxPathsAliases :: [ByteString]
 sandboxAliases = ["build-use-chroot", "build-use-sandbox"]
 sandboxPathsAliases = ["build-chroot-dirs", "build-sandbox-paths"]

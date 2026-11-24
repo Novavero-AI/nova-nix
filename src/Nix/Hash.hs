@@ -176,11 +176,12 @@ hexToBytes t
     pairs (hi : lo : rest) = fromIntegral (digitToInt hi * 16 + digitToInt lo) : pairs rest
     pairs [_] = [] -- unreachable: even length checked above
 
--- | Decode base64 as upstream's @base64Decode@ does (util.cc:240-275 at
--- 2.24.9).  Reading stops at the first @=@, so nothing after it is read;
--- a newline is skipped; any other character outside the standard
--- alphabet, a carriage return among them, refuses the input; and the bits
--- left after the last whole byte are dropped, whatever their value.
+-- | Decode base64 as upstream's @base64Decode@ does (util.cc at 2.24.9,
+-- @base64::decode@ in base-n.cc at 2.36.0).  Reading stops at the first @=@,
+-- so nothing after it is read; a newline is skipped; any other character
+-- outside the standard alphabet, a carriage return among them, refuses the
+-- input; and the bits left after the last whole byte are dropped, whatever
+-- their value.
 base64ToBytes :: Text -> Maybe BS.ByteString
 base64ToBytes encoded =
   BS.pack . sextetsToBytes <$> traverse sextet (T.unpack (T.filter (/= '\n') (T.takeWhile (/= '=') encoded)))
@@ -274,19 +275,19 @@ base64HashLen n = 4 * ((n + 2) `div` 3)
 -- ---------------------------------------------------------------------------
 
 -- | Upstream's refusal of an algorithm name it does not know
--- (@parseHashAlgo@, hash.cc:435-442 at 2.24.9).
+-- (@parseHashAlgo@ in hash.cc at 2.24.9).
 unknownHashAlgo :: Text -> Text
 unknownHashAlgo algo = "unknown hash algorithm '" <> algo <> "', expect 'md5', 'sha1', 'sha256', or 'sha512'"
 
 -- | The digest size in bytes of an algorithm upstream knows, or upstream's
--- refusal of the name (@parseHashAlgo@, hash.cc:435-442 at 2.24.9).
+-- refusal of the name (@parseHashAlgo@ in hash.cc at 2.24.9).
 parseHashAlgo :: Text -> Either Text Int
 parseHashAlgo algo = maybe (Left (unknownHashAlgo algo)) Right (hashAlgoBytes algo)
 
--- | Parse a hash as upstream's @Hash::parseAny@ does (hash.cc:184-198 at
--- 2.24.9).  The algorithm is the one the hash's own tag names, else
--- @expected@; when both are given they must be the same.  @expected@ is a
--- name 'parseHashAlgo' accepts.
+-- | Parse a hash as upstream's @Hash::parseAny@ does (hash.cc at 2.24.9).
+-- The algorithm is the one the hash's own tag names, else @expected@; when
+-- both are given they must be the same.  @expected@ is a name 'parseHashAlgo'
+-- accepts.
 parseAnyHash :: Maybe Text -> Text -> Either Text (Text, BS.ByteString)
 parseAnyHash expected original =
   hashSpelling original >>= \case
@@ -301,16 +302,16 @@ parseAnyHash expected original =
       _ -> (algo,) <$> decoded
 
 -- | Decode a digest that is not SRI, keyed by its length as upstream's
--- @Hash@ constructor keys it (hash.cc:205-262 at 2.24.9): an algorithm's
--- base16, nix32, and base64 spellings have pairwise distinct lengths, so
--- the input length selects the decoder and every other length is an
--- error.  Trying decoders in sequence instead mis-reads edge inputs - an
--- all-hex-digit string of nix32 length is a nix32 hash, and a truncated
--- hash must be rejected, not decoded by whichever shorter format happens
--- to accept it.  The length is counted in bytes, as upstream counts it,
--- not in characters: base64 decoding ignores what follows the padding,
--- and a character there that UTF-8 spells in more than one byte must
--- still make the length wrong.
+-- @Hash@ constructor keys it (hash.cc at 2.24.9, @baseFromSize@ there at
+-- 2.36.0): an algorithm's base16, nix32, and base64 spellings have pairwise
+-- distinct lengths, so the input length selects the decoder and every other
+-- length is an error.  Trying decoders in sequence instead mis-reads edge
+-- inputs - an all-hex-digit string of nix32 length is a nix32 hash, and a
+-- truncated hash must be rejected, not decoded by whichever shorter format
+-- happens to accept it.  The length is counted in bytes, as upstream counts
+-- it, not in characters: base64 decoding ignores what follows the padding,
+-- and a character there that UTF-8 spells in more than one byte must still
+-- make the length wrong.
 digestByLength :: Text -> Text -> Either Text BS.ByteString
 digestByLength algo s = parseHashAlgo algo >>= byLength
   where
@@ -322,7 +323,7 @@ digestByLength algo s = parseHashAlgo algo >>= byLength
       | otherwise = Left ("hash '" <> s <> "' has wrong length for hash algorithm '" <> algo <> "'")
 
 -- | Decode an SRI digest, base64 of whatever length, as the @isSRI@ branch
--- of upstream's @Hash@ constructor does (hash.cc:247-258 at 2.24.9).
+-- of upstream's @Hash@ constructor does (hash.cc at 2.24.9).
 sriDigest :: Text -> Text -> Either Text BS.ByteString
 sriDigest algo b64 = do
   size <- parseHashAlgo algo
@@ -331,9 +332,9 @@ sriDigest algo b64 = do
 -- | A decoded digest of the algorithm's size, or upstream's refusal of
 -- the spelling it was decoded from: @invalid base-16 hash@ and
 -- @invalid base-32 hash@ for a character outside the alphabet or nix32
--- bits past the digest's end (hash.cc:214, :232, :242 at 2.24.9), and
--- @invalid SRI hash@ or @invalid base-64 hash@ for base64 that is refused
--- or decodes to the wrong length (hash.cc:247-258).  A refused base64
+-- bits past the digest's end (the @Hash@ constructor in hash.cc at 2.24.9),
+-- and @invalid SRI hash@ or @invalid base-64 hash@ for base64 that is refused
+-- or decodes to the wrong length (its @isSRI@ branch).  A refused base64
 -- character is the same error as a wrong length there: the constructor
 -- catches @base64Decode@'s exception without rethrowing it, so the length
 -- check fails on the empty result.
@@ -352,7 +353,7 @@ data HashSpelling
     UntaggedHash
 
 -- | Split a hash string's algorithm tag off as upstream's
--- @getParsedTypeAndSRI@ does (hash.cc:150-169 at 2.24.9): at the first
+-- @getParsedTypeAndSRI@ does (hash.cc at 2.24.9): at the first
 -- @:@, else at the first @-@, which marks SRI.  The tag is everything
 -- before the separator, and one that names no known algorithm is an
 -- error.  Base64 decoding ignores what follows the padding, so this split
@@ -419,8 +420,8 @@ makeTextPath name contentsDigest refs =
    in makeStorePath defaultStoreDir typ contentsDigest name
 
 -- | How a fixed output's contents are hashed: upstream's
--- @FileIngestionMethod@ (file-content-address.hh:98-124 at 2.24.9)
--- without the git method its @git-hashing@ experimental feature adds.
+-- @FileIngestionMethod@ (file-content-address.hh) without the git method its
+-- @git-hashing@ experimental feature adds.
 data FileIngestionMethod
   = -- | The bytes of a single file (upstream's @Flat@).
     FlatIngestion
@@ -430,16 +431,16 @@ data FileIngestionMethod
 
 -- | What a method puts before the algorithm in a fixed output's hash
 -- fields and path (upstream's @makeFileIngestionPrefix@,
--- content-address.cc:7-21 at 2.24.9): @r:@ for a NAR hash, and nothing
--- for a flat one, which predates the prefix.
+-- content-address.cc): @r:@ for a NAR hash, and nothing for a flat one,
+-- which predates the prefix.
 fileIngestionPrefix :: FileIngestionMethod -> Text
 fileIngestionPrefix FlatIngestion = ""
 fileIngestionPrefix NarIngestion = "r:"
 
 -- | Construct a fixed-output store path.  @foHashDigest@ is the raw bytes of
 -- the EXPECTED output hash (e.g. a tarball's SHA-256), taken under
--- @method@.  Mirrors C++ Nix @makeFixedOutputPath@ (store-api.cc:122-141
--- at 2.24.9):
+-- @method@.  Mirrors C++ Nix @makeFixedOutputPath@ (store-api.cc at
+-- 2.24.9, store-dir-config.cc from 2.34.9):
 --
 -- * @sha256@ under 'NarIngestion' yields 'makeSourcePath' with no references
 -- * otherwise, @makeStorePath \"output:out\" sha256(\"fixed:out:\" prefix algo \":\" hex \":\") name@
@@ -457,9 +458,9 @@ makeFixedOutputPath name algo method foHashDigest
 
 -- | The path of a tree added by the SHA-256 of its NAR, @narDigest@, with
 -- the store paths it references: upstream's @makeFixedOutputPath@ under
--- @NixArchive@ and SHA-256 (store-dir-config.cc:114-115 at 2.35.4), whose
--- type is @source@ followed by each reference after a colon, in path
--- order, as @makeType@ appends them (:95-104).  Upstream's @makeType@
+-- @NixArchive@ and SHA-256 (store-dir-config.cc from 2.34.9, store-api.cc at
+-- 2.24.9), whose type is @source@ followed by each reference after a colon,
+-- in path order, as @makeType@ beside it appends them.  Upstream's @makeType@
 -- also marks a self-reference with @:self@, which no caller here makes.
 -- 'Left' on an invalid name, as 'makeStorePath'.
 makeSourcePath :: Text -> BS.ByteString -> Set.Set StorePath -> Either BadStorePath StorePath

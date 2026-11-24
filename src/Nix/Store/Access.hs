@@ -14,9 +14,8 @@
 --
 -- A mode says so: a store's directories and the parents made for them
 -- take the default mode narrowed by the umask, as upstream's
--- @createDirs@ makes them (file-system.cc:427-434 at 2.24.9), and a
--- build directory 0700, as upstream's @createTempDir@ makes its build
--- directories.
+-- @createDirs@ makes them (file-system.cc), and a build directory 0700, as
+-- upstream's @createTempDir@ makes its build directories.
 --
 -- == Windows
 --

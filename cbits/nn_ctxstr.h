@@ -14,9 +14,10 @@
  * The text, a StorePath's hash and name, and an output name are each an
  * nn_str_t (nn_str.h), made in the value arena for the string they
  * belong to, as upstream copies each context element for each value
- * (encodeContext, eval.cc:833-845 at 2.24.9).  None is a symbol: upstream
- * interns no string value, and a symbol taken here would move the place
- * of every name interned after it.
+ * (encodeContext in eval.cc at 2.24.9, and
+ * Value::StringWithContext::Context::fromBuilder at 2.36.0).  None is a
+ * symbol: upstream interns no string value, and a symbol taken here would
+ * move the place of every name interned after it.
  *
  * Memory: each nn_ctxstr_t is a single contiguous allocation via
  * C99 flexible array member, tracked (nn_tracker.h) for bulk cleanup via

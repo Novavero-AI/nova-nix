@@ -9,14 +9,15 @@
 # makes for the run.  Each cache is then made read-only, as a reader without
 # write access sees it: upstream's file:// store creates its directories in
 # every cache it opens, and drops one where it cannot
-# (local-binary-cache-store.cc:107-115, store-api.cc:1345-1352 at 2.24.9).
-# For each cache, upstream realises the output into a store of its own,
-# with that directory as its one substituter and signatures required:
-# first trusting a second key of the same name, under which it must ignore
-# the substitute for want of a trusted signature
-# (substitution-goal.cc:124-129 at 2.24.9), then trusting the signing key,
-# under which the closure must become valid there with the bytes and
-# references nova-nix built.
+# (LocalBinaryCacheStore::init in local-binary-cache-store.cc, and
+# getDefaultSubstituters, in store-api.cc at 2.24.9 and in
+# store-registration.cc at 2.36.0).  For each cache, upstream realises the
+# output into a store of its own, with that directory as its one substituter
+# and signatures required: first trusting a second key of the same name,
+# under which it must ignore the substitute for want of a trusted signature
+# (PathSubstitutionGoal's signature check in substitution-goal.cc), then
+# trusting the signing key, under which the closure must become valid there
+# with the bytes and references nova-nix built.
 #
 # NOVA_NIX_BIN names the executable under test; nix-store comes from PATH.
 # The secret keys stay in their files and are never printed.
@@ -44,9 +45,10 @@ fail() {
 }
 
 # Every upstream command runs on a store rooted in the scratch directory,
-# whose files live under ROOT/nix/store (store-reference.cc:88-96 and
-# local-fs-store.hh:37-39 at 2.24.9), so neither the daemon nor its
-# configured substituters take part.
+# whose files live under ROOT/nix/store (StoreReference::parse in
+# store-reference.cc and LocalFSStoreConfig::realStoreDir in
+# local-fs-store.hh), so neither the daemon nor its configured substituters
+# take part.
 upstreamRealise() {
   root=$1
   cache=$2

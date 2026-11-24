@@ -258,7 +258,7 @@ refused "deepSeq forces the set under a layer by its names" 'let b = { za = thro
 refused "deepSeq forces a layer by its names" 'let early = { zg = 0; }; b = { zh = throw "base"; }; l = b // { zg = throw "layer"; }; in builtins.deepSeq l null'
 check "a chain of updates reads the same however it nests" 'let a = { x = 1; y = 1; }; v = [ (a // { y = 2; } // { z = 3; } // { x = 4; }) (((a // { y = 2; }) // { z = 3; }) // { x = 4; }) ]; in builtins.deepSeq v v'
 # 2.24.9 evaluates a chain's operands first to last, and 2.34.9 and later
-# last to first (evalForUpdate, eval.cc:2014-2019 at 2.34.9), as nova-nix
+# last to first (ExprOpUpdate::evalForUpdate in eval.cc), as nova-nix
 # does.  Each of these holds one operand that fails, so every release
 # agrees; the two after them hold two, and run from 2.34.0.
 refused "a chain of updates fails at its first operand" 'throw "first" // { a = 1; } // { b = 2; }'
@@ -316,11 +316,11 @@ check "an outPath left of + is its own text, not a store copy" 'let s = { outPat
 echo
 
 echo "== what builtins.path copies =="
-# nix-instantiate --eval runs read-only (nix-instantiate.cc:154-155 at
-# 2.24.9), so it computes a copy's path without writing it (FetchMode::DryRun,
-# primops.cc:2473) and a toFile result's without adding the text (:2310);
-# nova-nix's eval computes them the same way, writing nothing to the store,
-# which upstream manages here.
+# nix-instantiate --eval runs read-only (main_nix_instantiate in
+# nix-instantiate.cc), so it computes a copy's path without writing it
+# (FetchMode::DryRun in primops.cc's addPath) and a toFile result's without
+# adding the text (prim_toFile); nova-nix's eval computes them the same
+# way, writing nothing to the store, which upstream manages here.
 check "a file, by its NAR" 'builtins.path { path = ./data.txt; }'
 check "a file, flat" 'builtins.path { path = ./data.txt; recursive = false; }'
 check "a directory, by its NAR" 'builtins.path { path = ./sub; }'
@@ -340,12 +340,11 @@ echo
 
 echo "== what a path inside a store path coerces to =="
 # A path value is copied to the store under its base name wherever it is
-# (copyPathToStore, eval.cc:2381-2406 at 2.24.9): one inside a store path
-# too, and a store path itself under its <hash>-<name> base name.  The
-# tree is added as a fetch or a channel leaves one, and drv.nix is a
-# derivation in a file imported from it, as nixpkgs' are once nixpkgs is
-# fetched; read-only, both evaluators compute each copy's path without
-# writing it.
+# (copyPathToStore in eval.cc): one inside a store path too, and a store path
+# itself under its <hash>-<name> base name.  The tree is added as a fetch or a
+# channel leaves one, and drv.nix is a derivation in a file imported from it,
+# as nixpkgs' are once nixpkgs is fetched; read-only, both evaluators compute
+# each copy's path without writing it.
 mkdir -p "$fixture/in-store"
 printf 'in the store\n' >"$fixture/in-store/data.txt"
 printf "\"\${./data.txt}\"\n" >"$fixture/in-store/use.nix"
@@ -362,21 +361,21 @@ check "a path inside it, in toJSON" "builtins.toJSON [ $inStore/data.txt ]"
 check "a path literal in a file imported from it" "import $inStore/use.nix"
 check "a derivation in a file imported from it, naming path literals in its args and environment" "(import $inStore/drv.nix).drvPath"
 # A link inside it is followed as one outside it is.  builtins.path copies
-# what the link points to at every tag (primops.cc:2472 at 2.24.9, :2880 at
-# 2.35.4), storePath resolves a path inside a store path in full
-# (primops.cc:1613-1614 at 2.24.9, :1970-1971 at 2.35.4), and a coerced
-# path has the links among its ancestors followed at every tag.
+# what the link points to at every tag (addPath in primops.cc), storePath
+# resolves a path inside a store path in full (prim_storePath in
+# primops.cc), and a coerced path has the links among its ancestors
+# followed at every tag.
 check "builtins.path of a link inside it" "builtins.path { path = $inStore/link; }"
 check "storePath of a link inside it" "builtins.storePath $inStore/link"
 check "a path below a link inside it, interpolated" "\"\${$inStore/dirlink/inner.txt}\""
 echo
 
 echo "== what a coerced path that is a symlink is copied as =="
-# From 2.34.9 copyPathToStore resolves only a path's ancestors
-# (eval.cc:2574 at 2.34.9, :2602 at 2.35.4) and copies a path that is a
-# link as the link, which nova-nix follows.  2.24.9 resolved the path in
-# full (eval.cc:2393) and copied what the link points to, so its row has
-# none of these.
+# From 2.34.9 copyPathToStore in eval.cc resolves only a path's ancestors
+# (SymlinkResolution::Ancestors) and copies a path that is a link as the
+# link, which nova-nix follows.  2.24.9 resolved the path in full
+# (path.resolveSymlinks()) and copied what the link points to, so its row
+# has none of these.
 ln -s data.txt "$fixture/link-to-file"
 ln -s sub "$fixture/link-to-dir"
 if upstreamAtLeast 2.34.0; then
@@ -480,8 +479,8 @@ check "not when its value evaluates" 'builtins.addErrorContext (throw "a") 1'
 check "a throw inside it stays catchable" '(builtins.tryEval (builtins.addErrorContext "c" (throw "x"))).success'
 refused "a throw inside it is the failure, with the message a line of its trace" 'builtins.addErrorContext "ctx-marker" (throw "x")' ctx-marker
 # 2.36.0 keeps the value's failure whatever evaluating the message does,
-# with a line naming the message's own failure (primops.cc:1027-1055 at
-# 2.36.0), as nova-nix does; earlier releases let the message's failure
+# with a line naming the message's own failure (prim_addErrorContext in
+# primops.cc), as nova-nix does; earlier releases let the message's failure
 # escape in its place.
 if upstreamAtLeast 2.36.0; then
   refused "a message that throws leaves the failure, with a line naming its own" 'builtins.addErrorContext (throw "a") (throw "b")' "another error occurred: a"
@@ -558,12 +557,13 @@ fi
 echo
 
 echo "== a path reader realises its argument's context =="
-# nix-instantiate --eval runs read-only (nix-instantiate.cc:154-155 at
-# 2.24.9), so derivationStrict computes a derivation's path without writing
-# it, and an import of its output finds the derivation not valid
-# (primops.cc:48-51).  The name is the case's own, so no other case has
-# made the derivation valid.  2.34.9 names the path by its base name alone
-# (eval-error.cc:9 at 2.34.9), where 2.24.9 and 2.35.4 name the whole store
+# nix-instantiate --eval runs read-only (main_nix_instantiate in
+# nix-instantiate.cc), so derivationStrict computes a derivation's path
+# without writing it, and an import of its output finds the derivation not
+# valid (EvalState::realiseContext in primops.cc).  The name is the case's
+# own, so no other case has made the derivation valid.  2.34.9 names the
+# path by its base name alone (the InvalidPathError constructor in
+# eval-error.cc at 2.34.9), where 2.24.9 and 2.35.4 name the whole store
 # path, as nova-nix does.
 if ! upstreamAtLeast 2.34.0 || upstreamAtLeast 2.35.0; then
   refused "an import from a derivation in a read-only evaluation" 'import (derivation { name = "parity-ifd-read-only"; system = "x86_64-linux"; builder = "/bin/sh"; })'
@@ -572,15 +572,14 @@ echo
 
 echo "== what a fetcher returns =="
 # A fetched store path is a string carrying itself as context
-# (allowAndSetStorePathString, fetchTree.cc:526 at 2.24.9 and :508 at
-# 2.34.9), and so is fetchGit's outPath (mkStorePathString, :30 and :33): it
-# prints quoted, and a coercion names the store path rather than copying it
-# again as it would a path.  A fetcher writes in any mode, and nova-nix
-# refuses to write into a store upstream's database manages, so it fetches
-# into a store of its own; both print the logical /nix/store path.  Each row
-# compares the value alone: upstream's first fetch of the tarball prints
-# "unpacking '<url>' into the Git cache..." on stderr at 2.24.9, 2.34.9 and
-# 2.35.4.
+# (allowAndSetStorePathString in fetchTree.cc's fetch), and so is fetchGit's
+# outPath (mkStorePathString in emitTreeAttrs): it prints quoted, and a
+# coercion names the store path rather than copying it again as it would a
+# path.  A fetcher writes in any mode, and nova-nix refuses to write into a
+# store upstream's database manages, so it fetches into a store of its own;
+# both print the logical /nix/store path.  Each row compares the value alone:
+# upstream's first fetch of the tarball prints "unpacking '<url>' into the Git
+# cache..." on stderr at 2.24.9, 2.34.9 and 2.35.4.
 printf 'fetched\n' >"$fixture/parity-fetched"
 mkdir -p "$fixture/tarball/tree"
 printf 'in a tarball\n' >"$fixture/tarball/tree/f"
@@ -607,10 +606,12 @@ echo
 
 echo "== a pinned fetch the store holds already =="
 # A pinned fetch whose path is valid returns it without downloading or
-# writing anything (fetchTree.cc:484-497 at 2.24.9).  2.34.9 ensures the path
-# instead (fetchTree.cc:456-478 at 2.34.9), which for a valid one returns at
-# once without asking a substituter (build/entry-points.cc:103).  nix-store --add-fixed makes the path valid with nothing fetched,
-# and the URL names no file, so a download would fail.
+# writing anything (the pinned early exit of fetch in fetchTree.cc).  2.34.9
+# ensures the path instead, which for a valid one returns at once without
+# asking a substituter (Store::ensurePath in build/entry-points.cc at
+# 2.34.9, LocalBuilder::ensurePath at 2.36.0).  nix-store --add-fixed makes
+# the path valid with nothing fetched, and the URL names no file, so a
+# download would fail.
 pinnedFile="$fixture/parity-pinned"
 printf 'pinned\n' >"$pinnedFile"
 pinnedHash=$(nix-hash --type sha256 --flat "$pinnedFile")
@@ -619,13 +620,13 @@ check "a pinned fetchurl whose path is valid" "builtins.fetchurl { url = \"file:
 echo
 
 echo "== what allow-import-from-derivation and trace-import-from-derivation say =="
-# The settings act once the derivation is valid, so it has to be in the
-# store already: a fixed-output one, whose .drv nix-instantiate writes
-# (it runs read-write without --eval, nix-instantiate.cc:154-155) and
-# whose output nix-store --add-fixed adds where outputHash says it goes,
-# with nothing built.  nova-nix's store here is upstream's, where a tree
-# that exists counts as valid.  Each row passes its setting through
-# NIX_CONFIG, which both evaluators read.
+# The settings act once the derivation is valid, so it has to be in the store
+# already: a fixed-output one, whose .drv nix-instantiate writes (it runs
+# read-write without --eval, main_nix_instantiate in nix-instantiate.cc) and
+# whose output nix-store --add-fixed adds where outputHash says it goes, with
+# nothing built.  nova-nix's store here is upstream's, where a tree that
+# exists counts as valid.  Each row passes its setting through NIX_CONFIG,
+# which both evaluators read.
 ifdOutput="$fixture/parity-ifd-settings"
 printf '"read from a derivation"' >"$ifdOutput"
 ifdHash=$(nix-hash --type sha256 --flat "$ifdOutput")
@@ -644,10 +645,11 @@ withConfig() {
 # and build nothing.
 check "an import from a derivation whose output is valid" "import ($ifdDrv)"
 # The refusal comes after the validity checks and before any build, so an
-# output already valid is refused too (primops.cc:79-83 at 2.24.9).
+# output already valid is refused too (EvalState::realiseContext in
+# primops.cc).
 withConfig "allow-import-from-derivation = false" refused "an import from a derivation whose output is valid, with allow-import-from-derivation off" "import ($ifdDrv)"
-# trace-import-from-derivation arrives after 2.24.9 (primops.cc:115-116 at
-# 2.34.9), which names it an unknown setting.
+# trace-import-from-derivation arrives after 2.24.9 (EvalState::realiseContext
+# in primops.cc), which names it an unknown setting.
 if upstreamAtLeast 2.34.0; then
   withConfig "trace-import-from-derivation = true" check "an import from a derivation, warned of under trace-import-from-derivation" "import ($ifdDrv)"
 fi

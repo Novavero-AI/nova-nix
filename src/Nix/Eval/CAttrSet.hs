@@ -11,11 +11,11 @@
 --
 -- A set 'cattrsetUpdate' makes can be a layer on its left operand,
 -- holding the right operand's entries alone, as upstream 2.34's
--- @Bindings@ layer on one another (attr-set.hh:56-112 at 2.34.9).  A set
--- is read by name ('cattrsetLookup', 'cattrsetFind', 'cattrsetMember'),
--- which searches its layers top first, or walked in symbol order
--- ('cattrsetWalk').  Only a name table ('cattrsetFromNames'), a
--- t'FlatCAttrSet', is read and written by index into its arrays.
+-- @Bindings@ layer on one another (attr-set.hh).  A set is read by name
+-- ('cattrsetLookup', 'cattrsetFind', 'cattrsetMember'), which searches its
+-- layers top first, or walked in symbol order ('cattrsetWalk').  Only a name
+-- table ('cattrsetFromNames'), a t'FlatCAttrSet', is read and written by
+-- index into its arrays.
 --
 -- Values are 'CThunkPtr' cells stored as @void*@ on the C side.  The set
 -- never dereferences them, and the census ("Nix.Eval.CStats") follows
@@ -351,8 +351,8 @@ cattrsetSize = cdataIO . c_nn_attrset_size
 cattrsetUnion :: (MonadCData m) => SetSite -> CAttrSet -> CAttrSet -> m CAttrSet
 cattrsetUnion site a b = cdataIO (checkedCPtr "nn_attrset_union" =<< c_nn_attrset_union a b (setSiteIndex site))
 
--- | @a // b@ at a site, as upstream 2.34 makes it (eval.cc:1916-1989 at
--- 2.34.9): a layer on @a@ holding @b@'s entries while @a@'s chain holds
+-- | @a // b@ at a site, as upstream 2.34 makes it (@ExprOpUpdate::eval@ in
+-- eval.cc): a layer on @a@ holding @b@'s entries while @a@'s chain holds
 -- fewer than @NN_ATTRSET_MAX_LAYERS@ (8) sets and @b@ at most
 -- @NN_ATTRSET_LAYER_RHS_MAX@ entries (16 where a pointer takes 8 bytes),
 -- else the set 'cattrsetUnion' makes.  While

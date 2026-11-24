@@ -407,7 +407,7 @@ pattern OpPos = 25
 -- | @OpAttrs@ flag values: a set, a recursive set, or a recursive set
 -- that binds @__overrides@ statically, in which upstream makes every
 -- static value but an inherited name's a thunk of its own
--- (eval.cc:1205-1218 at 2.24.9).
+-- (@ExprAttrs::eval@ in eval.cc).
 attrsPlain, attrsRec, attrsRecOverrides :: Word8
 attrsPlain = 0
 attrsRec = 1

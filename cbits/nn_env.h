@@ -13,7 +13,7 @@
  * is its parent's address, or 0 for none, with the slot count in the low
  * bits every env's alignment leaves clear, so it takes a word and a
  * pointer a slot, as upstream's Env is a parent and its values
- * (eval.hh:135-139 at 2.24.9).  A call's env, the most common, is short,
+ * (struct Env in eval.hh).  A call's env, the most common, is short,
  * and so is nearly every frame.  Any other env's word is a header: those
  * bits clear, which fields follow the slots, and the slot count.  Only a
  * root env (the builtins, or scopedImport's names over them), a frame
