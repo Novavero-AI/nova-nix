@@ -38,7 +38,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # The public cache's address and signing key, as ci.yml and
-# public-cache.yml spell them (test/Main.hs holds the three to one of
+# public-cache.yml spell them (test/Test/Pkgs.hs holds the three to one of
 # each): the x64 leg on main publishes to it, every stage takes its
 # sources from it, and in substitute mode the rungs it holds.  Ladder
 # (mode) passes both to ladder.yml, which does not see this env.

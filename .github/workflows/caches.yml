@@ -24,7 +24,7 @@ name: Caches
 # the key needs and saves it; the GHC installation, which setup here uses,
 # is restored whole.  It runs on a push to main that changes what
 # a key reads, this workflow included, where the GHC and ormolu versions are
-# spelled (test/Main.hs holds them to the other workflows'), as is the
+# spelled (test/Test/Pkgs.hs holds them to the other workflows'), as is the
 # haskell-actions/setup pin, whose bundled version list decides the cabal
 # "latest" resolves to; daily, for the Hackage index the sdist build
 # resolves against, for a new macOS image and for a cache GitHub evicted;

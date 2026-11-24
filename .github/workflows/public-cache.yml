@@ -29,7 +29,7 @@ concurrency:
   cancel-in-progress: false
 
 # The public cache's address and signing key, as ci.yml and
-# seed-ladder.yml spell them (test/Main.hs holds the three to one of
+# seed-ladder.yml spell them (test/Test/Pkgs.hs holds the three to one of
 # each): Publish (public cache) pushes to it and E2E (public cache)
 # substitutes from it.
 env:

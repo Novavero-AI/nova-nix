@@ -43,7 +43,7 @@ concurrency:
 
 # The public cache's address and signing key: E2E (Windows) and the Stage0
 # legs take every source pkgs/windows fetches from it.  seed-ladder.yml and
-# public-cache.yml spell the same two, and test/Main.hs holds the three to
+# public-cache.yml spell the same two, and test/Test/Pkgs.hs holds the three to
 # one of each.  publish.yml's installer check spells them inline, as
 # install-nova-nix's own check does, so a cache move or a key rotation
 # edits all four.
