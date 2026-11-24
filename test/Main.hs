@@ -61,7 +61,7 @@ import Foreign.Storable (Storable, peek, peekByteOff, peekElemOff, poke, pokeByt
 import qualified GHC.Foreign as GHCForeign
 import GHC.IO.Encoding (getFileSystemEncoding, mkTextEncoding, setFileSystemEncoding)
 import GHC.IO.Exception (IOErrorType (..), IOException (..))
-import HttpFixture (Reply (..), httpResponse, withDirectoryServer, withFetchurlServer, withHttpServer)
+import HttpFixture (Reply (..), httpResponse, withDirectoryServer, withFetchurlServer, withHttpServer, withKeepAliveDirectoryServer)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildLayout (..), BuildPlace (..), BuildResult (..), BuildStop (..), BuilderInvocation (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, builderInvocation, checkDerivation, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substituteFromCaches, substitutePaths, tryFetchUrlsWith, unionEnvs, verifyFetchHash)
@@ -84,6 +84,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), DrvFile, Platform
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), decodeStructuredAttrs, encodeStructuredAttrs, renderAttrsShell, stringsAttr, withOutputPlaceholders)
 import Nix.Develop.Capture (CaptureFailure (..), OutputObject (..), captureDerivation, captureFailureMessage, environmentOutput, getEnvScriptPath, noEnvironmentMessage)
 import Nix.Develop.Environment (AttrsFiles (..), BuildEnvironment (..), EnvironmentScript (..), Prompt (..), ScriptDirectories (..), ScriptFile (..), Shell (..), ShellMode (..), Variable (..), buildEnvironmentJson, environmentScript, escapeShellArgAlways, ignoreVars, parseBuildEnvironment, renderRcfile)
+import Nix.Develop.Shell (EnvironmentBase (..), EnvironmentChanges (..), bashProgram, shellArguments, shellEnvironment, shellModeFor)
 import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, checkGitRef, checkGitRev, checkGitUrl, currentSystemStr, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalBytecode, evalParsed, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, listedBuiltins, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
@@ -27776,6 +27777,115 @@ shellWordLaw scriptPath
       pure (printed QC.=== (ExitSuccess, word))
 
 -- ---------------------------------------------------------------------------
+-- Tests: develop's shell and its command line
+-- ---------------------------------------------------------------------------
+
+-- | What @develop@'s shell runs and the environment it starts with, and
+-- how the command line gives them, each refusal in upstream's words.
+testDevelopShell :: IO [Bool]
+testDevelopShell = do
+  putStrLn "develop/shell"
+  sequence
+    [ runTest "a phase, a command, or else an interactive shell with the prompt" $
+        assertEqual "phase" (Right (RunPhase "build")) (shellModeFor Nothing (Just "build") prompt)
+          `andThen` assertEqual "command" (Right (RunCommand ("sh" :| ["-c", "true"]))) (shellModeFor (Just ("sh" :| ["-c", "true"])) Nothing prompt)
+          `andThen` assertEqual "interactive" (Right (Interactive prompt)) (shellModeFor Nothing Nothing prompt),
+      runTest "a command beside a phase is refused in upstream's words" $
+        assertEqual "both" (Left "you cannot use both '--command' and '--phase'") (shellModeFor (Just ("true" :| [])) (Just "build") prompt),
+      runTest "an interactive shell reads the rcfile through --rcfile, a command or a phase runs it as a script" $
+        assertEqual "interactive" ["--rcfile", "/t/rc"] (shellArguments (Interactive prompt) "/t/rc")
+          `andThen` assertEqual "command" ["/t/rc"] (shellArguments (RunCommand ("true" :| [])) "/t/rc")
+          `andThen` assertEqual "phase" ["/t/rc"] (shellArguments (RunPhase "build") "/t/rc")
+          `andThen` assertEqual "program" "bash" bashProgram,
+      runTest "the caller's environment, set variables replacing its own and unset ones removed, then NIX_GCROOT and SHELL" $
+        assertEqual
+          "environment"
+          (Right (Map.fromList [("A", "set"), ("C", "c"), ("NIX_GCROOT", gcroot), ("SHELL", "bash")]))
+          (shellEnvironment (changes CallerEnvironment [] ["B", "NIX_GCROOT"] [("A", "set"), ("SHELL", "zsh")]) gcroot caller),
+      runTest "--ignore-env keeps only the variables --keep-env-var names, with those --set-env-var sets" $
+        assertEqual
+          "environment"
+          (Right (Map.fromList [("B", "b"), ("D", "d"), ("NIX_GCROOT", gcroot), ("SHELL", "bash")]))
+          (shellEnvironment (changes EmptyEnvironment ["B", "missing"] [] [("D", "d")]) gcroot caller),
+      runTest "--unset-env-var under --ignore-env, and --keep-env-var without it, are refused in upstream's words" $
+        assertEqual "unset" (Left "--unset-env-var does not make sense with --ignore-env") (shellEnvironment (changes EmptyEnvironment [] ["A"] []) gcroot caller)
+          `andThen` assertEqual "keep" (Left "--keep-env-var does not make sense without --ignore-env") (shellEnvironment (changes CallerEnvironment ["A"] [] []) gcroot caller),
+      runTest "a name setenv refuses is left out, as upstream's replaceEnv goes on without it" $
+        assertEqual
+          "names"
+          (Right ["A", "B", "C", "NIX_GCROOT", "SHELL", "x"])
+          (Map.keys <$> shellEnvironment (changes CallerEnvironment [] [] [("", "empty"), ("A=B", "eq"), ("x", "y")]) gcroot caller),
+      runTestM "under --ignore-env the environment depends on the caller's only through the variables kept" $
+        quickCheckPasses . QC.forAll ((,,) <$> genChanges <*> genCaller <*> genCaller) $ \(given, first, second) ->
+          let kept = ecKeep given
+              agreeing = Map.union (Map.restrictKeys first kept) (Map.withoutKeys second kept)
+           in shellEnvironment given gcroot first QC.=== shellEnvironment given gcroot agreeing,
+      runTest "develop takes a target and build's target and store flags" $
+        assertEqual
+          "parsed"
+          (Right (Cli.CmdDevelop (Cli.TargetExpr "1") (Just "a.b") developDefaults))
+          (Cli.optCommand <$> Cli.parseArgs ["develop", "--expr", "1", "-A", "a.b", "--store", "/s", "--no-sandbox", "--substituter", "u", "--arg", "x", "1"])
+          `andThen` assertEqual "requires a target" (Left "develop requires a PATH, <NAME> or --expr EXPR") (Cli.optCommand <$> Cli.parseArgs ["develop"])
+          `andThen` assertEqual "exec-wrapper" (Left "unknown develop flag: --exec-wrapper") (Cli.optCommand <$> Cli.parseArgs ["develop", "--exec-wrapper", "s=p", "--expr", "1"])
+          `andThen` assertEqual "out-link" (Left "unknown develop flag: --no-out-link") (Cli.optCommand <$> Cli.parseArgs ["develop", "--no-out-link", "--expr", "1"]),
+      runTest "--command takes every argument after it, flags and --help included, and needs one" $
+        assertEqual
+          "command"
+          (Right (Just ("sh" :| ["-c", "exit 7", "--phase", "x", "--help"])))
+          (developed ["develop", "--expr", "1", "-c", "sh", "-c", "exit 7", "--phase", "x", "--help"] Cli.daCommand)
+          `andThen` assertEqual "long" (Right (Just ("true" :| []))) (developed ["develop", "--expr", "1", "--command", "true"] Cli.daCommand)
+          `andThen` assertEqual "none" (Left "error: --command requires at least one argument") (Cli.optCommand <$> Cli.parseArgs ["develop", "--expr", "1", "-c"])
+          `andThen` assertEqual "none, short" (Left "error: --command requires at least one argument") (Cli.optCommand <$> Cli.parseArgs ["develop", "--expr", "1", "--command"]),
+      runTest "the last phase flag wins, installcheck naming installCheck, and --check is develop's phase there" $
+        assertEqual "last" (Right (Just "install")) (developed ["develop", "--phase", "build", "--install", "--expr", "1"] Cli.daPhase)
+          `andThen` assertEqual "installcheck" (Right (Just "installCheck")) (developed ["develop", "--unpack", "--installcheck", "--expr", "1"] Cli.daPhase)
+          `andThen` assertEqual "check" (Right (Just "check")) (developed ["develop", "--check", "--expr", "1"] Cli.daPhase)
+          `andThen` assertEqual "phase" (Right (Just "fixup")) (developed ["develop", "--configure", "--phase", "fixup", "--expr", "1"] Cli.daPhase)
+          `andThen` assertEqual "build's check" (Right True) (Cli.optCheck <$> Cli.parseArgs ["build", "--check", "--expr", "1"])
+          `andThen` assertEqual "a command beside a phase parses" (Right (Just ("true" :| []), Just "build")) (developed ["develop", "--build", "--expr", "1", "-c", "true"] (\args -> (Cli.daCommand args, Cli.daPhase args))),
+      runTest "the environment flags, under each spelling, gather what they name" $
+        assertEqual
+          "gathered"
+          (Right (EmptyEnvironment, Set.fromList ["K", "L"], Set.fromList ["U", "V"], Map.fromList [("S", "s"), ("T", "t")]))
+          ( developed
+              ["develop", "-i", "-k", "K", "--keep-env-var", "L", "-u", "U", "--unset", "V", "-s", "S", "s", "--set-env-var", "T", "t", "--expr", "1"]
+              (\args -> (Cli.daEnvironmentBase args, Cli.daKeep args, Cli.daUnset args, Cli.daSet args))
+          )
+          `andThen` assertEqual "ignore-environment" (Right EmptyEnvironment) (developed ["develop", "--ignore-environment", "--expr", "1"] Cli.daEnvironmentBase)
+          `andThen` assertEqual "keep" (Right (Set.singleton "K")) (developed ["develop", "--keep", "K", "--expr", "1"] Cli.daKeep),
+      runTest "a variable both set and unset, or set twice, is refused as it is read, in upstream's words" $
+        assertEqual "unset after set" (Left "error: Cannot unset environment variable 'X' that is set with '--set-env-var'") (Cli.optCommand <$> Cli.parseArgs ["develop", "-s", "X", "1", "-u", "X", "--expr", "1"])
+          `andThen` assertEqual "set after unset" (Left "error: Cannot set environment variable 'X' that is unset with '--unset-env-var'") (Cli.optCommand <$> Cli.parseArgs ["develop", "--unset", "X", "--set-env-var", "X", "1", "--expr", "1"])
+          `andThen` assertEqual "set twice" (Left "error: Duplicate definition of environment variable 'X' with '--set-env-var' is ambiguous") (Cli.optCommand <$> Cli.parseArgs ["develop", "-s", "X", "1", "-s", "X", "2", "--expr", "1"])
+          `andThen` assertEqual "one value" (Left "-s requires a name and a value") (Cli.optCommand <$> Cli.parseArgs ["develop", "--expr", "1", "-s", "X"]),
+      runTest "print-dev-env prints the script, or with --json the environment, and takes no develop flag" $
+        assertEqual "script" (Right (Cli.CmdPrintDevEnv (Cli.TargetFile "f.nix") Nothing Cli.DevEnvScript Cli.IndentedOnTerminal)) (Cli.optCommand <$> Cli.parseArgs ["print-dev-env", "f.nix"])
+          `andThen` assertEqual "json" (Right (Cli.CmdPrintDevEnv (Cli.TargetExpr "1") (Just "a") Cli.DevEnvJson Cli.IndentedOnTerminal)) (Cli.optCommand <$> Cli.parseArgs ["print-dev-env", "--json", "--expr", "1", "-A", "a"])
+          `andThen` assertEqual "pretty" (Right (Cli.CmdPrintDevEnv (Cli.TargetExpr "1") Nothing Cli.DevEnvJson Cli.Indented)) (Cli.optCommand <$> Cli.parseArgs ["print-dev-env", "--no-pretty", "--json", "--pretty", "--expr", "1"])
+          `andThen` assertEqual "no-pretty" (Right (Cli.CmdPrintDevEnv (Cli.TargetExpr "1") Nothing Cli.DevEnvScript Cli.Compact)) (Cli.optCommand <$> Cli.parseArgs ["print-dev-env", "--expr", "1", "--pretty", "--no-pretty"])
+          `andThen` assertEqual "develop's pretty" (Left "unknown develop flag: --pretty") (Cli.optCommand <$> Cli.parseArgs ["develop", "--pretty", "--expr", "1"])
+          `andThen` assertEqual "command" (Left "unknown print-dev-env flag: --command") (Cli.optCommand <$> Cli.parseArgs ["print-dev-env", "--command", "true", "--expr", "1"])
+          `andThen` assertEqual "develop's json" (Left "unknown develop flag: --json") (Cli.optCommand <$> Cli.parseArgs ["develop", "--json", "--expr", "1"])
+    ]
+  where
+    prompt = Prompt "p" "" ""
+    gcroot = "/s/hash-x-env"
+    caller = Map.fromList [("A", "a"), ("B", "b"), ("C", "c")]
+    changes base keep unset set = EnvironmentChanges base (Set.fromList keep) (Set.fromList unset) (Map.fromList set)
+    developDefaults = Cli.DevelopArgs Nothing Nothing CallerEnvironment Set.empty Set.empty Map.empty
+    developed args field = case Cli.optCommand <$> Cli.parseArgs args of
+      Right (Cli.CmdDevelop _ _ given) -> Right (field given)
+      Right other -> Left (T.pack (show other))
+      Left err -> Left (T.pack err)
+    genName = QC.elements ["A", "B", "C", "D", "NIX_GCROOT", "SHELL", "", "E=F"]
+    genNames = Set.fromList <$> QC.listOf genName
+    genCaller = Map.fromList <$> QC.listOf ((,) <$> genName <*> QC.elements ["1", "2", ""])
+    genChanges = EnvironmentChanges EmptyEnvironment <$> genNames <*> pure Set.empty <*> (Map.fromList <$> QC.listOf ((,) <$> genName <*> QC.elements ["s", ""]))
+    quickCheckPasses property = do
+      result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
+      pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+
+-- ---------------------------------------------------------------------------
 -- Tests: Builder (Phase 2, Batch 4)
 -- ---------------------------------------------------------------------------
 
@@ -30321,6 +30431,277 @@ testCheckCLI = do
           ]
     )
 
+-- | @develop@ and @print-dev-env@ through the built CLI, over
+-- test/data/develop/shell.nix: what a command, a phase and the
+-- environment flags see, the refusals before and after the capture and
+-- their order, the descriptors the command starts with after a
+-- substitution over HTTP, structured attributes' files, the JSON
+-- layouts, the temporary files left behind, and that a second run builds
+-- nothing.  The binary runs itself, with every descriptor of the suite's
+-- closed, and reads get-env.sh from the repository's data directory.
+-- The fixture's builder is a bash whose @declare -p@, given no name,
+-- prints declare commands, which get-env.sh reads: macOS's /bin/bash 3.2
+-- prints @NAME=value@ lines there, from which it captures no variable.
+-- The same bash leads @PATH@, so that it is the shell too, which needs
+-- @declare -A@ under structured attributes.  Each command removes the
+-- fresh @NIX_BUILD_TOP@ the rcfile makes, which macOS's @mktemp -t@ puts
+-- in the user's temporary directory whatever @TMPDIR@ says.  On Windows
+-- both commands are refused.
+testDevelopCLI :: IO [Bool]
+testDevelopCLI = do
+  putStrLn "cli/develop"
+  ambient <- getEnvironment
+  tmpBase <- getTemporaryDirectory
+  let root = tmpBase </> "nova-nix-test-cli-develop"
+      store = root </> "store"
+      marker = root </> "marker"
+      shellTemp = root </> "tmp"
+      isolatedNames = ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_STATE_HOME", "XDG_DATA_HOME", "NIX_STATE_HOME", "HOME", "ZDOTDIR", "BASH_ENV", "ENV", "TMPDIR", "NIX_DATA_DIR", "nova_nix_datadir", "DEVELOP_KEEP", "DEVELOP_DROP", "DEVELOP_NEW"]
+      isolatedEnv dataDir =
+        [ ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n"),
+          ("NIX_CONF_DIR", root </> "system"),
+          ("NIX_USER_CONF_FILES", ""),
+          ("XDG_CONFIG_HOME", root </> "home" </> "config"),
+          ("XDG_STATE_HOME", root </> "home" </> "state"),
+          ("XDG_DATA_HOME", root </> "home" </> "data"),
+          ("NIX_STATE_HOME", root </> "home" </> "nix"),
+          ("HOME", root </> "home"),
+          ("ZDOTDIR", root </> "home"),
+          ("TMPDIR", shellTemp),
+          ("NIX_DATA_DIR", dataDir),
+          ("DEVELOP_KEEP", "kept"),
+          ("DEVELOP_DROP", "dropped")
+        ]
+          <> filter ((`notElem` isolatedNames) . fst) ambient
+  if SI.os == "mingw32"
+    then do
+      let refused args = runTestM ("nova-nix " <> T.pack (unwords args) <> " is refused on Windows") $ do
+            (code, _, err) <- Proc.readCreateProcessWithExitCode ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just (isolatedEnv "data")}) ""
+            pure $
+              if code == ExitFailure 1 && listToMaybe (reverse (lines (filter (/= '\r') err))) == Just "error: develop and print-dev-env do not run on Windows yet"
+                then Pass
+                else Fail ("exit " <> T.pack (show code) <> ": " <> T.pack err)
+      bracket_
+        (forceRemoveIfExists root >> createDirectoryIfMissing True root)
+        (forceRemoveIfExists root)
+        (sequence [refused ["develop", "--expr", "1"], refused ["print-dev-env", "--expr", "1"]])
+    else do
+      builder <- declaringBash
+      case builder of
+        Nothing -> [True] <$ putStrLn "  SKIP  no bash whose declare -p prints declare commands"
+        Just bash -> do
+          (built, _, buildErr) <- Proc.readCreateProcessWithExitCode (Proc.proc "cabal" ["build", "-v0", "exe:nova-nix"]) ""
+          (_, listed, _) <- Proc.readCreateProcessWithExitCode (Proc.proc "cabal" ["list-bin", "-v0", "exe:nova-nix"]) ""
+          dataDir <- Dir.makeAbsolute "data"
+          fixture <- Dir.makeAbsolute ("test" </> "data" </> "develop" </> "shell.nix")
+          case (built, lines listed) of
+            (ExitSuccess, [binary]) ->
+              bracket_
+                (forceRemoveIfExists root >> mapM_ (createDirectoryIfMissing True) [root </> "home", shellTemp])
+                (forceRemoveIfExists root)
+                (runDevelopCLI bash binary fixture (isolatedEnv dataDir) root store marker shellTemp)
+            _ -> sequence [runTest "the CLI builds" (Fail (T.pack buildErr))]
+  where
+    -- A bash get-env.sh can run: the first whose declare -p, given no
+    -- name as get-env.sh gives it none, prints a declare command for a
+    -- variable.
+    declaringBash = do
+      onPath <- Dir.findExecutable "bash"
+      firstM declares (["/bin/bash", "/usr/bin/bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash"] <> maybeToList onPath)
+    declares candidate = do
+      present <- Dir.doesFileExist candidate
+      if not present
+        then pure False
+        else do
+          (code, out, _) <- Proc.readCreateProcessWithExitCode (Proc.proc candidate ["-c", "x=1; declare -p"]) ""
+          pure (code == ExitSuccess && any ("declare -- x=" `isPrefixOf`) (lines out))
+    firstM _ [] = pure Nothing
+    firstM check (candidate : rest) = do
+      found <- check candidate
+      if found then pure (Just candidate) else firstM check rest
+
+-- | The runs of 'testDevelopCLI' on a POSIX host, given the bash the
+-- fixture's builder is, the binary, the fixture, the environment, and
+-- the root, store, marker file and temporary directory under it.
+runDevelopCLI :: FilePath -> FilePath -> FilePath -> [(String, String)] -> FilePath -> FilePath -> FilePath -> FilePath -> IO [Bool]
+runDevelopCLI bash binary fixture ambientEnv root store marker shellTemp = do
+  let env = ("PATH", takeDirectory bash <> maybe "" (searchPathSeparator :) (lookup "PATH" ambientEnv)) : filter ((/= "PATH") . fst) ambientEnv
+      runIn environment args = Proc.readCreateProcessWithExitCode (Proc.proc binary args) {Proc.env = Just environment, Proc.close_fds = True} ""
+      run = runIn env
+      target command builder markerFile = [command, fixture, "--argstr", "marker", markerFile, "--argstr", "builder", builder, "--no-sandbox"]
+      developIn environment storeDir flags = runIn environment (target "develop" bash marker <> ["--store", storeDir] <> flags)
+      develop = developIn env
+      -- A command that first removes the fresh NIX_BUILD_TOP, which only
+      -- an empty directory lets it do.
+      inShell script = ["--command", "/bin/sh", "-c", "rmdir \"$NIX_BUILD_TOP\" && " <> script]
+      probe = "printf '%s/%s/%s' \"${DEVELOP_KEEP-unset}\" \"${DEVELOP_DROP-unset}\" \"${DEVELOP_NEW-unset}\""
+      outcome (code, out, err) = "exit " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err
+      -- Refused with status 1 and the message as stderr's last line, after
+      -- what the capture's build logged.
+      refusedWith message result@(code, _, err)
+        | code == ExitFailure 1 && listToMaybe (reverse (lines err)) == Just message = Pass
+        | otherwise = Fail (outcome result)
+      structuredTemp = root </> "structured-tmp"
+      structuredEnv = ("TMPDIR", structuredTemp) : filter ((/= "TMPDIR") . fst) env
+      -- A variant's capture is another derivation, with a marker of its
+      -- own, so that the main one counts the main capture's runs alone.
+      structured command flags = runIn structuredEnv (target command bash (root </> "structured-marker") <> ["--store", store, "--arg", "structured", "true"] <> flags)
+      substituting storeDir flags = run (target "develop" bash (root </> "substitution-marker") <> ["--store", storeDir] <> flags)
+  createDirectoryIfMissing True structuredTemp
+  seen@(_, seenOut, _) <- develop store (inShell "develop-tool && printf '%s|%s' \"$greeting\" \"$NIX_GCROOT\"")
+  exited <- develop store (inShell "exit 7")
+  phase <- develop store ["--phase", "build"]
+  phaseFlag <- develop store ["--build"]
+  ignored <- develop store (["-i", "-k", "DEVELOP_KEEP", "-k", "PATH"] <> inShell probe)
+  changed <- develop store (["-u", "DEVELOP_DROP", "-s", "DEVELOP_NEW", "new"] <> inShell probe)
+  emptyName <- developIn (("", "x") : env) store (inShell "true")
+  unsetIgnored <- develop store ["-i", "-u", "X", "--command", "true"]
+  keptWithout <- develop store ["-k", "X", "--command", "true"]
+  both <- develop store ["--phase", "build", "--command", "true"]
+  scriptFirst <- run (target "develop" bash (root </> "array-marker") <> ["--store", store, "--arg", "arrayOutput", "true", "-i", "-u", "X", "--phase", "build", "--command", "true"])
+  unexecutable <- develop store ["-s", "PATH", "/nonexistent", "--command", "true"]
+  parseRefused <- develop store ["-u", "X", "-s", "X", "1", "--command", "true"]
+  commandless <- develop store ["--command"]
+  notBash <- run (target "develop" "/bin/sh" marker <> ["--store", root </> "refused-store", "--command", "true"])
+  printed@(_, printedOut, _) <- run (target "print-dev-env" bash marker <> ["--store", store])
+  let printedScript = root </> "printed.sh"
+  BS.writeFile printedScript (TE.encodeUtf8 (T.pack printedOut))
+  sourced <- Proc.readCreateProcessWithExitCode (Proc.proc bash ["-c", ". \"$1\" && rmdir \"$NIX_BUILD_TOP\" && printf '%s' \"$greeting\"", "bash", printedScript]) {Proc.env = Just env} ""
+  json@(_, jsonOut, _) <- run (target "print-dev-env" bash marker <> ["--store", store, "--json"])
+  pretty@(_, prettyOut, _) <- run (target "print-dev-env" bash marker <> ["--store", store, "--no-pretty", "--json", "--pretty"])
+  notPretty@(_, notPrettyOut, _) <- run (target "print-dev-env" bash marker <> ["--store", store, "--pretty", "--json", "--no-pretty"])
+  structuredSeen@(_, structuredOut, _) <- structured "develop" (inShell "printf '%s|%s' \"$NIX_ATTRS_SH_FILE\" \"$NIX_ATTRS_JSON_FILE\"")
+  structuredRoot <- Dir.canonicalizePath structuredTemp
+  structuredFiles <- case T.splitOn "|" (T.pack structuredOut) of
+    [shFile, jsonFile] -> do
+      sh <- BS.readFile (T.unpack shFile)
+      jsonBytes <- BS.readFile (T.unpack jsonFile)
+      pure (Right (T.unpack shFile, T.unpack jsonFile, sh, jsonBytes))
+    _ -> pure (Left ())
+  structuredPrinted@(_, structuredPrintedOut, _) <- structured "print-dev-env" []
+  structuredLeft <- sort <$> Dir.listDirectory structuredTemp
+  descriptors <- substitutedDescriptors run substituting inShell fixture root
+  direct <- Proc.readCreateProcessWithExitCode (Proc.proc "/bin/sh" ["-c", "ls /dev/fd/"]) {Proc.env = Just env, Proc.close_fds = True} ""
+  gcrootEnvironment <- case T.splitOn "|" (T.pack seenOut) of
+    [_, gcroot] -> Right <$> BS.readFile (T.unpack gcroot)
+    _ -> pure (Left ())
+  refusedStore <- Dir.doesDirectoryExist (root </> "refused-store")
+  refusedScripts <- if refusedStore then filter ("-get-env.sh" `isSuffixOf`) <$> Dir.listDirectory (root </> "refused-store") else pure []
+  runs <- BS8.lines <$> BS.readFile marker
+  leftBehind <- Dir.listDirectory shellTemp
+  sequence
+    [ runTest "--command sees the captured variables and the build input on PATH" $
+        case T.splitOn "|" (T.pack seenOut) of
+          [greetingSeen, gcroot]
+            | greetingSeen == "tool ran\n" <> fixtureGreeting
+                && T.pack store `T.isPrefixOf` gcroot
+                && "-develop-fixture-env" `T.isSuffixOf` gcroot ->
+                Pass
+          _ -> Fail (outcome seen),
+      runTest "NIX_GCROOT names the output the environment was read from" $
+        assertRight "read" gcrootEnvironment $ \bytes ->
+          assertRight "parsed" (parseBuildEnvironment bytes) $
+            assertEqual "greeting" (Just (ExportedString fixtureGreeting)) . Map.lookup "greeting" . beVariables,
+      runTest "the shell's exit status is the command's" $
+        assertEqual "status" (ExitFailure 7) (fst3 exited),
+      runTest "--phase and a phase flag run the phase through runPhase" $
+        assertEqual "phase" (ExitSuccess, "build phase ran: tool ran\n") (fst3 phase, snd3 phase)
+          `andThen` assertEqual "flag" (ExitSuccess, "build phase ran: tool ran\n") (fst3 phaseFlag, snd3 phaseFlag),
+      runTest "--ignore-env keeps what --keep-env-var names" $
+        assertEqual "seen" (ExitSuccess, "kept/unset/unset") (fst3 ignored, snd3 ignored),
+      runTest "--unset-env-var and --set-env-var change the caller's environment" $
+        assertEqual "seen" (ExitSuccess, "kept/unset/new") (fst3 changed, snd3 changed),
+      runTest "an environment entry with an empty name, which unsetenv refuses, does not stop the shell" $
+        assertEqual "status" ExitSuccess (fst3 emptyName),
+      runTest "upstream's refusals once the environment is built are its whole lines" $
+        refusedWith "error: --unset-env-var does not make sense with --ignore-env" unsetIgnored
+          `andThen` refusedWith "error: --keep-env-var does not make sense without --ignore-env" keptWithout
+          `andThen` refusedWith "error: you cannot use both '--command' and '--phase'" both,
+      runTest "a script that cannot be made is refused before the flags, as upstream makes the script first" $
+        refusedWith "error: bash variable is not a string" scriptFirst,
+      runTest "a shell that cannot start is reported in upstream's words" $
+        refusedWith "error: unable to execute 'bash': No such file or directory" unexecutable,
+      runTest "the refusals made as the command line is read are whole lines after error:" $
+        refusedWith "error: Cannot set environment variable 'X' that is unset with '--unset-env-var'" parseRefused
+          `andThen` refusedWith "error: --command requires at least one argument" commandless,
+      runTest "a builder that is not bash is refused in upstream's words, and get-env.sh is not written" $
+        refusedWith "error: 'nix develop' only works on derivations that use 'bash' as their builder" notBash
+          `andThen` assertEqual "written" [] refusedScripts,
+      runTest "after a substitution over HTTP, the command starts with the descriptors a process started directly has" $
+        assertRight "substituted" descriptors $ \listing ->
+          assertEqual "descriptors" (snd3 direct) listing,
+      runTest "print-dev-env prints a script bash sources, followed by a newline" $
+        assertEqual "sourced" (ExitSuccess, T.unpack fixtureGreeting) (fst3 sourced, snd3 sourced)
+          `andThen` (if "eval \"${shellHook:-}\"\n\n" `isSuffixOf` printedOut then Pass else Fail (outcome printed)),
+      runTest "print-dev-env --json prints the environment on one line where stdout is no terminal, and --pretty and --no-pretty choose, the last winning" $
+        case (lines jsonOut, lines prettyOut, lines notPrettyOut) of
+          ([line], _ : _ : _, [notPrettyLine]) ->
+            assertRight "parsed" (parseBuildEnvironment (TE.encodeUtf8 (T.pack line))) $ \environment ->
+              assertEqual "greeting" (Just (ExportedString fixtureGreeting)) (Map.lookup "greeting" (beVariables environment))
+                `andThen` assertEqual "pretty" (Right environment) (parseBuildEnvironment (TE.encodeUtf8 (T.pack prettyOut)))
+                `andThen` assertEqual "no-pretty" line notPrettyLine
+          _ -> Fail (outcome json <> "; " <> outcome pretty <> "; " <> outcome notPretty),
+      runTest "under structured attributes the shell reads the files from a directory develop leaves for it" $
+        assertRight "files" structuredFiles $ \(shFile, jsonFile, sh, jsonBytes) ->
+          assertEqual "status" ExitSuccess (fst3 structuredSeen)
+            `andThen` assertEqual "directory" (takeDirectory shFile) (takeDirectory jsonFile)
+            `andThen` assertEqual "under TMPDIR, its links resolved" structuredRoot (takeDirectory (takeDirectory shFile))
+            `andThen` assertEqual "named" True ("nix-develop-" `isPrefixOf` takeFileName (takeDirectory shFile))
+            `andThen` assertEqual "names" (".attrs.sh", ".attrs.json") (takeFileName shFile, takeFileName jsonFile)
+            `andThen` assertEqual "written" (True, True) ("greeting" `BS.isInfixOf` sh, "greeting" `BS.isInfixOf` jsonBytes)
+            `andThen` assertEqual "left" [takeFileName (takeDirectory shFile)] structuredLeft,
+      runTest "print-dev-env names the structured attributes' files in a directory it removes" $
+        if fst3 structuredPrinted == ExitSuccess && (T.pack structuredRoot <> "/nix-dev-env-") `T.isInfixOf` T.pack structuredPrintedOut
+          then assertEqual "left" 1 (length structuredLeft)
+          else Fail (outcome structuredPrinted),
+      runTest "the capture is built once" $
+        assertEqual "runs" ["ran"] runs,
+      runTest "nothing is left in the temporary directory: the rcfile removes itself, and no directory is kept for files there are none of" $
+        assertEqual "left" [] leftBehind
+    ]
+  where
+    fixtureGreeting = "it's \"quoted\"\nand on two lines"
+    fst3 (code, _, _) = code
+    snd3 (_, out, _) = out
+
+-- | What @ls /dev/fd/@ prints in a @develop@ shell whose capture first
+-- substitutes the fixture's build input from a binary cache served over
+-- HTTP by a server that keeps its connections open, which leaves one in
+-- the HTTP client's pool: the input is built into a store of its own,
+-- pushed to a directory as a signed cache, and the directory served on
+-- loopback.  Given the CLI, @develop@ into a
+-- store with flags, the command the shell runs, the fixture and the
+-- root.  'Left' with what went wrong.
+substitutedDescriptors ::
+  ([String] -> IO (ExitCode, String, String)) ->
+  (FilePath -> [String] -> IO (ExitCode, String, String)) ->
+  (String -> [String]) ->
+  FilePath ->
+  FilePath ->
+  IO (Either Text String)
+substitutedDescriptors run develop inShell fixture root = do
+  seed <- BS.pack <$> QC.generate (QC.vectorOf ed25519SeedBytes QC.arbitrary)
+  case throwawayKey seed of
+    Left err -> pure (Left (T.pack err))
+    Right (keyText, publicKey) -> do
+      let keyFile = root </> "cache-secret-key"
+          cache = root </> "cache"
+          source = root </> "source-store"
+      BS.writeFile keyFile (TE.encodeUtf8 keyText)
+      built@(_, builtOut, _) <- run ["build", "--expr", "{ fixture }: builtins.head (import fixture { marker = \"\"; }).buildInputs", "--argstr", "fixture", fixture, "--store", source, "--no-out-link", "--no-sandbox"]
+      case listToMaybe (reverse (lines builtOut)) of
+        Nothing -> pure (Left ("build: " <> T.pack (show built)))
+        Just tool -> do
+          pushed <- run ["push", "--cache", "file://" <> cache, "--secret-key-file", keyFile, "--store", source, tool]
+          shown <- withKeepAliveDirectoryServer cache $ \base ->
+            develop
+              (root </> "substituted-store")
+              (["--substituter", T.unpack base, "--trusted-key", T.unpack (Signing.renderPublicKey publicKey)] <> inShell "ls /dev/fd/")
+          pure $ case shown of
+            (ExitSuccess, listing, err)
+              | any (\line -> "[subst]" `isInfixOf` line && "develop-tool" `isSuffixOf` line) (lines err) -> Right listing
+            _ -> Left ("push: " <> T.pack (show pushed) <> "; develop: " <> T.pack (show shown))
+
 -- | The CLI runs with upstream's file-creation mask, 0022, whatever the one
 -- it was started with, so a builder it runs does too.  POSIX only: Windows
 -- has no such mask.
@@ -31602,10 +31983,12 @@ testCliReference = do
               Ref.CommandFlag names <- [Ref.flagScope entry],
               name <- toList names,
               spelling <- toList (Ref.flagSpellings entry),
-              let args = cliWords name ++ [T.unpack spelling] ++ cliValue entry ++ cliOperands name flagName
+              let args = cliLine name flagName spelling (cliValue entry)
             ],
         -- The other way round, so --help lists exactly what each command
-        -- takes after its words.  A global flag is answered anywhere.
+        -- takes after its words.  A global flag is answered anywhere, and
+        -- a spelling two commands give different flags, as build's and
+        -- develop's --check, is the other flag's there.
         runTest "no command takes, after its words, a flag the reference does not list for it" $
           allPass
             [ case Cli.parseArgs args of
@@ -31616,7 +31999,8 @@ testCliReference = do
               name <- Ref.commandNames,
               name `notElem` names,
               spelling <- toList (Ref.flagSpellings entry),
-              let args = cliWords name ++ [T.unpack spelling] ++ cliValue entry ++ cliOperands name flagName
+              spelling `notElem` commandSpellings name,
+              let args = cliLine name flagName spelling (cliValue entry)
             ],
         runTest "a global flag is answered on its own" $
           allPass
@@ -31643,7 +32027,7 @@ testCliReference = do
         runTest "a flag asks for values exactly when its entry names them" $
           allPass
             [ let values = cliValue entry
-                  missing = Left (T.unpack spelling <> cliShortfall values)
+                  missing = Left (cliShortfall flagName spelling values)
                   given count = Cli.optCommand <$> Cli.parseArgs (prefix ++ [T.unpack spelling] ++ take count values)
                   complete = prefix ++ operands ++ [T.unpack spelling]
                in case (values, Cli.parseArgs complete) of
@@ -31666,8 +32050,11 @@ testCliReference = do
                      example <- toList (Ref.commandExamples (Ref.command name))
                    ]
             ),
-        runTest "spellings are well formed and name one flag each" $
-          let spellings = concatMap (toList . Ref.flagSpellings . snd) referenceFlags
+        runTest "spellings are well formed and name one flag each where they apply" $
+          let spellings = [(scope, spelling) | (_, entry) <- referenceFlags, scope <- scopeCommands (Ref.flagScope entry), spelling <- toList (Ref.flagSpellings entry)]
+              scopeCommands scope = case scope of
+                Ref.GlobalFlag -> [Nothing]
+                Ref.CommandFlag names -> map Just (toList names)
               longFormed = all (\part -> not (T.null part) && T.all isAsciiLower part) . T.splitOn "-"
               wellFormed entry =
                 all longFormed (Ref.flagLong entry : toList (Ref.flagAlias entry))
@@ -31750,6 +32137,13 @@ testCliReference = do
   pure (checks ++ ran)
   where
     referenceFlags = [(name, Ref.flag name) | name <- Ref.flagNames]
+    commandSpellings name =
+      [ spelling
+      | (_, entry) <- referenceFlags,
+        Ref.CommandFlag names <- [Ref.flagScope entry],
+        name `elem` names,
+        spelling <- toList (Ref.flagSpellings entry)
+      ]
     regenerateCliJson = "from the repository root, regenerate it with: cabal run --enable-tests -v0 nova-nix-test -- " <> writeCliJsonFlag
     allPass = foldr andThen Pass
     isAsciiLetter c = isAsciiLower c || isAsciiUpper c
@@ -31775,16 +32169,27 @@ globalAnswer flagName = case flagName of
   Ref.VersionFlag -> Just Cli.CmdVersion
   _ -> Nothing
 
--- | A value for each value a flag takes, which the parser accepts
--- unchecked: one for each name its entry gives.
+-- | A value for each value a flag needs, which the parser accepts
+-- unchecked: one for each name its entry gives outside brackets.
 cliValue :: Ref.FlagEntry -> [String]
-cliValue entry = maybe [] (map (const "value") . T.words) (Ref.flagArgument entry)
+cliValue entry = maybe [] (map (const "value") . filter (not . ("[" `T.isPrefixOf`)) . T.words) (Ref.flagArgument entry)
 
--- | What the parser says to a flag given fewer values than it takes.
-cliShortfall :: [String] -> String
-cliShortfall values = case values of
-  [_, _] -> " requires a name and a value"
-  _ -> " requires a value"
+-- | A command line with a flag and its values in it, completed by the
+-- operands the command needs: after the flag, or before it for
+-- @--command@, which takes every argument after it.
+cliLine :: Ref.CommandName -> Ref.FlagName -> Text -> [String] -> [String]
+cliLine name flagName spelling values = case flagName of
+  Ref.ShellCommandFlag -> cliWords name ++ cliOperands name flagName ++ [T.unpack spelling] ++ values
+  _ -> cliWords name ++ [T.unpack spelling] ++ values ++ cliOperands name flagName
+
+-- | What the parser says to a flag given fewer values than it needs:
+-- upstream's words after @error: @ for @--command@, under either
+-- spelling.
+cliShortfall :: Ref.FlagName -> Text -> [String] -> String
+cliShortfall flagName spelling values = case (flagName, values) of
+  (Ref.ShellCommandFlag, _) -> "error: --command requires at least one argument"
+  (_, [_, _]) -> T.unpack spelling <> " requires a name and a value"
+  _ -> T.unpack spelling <> " requires a value"
 
 -- | What completes a command line once a flag is in it: the operands the
 -- command needs, but an expression when the flag is @--expr@, which gives
@@ -31793,6 +32198,8 @@ cliOperands :: Ref.CommandName -> Ref.FlagName -> [String]
 cliOperands name flagName = case name of
   Ref.EvalCommand -> expression
   Ref.BuildCommand -> expression
+  Ref.DevelopCommand -> expression
+  Ref.PrintDevEnvCommand -> expression
   Ref.TrustCommand -> expression
   Ref.PushCommand -> ["--cache", "https://cache.example.org", "hash-name"]
   Ref.StoreDeleteCommand -> ["hash-name"]
@@ -31808,6 +32215,8 @@ cliSelects :: Ref.CommandName -> Cli.Command -> Bool
 cliSelects name parsed = case (name, parsed) of
   (Ref.EvalCommand, Cli.CmdEval _) -> True
   (Ref.BuildCommand, Cli.CmdBuild {}) -> True
+  (Ref.DevelopCommand, Cli.CmdDevelop {}) -> True
+  (Ref.PrintDevEnvCommand, Cli.CmdPrintDevEnv {}) -> True
   (Ref.TrustCommand, Cli.CmdTrust {}) -> True
   (Ref.PushCommand, Cli.CmdPush _) -> True
   (Ref.StoreDeleteCommand, Cli.CmdStoreDelete _) -> True
@@ -37402,11 +37811,13 @@ runSuite = do
           testInputAddressed,
           testDevelopCapture,
           testDevelopEnvironment,
+          testDevelopShell,
           testBuilder,
           testFlatOutputFormIO,
           testE2E,
           testExecWrapperCLI,
           testCheckCLI,
+          testDevelopCLI,
           testImportFromDerivationCLI,
           testBuildCoresCLI,
           testBuildUmaskCLI,

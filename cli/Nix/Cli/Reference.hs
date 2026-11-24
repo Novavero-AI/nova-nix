@@ -92,6 +92,8 @@ import qualified System.Info as SI
 data CommandName
   = EvalCommand
   | BuildCommand
+  | DevelopCommand
+  | PrintDevEnvCommand
   | TrustCommand
   | PushCommand
   | StoreDeleteCommand
@@ -158,6 +160,8 @@ commandWords :: CommandName -> [Text]
 commandWords name = case name of
   EvalCommand -> ["eval"]
   BuildCommand -> ["build"]
+  DevelopCommand -> ["develop"]
+  PrintDevEnvCommand -> ["print-dev-env"]
   TrustCommand -> ["trust"]
   PushCommand -> ["push"]
   StoreDeleteCommand -> ["store", "delete"]
@@ -196,7 +200,7 @@ globalForm =
   CommandEntry
     { commandForms = Form "COMMAND [FLAG...]" "Run one command, with the flags it takes" :| [],
       commandDescription =
-        "nova-nix evaluates Nix expressions, builds derivations, reports what a derivation's closure relies on, pushes store paths to a binary cache, keeps profiles of packages and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` alone has another status, 104, for an output that differs.",
+        "nova-nix evaluates Nix expressions, builds derivations, starts shells with a derivation's build environment, reports what a derivation's closure relies on, pushes store paths to a binary cache, keeps profiles of packages and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` has another status, 104, for an output that differs, and `develop`, once its shell has started, exits with the shell's.",
       commandExamples =
         Example "Print the release this binary was built from." ("--version" :| []) []
           :| [Example "Print the commands, flags and settings." ("--help" :| []) []]
@@ -275,6 +279,50 @@ command name = case name of
                  Example
                    "Check GNU Hello with the public cache as a substituter: Hello and what it is built from are downloaded where the cache holds them and built where it does not, then Hello is built again, and the command fails if its output comes out different."
                    ("build" :| ["pkgs/windows/hello.nix", "--check", "--substituter", "https://cache.novavero.ai", "--trusted-key", "cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ="])
+                   []
+               ]
+      }
+  DevelopCommand ->
+    CommandEntry
+      { commandForms =
+          Form "PATH" "Start a shell with the build environment of a derivation in a .nix file, or a directory's default.nix"
+            :| [ Form "'<NAME>'" "Start a shell with the build environment of a derivation in the file the search path finds for NAME",
+                 Form "--expr 'EXPR'" "Start a shell with the build environment of an inline derivation"
+               ],
+        commandDescription =
+          "Evaluates " <> targetSource <> ", selects the attribute `-A` names when it is given, and starts `bash` with the environment the builder of the derivation that results has once its stdenv's setup has run, as `nix develop` does. " <> targetCalls <> " " <> captureRule <> " The shell sets each variable and function again, but for those that belong to the shell running it, such as `HOME`, `TERM` and the temporary directories, with each output's path replaced by `outputs/NAME` under the working directory. It then puts the caller's `PATH` and `XDG_DATA_DIRS` after the captured ones, points `NIX_BUILD_TOP` and the temporary-directory variables at a fresh directory, and runs `shellHook`. Under structured attributes it reads `.attrs.sh` and `.attrs.json` from a temporary directory, which outlives the shell. An interactive shell reads `~/.bashrc` first and takes its prompt from the `bash-prompt` settings. With `--command` the command runs in place of an interactive shell, and with `--phase`, or a flag naming a phase, the phase runs through the setup's `runPhase`, or through `runHook` where it has none. The shell is `bash` found on the `PATH` of the environment it starts with, `/bin/bash` on macOS unless that `PATH` names another, with `SHELL` set to `bash` and `NIX_GCROOT` to the copy's output, which the garbage collector does not yet keep while the shell runs. That environment is the caller's, changed by `--ignore-env`, `--keep-env-var`, `--unset-env-var` and `--set-env-var`. nova-nix replaces itself with the shell, so the command exits with the shell's status. " <> developRefusals,
+        commandExamples =
+          Example
+            "Start a shell with GNU Hello's build environment, from a nixpkgs checkout in the working directory."
+            ("develop" :| ["--nix-path", "nixpkgs=./nixpkgs", "<nixpkgs>", "-A", "hello"])
+            []
+            :| [ Example
+                   "Run Hello's configure phase in its unpacked source, as its builder would."
+                   ("develop" :| ["--nix-path", "nixpkgs=./nixpkgs", "<nixpkgs>", "-A", "hello", "--configure"])
+                   [],
+                 Example
+                   "Run a command in Hello's build environment: here, print `$out`, which names `outputs/out` under the working directory."
+                   ("develop" :| ["--nix-path", "nixpkgs=./nixpkgs", "<nixpkgs>", "-A", "hello", "--command", "sh", "-c", "echo $out"])
+                   []
+               ]
+      }
+  PrintDevEnvCommand ->
+    CommandEntry
+      { commandForms =
+          Form "PATH" "Print the build environment of a derivation in a .nix file, or a directory's default.nix"
+            :| [ Form "'<NAME>'" "Print the build environment of a derivation in the file the search path finds for NAME",
+                 Form "--expr 'EXPR'" "Print the build environment of an inline derivation"
+               ],
+        commandDescription =
+          "Evaluates " <> targetSource <> ", selects the attribute `-A` names when it is given, and prints the script that `develop`'s shell runs to set the build environment of the derivation that results, which a running `bash` can source, as `nix print-dev-env` does. " <> targetCalls <> " " <> captureRule <> " Under structured attributes the script names `.attrs.sh` and `.attrs.json` in a temporary directory, which is removed when the command exits, as upstream's is. With `--json` it prints the captured environment instead, as one JSON document of the variables, the functions and, under structured attributes, the two files the builder read, laid out over several lines when stdout is a terminal and on one otherwise, unless `--pretty` or `--no-pretty` says which. " <> developRefusals,
+        commandExamples =
+          Example
+            "Print the script that sets GNU Hello's build environment, from a nixpkgs checkout in the working directory."
+            ("print-dev-env" :| ["--nix-path", "nixpkgs=./nixpkgs", "<nixpkgs>", "-A", "hello"])
+            []
+            :| [ Example
+                   "Print that environment as JSON."
+                   ("print-dev-env" :| ["--nix-path", "nixpkgs=./nixpkgs", "<nixpkgs>", "-A", "hello", "--json"])
                    []
                ]
       }
@@ -412,6 +460,15 @@ profileRules = "A profile is a link to one of its generations, `PROFILE-1-link`,
 targetSource :: Text
 targetSource = "the file `PATH` names, or its `default.nix` when `PATH` is a directory, the file the search path finds for `<NAME>`, or the expression `--expr` gives"
 
+-- | How @develop@ and @print-dev-env@ capture a build environment, as
+-- upstream's @nix develop@ does.
+captureRule :: Text
+captureRule = "The derivation's builder must be `bash`. A copy of it, named with `-env` after its name and with no checks on what its outputs refer to, is built in its place, with upstream's `get-env.sh` as its builder's script: it sources `$stdenv/setup` when `stdenv` is set, then writes the variables and functions bash holds to the copy's output, so the copy's path is the one `nix develop` builds. It reads the variables from the declare commands `declare -p` prints, which macOS's `/bin/bash`, bash 3.2, does not print, so a builder that is that bash captures none. What the derivation depends on is built or downloaded first, as `build` does, and a copy already built is not built again."
+
+-- | What @develop@ and @print-dev-env@ refuse before evaluating anything.
+developRefusals :: Text
+developRefusals = "A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is evaluated. On Windows the command is refused."
+
 -- | How a value is called with the arguments @--arg@ and @--argstr@
 -- give, upstream's @autoCallFunction@.
 callRule :: Text
@@ -446,6 +503,18 @@ data FlagName
   | TrustedKeyFlag
   | FallbackFlag
   | CheckFlag
+  | ShellCommandFlag
+  | PhaseFlag
+  | UnpackFlag
+  | ConfigureFlag
+  | BuildPhaseFlag
+  | CheckPhaseFlag
+  | InstallFlag
+  | InstallCheckFlag
+  | IgnoreEnvFlag
+  | KeepEnvVarFlag
+  | UnsetEnvVarFlag
+  | SetEnvVarFlag
   | SandboxFlag
   | NoSandboxFlag
   | RelaxedSandboxFlag
@@ -554,6 +623,30 @@ flag name = case name of
     long "fallback" Nothing "Build from source if substitution fails" evaluating
   CheckFlag ->
     long "check" Nothing "Build the derivation again beside its valid outputs, and fail with status 104 if an output comes out different" buildOnly
+  ShellCommandFlag ->
+    short 'c' "command" (Just "CMD [ARG...]") "Run `CMD` with every argument after it, flags included, in place of an interactive shell" developOnly
+  PhaseFlag ->
+    long "phase" (Just "NAME") "Run the phase `NAME`, such as `build`, in place of an interactive shell; the last phase flag given wins" developOnly
+  UnpackFlag ->
+    long "unpack" Nothing "Run the `unpack` phase" developOnly
+  ConfigureFlag ->
+    long "configure" Nothing "Run the `configure` phase" developOnly
+  BuildPhaseFlag ->
+    long "build" Nothing "Run the `build` phase" developOnly
+  CheckPhaseFlag ->
+    long "check" Nothing "Run the `check` phase" developOnly
+  InstallFlag ->
+    long "install" Nothing "Run the `install` phase" developOnly
+  InstallCheckFlag ->
+    long "installcheck" Nothing "Run the `installCheck` phase" developOnly
+  IgnoreEnvFlag ->
+    shortAliased 'i' "ignore-env" "ignore-environment" Nothing "Start the shell with only the variables `--keep-env-var` names" developOnly
+  KeepEnvVarFlag ->
+    shortAliased 'k' "keep-env-var" "keep" (Just "NAME") "Keep the variable `NAME` under `--ignore-env` (repeatable)" developOnly
+  UnsetEnvVarFlag ->
+    shortAliased 'u' "unset-env-var" "unset" (Just "NAME") "Unset the variable `NAME` (repeatable)" developOnly
+  SetEnvVarFlag ->
+    short 's' "set-env-var" (Just "NAME VALUE") "Set the variable `NAME` to `VALUE` (repeatable)" developOnly
   SandboxFlag ->
     long "sandbox" Nothing "Enable sandboxing" evaluating
   NoSandboxFlag ->
@@ -581,13 +674,13 @@ flag name = case name of
   RegexFlag ->
     long "regex" (Just "PATTERN") "Select the packages whose names a POSIX extended regular expression matches whole, ignoring case" (CommandFlag (ProfileRemoveCommand :| []))
   JsonFlag ->
-    long "json" Nothing "Print the profile's `manifest.json` in place of its packages' lines" (CommandFlag (ProfileListCommand :| []))
+    long "json" Nothing "Print JSON: the environment in place of the script, or the profile's `manifest.json` in place of its packages' lines" jsonCommands
   PrettyFlag ->
-    long "pretty" Nothing "With `--json`, indent the JSON, as when stdout is a terminal" (CommandFlag (ProfileListCommand :| []))
+    long "pretty" Nothing "With `--json`, indent the JSON, as when stdout is a terminal" jsonCommands
   NoPrettyFlag ->
-    long "no-pretty" Nothing "With `--json`, print the JSON on one line, as when stdout is not a terminal" (CommandFlag (ProfileListCommand :| []))
+    long "no-pretty" Nothing "With `--json`, print the JSON on one line, as when stdout is not a terminal" jsonCommands
   StoreFlag ->
-    long "store" (Just "DIR") "Use `DIR` as the store (default: the platform store)" (CommandFlag (EvalCommand :| [BuildCommand, TrustCommand, PushCommand, StoreDeleteCommand, StoreGcCommand, ProfileAddCommand, ProfileRemoveCommand, ProfileListCommand]))
+    long "store" (Just "DIR") "Use `DIR` as the store (default: the platform store)" (CommandFlag (EvalCommand :| [BuildCommand, DevelopCommand, PrintDevEnvCommand, TrustCommand, PushCommand, StoreDeleteCommand, StoreGcCommand, ProfileAddCommand, ProfileRemoveCommand, ProfileListCommand]))
   HelpFlag ->
     long "help" Nothing "Print the commands, flags and settings, and exit" GlobalFlag
   VersionFlag ->
@@ -596,13 +689,17 @@ flag name = case name of
     long longName = FlagEntry longName Nothing Nothing
     short letter longName = FlagEntry longName (Just letter) Nothing
     aliased longName aliasName = FlagEntry longName Nothing (Just aliasName)
+    shortAliased letter longName aliasName = FlagEntry longName (Just letter) (Just aliasName)
     evalOnly = CommandFlag (EvalCommand :| [])
     buildOnly = CommandFlag (BuildCommand :| [])
     pushOnly = CommandFlag (PushCommand :| [])
+    developOnly = CommandFlag (DevelopCommand :| [])
+    -- The commands that print JSON with --json.
+    jsonCommands = CommandFlag (PrintDevEnvCommand :| [ProfileListCommand])
     -- The commands that select an attribute of what they evaluate, and
     -- those that evaluate.
-    selecting = CommandFlag (BuildCommand :| [TrustCommand, ProfileAddCommand])
-    evaluating = CommandFlag (EvalCommand :| [BuildCommand, TrustCommand, ProfileAddCommand])
+    selecting = CommandFlag (BuildCommand :| [DevelopCommand, PrintDevEnvCommand, TrustCommand, ProfileAddCommand])
+    evaluating = CommandFlag (EvalCommand :| [BuildCommand, DevelopCommand, PrintDevEnvCommand, TrustCommand, ProfileAddCommand])
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -652,7 +749,10 @@ configuration =
                Setting "sandbox-dev-shm-size" "The size of a sandboxed build's `/dev/shm`, as `tmpfs` takes it (default `50%`)" Nothing,
                Setting "require-drop-supplementary-groups" "Fail a sandboxed build when the user's supplementary groups cannot be dropped (default: on for root)" Nothing,
                Setting "use-xdg-base-directories" "Link the default profile from `profile` in the state directory in place of `~/.nix-profile` (default `false`)" Nothing,
-               Setting "ssl-cert-file" "The CA bundle a sandboxed fixed-output build sees (default: `$NIX_SSL_CERT_FILE`, `$SSL_CERT_FILE`, or the first that exists of `/etc/ssl/certs/ca-certificates.crt` and `etc/ssl/certs/ca-bundle.crt` under `/nix/var/nix/profiles/default`)" Nothing
+               Setting "ssl-cert-file" "The CA bundle a sandboxed fixed-output build sees (default: `$NIX_SSL_CERT_FILE`, `$SSL_CERT_FILE`, or the first that exists of `/etc/ssl/certs/ca-certificates.crt` and `etc/ssl/certs/ca-bundle.crt` under `/nix/var/nix/profiles/default`)" Nothing,
+               Setting "bash-prompt" "The prompt (`PS1`) of an interactive `develop` shell, in place of the user's" Nothing,
+               Setting "bash-prompt-prefix" "Text put before the prompt of an interactive `develop` shell" Nothing,
+               Setting "bash-prompt-suffix" "Text put after the prompt of an interactive `develop` shell" Nothing
              ],
       configDescription =
         "`nix.conf` is read in upstream's order: `$NIX_CONF_DIR/nix.conf`, where `NIX_CONF_DIR` defaults to "

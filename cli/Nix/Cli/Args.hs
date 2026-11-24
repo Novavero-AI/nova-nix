@@ -15,6 +15,8 @@ module Nix.Cli.Args
     AutoArg (..),
     OutLink (..),
     outLinkFor,
+    DevelopArgs (..),
+    DevEnvFormat (..),
     PushArgs (..),
     ProfileSelection (..),
     RemoveSelection (..),
@@ -28,8 +30,11 @@ where
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import qualified Data.Text as T
 import Nix.Builder.Sandbox (SandboxMode (..))
+import Nix.Develop.Shell (EnvironmentBase (..))
 
 -- | Parsed CLI options.
 data CliOpts = CliOpts
@@ -81,6 +86,12 @@ data Command
   = -- | @eval@: evaluate the target and print its value.
     CmdEval !Target
   | CmdBuild !Target !(Maybe T.Text) !OutLink
+  | -- | @develop@: start a shell with the build environment of the
+    -- target's derivation, at the attribute path when one is given.
+    CmdDevelop !Target !(Maybe T.Text) !DevelopArgs
+  | -- | @print-dev-env@: print that environment, with JSON laid out as
+    -- the layout says.
+    CmdPrintDevEnv !Target !(Maybe T.Text) !DevEnvFormat !JsonLayout
   | -- | @trust@: report what the closure of the target's derivation, at
     -- the attribute path when one is given, relies on.
     CmdTrust !Target !(Maybe T.Text)
@@ -214,10 +225,13 @@ data ListFormat
     ListJson !JsonLayout
   deriving (Eq, Show)
 
--- | How JSON is laid out, as upstream's @MixPrintJSON@ chooses
--- (common-args.hh:46-72 at 2.35.4).
+-- | How @profile list --json@ and @print-dev-env --json@ lay out their
+-- JSON, as upstream's @MixPrintJSON@ chooses (common-args.hh:46-72 at
+-- 2.35.4): @--pretty@ and @--no-pretty@ set it, the last one given
+-- winning.
 data JsonLayout
-  = -- | Indented when stdout is a terminal, on one line otherwise.
+  = -- | Indented when stdout is a terminal, on one line otherwise:
+    -- upstream's default.
     IndentedOnTerminal
   | -- | @--pretty@: indented.
     Indented
@@ -231,10 +245,50 @@ data ListOutput = TextOutput | JsonOutput
 -- | A selector of @profile remove@ while its line is parsed.
 data Selected = SelectedAll | Selected !RemoveMatcher
 
+-- | What @develop@ runs in place of an interactive shell, and how it
+-- changes the shell's environment, as the command line gives them, each
+-- name, value and word as 'System.Environment.getArgs' gave it.  The
+-- refusals upstream makes only once the environment is built,
+-- @--command@ beside a phase and an environment flag that makes no sense
+-- with @--ignore-env@ or without it, are made then here too
+-- ("Nix.Develop.Shell").
+data DevelopArgs = DevelopArgs
+  { -- | @--command@: every argument after it.
+    daCommand :: !(Maybe (NonEmpty String)),
+    -- | The phase @--phase@ or a phase flag named, the last one given.
+    daPhase :: !(Maybe String),
+    -- | @--ignore-env@.
+    daEnvironmentBase :: !EnvironmentBase,
+    -- | @--keep-env-var@'s names.
+    daKeep :: !(Set String),
+    -- | @--unset-env-var@'s names.
+    daUnset :: !(Set String),
+    -- | @--set-env-var@'s names, each with its value.
+    daSet :: !(Map String String)
+  }
+  deriving (Eq, Show)
+
+-- | @develop@'s arguments before any flag is parsed: an interactive shell
+-- in the caller's environment.
+emptyDevelopArgs :: DevelopArgs
+emptyDevelopArgs = DevelopArgs Nothing Nothing CallerEnvironment Set.empty Set.empty Map.empty
+
+-- | What @print-dev-env@ prints.
+data DevEnvFormat
+  = -- | The script that sets the environment.
+    DevEnvScript
+  | -- | @--json@: the environment as JSON.
+    DevEnvJson
+  deriving (Eq, Show)
+
 -- | A command that evaluates one target to a derivation.
 data TargetCommand
   = -- | @build@, which builds it.
     BuildsTarget
+  | -- | @develop@, which starts a shell with its build environment.
+    DevelopsTarget
+  | -- | @print-dev-env@, which prints that environment.
+    PrintsDevEnv
   | -- | @trust@, which reports what its closure relies on.
     TrustsTarget
   | -- | @profile add@, which builds it and adds it to a profile.
@@ -244,15 +298,21 @@ data TargetCommand
 targetWord :: TargetCommand -> String
 targetWord kind = case kind of
   BuildsTarget -> "build"
+  DevelopsTarget -> "develop"
+  PrintsDevEnv -> "print-dev-env"
   TrustsTarget -> "trust"
   AddsToProfile -> "profile add"
 
 -- | Whether a target command builds what it evaluates, and so takes the
--- launchers @--exec-wrapper@ names.
+-- launchers @--exec-wrapper@ names.  @develop@ and @print-dev-env@ build
+-- a capture whose environment a shell on this host reads, which a
+-- launcher for another system cannot serve, so they take none.
 buildsTarget :: TargetCommand -> Bool
 buildsTarget kind = case kind of
   BuildsTarget -> True
   AddsToProfile -> True
+  DevelopsTarget -> False
+  PrintsDevEnv -> False
   TrustsTarget -> False
 
 -- | Arguments to a target command, while the target is still unknown.
@@ -267,12 +327,21 @@ data BuildArgs = BuildArgs
     baProfile :: !ProfileSelection,
     -- | The priority @profile add@ gives what it adds.  Only
     -- @profile add@ takes a flag that sets it.
-    baPriority :: !(Maybe String)
+    baPriority :: !(Maybe String),
+    -- | What @develop@ runs, and its shell's environment.  Only @develop@
+    -- takes a flag that sets them.
+    baDevelop :: !DevelopArgs,
+    -- | What @print-dev-env@ prints.  Only @print-dev-env@ takes a flag
+    -- that sets it.
+    baFormat :: !DevEnvFormat,
+    -- | How @print-dev-env@ lays out its JSON.  Only @print-dev-env@
+    -- takes a flag that sets it.
+    baJsonLayout :: !JsonLayout
   }
 
 -- | Target command arguments before any flag is parsed.
 emptyBuildArgs :: BuildArgs
-emptyBuildArgs = BuildArgs Nothing Nothing defaultOutLink DefaultProfile Nothing
+emptyBuildArgs = BuildArgs Nothing Nothing defaultOutLink DefaultProfile Nothing emptyDevelopArgs DevEnvScript IndentedOnTerminal
 
 -- | Arguments to the push command.
 data PushArgs = PushArgs
@@ -331,6 +400,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       | Just mode <- sandboxFlag flag = go (opts {optSandbox = Just mode}) rest
     go opts ("eval" : rest) = goEval opts rest
     go opts ("build" : rest) = goTarget BuildsTarget opts emptyBuildArgs rest
+    go opts ("develop" : rest) = goTarget DevelopsTarget opts emptyBuildArgs rest
+    go opts ("print-dev-env" : rest) = goTarget PrintsDevEnv opts emptyBuildArgs rest
     go opts ("trust" : rest) = goTarget TrustsTarget opts emptyBuildArgs rest
     go opts ("push" : rest) = goPush opts emptyPushArgs rest
     go opts ("store" : rest) = goStore opts rest
@@ -433,6 +504,45 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       goTarget AddsToProfile opts (targetArgs {baProfile = ProfileAt path}) rest
     goTarget AddsToProfile opts targetArgs ("--priority" : priority : rest) =
       goTarget AddsToProfile opts (targetArgs {baPriority = Just priority}) rest
+    -- Every argument after --command is the command's, a flag or --help
+    -- included, as upstream's flag of any arity takes them
+    -- (args.cc:398-418 at 2.35.4), and one is needed (develop.cc:525-526).
+    goTarget DevelopsTarget opts targetArgs (flag : rest)
+      | flag `elem` commandFlags = case rest of
+          [] -> Left "error: --command requires at least one argument"
+          first : more -> finishTarget DevelopsTarget opts (developing targetArgs (\args -> args {daCommand = Just (first :| more)}))
+    goTarget DevelopsTarget opts targetArgs ("--phase" : phase : rest) =
+      goTarget DevelopsTarget opts (developing targetArgs (\args -> args {daPhase = Just phase})) rest
+    goTarget DevelopsTarget opts targetArgs (flag : rest)
+      | Just phase <- lookup flag phaseFlags = goTarget DevelopsTarget opts (developing targetArgs (\args -> args {daPhase = Just phase})) rest
+      | flag `elem` ignoreEnvFlags = goTarget DevelopsTarget opts (developing targetArgs (\args -> args {daEnvironmentBase = EmptyEnvironment})) rest
+    -- The refusals upstream's flag handlers make as they read
+    -- --unset-env-var and --set-env-var (command.cc:362-386 at 2.35.4),
+    -- each after error:, as nova-nix reports upstream's errors.
+    goTarget DevelopsTarget opts targetArgs (flag : name : rest)
+      | flag `elem` keepFlags = goTarget DevelopsTarget opts (developing targetArgs (\args -> args {daKeep = Set.insert name (daKeep args)})) rest
+      | flag `elem` unsetFlags,
+        Map.member name (daSet (baDevelop targetArgs)) =
+          Left ("error: Cannot unset environment variable '" ++ name ++ "' that is set with '--set-env-var'")
+      | flag `elem` unsetFlags = goTarget DevelopsTarget opts (developing targetArgs (\args -> args {daUnset = Set.insert name (daUnset args)})) rest
+    goTarget DevelopsTarget opts targetArgs (flag : name : value : rest)
+      | flag `elem` setFlags,
+        Set.member name (daUnset (baDevelop targetArgs)) =
+          Left ("error: Cannot set environment variable '" ++ name ++ "' that is unset with '--unset-env-var'")
+      | flag `elem` setFlags,
+        Map.member name (daSet (baDevelop targetArgs)) =
+          Left ("error: Duplicate definition of environment variable '" ++ name ++ "' with '--set-env-var' is ambiguous")
+      | flag `elem` setFlags = goTarget DevelopsTarget opts (developing targetArgs (\args -> args {daSet = Map.insert name value (daSet args)})) rest
+    goTarget DevelopsTarget _ _ [flag]
+      | flag `elem` developValueFlags = Left (flag ++ " requires a value")
+    goTarget DevelopsTarget _ _ (flag : _)
+      | flag `elem` setFlags = Left (flag ++ " requires a name and a value")
+    goTarget PrintsDevEnv opts targetArgs ("--json" : rest) =
+      goTarget PrintsDevEnv opts (targetArgs {baFormat = DevEnvJson}) rest
+    goTarget PrintsDevEnv opts targetArgs ("--pretty" : rest) =
+      goTarget PrintsDevEnv opts (targetArgs {baJsonLayout = Indented}) rest
+    goTarget PrintsDevEnv opts targetArgs ("--no-pretty" : rest) =
+      goTarget PrintsDevEnv opts (targetArgs {baJsonLayout = Compact}) rest
     goTarget _ _ _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     goTarget _ _ _ (flag : _)
@@ -448,6 +558,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     finishTarget kind opts targetArgs = case (baTarget targetArgs, kind) of
       (Nothing, _) -> Left (targetWord kind ++ " requires a PATH, <NAME> or --expr EXPR")
       (Just target, BuildsTarget) -> Right opts {optCommand = CmdBuild target (baAttrPath targetArgs) (baOutLink targetArgs)}
+      (Just target, DevelopsTarget) -> Right opts {optCommand = CmdDevelop target (baAttrPath targetArgs) (baDevelop targetArgs)}
+      (Just target, PrintsDevEnv) -> Right opts {optCommand = CmdPrintDevEnv target (baAttrPath targetArgs) (baFormat targetArgs) (baJsonLayout targetArgs)}
       (Just target, TrustsTarget) -> Right opts {optCommand = CmdTrust target (baAttrPath targetArgs)}
       (Just target, AddsToProfile) -> Right opts {optCommand = CmdProfileAdd target (baAttrPath targetArgs) (baProfile targetArgs) (baPriority targetArgs)}
     -- Sub-parser for push: flags and explicit store paths in any order.
@@ -579,6 +691,17 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     outLinkFlags = ["-o", "--out-link"]
     -- No result link, under both of nix-build's spellings.
     noOutLinkFlags = ["--no-out-link", "--no-link"]
+    -- develop's flags, under each of upstream's spellings: the short one,
+    -- the long one and the name 2.24.9 gave it (command.cc:333-388 and
+    -- develop.cc:519-572 at 2.35.4).
+    commandFlags = ["-c", "--command"]
+    phaseFlags = [("--unpack", "unpack"), ("--configure", "configure"), ("--build", "build"), ("--check", "check"), ("--install", "install"), ("--installcheck", "installCheck")]
+    ignoreEnvFlags = ["-i", "--ignore-env", "--ignore-environment"]
+    keepFlags = ["-k", "--keep-env-var", "--keep"]
+    unsetFlags = ["-u", "--unset-env-var", "--unset"]
+    setFlags = ["-s", "--set-env-var"]
+    developValueFlags = "--phase" : keepFlags ++ unsetFlags
+    developing targetArgs change = targetArgs {baDevelop = change (baDevelop targetArgs)}
     -- The flags that pass a function an argument, each followed by the
     -- argument's name and its value, and what each makes of the value.
     autoArgKinds = [("--arg", AutoArgExpr), ("--argstr", AutoArgString)]

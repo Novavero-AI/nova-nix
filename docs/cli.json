@@ -204,6 +204,117 @@
       ]
     },
     {
+      "description": "Evaluates the file `PATH` names, or its `default.nix` when `PATH` is a directory, the file the search path finds for `<NAME>`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, and starts `bash` with the environment the builder of the derivation that results has once its stdenv's setup has run, as `nix develop` does. Before each component of the `-A` path is selected from it, and once the path has selected it, the value is called as `nix-build` calls it, with the arguments from `--arg` and `--argstr` or with none: a set with `__functor` stands for what its functor returns given the set, which is called in turn; a function with a set pattern is called with every argument when it takes `...` and otherwise with those its formals name, its defaults filling the rest, and a formal with neither an argument nor a default fails the command; any other value is left as it is. The derivation's builder must be `bash`. A copy of it, named with `-env` after its name and with no checks on what its outputs refer to, is built in its place, with upstream's `get-env.sh` as its builder's script: it sources `$stdenv/setup` when `stdenv` is set, then writes the variables and functions bash holds to the copy's output, so the copy's path is the one `nix develop` builds. It reads the variables from the declare commands `declare -p` prints, which macOS's `/bin/bash`, bash 3.2, does not print, so a builder that is that bash captures none. What the derivation depends on is built or downloaded first, as `build` does, and a copy already built is not built again. The shell sets each variable and function again, but for those that belong to the shell running it, such as `HOME`, `TERM` and the temporary directories, with each output's path replaced by `outputs/NAME` under the working directory. It then puts the caller's `PATH` and `XDG_DATA_DIRS` after the captured ones, points `NIX_BUILD_TOP` and the temporary-directory variables at a fresh directory, and runs `shellHook`. Under structured attributes it reads `.attrs.sh` and `.attrs.json` from a temporary directory, which outlives the shell. An interactive shell reads `~/.bashrc` first and takes its prompt from the `bash-prompt` settings. With `--command` the command runs in place of an interactive shell, and with `--phase`, or a flag naming a phase, the phase runs through the setup's `runPhase`, or through `runHook` where it has none. The shell is `bash` found on the `PATH` of the environment it starts with, `/bin/bash` on macOS unless that `PATH` names another, with `SHELL` set to `bash` and `NIX_GCROOT` to the copy's output, which the garbage collector does not yet keep while the shell runs. That environment is the caller's, changed by `--ignore-env`, `--keep-env-var`, `--unset-env-var` and `--set-env-var`. nova-nix replaces itself with the shell, so the command exits with the shell's status. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is evaluated. On Windows the command is refused.",
+      "examples": [
+        {
+          "arguments": [
+            "develop",
+            "--nix-path",
+            "nixpkgs=./nixpkgs",
+            "<nixpkgs>",
+            "-A",
+            "hello"
+          ],
+          "command": "nova-nix develop --nix-path nixpkgs=./nixpkgs '<nixpkgs>' -A hello",
+          "description": "Start a shell with GNU Hello's build environment, from a nixpkgs checkout in the working directory.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "develop",
+            "--nix-path",
+            "nixpkgs=./nixpkgs",
+            "<nixpkgs>",
+            "-A",
+            "hello",
+            "--configure"
+          ],
+          "command": "nova-nix develop --nix-path nixpkgs=./nixpkgs '<nixpkgs>' -A hello --configure",
+          "description": "Run Hello's configure phase in its unpacked source, as its builder would.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "develop",
+            "--nix-path",
+            "nixpkgs=./nixpkgs",
+            "<nixpkgs>",
+            "-A",
+            "hello",
+            "--command",
+            "sh",
+            "-c",
+            "echo $out"
+          ],
+          "command": "nova-nix develop --nix-path nixpkgs=./nixpkgs '<nixpkgs>' -A hello --command sh -c 'echo $out'",
+          "description": "Run a command in Hello's build environment: here, print `$out`, which names `outputs/out` under the working directory.",
+          "output": []
+        }
+      ],
+      "name": "nova-nix develop",
+      "synopsis": [
+        {
+          "summary": "Start a shell with the build environment of a derivation in a .nix file, or a directory's default.nix",
+          "usage": "nova-nix develop PATH"
+        },
+        {
+          "summary": "Start a shell with the build environment of a derivation in the file the search path finds for NAME",
+          "usage": "nova-nix develop '<NAME>'"
+        },
+        {
+          "summary": "Start a shell with the build environment of an inline derivation",
+          "usage": "nova-nix develop --expr 'EXPR'"
+        }
+      ]
+    },
+    {
+      "description": "Evaluates the file `PATH` names, or its `default.nix` when `PATH` is a directory, the file the search path finds for `<NAME>`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, and prints the script that `develop`'s shell runs to set the build environment of the derivation that results, which a running `bash` can source, as `nix print-dev-env` does. Before each component of the `-A` path is selected from it, and once the path has selected it, the value is called as `nix-build` calls it, with the arguments from `--arg` and `--argstr` or with none: a set with `__functor` stands for what its functor returns given the set, which is called in turn; a function with a set pattern is called with every argument when it takes `...` and otherwise with those its formals name, its defaults filling the rest, and a formal with neither an argument nor a default fails the command; any other value is left as it is. The derivation's builder must be `bash`. A copy of it, named with `-env` after its name and with no checks on what its outputs refer to, is built in its place, with upstream's `get-env.sh` as its builder's script: it sources `$stdenv/setup` when `stdenv` is set, then writes the variables and functions bash holds to the copy's output, so the copy's path is the one `nix develop` builds. It reads the variables from the declare commands `declare -p` prints, which macOS's `/bin/bash`, bash 3.2, does not print, so a builder that is that bash captures none. What the derivation depends on is built or downloaded first, as `build` does, and a copy already built is not built again. Under structured attributes the script names `.attrs.sh` and `.attrs.json` in a temporary directory, which is removed when the command exits, as upstream's is. With `--json` it prints the captured environment instead, as one JSON document of the variables, the functions and, under structured attributes, the two files the builder read, laid out over several lines when stdout is a terminal and on one otherwise, unless `--pretty` or `--no-pretty` says which. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is evaluated. On Windows the command is refused.",
+      "examples": [
+        {
+          "arguments": [
+            "print-dev-env",
+            "--nix-path",
+            "nixpkgs=./nixpkgs",
+            "<nixpkgs>",
+            "-A",
+            "hello"
+          ],
+          "command": "nova-nix print-dev-env --nix-path nixpkgs=./nixpkgs '<nixpkgs>' -A hello",
+          "description": "Print the script that sets GNU Hello's build environment, from a nixpkgs checkout in the working directory.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "print-dev-env",
+            "--nix-path",
+            "nixpkgs=./nixpkgs",
+            "<nixpkgs>",
+            "-A",
+            "hello",
+            "--json"
+          ],
+          "command": "nova-nix print-dev-env --nix-path nixpkgs=./nixpkgs '<nixpkgs>' -A hello --json",
+          "description": "Print that environment as JSON.",
+          "output": []
+        }
+      ],
+      "name": "nova-nix print-dev-env",
+      "synopsis": [
+        {
+          "summary": "Print the build environment of a derivation in a .nix file, or a directory's default.nix",
+          "usage": "nova-nix print-dev-env PATH"
+        },
+        {
+          "summary": "Print the build environment of a derivation in the file the search path finds for NAME",
+          "usage": "nova-nix print-dev-env '<NAME>'"
+        },
+        {
+          "summary": "Print the build environment of an inline derivation",
+          "usage": "nova-nix print-dev-env --expr 'EXPR'"
+        }
+      ]
+    },
+    {
       "description": "Evaluates the file `PATH` names, or its `default.nix` when `PATH` is a directory, the file the search path finds for `<NAME>`, or the expression `--expr` gives, selects the attribute `-A` names when it is given, and reports what the closure of the derivation that results relies on. Before each component of the `-A` path is selected from it, and once the path has selected it, the value is called as `nix-build` calls it, with the arguments from `--arg` and `--argstr` or with none: a set with `__functor` stands for what its functor returns given the set, which is called in turn; a function with a set pattern is called with every argument when it takes `...` and otherwise with those its formals name, its defaults filling the rest, and a formal with neither an argument nor a default fails the command; any other value is left as it is. A closure bottoms out in fixed-output derivations, whose outputs are held to the hash their recipe states, whether a builtin fetches them or the closure builds them. First come those a build runs as builders, where a derivation's builder is inside one's output, or inside the tree a builtin such as `builtin:unpack` makes from it and any others; then those whose files hold prebuilt code, each with the files found; then those not fully read, each with what was not. Each says whether a builtin fetched it or the closure built it, and names any other with the same hash. Then come how many hold no prebuilt code, the builders the closure does not contain, such as a program on the host, the builders in its input sources, the builtins nova-nix runs itself, and how many input sources its derivations take, store paths none of them builds. A fixed-output derivation whose builder is a builtin and which has no inputs is fetched first, or downloaded from a substituter, so that its bytes can be read; any other is only downloaded, with the paths it references, from a substituter that holds it, since making it would run its builder, and is read only when one does or the store already holds it. A fetch that fails stops the command, and so does a failed download of one that no builtin fetches. The scan finds prebuilt code by its header: a PE image, an ELF or Mach-O file, a COFF object, or an ar archive, whose members it does not read. It looks in a fetched file, in each file of a fetched tree, and in each file of a tar archive, plain or compressed with gzip, bzip2, xz or zstd, that one of those is; it does not open an archive inside another, and it reports a file in another archive format it knows, such as zip, as not read. It reports what the closure relies on, not whether any of it is safe. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is fetched or read.",
       "examples": [
         {
@@ -587,6 +698,21 @@
         "description": "The CA bundle a sandboxed fixed-output build sees (default: `$NIX_SSL_CERT_FILE`, `$SSL_CERT_FILE`, or the first that exists of `/etc/ssl/certs/ca-certificates.crt` and `etc/ssl/certs/ca-bundle.crt` under `/nix/var/nix/profiles/default`)",
         "flag": null,
         "name": "ssl-cert-file"
+      },
+      {
+        "description": "The prompt (`PS1`) of an interactive `develop` shell, in place of the user's",
+        "flag": null,
+        "name": "bash-prompt"
+      },
+      {
+        "description": "Text put before the prompt of an interactive `develop` shell",
+        "flag": null,
+        "name": "bash-prompt-prefix"
+      },
+      {
+        "description": "Text put after the prompt of an interactive `develop` shell",
+        "flag": null,
+        "name": "bash-prompt-suffix"
       }
     ]
   },
@@ -596,6 +722,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -609,6 +737,8 @@
       "argument": "ATTRPATH",
       "commands": [
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -681,6 +811,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -695,6 +827,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -709,6 +843,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -723,6 +859,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -737,6 +875,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -751,6 +891,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -765,6 +907,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -779,6 +923,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -793,6 +939,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -807,6 +955,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -828,10 +978,152 @@
       ]
     },
     {
+      "argument": "CMD [ARG...]",
+      "commands": [
+        "nova-nix develop"
+      ],
+      "description": "Run `CMD` with every argument after it, flags included, in place of an interactive shell",
+      "name": "--command",
+      "spellings": [
+        "-c",
+        "--command"
+      ]
+    },
+    {
+      "argument": "NAME",
+      "commands": [
+        "nova-nix develop"
+      ],
+      "description": "Run the phase `NAME`, such as `build`, in place of an interactive shell; the last phase flag given wins",
+      "name": "--phase",
+      "spellings": [
+        "--phase"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix develop"
+      ],
+      "description": "Run the `unpack` phase",
+      "name": "--unpack",
+      "spellings": [
+        "--unpack"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix develop"
+      ],
+      "description": "Run the `configure` phase",
+      "name": "--configure",
+      "spellings": [
+        "--configure"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix develop"
+      ],
+      "description": "Run the `build` phase",
+      "name": "--build",
+      "spellings": [
+        "--build"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix develop"
+      ],
+      "description": "Run the `check` phase",
+      "name": "--check",
+      "spellings": [
+        "--check"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix develop"
+      ],
+      "description": "Run the `install` phase",
+      "name": "--install",
+      "spellings": [
+        "--install"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix develop"
+      ],
+      "description": "Run the `installCheck` phase",
+      "name": "--installcheck",
+      "spellings": [
+        "--installcheck"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix develop"
+      ],
+      "description": "Start the shell with only the variables `--keep-env-var` names",
+      "name": "--ignore-env",
+      "spellings": [
+        "-i",
+        "--ignore-env",
+        "--ignore-environment"
+      ]
+    },
+    {
+      "argument": "NAME",
+      "commands": [
+        "nova-nix develop"
+      ],
+      "description": "Keep the variable `NAME` under `--ignore-env` (repeatable)",
+      "name": "--keep-env-var",
+      "spellings": [
+        "-k",
+        "--keep-env-var",
+        "--keep"
+      ]
+    },
+    {
+      "argument": "NAME",
+      "commands": [
+        "nova-nix develop"
+      ],
+      "description": "Unset the variable `NAME` (repeatable)",
+      "name": "--unset-env-var",
+      "spellings": [
+        "-u",
+        "--unset-env-var",
+        "--unset"
+      ]
+    },
+    {
+      "argument": "NAME VALUE",
+      "commands": [
+        "nova-nix develop"
+      ],
+      "description": "Set the variable `NAME` to `VALUE` (repeatable)",
+      "name": "--set-env-var",
+      "spellings": [
+        "-s",
+        "--set-env-var"
+      ]
+    },
+    {
       "argument": null,
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -846,6 +1138,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -860,6 +1154,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix profile add"
       ],
@@ -987,9 +1283,10 @@
     {
       "argument": null,
       "commands": [
+        "nova-nix print-dev-env",
         "nova-nix profile list"
       ],
-      "description": "Print the profile's `manifest.json` in place of its packages' lines",
+      "description": "Print JSON: the environment in place of the script, or the profile's `manifest.json` in place of its packages' lines",
       "name": "--json",
       "spellings": [
         "--json"
@@ -998,6 +1295,7 @@
     {
       "argument": null,
       "commands": [
+        "nova-nix print-dev-env",
         "nova-nix profile list"
       ],
       "description": "With `--json`, indent the JSON, as when stdout is a terminal",
@@ -1009,6 +1307,7 @@
     {
       "argument": null,
       "commands": [
+        "nova-nix print-dev-env",
         "nova-nix profile list"
       ],
       "description": "With `--json`, print the JSON on one line, as when stdout is not a terminal",
@@ -1022,6 +1321,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
         "nova-nix trust",
         "nova-nix push",
         "nova-nix store delete",
@@ -1060,7 +1361,7 @@
     }
   ],
   "global": {
-    "description": "nova-nix evaluates Nix expressions, builds derivations, reports what a derivation's closure relies on, pushes store paths to a binary cache, keeps profiles of packages and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` alone has another status, 104, for an output that differs.",
+    "description": "nova-nix evaluates Nix expressions, builds derivations, starts shells with a derivation's build environment, reports what a derivation's closure relies on, pushes store paths to a binary cache, keeps profiles of packages and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` has another status, 104, for an output that differs, and `develop`, once its shell has started, exits with the shell's.",
     "examples": [
       {
         "arguments": [

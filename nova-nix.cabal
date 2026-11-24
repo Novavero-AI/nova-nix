@@ -119,6 +119,7 @@ library
     Nix.Derivation.StructuredAttrs
     Nix.Develop.Capture
     Nix.Develop.Environment
+    Nix.Develop.Shell
     Nix.Builder
     Nix.Builder.BuildDir
     Nix.Builder.Buildenv
@@ -196,8 +197,10 @@ library
   -- reads it through base's UTF-16 API, marking a builder's log pipe
   -- close-on-exec on POSIX (Nix.Builder.Log), creating a store or build
   -- directory with its mode on POSIX, and on Windows raising a failure to
-  -- create one as the IOError base raises (Nix.Store.Access), and a
-  -- registered path's modes, times and owner (Nix.Store.Metadata).
+  -- create one as the IOError base raises (Nix.Store.Access), a
+  -- registered path's modes, times and owner (Nix.Store.Metadata), and on
+  -- POSIX a develop shell's temporary files, environment and exec
+  -- (Nix.Develop.Shell).
   -- Win32 2.12 is the first whose setFileTime leaves a time it is not
   -- given as it is; unix 2.8 is the first whose openFd takes creat and
   -- cloexec in its flags.  advapi32 holds the token and

@@ -29,6 +29,7 @@ module Nix.Develop.Environment
     EnvironmentScript (..),
     ScriptFile (..),
     environmentScript,
+    appendPath,
 
     -- * The rcfile
     Shell (..),
