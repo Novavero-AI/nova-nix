@@ -1,11 +1,14 @@
-# zlib, built from source through the stage-1 stdenv as a proper Windows DLL.
-# zlib's ./configure emits Unix .so naming under MSYS2, so we use zlib's bundled
-# win32/Makefile.gcc (with SHARED_MODE=1) instead, which yields zlib1.dll plus
-# the libz.dll.a import lib and libz.a.  A consumer linking -lz then resolves the
-# import lib and links zlib1.dll *dynamically*, and fixupPhase bundles the DLL --
-# the dynamic-link + real-library DLL-bundling pattern.  The
-# dontConfigure/buildPhase/installPhase attrs are the stdenv's build-style
-# overrides.
+# zlib, built from source as a Windows DLL.  zlib's ./configure names its
+# shared library as Unix does, so this uses zlib's own win32/Makefile.gcc,
+# whose install with SHARED_MODE=1 gives zlib1.dll, its import library
+# libz.dll.a and the static libz.a.  A consumer linking -lz takes the
+# import library first and so links zlib1.dll dynamically, and the
+# stdenv's fixup phase bundles the DLL beside it.
+#
+# The makefile names ar, windres and strip by those names, which neither
+# a stdenv that keeps its toolchain off PATH nor busybox's applets
+# provide, so each is given as the stdenv names it, AR, WINDRES and STRIP,
+# where it does, and by its name otherwise.
 { stdenv, fetchurl }:
 stdenv.mkDerivation {
   name = "zlib";
@@ -17,9 +20,11 @@ stdenv.mkDerivation {
     sha256 = "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16";
   };
   dontConfigure = true;
-  buildPhase = "make -f win32/Makefile.gcc";
+  buildPhase = ''
+    make -f win32/Makefile.gcc AR="''${AR:-ar}" RC="''${WINDRES:-windres}" STRIP="''${STRIP:-strip}"
+  '';
   installPhase = ''
     mkdir -p "$prefix/bin" "$prefix/include" "$prefix/lib"
-    make install -f win32/Makefile.gcc SHARED_MODE=1 BINARY_PATH="$prefix/bin" INCLUDE_PATH="$prefix/include" LIBRARY_PATH="$prefix/lib"
+    make install -f win32/Makefile.gcc SHARED_MODE=1 AR="''${AR:-ar}" RC="''${WINDRES:-windres}" STRIP="''${STRIP:-strip}" BINARY_PATH="$prefix/bin" INCLUDE_PATH="$prefix/include" LIBRARY_PATH="$prefix/lib"
   '';
 }
