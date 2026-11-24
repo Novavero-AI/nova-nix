@@ -5,8 +5,10 @@
 #
 # ld writes the time of the link into the header of the PE image it links,
 # SOURCE_DATE_EPOCH where the environment sets it, and 0 with
-# --no-insert-timestamp (ld/emultempl/pep.em:188 and 1548-1551,
-# bfd/peXXigen.c:850-858 and bfd/bfdio.c:938-963 in binutils 2.46), which
+# --no-insert-timestamp (insert_timestamp and
+# gld${EMULATION_NAME}_after_open in ld/emultempl/pep.em,
+# _bfd_XXi_only_swap_filehdr_out in bfd/peXXigen.c and
+# bfd_get_current_time in bfd/bfdio.c in binutils 2.46), which
 # leaves the image the same whenever, and under whatever
 # SOURCE_DATE_EPOCH, it was linked.  The flag precedes the package's
 # arguments, so its own --insert-timestamp wins.
