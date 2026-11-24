@@ -577,9 +577,30 @@ testStorePaths = do
           QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
             QC.forAll genCompressCase $ \(len, bytes) ->
               BS.unpack (compressHash len (BS.pack bytes)) QC.=== compressHashModel len bytes
-        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      -- Upstream's own fixture (libstore-tests/nar-info.cc:44-62 and
+      -- data/nar-info/json-1/impure.json at 2.35.4): foo, the NAR SHA-256
+      -- of "(...)", referencing bar and itself, is n5wkd9...-foo, so the
+      -- type upstream hashes is source, then each reference after a colon.
+      runTest "a source path's type is upstream's: source, then each reference after a colon" $
+        assertEqual
+          "upstream's fixture"
+          (Right "n5wkd9frr45pa74if5gpz9j7mifg27fh")
+          (spHash <$> Hash.makeStorePath defaultStoreDir "source:/nix/store/g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar:self" (sha256Digest "(...)") "foo"),
+      runTestM "a source path appends its references in path order, each once" $
+        property $
+          QC.forAll ((,) <$> QC.resize 4 (QC.listOf (genFixturePath "")) <*> genSourceDigest) $ \(refs, digest) ->
+            Hash.makeSourcePath "profile" digest (Set.fromList refs)
+              QC.=== Hash.makeStorePath defaultStoreDir ("source" <> T.concat [":" <> storePathToText defaultStoreDir r | r <- sort (nub refs)]) digest "profile",
+      runTestM "a NAR SHA-256 fixed output is a source path with no references, its type source alone" $
+        property $
+          QC.forAll ((,) <$> genDrvName <*> genSourceDigest) $ \(name, digest) ->
+            makeFixedOutputPath name "sha256" NarIngestion digest
+              QC.=== Hash.makeSourcePath name digest Set.empty
+              QC..&&. Hash.makeSourcePath name digest Set.empty QC.=== Hash.makeStorePath defaultStoreDir "source" digest name
     ]
   where
+    genSourceDigest = sha256Digest . BS.pack <$> QC.resize 16 (QC.listOf QC.arbitrary)
     -- Lengths on both sides of the input's, so the last chunk is short,
     -- whole or absent, and below one, where there is nothing to fold into.
     genCompressCase = (,) <$> QC.choose (-1, 40) <*> QC.resize 70 (QC.listOf QC.arbitrary)

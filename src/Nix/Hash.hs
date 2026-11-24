@@ -64,6 +64,7 @@ module Nix.Hash
     FileIngestionMethod (..),
     fileIngestionPrefix,
     makeFixedOutputPath,
+    makeSourcePath,
     makeOutputPath,
     compressHash,
     sha256Digest,
@@ -440,7 +441,7 @@ fileIngestionPrefix NarIngestion = "r:"
 -- @method@.  Mirrors C++ Nix @makeFixedOutputPath@ (store-api.cc:122-141
 -- at 2.24.9):
 --
--- * @sha256@ under 'NarIngestion' yields @makeStorePath \"source\" foHash name@
+-- * @sha256@ under 'NarIngestion' yields 'makeSourcePath' with no references
 -- * otherwise, @makeStorePath \"output:out\" sha256(\"fixed:out:\" prefix algo \":\" hex \":\") name@
 --
 -- 'Left' on an invalid name, as 'makeStorePath'.
@@ -448,11 +449,24 @@ makeFixedOutputPath :: Text -> Text -> FileIngestionMethod -> BS.ByteString -> E
 makeFixedOutputPath name algo method foHashDigest
   | NarIngestion <- method,
     algo == "sha256" =
-      makeStorePath defaultStoreDir "source" foHashDigest name
+      makeSourcePath name foHashDigest Set.empty
   | otherwise =
       let inner = "fixed:out:" <> fileIngestionPrefix method <> algo <> ":" <> bytesToHexText foHashDigest <> ":"
           innerDigest = sha256Digest (encodeUtf8 inner)
        in makeStorePath defaultStoreDir "output:out" innerDigest name
+
+-- | The path of a tree added by the SHA-256 of its NAR, @narDigest@, with
+-- the store paths it references: upstream's @makeFixedOutputPath@ under
+-- @NixArchive@ and SHA-256 (store-dir-config.cc:114-115 at 2.35.4), whose
+-- type is @source@ followed by each reference after a colon, in path
+-- order, as @makeType@ appends them (:95-104).  Upstream's @makeType@
+-- also marks a self-reference with @:self@, which no caller here makes.
+-- 'Left' on an invalid name, as 'makeStorePath'.
+makeSourcePath :: Text -> BS.ByteString -> Set.Set StorePath -> Either BadStorePath StorePath
+makeSourcePath name narDigest refs =
+  makeStorePath defaultStoreDir typ narDigest name
+  where
+    typ = "source" <> T.concat [":" <> storePathToText defaultStoreDir r | r <- Set.toAscList refs]
 
 -- | Construct an input-addressed output store path.  @moduloDigest@ is the raw
 -- bytes of @hashDerivationModulo@ (masked).  Mirrors C++ Nix @makeOutputPath@:
