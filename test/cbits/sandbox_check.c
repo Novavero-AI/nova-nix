@@ -80,10 +80,11 @@ static int append_bind(struct buffer *buffer, const struct bind *bind)
         && append_token(buffer, flags);
 }
 
-static int render(struct buffer *buffer, const struct plan *plan)
+static int render_linux(struct buffer *buffer, const struct plan *plan)
 {
     size_t i;
-    if (!(append_token(buffer, "root") && append_token(buffer, plan->root) && append_token(buffer, "build-dir")
+    if (!(append_token(buffer, "backend") && append_token(buffer, "linux") && append_token(buffer, "root")
+          && append_token(buffer, plan->root) && append_token(buffer, "build-dir")
           && append_token(buffer, plan->build_dir) && append_token(buffer, "dev-shm-size")
           && append_token(buffer, plan->dev_shm_size) && append_token(buffer, "sandbox-uid")
           && append_number(buffer, plan->sandbox_uid) && append_token(buffer, "sandbox-gid")
@@ -94,6 +95,28 @@ static int render(struct buffer *buffer, const struct plan *plan)
     for (i = 0; i < plan->bind_count; i++)
         if (!append_bind(buffer, &plan->binds[i]))
             return 0;
+    return 1;
+}
+
+static int render_darwin(struct buffer *buffer, const struct plan *plan)
+{
+    size_t i;
+    if (!(append_token(buffer, "backend") && append_token(buffer, "darwin") && append_token(buffer, "build-dir")
+          && append_token(buffer, plan->build_dir) && append_token(buffer, "profile")
+          && append_token(buffer, plan->profile)))
+        return 0;
+    for (i = 0; i < plan->parameter_count; i++)
+        if (!(append_token(buffer, "param") && append_token(buffer, plan->parameters[2 * i])
+              && append_token(buffer, plan->parameters[2 * i + 1])))
+            return 0;
+    return plan->parameters[2 * plan->parameter_count] == NULL;
+}
+
+static int render(struct buffer *buffer, const struct plan *plan)
+{
+    size_t i;
+    if (!(plan->backend == PLAN_LINUX ? render_linux(buffer, plan) : render_darwin(buffer, plan)))
+        return 0;
     for (i = 0; i < plan->environment_count; i++)
         if (!append_token(buffer, "env") || !append_token(buffer, plan->environment[i]))
             return 0;

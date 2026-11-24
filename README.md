@@ -346,10 +346,13 @@ it sees only its inputs and, unless it is fixed-output, no network; a builder
 that is a host program such as `/bin/sh` needs `sandbox-paths` to bind it, as a
 release archive binds its own shell. Ubuntu lets the sandbox in only under an
 AppArmor profile for `nova-nix-sandbox`, and without one a build runs
-unsandboxed after a warning. As root a sandboxed build is refused, since
-nova-nix has no build users yet. Builds on macOS and Windows are not sandboxed: a
-builder there can read and write outside its build directory and reach the
-network.
+unsandboxed after a warning. On macOS `sandbox = true` runs a build under a
+profile of macOS's sandbox, off by default as upstream's is, where it reads
+only its inputs and the paths `sandbox-paths` names and, unless it is
+fixed-output, reaches no network. As root a sandboxed build is refused, since
+nova-nix has no build users yet. Builds on Windows, and on macOS by default,
+are not sandboxed: a builder there can read and write outside its build
+directory and reach the network.
 
 A target is a file, a directory or a `<NAME>` the search path finds, not a
 URL, and `build` builds one derivation, where `nix-build` builds each one in a

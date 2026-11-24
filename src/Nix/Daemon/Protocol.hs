@@ -169,7 +169,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Word (Word32, Word64, Word8)
 import Nix.Daemon.Wire (Decoder, getBool, getBytes, getCount, getInt64, getList, getWord32, getWord64, getWord8, malformed, putBool, putBytes, putList, putNum)
 import Nix.Hash (FileIngestionMethod (..), base64ToBytes, bytesToHexText, digestByLength, hashAlgoBytes, parseAnyHash)
-import Nix.Json (Json (..), parseJson, renderJson)
+import Nix.Json (Json (..), expectJson, jsonText, parseJson, renderJson)
 import Nix.Store.Path (StoreDir (..), StorePath, checkStorePathName, parseStorePathBaseName, spName, storePathBaseNameError, storePathBasename, storePathHashLen, storePathNameUpstreamText, storePathToText)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
@@ -1217,28 +1217,6 @@ getBuiltOutputs storeDir version
       value <- maybe (Left ("Expected JSON object to contain key 'outPath' but it doesn't: " <> jsonText document)) Right (Map.lookup "outPath" members)
       base <- expectJson "string" (\case JsonString text -> Just text; _ -> Nothing) value
       storePathFromBaseName base
-
--- | A JSON value of the type upstream's @ensureType@ expects, or its
--- refusal (json-utils.cc at 2.35.4).
-expectJson :: Text -> (Json -> Maybe a) -> Json -> Either Text a
-expectJson expected match value =
-  maybe (Left ("Expected JSON value to be of type '" <> expected <> "' but it is of type '" <> jsonTypeName value <> "': " <> jsonText value)) Right (match value)
-
--- | The name nlohmann gives a JSON value's type.
-jsonTypeName :: Json -> Text
-jsonTypeName value = case value of
-  JsonNull -> "null"
-  JsonBool _ -> "boolean"
-  JsonInt _ -> "number"
-  JsonFloat _ -> "number"
-  JsonString _ -> "string"
-  JsonArray _ -> "array"
-  JsonObject _ -> "object"
-
--- | A JSON value as nlohmann's @dump@ writes it, for a message.
--- 'renderJson' writes UTF-8, so the decoding is exact.
-jsonText :: Json -> Text
-jsonText = TE.decodeUtf8Lenient . renderJson
 
 -- | Write a build result, as far as the version carries it.
 putBuildResult :: StoreDir -> Version -> BuildResult -> Builder

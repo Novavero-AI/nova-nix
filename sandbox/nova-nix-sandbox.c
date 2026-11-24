@@ -23,9 +23,10 @@
  *     exits 1.
  *
  * The plan is a version line, a line holding the length of the rest, then
- * the tokens plan.h describes, which plan.c parses.  Its format and the
- * stage names are shared with Nix.Builder.Sandbox, which writes the one
- * and reads the other.
+ * the tokens plan.h describes, which plan.c parses; a plan for another
+ * backend than the one linked is refused as one that cannot be read.  Its
+ * format and the stage names are shared with Nix.Builder.Sandbox, which
+ * writes the one and reads the other.
  */
 
 #include <errno.h>
@@ -139,6 +140,8 @@ static int run(char **argv)
     error = read_plan_bytes(&plan_bytes, &plan_length);
     if (error == 0)
         error = plan_parse(plan_bytes, plan_length, &plan);
+    if (error == 0 && plan.backend != backend_plan)
+        error = EINVAL;
     if (error != 0)
         status_fail("plan", error, NO_INDEX);
     status = backend_run(&plan, argv);

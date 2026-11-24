@@ -113,8 +113,8 @@ import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder.BuildDir (createBuildDir, sandboxedBuildDir, withBuildDir)
 import Nix.Builder.Buildenv (builtinBuildenvBuilder, runBuiltinBuildenv)
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
-import Nix.Builder.Sandbox (HelperOutcome (..), Network, PathPresence (..), PlanInputs (..), SandboxConfig (..), SandboxFallback (..), SandboxPath (..), SandboxPlan, SandboxUse (..), chrootSkeleton, defaultSandboxConfig, helperOutcome, renderPlan, rootRefusal, sandboxHome, sandboxPlan, sandboxUse, unavailableMessage)
-import Nix.Builder.Sandbox.Spawn (HelperRun (..), bytesFilePath, filePathBytes, processIsRoot, runHelper, sandboxAvailability, sealChroot, warnFallback, withChroot)
+import Nix.Builder.Sandbox (DarwinOptions (..), DarwinPathInputs (..), DarwinPaths (..), DarwinPlan (..), DarwinProfile (..), HelperOutcome (..), Network, PathPresence (..), PlanInputs (..), SandboxBackend (..), SandboxConfig (..), SandboxFallback (..), SandboxPath (..), SandboxUse (..), backendFallback, chrootSkeleton, darwinOptions, darwinParameters, darwinPathsInSandbox, darwinProfile, darwinSetupFailureMessage, darwinStageName, defaultSandboxConfig, helperOutcome, hostSandboxBackend, renderDarwinPlan, renderPlan, rootRefusal, sandboxHome, sandboxPlan, sandboxUse, setupFailureMessage, setupStageName, unavailableMessage)
+import Nix.Builder.Sandbox.Spawn (HelperRun (..), bytesFilePath, filePathBytes, processIsRoot, profileFilters, resolvedPath, runHelper, sandboxAvailability, sealChroot, warnFallback, withChroot)
 import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimits, runBuiltinUnpack)
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, buildDepGraphFrom, topoSort)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fixedOutput, fromATerm, platformToText)
@@ -828,15 +828,18 @@ scratchPathOf config p = storePathToFilePath (bcStoreDir config) (opScratch p)
 
 -- | Run a derivation's spawned builder: in the sandbox when the settings
 -- and the derivation ask for it ('sandboxUse') and this system can make
--- one, otherwise where its directory and outputs are.  A system that
--- cannot make the sandbox runs the build unsandboxed under
+-- one, otherwise where its directory and outputs are.  A Linux system
+-- that cannot make the sandbox runs the build unsandboxed under
 -- @sandbox-fallback@, after one warning a process ('warnFallback'), and
 -- fails it otherwise, as upstream does (@tryLocalBuild@ in
--- local-derivation-goal.cc at 2.24.9).  Once the builder has succeeded,
--- @continue@ runs with where its outputs are.
+-- local-derivation-goal.cc at 2.24.9, @makeDerivationBuilder@ in
+-- unix-derivation-builder.cc at 2.36.0); on macOS it fails the build
+-- whatever @sandbox-fallback@ says ('backendFallback'), as upstream
+-- 2.36.0 does.  Once the builder has succeeded, @continue@ runs with
+-- where its outputs are.
 runSpawnedBuilder :: BuildConfig -> BuildContext -> Derivation -> FilePath -> [OutputPlan] -> (Written -> IO r) -> IO (Either BuilderFailure r)
 runSpawnedBuilder config context drv buildDir plans continue =
-  case sandboxUse (scMode sandbox) (bxDrvPath context) drv of
+  case sandboxUse hostSandboxBackend (scMode sandbox) (bxDrvPath context) drv of
     Left reason -> pure (Left (BuilderSandboxFailed reason))
     Right Unsandboxed -> unsandboxed
     Right (Sandboxed network) -> do
@@ -846,10 +849,11 @@ runSpawnedBuilder config context drv buildDir plans continue =
         then pure (Left (BuilderSandboxFailed rootRefusal))
         else do
           available <- sandboxAvailability (scHelper sandbox)
-          case (available, scFallback sandbox) of
-            (Right helper, _) -> runSandboxedBuild config context drv buildDir plans helper network continue
+          case (available, backendFallback hostSandboxBackend (scFallback sandbox)) of
+            (Right (LinuxBackend, helper), _) -> runSandboxedBuild config context drv buildDir plans helper network continue
+            (Right (DarwinBackend, helper), _) -> runDarwinSandboxedBuild config context drv buildDir plans helper network continue
             (Left cause, FallBackUnsandboxed) -> warnFallback cause *> unsandboxed
-            (Left cause, RefuseUnsandboxed) -> pure (Left (BuilderSandboxFailed (unavailableMessage cause)))
+            (Left cause, RefuseUnsandboxed) -> pure (Left (BuilderSandboxFailed (unavailableMessage hostSandboxBackend cause)))
   where
     sandbox = bcSandbox config
     -- The builder runs where its directory and outputs are, so it is told
@@ -878,11 +882,8 @@ runSpawnedBuilder config context drv buildDir plans continue =
 -- bound into the chroot as a @sandbox-paths@ entry naming itself.
 runSandboxedBuild :: BuildConfig -> BuildContext -> Derivation -> FilePath -> [OutputPlan] -> FilePath -> Network -> (Written -> IO r) -> IO (Either BuilderFailure r)
 runSandboxedBuild config context drv outerBuildDir plans helper network continue = do
-  launcherPaths <- case execWrapperFor config drv of
-    SpawnThrough launcher -> (\bytes -> [SandboxPath bytes bytes RequiredPath]) <$> filePathBytes launcher
-    _ -> pure []
-  let paths = scPaths sandbox ++ launcherPaths
-  closure <- sandboxPathsClosure paths
+  paths <- buildSandboxPaths config drv
+  closure <- sandboxPathsClosure config context paths
   case closure of
     Left reason -> pure (Left (BuilderSandboxFailed reason))
     Right closurePaths -> do
@@ -924,7 +925,7 @@ runSandboxedBuild config context drv outerBuildDir plans helper network continue
               Left reason -> pure (Left (BuilderSandboxFailed reason))
               Right plan -> do
                 for_ (invFiles invocation) (uncurry BS.writeFile)
-                ran <- runSandboxedBuilder (bcBuildLog config) helper plan invocation
+                ran <- runSandboxedBuilder (bcBuildLog config) helper (renderPlan plan) (helperOutcome setupStageName . setupFailureMessage plan) invocation
                 case ran of
                   Left failure -> pure (Left failure)
                   Right () -> do
@@ -941,12 +942,86 @@ runSandboxedBuild config context drv outerBuildDir plans helper network continue
   where
     sandbox = bcSandbox config
     storeFile = storePathToFilePath (bcStoreDir config)
-    -- The closures of the entries whose source is in the store, which are
-    -- bound beside them (@startBuilder@ in local-derivation-goal.cc at
-    -- 2.24.9).  A source that names no store path adds nothing.
-    sandboxPathsClosure paths = do
-      let inStore = [sp | entry <- paths, Right source <- [TE.decodeUtf8' (spSource entry)], Just sp <- [parseStorePathPrefix (bcStoreDir config) source]]
-      fmap Set.toAscList <$> inputClosure (bxStore context) inStore
+
+-- | A sandboxed build's @sandbox-paths@ entries: the setting's, and an
+-- @--exec-wrapper@ launcher the build runs through, as an entry naming
+-- itself.
+buildSandboxPaths :: BuildConfig -> Derivation -> IO [SandboxPath]
+buildSandboxPaths config drv = do
+  launcherPaths <- case execWrapperFor config drv of
+    SpawnThrough launcher -> (\bytes -> [SandboxPath bytes bytes RequiredPath]) <$> filePathBytes launcher
+    _ -> pure []
+  pure (scPaths (bcSandbox config) ++ launcherPaths)
+
+-- | The closures of the @sandbox-paths@ entries whose source is in the
+-- store, which the sandbox holds beside them
+-- (@LocalDerivationGoal::startBuilder@ at 2.24.9,
+-- @DerivationBuildingGoal::buildLocally@ at 2.36.0).  A source that names no
+-- store path adds nothing.
+sandboxPathsClosure :: BuildConfig -> BuildContext -> [SandboxPath] -> IO (Either Text [StorePath])
+sandboxPathsClosure config context paths = do
+  let inStore = [sp | entry <- paths, Right source <- [TE.decodeUtf8' (spSource entry)], Just sp <- [parseStorePathPrefix (bcStoreDir config) source]]
+  fmap Set.toAscList <$> inputClosure (bxStore context) inStore
+
+-- | Run a builder under the macOS sandbox's profile, through the helper,
+-- then @continue@ with each output where the builder wrote it.  macOS's
+-- sandbox has no chroot: the builder sees its build directory and its
+-- outputs where they are on disk, as an unsandboxed one does and as
+-- upstream's does (@tmpDirInSandbox@ in unix-derivation-builder-impl.hh
+-- at 2.36.0), and is told upstream's @HOME@.  The profile
+-- ('darwinProfile') names the store directory and the build directory
+-- with their links resolved here, since macOS's sandbox matches a file by
+-- its resolved path.  A derivation's impure host paths, and the refusals
+-- of a path the profile cannot name, are upstream's
+-- ('darwinPathsInSandbox', 'profileFilters').
+runDarwinSandboxedBuild :: BuildConfig -> BuildContext -> Derivation -> FilePath -> [OutputPlan] -> FilePath -> Network -> (Written -> IO r) -> IO (Either BuilderFailure r)
+runDarwinSandboxedBuild config context drv buildDir plans helper network continue = runExceptT $ do
+  options <- liftEither (first BuilderSandboxFailed (darwinOptions (bxDrvPath context) drv))
+  paths <- liftIO (buildSandboxPaths config drv)
+  closurePaths <- ExceptT (first BuilderSandboxFailed <$> sandboxPathsClosure config context paths)
+  storeBytes <- liftIO (filePathBytes (unStoreDir (bcStoreDir config)))
+  realStore <- liftIO (resolvedPath storeBytes)
+  buildBytes <- liftIO (filePathBytes buildDir)
+  realBuild <- liftIO (resolvedPath buildBytes)
+  realStoreDir <- liftIO (StoreDir <$> bytesFilePath realStore)
+  let resolved = filePathBytes . storePathToFilePath realStoreDir
+  inputBytes <- liftIO (traverse resolved (Set.toAscList (bxInputs context)))
+  closureBytes <- liftIO (traverse resolved closurePaths)
+  outputBytes <- liftIO (traverse (resolved . opScratch) plans)
+  darwinPaths <-
+    liftEither . first BuilderSandboxFailed $
+      darwinPathsInSandbox
+        DarwinPathInputs
+          { dpiDrvPath = bxDrvPath context,
+            dpiStoreDir = storeBytes,
+            dpiRealStoreDir = realStore,
+            dpiBuildDir = buildBytes,
+            dpiRealBuildDir = realBuild,
+            dpiSandboxPaths = paths,
+            dpiSandboxClosure = closureBytes,
+            dpiImpureHostDeps = doImpureHostDeps options,
+            dpiAllowedImpureHostDeps = scAllowedImpureHostDeps (bcSandbox config),
+            dpiInputs = inputBytes
+          }
+  filters <- ExceptT (first BuilderSandboxFailed <$> profileFilters (dpPaths darwinPaths))
+  let layout = BuildLayout (inPlace buildDir) [(opName p, inPlace (scratchPathOf config p)) | p <- plans] sandboxHome
+      profile =
+        darwinProfile
+          DarwinProfile
+            { dprViolationLog = scViolationLog (bcSandbox config),
+              dprNetwork = network,
+              dprStoreDir = realStore,
+              dprOutputs = outputBytes,
+              dprPaths = filters,
+              dprAncestry = dpAncestry darwinPaths,
+              dprExtra = doExtraProfile options
+            }
+  invocation <- liftEither (first (BuilderRefused 1) (builderInvocation config drv layout))
+  environment <- liftIO (builderEnvironment invocation)
+  let plan = DarwinPlan realBuild profile (darwinParameters realBuild (doLocalNetworking options)) (map TE.encodeUtf8 environment)
+  liftIO (for_ (invFiles invocation) (uncurry BS.writeFile))
+  ExceptT (runSandboxedBuilder (bcBuildLog config) helper (renderDarwinPlan plan) (helperOutcome darwinStageName . darwinSetupFailureMessage plan) invocation)
+  liftIO (continue (Written (scratchPathOf config) (writableByOthers . scratchPathOf config)))
 
 -- | Why the builder step of a build failed, with the exit code the
 -- build reports.
@@ -1563,13 +1638,15 @@ builderProcessEnv invocation = mapMaybe asPair <$> builderEnvironment invocation
       (name, rest) | Just (_, value) <- T.uncons rest -> Just (T.unpack name, T.unpack value)
       _ -> Nothing
 
--- | Run a builder through the sandbox helper ('runHelper'), its
--- environment in the plan ('builderEnvironment').
-runSandboxedBuilder :: System.IO.Handle -> FilePath -> SandboxPlan -> BuilderInvocation -> IO (Either BuilderFailure ())
-runSandboxedBuilder buildLog helper plan invocation = do
+-- | Run a builder through the sandbox helper ('runHelper'), given the
+-- plan as the helper reads it, with the builder's environment in it
+-- ('builderEnvironment'), and how a run is read for the program it
+-- executes ('helperOutcome').
+runSandboxedBuilder :: System.IO.Handle -> FilePath -> BS.ByteString -> (BS.ByteString -> Either Text () -> ExitCode -> BS.ByteString -> HelperOutcome) -> BuilderInvocation -> IO (Either BuilderFailure ())
+runSandboxedBuilder buildLog helper plan outcomeOf invocation = do
   program <- filePathBytes (invProgram invocation)
-  run <- runHelper buildLog helper (renderPlan plan) (invWorkDir invocation) (invProgram invocation : invArgs invocation)
-  pure $ case helperOutcome plan program (hrDelivered run) (hrExit run) (hrStatus run) of
+  run <- runHelper buildLog helper plan (invWorkDir invocation) (invProgram invocation : invArgs invocation)
+  pure $ case outcomeOf program (hrDelivered run) (hrExit run) (hrStatus run) of
     SetupIncomplete reason -> Left (BuilderSandboxFailed reason)
     BuilderRan ExitSuccess -> Right ()
     BuilderRan (ExitFailure code) -> Left (BuilderExited code)

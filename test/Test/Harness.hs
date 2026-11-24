@@ -104,11 +104,12 @@ module Test.Harness
     purePolicy,
     restrictedPolicy,
     evalNixWith,
+    withEnvVar,
   )
 where
 
 import qualified Codec.Archive.Tar.Entry as TarEntry
-import Control.Exception (SomeAsyncException (..), SomeException, fromException, throwIO, try)
+import Control.Exception (SomeAsyncException (..), SomeException, bracket, fromException, throwIO, try)
 import Control.Monad (filterM, unless, when)
 import Control.Monad.State.Strict (evalStateT)
 import Data.Bits (shiftR, (.&.))
@@ -161,7 +162,8 @@ import qualified NovaCache.NarInfo as NarInfo
 import qualified NovaCache.Signing as Signing
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
-import System.Environment (getExecutablePath)
+import System.Environment (getExecutablePath, lookupEnv, unsetEnv)
+import qualified System.Environment.Blank as Blank
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
@@ -1393,3 +1395,11 @@ evalNixWith :: EvalPolicy -> Text -> Either Text NixValue
 evalNixWith policy source = case parseNixWithScope (rootScopeNames policy) testBaseDir testOrigin (TE.encodeUtf8 source) of
   Left err -> Left (sourceFailure err)
   Right parsed -> runPureEval (evalParsed (builtinEnv policy 0 []) parsed)
+
+-- | Run an action with a variable set (to an empty value too, which
+-- 'setEnv' would unset), restoring what the variable held afterwards.
+withEnvVar :: String -> String -> IO a -> IO a
+withEnvVar name value action =
+  bracket (lookupEnv name) restore (const (Blank.setEnv name value True >> action))
+  where
+    restore = maybe (unsetEnv name) (\saved -> Blank.setEnv name saved True)

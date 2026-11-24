@@ -4,11 +4,12 @@
  * The core (nova-nix-sandbox.c) is the program as every OS runs it: the
  * command line, the plan read from standard input, and the record a step
  * that fails writes on the status channel.  A backend is the sandbox of
- * one OS (linux.c): it starts the builder there as the plan says, waits
- * for it, ends it when the lifeline closes, and has the helper end as the
- * builder ended.  The executable links the core with the one backend for
- * the OS it is built for.  The core reads and writes its channels through
- * the backend, since each OS has its own calls for them.
+ * one OS (linux.c, darwin.c): it starts the builder there as the plan
+ * says, waits for it, ends it when the lifeline closes, and has the helper
+ * end as the builder ended.  The executable links the core with the one
+ * backend for the OS it is built for.  The core reads and writes its
+ * channels through the backend, since each OS has its own calls for them;
+ * the POSIX backends share theirs (posix.h).
  */
 
 #ifndef NOVA_NIX_SANDBOX_BACKEND_H
@@ -45,6 +46,9 @@ void status_fail(const char *stage, int error, long index) NO_RETURN;
 /* ------------------------------------------------------------------------
  * A backend, for the core
  * ------------------------------------------------------------------------ */
+
+/* The backend a plan must be for; the core refuses a plan for another. */
+extern const enum plan_backend backend_plan;
 
 /* Ready this process to run a builder, before the core reads the plan.
  * Once it answers 0 the status channel takes records, and nothing the

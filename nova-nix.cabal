@@ -325,8 +325,10 @@ executable nova-nix
 -- step as every OS does, and links the backend for the OS it is built
 -- for (sandbox/backend.h), which makes the sandbox: on Linux,
 -- sandbox/linux.c, namespaces and a chroot, set up between their creation
--- and the builder's exec, where nova-nix itself can run nothing.  The
--- runtime it links is never started.  nova-nix finds it beside itself.
+-- and the builder's exec, where nova-nix itself can run nothing; on
+-- macOS, sandbox/darwin.c, a profile applied in the builder's process
+-- before its exec.  Both share sandbox/posix.c.  The runtime it links is
+-- never started.  nova-nix finds it beside itself.
 -- ---------------------------------------------------------------------------
 
 executable nova-nix-sandbox
@@ -338,7 +340,9 @@ executable nova-nix-sandbox
   build-depends:
       base                >= 4.22 && < 5
   if os(linux)
-    c-sources:      sandbox/linux.c sandbox/mountinfo.c
+    c-sources:      sandbox/linux.c sandbox/mountinfo.c sandbox/posix.c
+  elif os(darwin)
+    c-sources:      sandbox/darwin.c sandbox/posix.c
   else
     buildable: False
 
@@ -369,6 +373,7 @@ test-suite nova-nix-test
     Test.Store
     Test.Substituter
     Test.Trust
+    UserResources
   default-language: Haskell2010
   default-extensions:
     OverloadedStrings

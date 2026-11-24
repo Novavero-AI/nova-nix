@@ -15,7 +15,7 @@ import System.Exit (exitFailure, exitSuccess)
 import System.FilePath ((</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 import qualified System.Process as Proc
-import Test.Builder (sandboxBuildChild, sandboxBuildChildFlag, sandboxFallbackChild, sandboxFallbackChildFlag, testBuildCheckIO, testBuildCores, testBuildCoresIO, testBuildDirIO, testBuildLogIO, testBuildOrchestrator, testBuildenvBuildIO, testBuildenvDerivations, testBuilder, testBuilderLayout, testDependentBuildIO, testExecWrapper, testFetchMirrors, testFetchurlUnpack, testFlatOutputFormIO, testLinuxSandboxIO, testOutputCycleBuildIO, testOutputOrderIO, testPassAsFile, testProfileGenerations, testProfileManifest, testProfileTree, testProfileUpdateIO, testReferenceClosureIO, testSandboxFallbackIO, testSandboxPure, testSandboxSpawnIO, testScrubbedBuildEnvIO, testSourceDateEpochIO, testSubstituteFromCaches, testTrivialBuildIO, testUnpackBuildIO, testWantedOutputsIO)
+import Test.Builder (sandboxBuildChild, sandboxBuildChildFlag, sandboxEscapeChild, sandboxEscapeChildFlag, sandboxFallbackChild, sandboxFallbackChildFlag, sandboxForkerChild, sandboxForkerChildFlag, sandboxThawChild, sandboxThawChildFlag, testBuildCheckIO, testBuildCores, testBuildCoresIO, testBuildDirIO, testBuildLogIO, testBuildOrchestrator, testBuildenvBuildIO, testBuildenvDerivations, testBuilder, testBuilderLayout, testDarwinSandboxIO, testDependentBuildIO, testExecWrapper, testFetchMirrors, testFetchurlUnpack, testFlatOutputFormIO, testLinuxSandboxIO, testOutputCycleBuildIO, testOutputOrderIO, testPassAsFile, testProfileGenerations, testProfileManifest, testProfileTree, testProfileUpdateIO, testReferenceClosureIO, testSandboxFallbackIO, testSandboxPure, testSandboxSpawnIO, testScrubbedBuildEnvIO, testSourceDateEpochIO, testSubstituteFromCaches, testTrivialBuildIO, testUnpackBuildIO, testWantedOutputsIO)
 import Test.CData (arenaGuardChild, arenaGuardChildFlag, testArenaGuard, testBytecodeCompile, testBytecodeCorrupt, testBytecodeCountSpill, testBytecodePerElement, testBytecodeTags, testCAttrSet, testCThunk, testLambdaShape, testSymbol, testUnknownTags, testValueCountWidths)
 import Test.Cli (cliJsonPath, testBuildCoresCLI, testBuildUmaskCLI, testCheckCLI, testCliReference, testClosedStdoutCLI, testConfigBytesCLI, testDevelopCLI, testE2E, testEvalPolicyCLI, testExecWrapperCLI, testImportFromDerivationCLI, testNixConfig, testOutLinkCLI, testProfileCLI, testResultPrinterCLI, testSandboxSessionsCLI, testTargetArgsCLI, testTrustCLI, testUncaughtIOFailureCLI, writeCliJsonFlag)
 import Test.Daemon (testDaemonFixtures, testDaemonProtocol, testDaemonWire)
@@ -44,6 +44,9 @@ main = do
     [flag, source] | flag == failureChildFlag -> inTestSession (failureChild source)
     [flag, helper, busybox, storeRoot, marker] | flag == sandboxBuildChildFlag -> sandboxBuildChild helper busybox storeRoot marker
     [flag, storeRoot] | flag == sandboxFallbackChildFlag -> sandboxFallbackChild storeRoot
+    [flag, out, ready] | flag == sandboxEscapeChildFlag -> sandboxEscapeChild out ready
+    [flag, marker, ready] | flag == sandboxForkerChildFlag -> sandboxForkerChild marker ready
+    [flag, marker, ready] | flag == sandboxThawChildFlag -> sandboxThawChild marker ready
     [flag, source] | flag == namesOnlyChildFlag -> inTestSession (namesOnlyChild source)
     [flag] | flag == arenaCycleChildFlag -> arenaCycleChild
     [flag] | flag == writeCliJsonFlag -> BS.writeFile cliJsonPath Ref.referenceJson
@@ -278,6 +281,7 @@ runSuite = do
           testSandboxSpawnIO,
           testSandboxFallbackIO,
           testLinuxSandboxIO,
+          testDarwinSandboxIO,
           testStoreDB,
           testParseStorePath,
           testDaemonWire,

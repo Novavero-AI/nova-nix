@@ -38,7 +38,7 @@ import GHC.Profiling (requestHeapCensus)
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuildStop (..), SubstitutionAccess (..), buildWithDeps, defaultBuildConfig, execWrapperConfig, substituteFromCaches)
 import Nix.Builder.Buildenv (Activity (..))
 import qualified Nix.Builder.Cores as Cores
-import Nix.Builder.Sandbox (DropGroups (..), SandboxConfig (..), SandboxFallback (..), SandboxMode (..), parseSandboxPaths)
+import Nix.Builder.Sandbox (DropGroups (..), SandboxConfig (..), SandboxFallback (..), SandboxMode (..), ViolationLog (..), darwinImpureHostPrefixes, darwinSandboxPaths, parseSandboxPaths)
 import Nix.Builder.Sandbox.Spawn (filePathBytes, processIsRoot)
 import Nix.Builtins (isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
 import Nix.Cli.Args (AutoArg (..), CliOpts (..), Command (..), DevEnvFormat (..), DevelopArgs (..), JsonLayout (..), ListFormat (..), OutLink, ProfileSelection (..), PushArgs (..), RemoveMatcher (..), RemoveSelection (..), Target (..), outLinkFor, parseArgs)
@@ -980,9 +980,12 @@ buildModeFor opts
 -- take the platform or IO to find.  @sandbox@ is on by default on Linux
 -- alone (@sandboxMode@ in globals.hh at 2.24.9, local-settings.hh from
 -- 2.34.9).  @sandbox-paths@ keeps a release archive's bundled shell as
--- @\/bin\/sh@ unless a plain assignment replaces it, as upstream's default
--- names the shell a package was built with (the @Settings@ constructor in
--- globals.cc).  @require-drop-supplementary-groups@ is on for root
+-- @\/bin\/sh@ on Linux, and macOS's system paths there
+-- ('darwinSandboxPaths'), unless a plain assignment replaces it, as
+-- upstream's default names the shell a package was built with and those
+-- paths (the @Settings@ constructor in globals.cc);
+-- @allowed-impure-host-deps@ keeps upstream's macOS prefixes the same
+-- way.  @require-drop-supplementary-groups@ is on for root
 -- (@requireDropSupplementaryGroups@ in globals.hh at 2.24.9,
 -- local-settings.hh from 2.34.9).  @ssl-cert-file@ comes from
 -- @NIX_SSL_CERT_FILE@, else @SSL_CERT_FILE@, else the first bundle that
@@ -998,18 +1001,19 @@ sandboxConfigFor config opts = do
   shell <- bundledSandboxShell exeDir
   root <- processIsRoot
   caFile <- maybe defaultSslCertFile (pure . Just) (ncSslCertFile config)
-  let setPaths = ncSandboxPaths config
-      paths = case psvDefault setPaths of
-        KeepsDefault -> Set.union shell (psvPaths setPaths)
-        ReplacesDefault -> psvPaths setPaths
+  let withDefault defaults setting = case psvDefault setting of
+        KeepsDefault -> Set.union defaults (psvPaths setting)
+        ReplacesDefault -> psvPaths setting
   pure
     SandboxConfig
       { scMode = fromMaybe platformSandboxMode (optSandbox opts <|> ncSandbox config),
         scFallback = fallbackSetting (ncSandboxFallback config),
-        scPaths = parseSandboxPaths paths,
+        scPaths = parseSandboxPaths (withDefault (Set.union shell platformSandboxPaths) (ncSandboxPaths config)),
         scBuildDir = ncSandboxBuildDir config,
         scDevShmSize = ncSandboxDevShmSize config,
         scDropGroups = dropGroupsSetting (fromMaybe root (ncRequireDropSupplementaryGroups config)),
+        scAllowedImpureHostDeps = withDefault platformImpureHostPrefixes (ncAllowedImpureHostDeps config),
+        scViolationLog = violationLogSetting (ncDarwinLogSandboxViolations config),
         scCaFile = caFile,
         scHelper = helper
       }
@@ -1018,12 +1022,30 @@ sandboxConfigFor config opts = do
     fallbackSetting False = RefuseUnsandboxed
     dropGroupsSetting True = RequireDropGroups
     dropGroupsSetting False = TolerateKeptGroups
+    violationLogSetting True = ViolationsLogged
+    violationLogSetting False = ViolationsUnlogged
 
 -- | Upstream's default for @sandbox@ on this platform.
 platformSandboxMode :: SandboxMode
 platformSandboxMode
   | System.Info.os == "linux" = SandboxEnabled
   | otherwise = SandboxDisabled
+
+-- | The @sandbox-paths@ default beside a sandbox shell: on macOS the
+-- system paths a build reads ('darwinSandboxPaths'), and elsewhere
+-- nothing.
+platformSandboxPaths :: Set.Set BS.ByteString
+platformSandboxPaths
+  | System.Info.os == "darwin" = darwinSandboxPaths
+  | otherwise = Set.empty
+
+-- | Upstream's @allowed-impure-host-deps@ default: on macOS, the prefixes
+-- a derivation's @__impureHostDeps@ may name a path beneath
+-- ('darwinImpureHostPrefixes'), and elsewhere none.
+platformImpureHostPrefixes :: Set.Set BS.ByteString
+platformImpureHostPrefixes
+  | System.Info.os == "darwin" = darwinImpureHostPrefixes
+  | otherwise = Set.empty
 
 -- | The sandbox helper's file name.
 sandboxHelperName :: FilePath
