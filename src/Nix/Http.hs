@@ -132,7 +132,7 @@ retryBaseDelayMs = 250
 
 -- | The spread upstream adds to the backoff exponent so that clients
 -- which failed together do not retry together: a uniform draw from
--- @[0, 0.5)@ (@filetransfer.cc@ at 2.24.9, line 500).
+-- @[0, 0.5)@ (@TransferItem::finish@ in @filetransfer.cc@ at 2.24.9).
 retryJitterCeiling :: Double
 retryJitterCeiling = 0.5
 
@@ -153,8 +153,8 @@ defaultFetchRetryPolicy = FetchRetryPolicy {frpAttempts = downloadAttempts, frpB
 
 -- | The delay before retry number @retry@ (counting from one), given the
 -- jitter drawn for it: upstream's @baseRetryTimeMs * 2 ^ (attempt - 1 +
--- jitter)@ (@filetransfer.cc@ at 2.24.9, line 500), truncated to whole
--- milliseconds as its assignment to an @int@ truncates.
+-- jitter)@ (@TransferItem::finish@ in @filetransfer.cc@ at 2.24.9),
+-- truncated to whole milliseconds as its assignment to an @int@ truncates.
 retryDelayMs :: FetchRetryPolicy -> Int -> Double -> Int
 retryDelayMs policy retry jitter =
   truncate (fromIntegral (frpBaseDelayMs policy) * 2 ** (fromIntegral (retry - 1) + jitter) :: Double)
@@ -243,9 +243,8 @@ transferFailureHandlers url =
 -- @Interrupted@ is an asynchronous exception here, never a value).  Only
 -- 'Transient' is retried.  A binary cache store reads 'NotFound' and
 -- 'Forbidden' alike as the file not being in that cache
--- (@http-binary-cache-store.cc@ at 2.24.9, lines 123, 160 and 182),
--- since an S3 bucket that cannot be listed answers a missing key with
--- 403.
+-- (@fileExists@ and @getFile@ in @http-binary-cache-store.cc@), since an S3
+-- bucket that cannot be listed answers a missing key with 403.
 data TransferError
   = -- | 404 or 410: the file is not there.
     NotFound
@@ -258,12 +257,12 @@ data TransferError
   deriving (Eq, Show)
 
 -- | Classify a response status the way upstream's transfer layer does,
--- in its order (@filetransfer.cc@ at 2.24.9, lines 423-441): 404 and 410
--- are 'NotFound'; 401, 403 and 407 are 'Forbidden'; every other 4xx
--- except 408 and 429 (the server timed out waiting for the request, or
--- asked for a slower pace) is 'Misc', as are 501, 505 and 511 (the
--- server cannot speak this protocol, or a captive portal is in the way).
--- Everything else is 'Transient', the remaining 5xx included.
+-- in its order (@TransferItem::finish@ in @filetransfer.cc@ at 2.24.9): 404
+-- and 410 are 'NotFound'; 401, 403 and 407 are 'Forbidden'; every other 4xx
+-- except 408 and 429 (the server timed out waiting for the request, or asked
+-- for a slower pace) is 'Misc', as are 501, 505 and 511 (the server cannot
+-- speak this protocol, or a captive portal is in the way).  Everything else
+-- is 'Transient', the remaining 5xx included.
 statusError :: HTTP.Status -> TransferError
 statusError status
   | status `elem` [HTTP.status404, HTTP.status410] = NotFound
@@ -284,19 +283,18 @@ fetchStatusFailure url status = case statusError status of
     message = "HTTP " <> T.pack (show (HTTP.statusCode status)) <> " fetching " <> url
 
 -- | Classify a failure of the HTTP client, by upstream's list of curl
--- results that are not retried (@filetransfer.cc@ at 2.24.9, lines
--- 443-465).  A URL the client cannot parse (@CURLE_URL_MALFORMAT@) is an
--- 'HTTP.InvalidUrlException' from the parser, except for an empty host,
--- which the parser accepts and the connection lookup rejects as
--- 'HTTP.InvalidDestinationHost' on every attempt.  A scheme the client
--- does not speak (@CURLE_UNSUPPORTED_PROTOCOL@) is an
--- 'HTTP.InvalidUrlException' too, or 'HTTP.TlsNotSupported' when the
--- manager has no TLS.  A redirect loop (@CURLE_TOO_MANY_REDIRECTS@)
--- completes the deterministic set.  Every other transport failure is
--- transient, name resolution and TLS included, as upstream has it.  The
--- message names the URL and the failure only: the client's own rendering
--- prints the whole request record over a dozen lines, and a retry would
--- repeat it.
+-- results that are not retried (@TransferItem::finish@ in @filetransfer.cc@
+-- at 2.24.9).  A URL the client cannot parse (@CURLE_URL_MALFORMAT@) is an
+-- 'HTTP.InvalidUrlException' from the parser, except for an empty host, which
+-- the parser accepts and the connection lookup rejects as
+-- 'HTTP.InvalidDestinationHost' on every attempt.  A scheme the client does
+-- not speak (@CURLE_UNSUPPORTED_PROTOCOL@) is an 'HTTP.InvalidUrlException'
+-- too, or 'HTTP.TlsNotSupported' when the manager has no TLS.  A redirect
+-- loop (@CURLE_TOO_MANY_REDIRECTS@) completes the deterministic set.  Every
+-- other transport failure is transient, name resolution and TLS included, as
+-- upstream has it.  The message names the URL and the failure only: the
+-- client's own rendering prints the whole request record over a dozen lines,
+-- and a retry would repeat it.
 fetchExceptionFailure :: Text -> HTTP.HttpException -> AttemptFailure
 fetchExceptionFailure url = exceptionFailure (describeFailure url)
 

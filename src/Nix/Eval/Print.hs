@@ -293,39 +293,40 @@ entering repeated (Just key) body = gets (Set.member key . shownEntered) >>= ent
 repeatedMarker :: Text
 repeatedMarker = marker "repeated"
 
--- | What 'printValue' enters a set by (print.cc:332 at 2.24.9): its
+-- | What 'printValue' enters a set by (@printAttrs@ in print.cc): its
 -- bindings, an empty set's included.
 printedSet :: AttrSet -> Entered
 printedSet = EnteredSet . unAttrSet
 
--- | What 'printValue' enters a list with elements by (print.cc:410): the
--- cell holding it.  The top-level value has no cell, so a list there is
--- entered by nothing.  Upstream's top-level @Value@ is the one its caller
--- hands over: a temporary for a coercion (eval.cc:2010-2014), which
--- nothing else holds either, and for @builtins.trace@ the argument itself
--- (primops.cc:1018), so a traced list that holds itself prints one level
--- deeper here before the marker.
+-- | What 'printValue' enters a list with elements by (@printList@ in
+-- print.cc): the cell holding it.  The top-level value has no cell, so a
+-- list there is entered by nothing.  Upstream's top-level @Value@ is the
+-- one its caller hands over: a temporary for a coercion
+-- (@ExprConcatStrings::eval@ in eval.cc), which nothing else holds either,
+-- and for @builtins.trace@ the argument itself (@prim_trace@ in
+-- primops.cc), so a traced list that holds itself prints one level deeper
+-- here before the marker.
 printedList :: (MonadCData m) => Maybe Thunk -> CList -> m (Maybe Entered)
 printedList cell cl = do
   len <- clistLen cl
   pure (if len == 0 then Nothing else EnteredCell . unThunk <$> cell)
 
 -- | What 'printAmbiguous' enters a set with attributes by
--- (print-ambiguous.cc:39 at 2.24.9): its bindings.  An empty set is
--- entered by nothing and always prints in full.
+-- (print-ambiguous.cc): its bindings.  An empty set is entered by nothing and
+-- always prints in full.
 resultSet :: (MonadCData m) => AttrSet -> m (Maybe Entered)
 resultSet attrs = do
   empty <- attrSetNull attrs
   pure (if empty then Nothing else Just (EnteredSet (unAttrSet attrs)))
 
 -- | What 'printAmbiguous' enters a list with elements by
--- (print-ambiguous.cc:53): where its elements are.  Upstream keeps a short
--- list's elements inside its @Value@ and a longer one's in an array every
--- copy of that @Value@ shares (value.hh:407-410), so a short list is
--- entered by the cell holding it and a longer one by its C list.  The
--- top-level value has no cell, and upstream's is nix-instantiate's own
--- copy (nix-instantiate.cc:50), which nothing else holds, so a short list
--- there is entered by nothing.
+-- (print-ambiguous.cc at 2.24.9): where its elements are.  Upstream keeps a
+-- short list's elements inside its @Value@ and a longer one's in an array
+-- every copy of that @Value@ shares (@Value::listElems@ in value.hh), so a
+-- short list is entered by the cell holding it and a longer one by its C
+-- list.  The top-level value has no cell, and upstream's is
+-- nix-instantiate's own copy (@processExpr@ in nix-instantiate.cc), which
+-- nothing else holds, so a short list there is entered by nothing.
 resultList :: (MonadCData m) => Maybe Thunk -> CList -> m (Maybe Entered)
 resultList cell cl = enteredBy <$> clistLen cl
   where
@@ -335,7 +336,7 @@ resultList cell cl = enteredBy <$> clistLen cl
       | otherwise = Just (EnteredList (unCList cl))
 
 -- | The most elements upstream keeps inside a list's @Value@
--- (@smallList@, value.hh:250 at 2.24.9).
+-- (@smallList@ in value.hh).
 inlineListElements :: Int
 inlineListElements = 2
 
@@ -391,9 +392,9 @@ printElement :: (MonadCData m) => Thunk -> Printer m BB.Builder
 printElement thunk = lift (readThunkValue thunk) >>= maybe (pure "<CODE>") (printAmbiguousAt (Just thunk))
 
 -- | A name as upstream writes a symbol into a message: its @operator<<@ on
--- a @SymbolStr@ writes it through @printIdentifier@ (nixexpr.cc:20-24 at
--- 2.24.9, 2.34.9 and 2.35.4), so a name that is not an identifier, the
--- empty name or a keyword prints as a string literal.
+-- a @SymbolStr@ writes it through @printIdentifier@ (nixexpr.cc), so a name
+-- that is not an identifier, the empty name or a keyword prints as a string
+-- literal.
 printSymbol :: Text -> Text
 printSymbol = builderText . printIdentifier . TE.encodeUtf8
 

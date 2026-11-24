@@ -1,5 +1,5 @@
 -- | __builtin:buildenv__, upstream's builder of a user environment
--- (builtins\/buildenv.cc:173-207 at 2.35.4): the builder of the
+-- (@builtinBuildenv@ in builtins\/buildenv.cc): the builder of the
 -- derivation @nix-env@ evaluates from its @buildenv.nix@.  Its output is
 -- the tree ("Nix.Profile.Tree") of the packages its @derivations@
 -- attribute names, with @manifest.nix@ linked to its @manifest@.
@@ -125,11 +125,11 @@ data DerivationsError
 -- | Read the @derivations@ attribute: whitespace-separated tokens with the
 -- empty ones dropped, as upstream's @tokenizeString@ gives them, in groups
 -- of an activity, a priority, an output count and that many paths
--- (buildenv.cc:189-201).
+-- (@builtinBuildenv@ in buildenv.cc).
 parseDerivations :: ByteString -> Either DerivationsError [Element]
 parseDerivations = elementsOf . filter (not . BS.null) . BS8.splitWith (`elem` tokenSeparators)
   where
-    -- tokenizeString's default separators (strings.hh:28).
+    -- tokenizeString's default separators (its declaration in strings.hh).
     tokenSeparators = " \t\n\r" :: String
 
 -- | The elements a token list holds, in order.
@@ -192,7 +192,7 @@ leadingInteger token = case BS8.uncons unspaced of
 
 -- | Each path of each active element, with the element's priority, in
 -- order: upstream's builder passes an inactive one to @buildProfile@,
--- which never reads it (buildenv.cc:153-155).
+-- which never reads it (buildenv.cc).
 elementPackages :: [Element] -> [(ByteString, Int)]
 elementPackages elements = [(path, priority) | Element Active priority paths <- elements, path <- paths]
 

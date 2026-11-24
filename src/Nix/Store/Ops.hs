@@ -167,10 +167,10 @@ withLocalStore config action = withOpenedOnFirstUse (openStore dir) closeStore (
 -- it).  A store with no database, or one whose database does not hold the
 -- store's tables yet ('storeTablesExist'), answers that it holds nothing,
 -- as upstream's read-only evaluation answers once it has made the tables
--- of a store that has none (local-store.cc:340-344 at 2.24.9); neither
--- the directory, its metadata, its database nor its collector lock is
--- ever made.  No lease is taken, so a collection may remove a path a
--- query answered for, which a later read then finds missing.
+-- of a store that has none (the @LocalStore@ constructor in local-store.cc at
+-- 2.24.9); neither the directory, its metadata, its database nor its
+-- collector lock is ever made.  No lease is taken, so a collection may remove
+-- a path a query answered for, which a later read then finds missing.
 localQueries :: StoreDir -> StoreQueries IO
 localQueries rawDir = queriesOf rawDir inDatabase
   where

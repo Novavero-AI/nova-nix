@@ -160,12 +160,12 @@ instance Exception NixAbortError
 -- | A failure as upstream's @showErrorInfo@ prints it (error.cc at
 -- 2.24.9) when no line has a position: each line of context after an
 -- ellipsis and a blank line, then the message after an @error:@ of its
--- own.  An empty line of context prints nothing, as upstream passes over
--- a trace whose text is empty (error.cc:386), and the message still
--- follows an @error:@ of its own, as upstream's follows one whenever the
--- failure has a trace (error.cc:376, 416).  The report is upstream's
--- @indent@: the first line follows @error: @, every later line is
--- indented to align with it, and each line loses its trailing whitespace.
+-- own.  An empty line of context prints nothing, as upstream passes over a
+-- trace whose text is empty, and the message still follows an @error:@ of
+-- its own, as upstream's follows one whenever the failure has a trace.  The
+-- report is upstream's @indent@: the first line follows @error: @, every
+-- later line is indented to align with it, and each line loses its trailing
+-- whitespace.
 renderEvalFailure :: EvalFailure -> Text
 renderEvalFailure (EvalFailure trace msg) =
   T.intercalate "\n" (zipWith indentLine (errorPrefix : repeat continuation) (T.splitOn "\n" (chomp report)))
@@ -600,7 +600,7 @@ instance MonadEval EvalIO where
             result <- nested
             -- Every file's value is cached, kept in a cell registered as
             -- a root, as upstream's fileEvalCache keeps every file it
-            -- evaluates (eval.cc:1096 at 2.24.9): a later import of the
+            -- evaluates (evalFile in eval.cc): a later import of the
             -- file is the same value.
             cell <- evaluated result
             crootsAddThunk (unThunk cell)
@@ -709,12 +709,11 @@ instance MonadEval EvalIO where
         -- own left alone, under the path's own name, inside the store
         -- too: upstream's copyPathToStore stores
         -- path.resolveSymlinks(SymlinkResolution::Ancestors) under
-        -- path.baseName() (eval.cc:2602 at 2.35.4, :2574 at 2.34.9), so a
-        -- path that is a link is copied as the link, and the policy walks
-        -- no further, since upstream's accessor reads the link rather
-        -- than following it.  2.24.9 resolved the path in full
-        -- (eval.cc:2393) and copied what a link points to; nova-nix
-        -- follows the newest release.
+        -- path.baseName() (eval.cc, 2.34.9 and later), so a path that is a
+        -- link is copied as the link, and the policy walks no further, since
+        -- upstream's accessor reads the link rather than following it.
+        -- 2.24.9 resolved the path in full (copyPathToStore in eval.cc) and
+        -- copied what a link points to; nova-nix follows the newest release.
         accessPathResolving ResolveAncestors rawPath
         resolvedText <- resolvedAncestors rawPath
         -- Read where the text names it and under the case-hack its
@@ -762,8 +761,8 @@ instance MonadEval EvalIO where
           Dir.removePathForcibly filePath
           BS.writeFile filePath contents
         -- Adopted or written, the file takes the metadata upstream's
-        -- addToStoreFromDump gives what it adds (local-store.cc:1342 at
-        -- 2.24.9), which builtins.toFile calls (primops.cc:2317).
+        -- LocalStore::addToStoreFromDump gives what it adds (local-store.cc),
+        -- which builtins.toFile calls (prim_toFile in primops.cc).
         canonicalizeMetadata filePath
     recordStoreWrite Computed storePath refs SP.WriteText
     -- Upstream's toFile returns the path through allowAndSetStorePathString.
@@ -983,7 +982,7 @@ instance MonadEval EvalIO where
           Dir.removePathForcibly filePath
           BS.writeFile filePath bytes
         -- The metadata upstream gives a downloaded file it adds
-        -- (LocalStore::addToStore, local-store.cc:1190 at 2.24.9).
+        -- (LocalStore::addToStore in local-store.cc).
         canonicalizeMetadata filePath
     recordStoreWrite origin storePath [] SP.WriteFlat
     allowPath storePath
@@ -1002,10 +1001,11 @@ instance MonadEval EvalIO where
 
   -- Every path is resolved in the value domain, as upstream resolves
   -- one over the union of the host's file system and the store
-  -- (eval.cc:267-293 at 2.35.4): each link is read through the store
-  -- this evaluation was given, so a host link into the store is
-  -- followed on inside it, and store text keeps its canonical spelling,
-  -- as an import target's does ('resolveImportTarget' says why).
+  -- (rootFS in EvalState's constructor, eval.cc, 2.34.9 and later): each
+  -- link is read through the store this evaluation was given, so a host
+  -- link into the store is followed on inside it, and store text keeps its
+  -- canonical spelling, as an import target's does ('resolveImportTarget'
+  -- says why).
   resolveSymlinks path = do
     accessPath path
     st <- EvalIO ask
@@ -1230,7 +1230,7 @@ addMade ops = do
 
 -- | Under a restricting policy, make readable every path in the closures
 -- of a realisation's outputs, as upstream's @allowClosure@ does
--- (eval.cc:378-387 at 2.34.9).  A no-op otherwise, and nothing is asked.
+-- (eval.cc at 2.34.9).  A no-op otherwise, and nothing is asked.
 allowClosures :: StoreQueries IO -> [SP.StorePath] -> EvalIO (Either ContextRefusal ())
 allowClosures queries outputs = do
   st <- EvalIO ask
@@ -1304,8 +1304,9 @@ pathAllowed mode path = do
 -- the parent, at 2.24.9), in every mode, and names the first symlink it
 -- meets walking up from the parent.  It looks only beneath its root, and
 -- the store's accessor has the store directory for its root
--- (posix-source-accessor.cc:342-404 at 2.35.4), so the store directory
--- and its ancestors are not looked at for a path in the store
+-- (@PosixDirectorySourceAccessor::openParent@ in posix-source-accessor.cc
+-- at 2.35.4, @openParentAndUpsert@ at 2.36.0), so the store directory and
+-- its ancestors are not looked at for a path in the store
 -- ('storeRootPrefix').
 refuseSymlinkedAncestor :: Text -> EvalIO ()
 refuseSymlinkedAncestor path = do
@@ -1416,10 +1417,11 @@ storeFilePath = SP.storePathToFilePath
 
 -- | Run a write of an object evaluation made unless the session only
 -- names it: a read-only session writes what a fetcher fetched, as
--- upstream's fetchers add their results in any mode (fetchTree.cc:504-509
--- at 2.24.9), and computes the path of everything else without writing
--- it, as upstream's read-only evaluation does (primops.cc:2310 and :2473,
--- eval.cc:2394).  A read-write session writes everything.  An evaluation
+-- upstream's fetchers add their results in any mode (@fetch@ in
+-- fetchTree.cc at 2.24.9), and computes the path of everything else
+-- without writing it, as upstream's read-only evaluation does
+-- (@prim_toFile@ and @addPath@ in primops.cc, @copyPathToStore@ in
+-- eval.cc).  A read-write session writes everything.  An evaluation
 -- that writes nothing never makes the store.
 writtenFor :: PendingOrigin -> EvalIO () -> EvalIO ()
 writtenFor origin write = do
@@ -1440,7 +1442,7 @@ writtenFor origin write = do
 --
 -- A read-only session adds what a fetcher fetched to its store at once,
 -- as upstream's local store adds a fetch the moment it lands, whatever
--- the mode (@addToStore@, tarball.cc:86 at 2.24.9), making its database
+-- the mode (@addToStore@ in tarball.cc's @downloadFile@), making its database
 -- if it has none: a later read in this evaluation or a later evaluation
 -- finds it valid, even if this one fails.  A read-write session adds
 -- everything it made before a realisation and once evaluation is done.
@@ -1587,11 +1589,11 @@ firstMatch def ((test, label) : rest) =
     False -> firstMatch def rest
 
 -- | Classify a directory entry (name relative to parent) as upstream's
--- @readDirectory@ types one (posix-source-accessor.cc:136-163 at
--- 2.24.9): an entry whose lstat is refused with @EACCES@ or @EPERM@
--- (@permission_denied@, @operation_not_permitted@) has no type, and any
--- other failure fails the listing.  A directory that can be read but not
--- searched refuses every entry's lstat this way.
+-- @readDirectory@ types one (@PosixSourceAccessor::readDirectory@ in
+-- posix-source-accessor.cc at 2.24.9): an entry whose lstat is refused with
+-- @EACCES@ or @EPERM@ (@permission_denied@, @operation_not_permitted@) has
+-- no type, and any other failure fails the listing.  A directory that can
+-- be read but not searched refuses every entry's lstat this way.
 classifyEntry :: FilePath -> FilePath -> IO (Text, Maybe Text)
 classifyEntry parentDir name = do
   ty <- catchJust refusedStat (Just <$> classifyPath (parentDir </> name)) (\() -> pure Nothing)
@@ -1685,14 +1687,13 @@ runEvalIOTraced st (EvalIO action) = do
 
 -- | Unpack a NAR entry at its content-addressed destination and make the
 -- tree's metadata canonical ('canonicalizeMetadata'), as upstream's
--- @addToStoreFromDump@ does to what it restores (local-store.cc:1342 at
--- 2.24.9).  An existing destination is adopted only when its NAR digest
--- is the expected one - same content means same path, so a matching tree
--- is byte-identical by construction; anything else (an interrupted
--- earlier unpack, a squatter) is cleared and unpacked afresh.  The
--- entry is the one evaluation hashed to name the path, so the tree
--- that lands is the one the address names, with the store volume's
--- own sibling-name handling.
+-- @addToStoreFromDump@ does to what it restores (local-store.cc).  An
+-- existing destination is adopted only when its NAR digest is the expected
+-- one - same content means same path, so a matching tree is byte-identical
+-- by construction; anything else (an interrupted earlier unpack, a
+-- squatter) is cleared and unpacked afresh.  The entry is the one
+-- evaluation hashed to name the path, so the tree that lands is the one the
+-- address names, with the store volume's own sibling-name handling.
 unpackToStoreVerified :: FilePath -> NAR.NarEntry -> BS.ByteString -> IO (Either Text ())
 unpackToStoreVerified dest entry expectedDigest = do
   Dir.createDirectoryIfMissing True (takeDirectory dest)

@@ -220,12 +220,12 @@ envExecutable = "executable"
 
 -- | The value a derivation attribute set to @true@ has in the
 -- environment, and the one upstream's @builtin:fetchurl@ compares
--- @unpack@ and @executable@ with (fetchurl.cc:31 and :56 at 2.24.9).
+-- @unpack@ and @executable@ with (@builtinFetchurl@ in fetchurl.cc).
 envTrue :: BS.ByteString
 envTrue = "1"
 
 -- | The URL suffix that marks the NAR @builtin:fetchurl@ restores as
--- xz-compressed (fetchurl.cc:45 at 2.24.9).
+-- xz-compressed (@builtinFetchurl@ in fetchurl.cc).
 xzUrlSuffix :: Text
 xzUrlSuffix = ".xz"
 
@@ -343,7 +343,7 @@ data SubstitutionAccess
     -- ('Nix.Realise.noWriteAccessMessage').  An output that may not be
     -- substituted is still built, as upstream builds one there: nothing
     -- on its build path checks for read-only mode
-    -- (derivation-goal.cc:249 at 2.24.9, :103 at 2.34.9).
+    -- (@DerivationGoal::haveDerivation@ in derivation-goal.cc).
     RefuseSubstitution
   deriving (Eq, Show)
 
@@ -631,10 +631,12 @@ buildUnderLock config store drvPath drv redirected finish = do
 -- and 'placeInStore' has already sealed it read-only.  A check builds a
 -- derivation whose outputs are all valid, so there every output is written
 -- to a scratch path, as upstream writes a valid output wherever it builds
--- outside a Linux chroot (@startBuilder@, local-derivation-goal.cc:539-554
--- at 2.24.9).  nova-nix's sandbox writes one to a scratch path too, where
--- upstream's chroot leaves the output's own path free
--- (@needsHashRewrite@, :116-124).
+-- outside a Linux chroot (@startBuilder@ in local-derivation-goal.cc at
+-- 2.24.9, @startBuild@ in unix-derivation-builder.cc at 2.36.0).
+-- nova-nix's sandbox writes one to a scratch path too, where upstream's
+-- chroot leaves the output's own path free (@needsHashRewrite@, in
+-- local-derivation-goal.cc at 2.24.9 and chroot-derivation-builder.hh at
+-- 2.36.0).
 data OutputPlan = OutputPlan
   { -- | The derivation output's name, as it reaches the environment.
     opName :: !Text,
@@ -832,8 +834,9 @@ scratchPathOf config p = storePathToFilePath (bcStoreDir config) (opScratch p)
 -- one, otherwise where its directory and outputs are.  A system that
 -- cannot make the sandbox runs the build unsandboxed under
 -- @sandbox-fallback@, after one warning a process ('warnFallback'), and
--- fails it otherwise, as upstream does (LDG 224-231).  Once the builder
--- has succeeded, @continue@ runs with where its outputs are.
+-- fails it otherwise, as upstream does (@tryLocalBuild@ in
+-- local-derivation-goal.cc at 2.24.9).  Once the builder has succeeded,
+-- @continue@ runs with where its outputs are.
 runSpawnedBuilder :: BuildConfig -> BuildContext -> Derivation -> FilePath -> [OutputPlan] -> (Written -> IO r) -> IO (Either BuilderFailure r)
 runSpawnedBuilder config context drv buildDir plans continue =
   case sandboxUse (scMode sandbox) (bxDrvPath context) drv of
@@ -866,16 +869,16 @@ runSpawnedBuilder config context drv buildDir plans continue =
 -- ("Nix.Builder.Sandbox.Spawn") through the helper, then @continue@ with
 -- each output where the builder wrote it, in the chroot, which is
 -- removed once @continue@ ends: an output leaves the chroot only when it
--- is registered, as upstream's leaves its chroot last (LDG 2685-2688), so
--- a check or an output that was already valid never enters the store.
--- The builder sees its build directory at @sandbox-build-dir@ and each
--- output at its own path, which on disk is that path beneath the chroot's
--- root, upstream's @toRealPathChroot@ (LDG 2282-2286).  The chroot is in
--- the store's state directory, so the move into the store is a rename
--- ('Nix.Store.placeInStore').
--- The directory the builder sees is one inside the build directory
--- ('sandboxedBuildDir').  An @--exec-wrapper@ launcher is bound into the
--- chroot as a @sandbox-paths@ entry naming itself.
+-- is registered, as upstream's leaves its chroot last (@registerOutputs@ in
+-- local-derivation-goal.cc at 2.24.9), so a check or an output that was
+-- already valid never enters the store.  The builder sees its build directory
+-- at @sandbox-build-dir@ and each output at its own path, which on disk is
+-- that path beneath the chroot's root, upstream's @toRealPathChroot@
+-- (@registerOutputs@ in local-derivation-goal.cc at 2.24.9).  The chroot is
+-- in the store's state directory, so the move into the store is a rename
+-- ('Nix.Store.placeInStore').  The directory the builder sees is one inside
+-- the build directory ('sandboxedBuildDir').  An @--exec-wrapper@ launcher is
+-- bound into the chroot as a @sandbox-paths@ entry naming itself.
 runSandboxedBuild :: BuildConfig -> BuildContext -> Derivation -> FilePath -> [OutputPlan] -> FilePath -> Network -> (Written -> IO r) -> IO (Either BuilderFailure r)
 runSandboxedBuild config context drv outerBuildDir plans helper network continue = do
   launcherPaths <- case execWrapperFor config drv of
@@ -895,7 +898,7 @@ runSandboxedBuild config context drv outerBuildDir plans helper network continue
       closureBytes <- traverse (filePathBytes . storeFile) closurePaths
       -- Each output's final path and the path it is written to are kept
       -- out of the chroot, as upstream keeps every known output path out
-      -- (LDG 764-772).
+      -- (@startBuilder@ in local-derivation-goal.cc at 2.24.9).
       outputBytes <- traverse filePathBytes (Set.toAscList (Set.fromList (concat [[storeFile (opFinal p), scratchPathOf config p] | p <- plans])))
       chrooted <- withChroot outerBuildDir (chrootSkeleton storeBytes (scBuildDir sandbox) network paths) $ \root -> do
         rootBytes <- filePathBytes root
@@ -942,8 +945,8 @@ runSandboxedBuild config context drv outerBuildDir plans helper network continue
     sandbox = bcSandbox config
     storeFile = storePathToFilePath (bcStoreDir config)
     -- The closures of the entries whose source is in the store, which are
-    -- bound beside them (LDG 643-657).  A source that names no store path
-    -- adds nothing.
+    -- bound beside them (@startBuilder@ in local-derivation-goal.cc at
+    -- 2.24.9).  A source that names no store path adds nothing.
     sandboxPathsClosure paths = do
       let inStore = [sp | entry <- paths, Right source <- [TE.decodeUtf8' (spSource entry)], Just sp <- [parseStorePathPrefix (bcStoreDir config) source]]
       fmap Set.toAscList <$> inputClosure (bxStore context) inStore
@@ -1058,10 +1061,12 @@ resolveInputOutputs config drv =
 -- | The closure of a build's inputs under the references the store records:
 -- the paths besides its own outputs that an output may reference.  This is
 -- upstream's @inputPaths@, the closures of the requested input outputs and
--- of the input sources (derivation-goal.cc:601-613 at 2.24.9).  An output
--- that embeds a dependency of a dependency must record it, or a collection
--- deletes it while the output still uses it.  As in upstream's, an input
--- derivation's @.drv@ is in it only when an input source reaches it.
+-- of the input sources (@DerivationGoal::inputsRealised@ in
+-- derivation-goal.cc at 2.24.9, @DerivationBuildingGoal::tryToBuild@ in
+-- derivation-building-goal.cc at 2.36.0).  An output that embeds a
+-- dependency of a dependency must record it, or a collection deletes it
+-- while the output still uses it.  As in upstream's, an input derivation's
+-- @.drv@ is in it only when an input source reaches it.
 --
 -- A recorded reference that does not parse is a corrupt database, and fails
 -- the build rather than dropping out of the scan.
@@ -1117,7 +1122,8 @@ inPlace path = BuildPlace path path
 data BuildLayout = BuildLayout
   { -- | The build directory, upstream's @tmpDir@ on disk and
     -- @tmpDirInSandbox@ as the builder sees it
-    -- (local-derivation-goal.cc:1084-1091 at 2.24.9).
+    -- (@initTmpDir@ in local-derivation-goal.cc at 2.24.9,
+    -- @tmpDirInSandbox@ in chroot-derivation-builder.cc at 2.36.0).
     layoutBuildDir :: !BuildPlace,
     -- | Each output by name, at the path the builder writes it to.
     layoutOutputs :: ![(Text, BuildPlace)],
@@ -1151,9 +1157,11 @@ data BuilderInvocation = BuilderInvocation
 -- directory and outputs are.  What the builder is told of, its arguments
 -- and environment, names the build directory and each output as the
 -- builder sees it, as upstream's environment names @tmpDirInSandbox@
--- (local-derivation-goal.cc:1112-1129 and 1218-1221 at 2.24.9); the files
--- it finds are written, and it is started, where the directory is on
--- disk.
+-- (@initTmpDir@ and @writeStructuredAttrs@ in local-derivation-goal.cc at
+-- 2.24.9, @initEnv@ in unix-derivation-builder.cc and
+-- @DesugaredEnv::create@ in derivation-env-desugar.cc at 2.36.0); the
+-- files it finds are written, and it is started, where the directory is
+-- on disk.
 --
 -- Derivation strings are bytes, and spawning a process needs text, so
 -- invalid UTF-8 in the builder, an argument or a variable refuses the
@@ -1176,9 +1184,12 @@ builderInvocation config drv layout = case (execWrapperFor config drv, decodeBui
           _ -> (builderPath, builderArgs)
         -- Only a fixed-output derivation's impureEnvVars reach
         -- the spawn.  Upstream passes them to a derivation whose
-        -- type is not sandboxed (local-derivation-goal.cc:1176 at
-        -- 2.24.9): a fixed-output one, or an impure one
-        -- (derivations.cc:99-112 and 746), which takes the
+        -- type is not sandboxed (initEnv in local-derivation-goal.cc
+        -- at 2.24.9, unix-derivation-builder.cc at 2.36.0): a
+        -- fixed-output one, or an impure one
+        -- (DerivationType::isSandboxed and BasicDerivation::type in
+        -- derivations.cc at 2.24.9, derivation::Type::isSandboxed and
+        -- derivation::type there at 2.36.0), which takes the
         -- impure-derivations experimental feature nova-nix does
         -- not implement.
         impureVars delivery = case fixedOutput drv of
@@ -1203,7 +1214,8 @@ builderInvocation config drv layout = case (execWrapperFor config drv, decodeBui
 -- build-time path (the same value @$out@ carries).  Only the args and the
 -- environment are rewritten; the builder path is left alone, matching
 -- upstream, which assigns @builder = drv->builder@ unrewritten and rewrites
--- only @drv->args@ (local-derivation-goal.cc:2170,2176).
+-- only @drv->args@ (@runChild@ in local-derivation-goal.cc at 2.24.9,
+-- unix-derivation-builder.cc at 2.36.0).
 rewritePlaceholders :: [(Text, FilePath)] -> Text -> Text
 rewritePlaceholders outputDirs value =
   foldr (uncurry T.replace) value (placeholderRewrites outputDirs)
@@ -1232,10 +1244,11 @@ buildRewriteBytes config outputDirs =
     ]
 
 -- | Apply a build-time rewrite to an environment's names as well as its
--- values.  Upstream rewrites the whole @name=value@ string
--- (local-derivation-goal.cc:2004), so a placeholder in a dynamic attribute
--- name is substituted too; rewriting only the values would hand the builder
--- a variable whose name still held the sentinel.
+-- values.  Upstream rewrites the whole @name=value@ string (@runChild@ in
+-- local-derivation-goal.cc at 2.24.9, unix-derivation-builder.cc at
+-- 2.36.0), so a placeholder in a dynamic attribute name is substituted
+-- too; rewriting only the values would hand the builder a variable whose
+-- name still held the sentinel.
 rewriteEnv :: (Text -> Text) -> Map Text Text -> Map Text Text
 rewriteEnv rewrite = Map.fromList . map rewritePair . Map.toList
   where
@@ -1519,9 +1532,9 @@ runBuilder buildLog invocation = do
 
 -- | A builder's string as exec takes it, a C string: its text up to the
 -- first NUL, as upstream's execve takes each argument and each
--- @NAME=VALUE@ entry it builds (stringsToCharPtrs, util.cc:44-50 at
--- 2.24.9, and local-derivation-goal.cc:2000-2004 and 2231).  Cut here, a
--- NUL reaches neither the process library, which refuses one in an
+-- @NAME=VALUE@ entry it builds (stringsToCharPtrs in util.cc at 2.24.9 and
+-- 2.34.9, and @runChild@ in local-derivation-goal.cc at 2.24.9).  Cut
+-- here, a NUL reaches neither the process library, which refuses one in an
 -- environment entry and on Windows would end an entry or the command line
 -- at it, nor the sandbox helper's plan.
 asExecString :: Text -> Text
@@ -1616,8 +1629,8 @@ isWindows = System.Info.os == "mingw32"
 -- 'runBuilder', so the shared output-registration path is reused
 -- unchanged.
 --
--- The output is made as upstream's builtin makes it (fetchurl.cc:37-60
--- at 2.24.9): the download is the output file, or, when @unpack@ is
+-- The output is made as upstream's builtin makes it (@builtinFetchurl@ in
+-- fetchurl.cc): the download is the output file, or, when @unpack@ is
 -- true, a NAR restored as the output ('Unpacking'); then, when
 -- @executable@ is true, the output is made executable ('Marking').  The
 -- hash it is held to is the one the derivation declares, in the mode it
@@ -1707,14 +1720,13 @@ runBuiltinFetchurl policy sensitivity drv outputDirs =
 
 -- | What @builtin:fetchurl@ makes its output from: the download as it
 -- is, or the NAR the download holds, restored.  Upstream restores when
--- the derivation's @unpack@ is true (fetchurl.cc:31 and :50-53 at
--- 2.24.9).
+-- the derivation's @unpack@ is true (@builtinFetchurl@ in fetchurl.cc).
 data Unpacking = KeepDownload | RestoreNar
 
 -- | Whether @builtin:fetchurl@ makes its output executable once it is
 -- made: upstream does when the derivation's @executable@ is true, with a
 -- @chmod@ to @0755@ that the store's canonical metadata then makes
--- @0555@ (fetchurl.cc:55-59 at 2.24.9).  Here a regular file is marked
+-- @0555@ (@builtinFetchurl@ in fetchurl.cc).  Here a regular file is marked
 -- executable ('ExecBit.markExecutable'), on POSIX by its owner's execute
 -- bit, which the canonical metadata makes @0555@ alike.  A directory is
 -- left as it is: a NAR records no mode for one, and canonical metadata
@@ -1723,18 +1735,19 @@ data Unpacking = KeepDownload | RestoreNar
 -- A symlink root fails the URL, and the next is tried.  Upstream's
 -- @chmod@ follows the link, in the build's child process: after the
 -- @chroot@ when the build is sandboxed, and as the build user when there
--- are build users (local-derivation-goal.cc:1954-2027).  There a target
--- outside the build is absent or not the build user's to change, so the
--- @chmod@ fails the build; only a build with neither changes the file
--- the link names.  nova-nix runs every builtin as the invoking user with
--- neither, so it does not follow the link.
+-- are build users (@runChild@ in local-derivation-goal.cc at 2.24.9,
+-- unix-derivation-builder.cc at 2.36.0).  There a target outside the
+-- build is absent or not the build user's to change, so the @chmod@ fails
+-- the build; only a build with neither changes the file the link names.
+-- nova-nix runs every builtin as the invoking user with neither, so it
+-- does not follow the link.
 data Marking = LeaveMode | MarkExecutable
 
 -- | How the NAR a download holds is encoded.
 data NarEncoding = PlainNar | XzNar
 
 -- | The encoding of the NAR a URL serves: xz when the URL ends in
--- 'xzUrlSuffix', as upstream decides (fetchurl.cc:44-45 at 2.24.9).
+-- 'xzUrlSuffix', as upstream decides (@builtinFetchurl@ in fetchurl.cc).
 -- Upstream asks it of the derivation's @url@ whatever URL it fetches;
 -- here it is asked of each URL tried, which for a derivation
 -- @\<nix\/fetchurl.nix\>@ writes is that @url@ alone.
@@ -1829,7 +1842,7 @@ writeBody outPath ctx0 body =
 -- what the archive holds is fatal, and a body that ends short of a whole
 -- archive is transient ('narStreamFailure').  Bytes after the archive's
 -- end fail it as malformed, where upstream's restore stops reading at
--- that end (@parseDump@, archive.cc:287 at 2.24.9) and never sees them.
+-- that end (@parseDump@ in archive.cc) and never sees them.
 restoreNarBody :: CaseSensitivity -> FilePath -> NarEncoding -> HTTP.BodyReader -> IO (Either AttemptFailure ())
 restoreNarBody sensitivity outPath encoding body = case encoding of
   PlainNar -> restore (HTTP.brRead body)
@@ -1914,11 +1927,12 @@ malformedExpectedHash url = "builtin:fetchurl: malformed expected hash for " <> 
 -- ---------------------------------------------------------------------------
 
 -- | After a successful build, register every output in the store, in
--- upstream's two passes (registerOutputs, local-derivation-goal.cc:2288-2751
--- at 2.24.9).  Every output is scanned first.  Then the outputs are ordered
--- so that each follows the siblings it references ('orderByReferences'),
--- and placed in that order.  Outputs that reference each other in a cycle
--- fail the build before any is placed, so none is registered.
+-- upstream's two passes (registerOutputs in local-derivation-goal.cc at
+-- 2.24.9, derivation-builder-impl.cc at 2.36.0).  Every output is scanned
+-- first.  Then the outputs are ordered so that each follows the siblings it
+-- references ('orderByReferences'), and placed in that order.  Outputs that
+-- reference each other in a cycle fail the build before any is placed, so
+-- none is registered.
 --
 -- The placed outputs register together in one transaction, so a
 -- cross-output reference finds its referent's row (see 'registerPaths').
@@ -1942,8 +1956,9 @@ registerOutputs store drv drvPath inputPaths plans written commit = runExceptT $
   where
     scan = outputScan drv inputPaths plans
     -- Every output names the @.drv@ that built it, as upstream's
-    -- @newInfo.deriver = drvPath@ does (local-derivation-goal.cc:2738 at
-    -- 2.24.9), spelled as the store's own rows spell a path, the form a
+    -- @newInfo.deriver = drvPath@ does (@registerOutputs@ in
+    -- local-derivation-goal.cc at 2.24.9, derivation-builder-impl.cc at
+    -- 2.36.0), spelled as the store's own rows spell a path, the form a
     -- substituted path's deriver takes ('Nix.Substituter.parseDeriver').
     deriver = Just (T.pack (storePathToFilePath (stDir store) drvPath))
 
@@ -1952,14 +1967,14 @@ registerOutputs store drv drvPath inputPaths plans written commit = runExceptT $
 -- the derivation's outputs: upstream's @registerOutputs@ under @bmCheck@
 -- (local-derivation-goal.cc at 2.24.9).  Every output is scanned and the
 -- outputs ordered as a build's are, so a reference cycle between them
--- fails a check as it fails a build (:2317, :2381-2411).  Each is then
--- compared in that order, an output after the siblings it references, and
--- the first that differs ends the comparison, where upstream's loop throws
--- (:2415, :2694-2715).
+-- fails a check as it fails a build (its @wanted@ flag and its @topoSort@
+-- of the outputs).  Each is then compared in that order, an output after
+-- the siblings it references, and the first that differs ends the
+-- comparison, where upstream's loop throws (its @bmCheck@ branch).
 --
 -- Nothing is registered and no output is moved.  Upstream marks a path it
--- has checked as ultimately trusted and signs it (:2717-2722); the store
--- database here records neither.
+-- has checked as ultimately trusted and signs it (the end of that
+-- branch); the store database here records neither.
 compareOutputs ::
   Store ->
   Derivation ->
@@ -1994,8 +2009,9 @@ orderScanned drvPath references scanned =
   first (scanStop . outputCycleMessage drvPath) (orderByReferences references (Map.fromList scanned))
 
 -- | Upstream's failure for outputs that reference each other in a cycle
--- (local-derivation-goal.cc:2406-2408 at 2.24.9), naming the @.drv@ and
--- the reference that closes the cycle.
+-- (@registerOutputs@ in local-derivation-goal.cc at 2.24.9,
+-- derivation-builder-impl.cc at 2.36.0), naming the @.drv@ and the
+-- reference that closes the cycle.
 outputCycleMessage :: StorePath -> ReferenceCycle Text -> Text
 outputCycleMessage drvPath (ReferenceCycle node referrer) =
   "cycle detected in build of '"
@@ -2017,7 +2033,8 @@ data OutputScan = OutputScan
     osScratchRewrites :: ![(Text, Text)],
     -- | Candidates for reference scanning: the input closure and this
     -- derivation's own outputs, upstream's @referenceablePaths@
-    -- (local-derivation-goal.cc:2275-2278 at 2.24.9).
+    -- (@registerOutputs@ in local-derivation-goal.cc at 2.24.9,
+    -- derivation-builder-impl.cc at 2.36.0).
     osCandidates :: ![StorePath]
   }
 
@@ -2056,8 +2073,9 @@ writtenOutput outDir = do
   pure outDir
 
 -- | Whether nothing is at a path, read without following a link, as
--- upstream reads an output (@lstat@, local-derivation-goal.cc:2326 at
--- 2.24.9): one that is a symlink is there whatever it names, a sibling
+-- upstream reads an output (@maybeLstat@ in @registerOutputs@,
+-- local-derivation-goal.cc at 2.24.9, derivation-builder-impl.cc at
+-- 2.36.0): one that is a symlink is there whatever it names, a sibling
 -- output still in the chroot, or nothing at all.
 nothingAt :: FilePath -> IO Bool
 nothingAt path = do
@@ -2094,20 +2112,20 @@ scanOutput store scan written (output, plan) = do
   pure (doName output, scanned)
 
 -- | An output the builder wrote, made ready where it is to be placed or
--- compared, in upstream's order (@registerOutputs@,
--- local-derivation-goal.cc:2333-2351 and 2594-2600 at 2.24.9, and
--- posix-fs-canonicalise.cc:95-107): one that lets its group or anyone
--- else write it is refused, since someone other than the build may have
--- changed it, and so is one holding a node another user owns; it is made
--- canonical, so nothing in it is setuid or writable by another user,
--- before it is read or changed; a fixed output is replaced with a fresh
--- copy of itself, made canonical again, so a descriptor the builder passed
--- out names an inode that is not registered; and its hashes are rewritten
--- and its references scanned ('scanBuilt').  Whether others could write
--- the output is read from what the builder left, before a sandboxed
+-- compared, in upstream's order (@registerOutputs@ in
+-- local-derivation-goal.cc at 2.24.9, derivation-builder-impl.cc at
+-- 2.36.0, and @canonicalisePathMetaData_@ in posix-fs-canonicalise.cc): one
+-- that lets its group or anyone else write it is refused, since someone other
+-- than the build may have changed it, and so is one holding a node another
+-- user owns; it is made canonical, so nothing in it is setuid or writable by
+-- another user, before it is read or changed; a fixed output is replaced with
+-- a fresh copy of itself, made canonical again, so a descriptor the builder
+-- passed out names an inode that is not registered; and its hashes are
+-- rewritten and its references scanned ('scanBuilt').  Whether others could
+-- write the output is read from what the builder left, before a sandboxed
 -- build's seal changed its mode.  A sandboxed build's chroot is closed to
--- other users before this ('Nix.Builder.Sandbox.Spawn.sealChroot'); a
--- process of the same user can still change an output while it is read.
+-- other users before this ('Nix.Builder.Sandbox.Spawn.sealChroot'); a process
+-- of the same user can still change an output while it is read.
 preparedOutput :: OutputScan -> DerivationOutput -> FilePath -> Bool -> ExceptT Text IO BuiltOutput
 preparedOutput scan output outDir open = do
   when open (throwError ("suspicious ownership or permission on '" <> T.pack outDir <> "' for output '" <> doName output <> "'; rejecting this build output"))
@@ -2160,14 +2178,16 @@ firstDifference caseHack drvPath (rebuilt : rest) = do
 
 -- | Compare one rebuilt output with the NAR hash the store recorded for
 -- the valid one, which is all upstream compares (@newInfo.narHash !=
--- oldInfo.narHash@, local-derivation-goal.cc:2698 at 2.24.9).  The rebuilt
--- tree's hash is 'ExecBit.narHashOfPath', which streams the archive that
--- registration serialises whole ('Nix.Store.registrationFor'), under the
--- same case-hack mode and source of the executable bit.
+-- oldInfo.narHash@ in @registerOutputs@, local-derivation-goal.cc at
+-- 2.24.9, derivation-builder-impl.cc at 2.36.0).  The rebuilt tree's hash
+-- is 'ExecBit.narHashOfPath', which streams the archive that registration
+-- serialises whole ('Nix.Store.registrationFor'), under the same case-hack
+-- mode and source of the executable bit.
 --
 -- A fixed output is held to its declared hash first, as a build holds it:
 -- upstream raises that mismatch for a checked fixed output and never
--- reaches the comparison (:2612-2621, :2696, :2757).
+-- reaches the comparison (the @CAFixed@ case, the @bmCheck@ branch and the
+-- final rethrow of @delayedException@ in @registerOutputs@ at 2.24.9).
 compareOutput :: NAR.CaseHack -> StorePath -> (BuiltOutput, Text) -> IO (Either BuildStop CheckVerdict)
 compareOutput caseHack drvPath (built, recorded) = do
   fixedCheck <- verifyFixedOutput caseHack drvPath (boOutput built) (boReferences built) (boDir built)
@@ -2218,7 +2238,8 @@ data Walk k v = Walk
 -- | Order nodes so that each follows every node it references, or report
 -- a cycle among them: upstream's @topoSort@ (src/libutil/topo-sort.hh at
 -- 2.24.9) with the reversal its @registerOutputs@ applies to the result
--- (local-derivation-goal.cc:2411).
+-- (local-derivation-goal.cc at 2.24.9, derivation-builder-impl.cc at
+-- 2.36.0).
 --
 -- The walk is upstream's depth-first one, so the order and the cycle it
 -- reports are upstream's too: it starts from each node in ascending
@@ -2263,11 +2284,11 @@ orderByReferences references nodes =
 -- A fixed output that references any store path, itself included, is
 -- refused once its digest is taken, in upstream's order: an output its
 -- hash mode cannot take fails first, and a reference before a hash that
--- does not match (local-derivation-goal.cc:2601-2625 at 2.24.9).  Its
--- path comes from its content alone, which a reference would leave
--- incomplete.  Upstream registers such an output under the path its
--- references give it before it fails the build; nova-nix registers
--- nothing, as for a hash that does not match.
+-- does not match (the @CAFixed@ case of @registerOutputs@ in
+-- local-derivation-goal.cc at 2.24.9).  Its path comes from its content
+-- alone, which a reference would leave incomplete.  Upstream registers such
+-- an output under the path its references give it before it fails the build;
+-- nova-nix registers nothing, as for a hash that does not match.
 verifyFixedOutput :: NAR.CaseHack -> StorePath -> DerivationOutput -> [StorePath] -> FilePath -> IO (Either Text ())
 verifyFixedOutput caseHack drvPath out refs placedPath
   | T.null (doHashAlgo out) = pure (Right ())
@@ -2304,10 +2325,10 @@ verifyFixedOutput caseHack drvPath out refs placedPath
 --
 -- A flat output must first be a regular file its owner may not execute,
 -- read without following a symlink ('isPlainFile'), or it fails with
--- upstream's words for any other (@registerOutputs@,
--- local-derivation-goal.cc:2501-2507 at 2.24.9): a directory, a symlink
--- whose target's bytes would otherwise be hashed, or an executable file,
--- whose mode a flat hash does not record.
+-- upstream's words for any other (@newInfoFromCA@ in @registerOutputs@,
+-- local-derivation-goal.cc at 2.24.9, derivation-builder-impl.cc at 2.36.0):
+-- a directory, a symlink whose target's bytes would otherwise be hashed, or
+-- an executable file, whose mode a flat hash does not record.
 fixedOutputDigest :: NAR.CaseHack -> DerivationOutput -> FilePath -> IO (Either Text BS.ByteString)
 fixedOutputDigest caseHack out path
   | recursive = maybe unsupported Right <$> narDigestWithAlgo caseHack algo path

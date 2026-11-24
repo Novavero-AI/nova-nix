@@ -9,26 +9,26 @@
 -- A user's profiles are in @profiles@ under the state directory:
 -- @$NIX_STATE_HOME@, else @$XDG_STATE_HOME\/nix@, else
 -- @~\/.local\/state\/nix@, and on Windows @\<Local AppData\>\\nix\\state@
--- (users.cc:63-73, xdg-dirs.cc:48-56).  The default profile is
--- @profiles\/profile@, which @~\/.nix-profile@, or @\<state\>\/profile@
--- under @use-xdg-base-directories@, links to (profiles.cc:294-314).
--- Upstream keeps root's profiles under its state directory instead; here
--- every user's are where a user's are.
+-- (@getStateDir@ in users.cc, @getStateHome@ in xdg-dirs.cc).  The default
+-- profile is @profiles\/profile@, which @~\/.nix-profile@, or
+-- @\<state\>\/profile@ under @use-xdg-base-directories@, links to
+-- (@getDefaultProfile@ in profiles.cc).  Upstream keeps root's profiles under
+-- its state directory instead; here every user's are where a user's are.
 --
 -- A profile named @P@ has generations @P-1-link@, @P-2-link@ and on beside
 -- it, and @P@ links to one of them by its bare name.  A new generation is
 -- one past the highest, unless the highest already names the path, which
--- it then stays (profiles.cc:61-96).  Each is linked as @nova-nix build@
--- links its output ('Nix.Store.Ops.soAddOutLinkRoot', upstream's
--- @addPermRoot@), so it is an indirect root of the store it names.
+-- it then stays (@createGeneration@ in profiles.cc).  Each is linked as
+-- @nova-nix build@ links its output ('Nix.Store.Ops.soAddOutLinkRoot',
+-- upstream's @addPermRoot@), so it is an indirect root of the store it names.
 --
 -- A change to a profile reads the profile's link, makes the new
 -- generation's store path with no lock held, then takes the profile's
 -- lock and starts again if the link moved meanwhile, as @nix-env@ does
--- (user-env.cc:159-175).  Upstream's @nix profile@ takes no lock, so two
--- changes at once can both start from one manifest and the later switch
--- drop what the earlier added.  The lock file stays once it is released,
--- as every lock file nova-nix takes does ("Nix.Store.Lock"), where
+-- (@createUserEnv@ in user-env.cc).  Upstream's @nix profile@ takes no lock,
+-- so two changes at once can both start from one manifest and the later
+-- switch drop what the earlier added.  The lock file stays once it is
+-- released, as every lock file nova-nix takes does ("Nix.Store.Lock"), where
 -- upstream deletes it.
 --
 -- The location, the names and the decisions are pure; the IO below lists
@@ -146,7 +146,8 @@ data ProfileEnvironment = ProfileEnvironment
   deriving (Eq, Show)
 
 -- | Where the link to the default profile is, as
--- @use-xdg-base-directories@ chooses (globals.hh:379-382, profiles.cc:296-297).
+-- @use-xdg-base-directories@ chooses (@useXDGBaseDirectories@ in
+-- globals.hh, @getDefaultProfile@ in profiles.cc).
 data ProfileLinkPlace
   = -- | @~\/.nix-profile@, upstream's default.
     HomeProfileLink
@@ -154,8 +155,8 @@ data ProfileLinkPlace
     StateProfileLink
   deriving (Eq, Show)
 
--- | The state directory (users.cc:63-73).  A variable is used as it is
--- set, an empty one included, as upstream's @getEnv@ reads it.
+-- | The state directory (@getStateDir@ in users.cc).  A variable is used
+-- as it is set, an empty one included, as upstream's @getEnv@ reads it.
 stateDirectory :: ProfileEnvironment -> OsPath
 stateDirectory env = case peStateHome env of
   NixStateHome dir -> dir
@@ -163,7 +164,7 @@ stateDirectory env = case peStateHome env of
   XdgStateHome Nothing -> peHome env </> ascii ".local" </> ascii "state" </> ascii "nix"
   LocalAppDataHome dir -> dir </> ascii "nix" </> ascii "state"
 
--- | The directory a user's profiles are in (profiles.cc:282-287).
+-- | The directory a user's profiles are in (@profilesDir@ in profiles.cc).
 profilesDirectory :: ProfileEnvironment -> OsPath
 profilesDirectory env = stateDirectory env </> ascii "profiles"
 
@@ -180,7 +181,8 @@ defaultProfilePath env = profilesDirectory env </> ascii "profile"
 -- | A path made absolute against a directory and collapsed, @.@ dropped
 -- and @..@ taking off what precedes it, without reading a link:
 -- upstream's @absPath@, which @--profile@ and a link's target go through
--- (command.cc:295, profiles.cc:310).
+-- (@MixProfile::updateProfile@ in command.cc, @getDefaultProfile@ in
+-- profiles.cc).
 absolutePath :: OsPath -> OsPath -> OsPath
 absolutePath base path = OP.joinPath (reverse (foldl' step [] (OP.splitDirectories joined)))
   where
@@ -225,7 +227,8 @@ hostStateHome :: IO (Either Text StateHome)
 hostStateHome = do
   -- SHGetFolderPath's CSIDL_LOCAL_APPDATA is the folder
   -- SHGetKnownFolderPath's FOLDERID_LocalAppData names, which upstream
-  -- asks (windows/known-folders.cc:21-25); neither reads LOCALAPPDATA.
+  -- asks (getLocalAppData in windows/known-folders.cc); neither reads
+  -- LOCALAPPDATA.
   found <- try (sHGetFolderPath nullPtr cSIDL_LOCAL_APPDATA nullPtr sHGFP_TYPE_CURRENT)
   case found of
     Left (failure :: IOException) -> pure (Left ("failed to get known folder path: " <> T.pack (show failure)))
@@ -238,7 +241,7 @@ hostStateHome = fmap XdgStateHome <$> variablePath "XDG_STATE_HOME"
 readHome :: IO (Either Text OsPath)
 #if defined(mingw32_HOST_OS)
 -- @USERPROFILE@, else the default user's profile, collapsed
--- (windows/users.cc:34-42).
+-- (@getHome@ in windows/users.cc).
 readHome = do
   found <- variablePath "USERPROFILE"
   cwd <- OsDir.getCurrentDirectory
@@ -248,9 +251,9 @@ readHome = do
 #else
 -- @HOME@, unless what it names exists and another user owns it, or its
 -- status cannot be read for a reason other than its absence, which
--- @ENOENT@ and @ENOTDIR@ are (@maybeStat@, file-system.cc:186-195), when
--- the password database's home is used, with upstream's warning
--- (unix/users.cc:31-62).
+-- @ENOENT@ and @ENOTDIR@ are (@maybeStat@ in file-system.cc), when the
+-- password database's home is used, with upstream's warning (@getHome@ in
+-- unix/users.cc).
 readHome = do
   found <- lookupEnvBytes "HOME"
   case found of
@@ -287,12 +290,12 @@ readHome = do
 
 -- | Resolve the default profile, making its directory and its link when
 -- they are absent, as upstream's @getDefaultProfile@ does
--- (profiles.cc:294-314): the link's target, made absolute against the
--- link's directory, or the link itself when the directory or the link
--- cannot be made or the link cannot be read.  Absence is by @lstat@
--- (file-system.cc:199-202), so a link that leads nowhere is kept.  Under
--- 'StateProfileLink' the state directory is made first, and a failure to
--- make it is the result.
+-- (profiles.cc): the link's target, made absolute against the link's
+-- directory, or the link itself when the directory or the link cannot be made
+-- or the link cannot be read.  Absence is by @lstat@ (@pathExists@ in
+-- file-system.cc), so a link that leads nowhere is kept.  Under
+-- 'StateProfileLink' the state directory is made first, and a failure to make
+-- it is the result.
 resolveDefaultProfile :: ProfileLinkPlace -> ProfileEnvironment -> IO (Either Text OsPath)
 resolveDefaultProfile place env = do
   made <- case place of
@@ -330,15 +333,15 @@ data Generation = Generation
   deriving (Eq, Show)
 
 -- | The link of a profile's generation: the profile's path with
--- @-N-link@ appended (profiles.cc:54-59).
+-- @-N-link@ appended (@makeName@ in profiles.cc).
 generationName :: OsPath -> GenerationNumber -> OsPath
 generationName profile (GenerationNumber n) = profile <> ascii ("-" <> show n <> "-link")
 
 -- | The generation a name in the profile's directory is, given the
 -- profile's own name, as upstream's @parseName@ reads one
--- (profiles.cc:17-29): the profile's name and @-@, then what precedes the
+-- (profiles.cc): the profile's name and @-@, then what precedes the
 -- first @-link@ after them, read as a 64-bit unsigned number is by
--- @string2Int@ (util.cc:104-114), which takes digits after an optional
+-- @string2Int@ in util.cc, which takes digits after an optional
 -- @+@.  Whatever follows the first @-link@ is ignored, so
 -- @profile-3-link.tmp@ is generation 3 too.
 parseGenerationName :: OsPath -> OsPath -> Maybe GenerationNumber
@@ -361,8 +364,8 @@ parseGenerationName profileName name = do
       | otherwise = Nothing
 
 -- | The generations of a profile among the names of its directory, in
--- order of number (profiles.cc:31-49).  Names are taken in sorted order,
--- so of two names for one number, as @profile-3-link@ and
+-- order of number (@findGenerations@ in profiles.cc).  Names are taken in
+-- sorted order, so of two names for one number, as @profile-3-link@ and
 -- @profile-3-link.tmp@ are, the later in that order counts as the later
 -- generation; upstream takes them in @readdir@ order.
 generationsIn :: OsPath -> [OsPath] -> [Generation]
@@ -379,7 +382,7 @@ data NextGeneration
 
 -- | The generation a profile switches to for a store path, given its
 -- newest generation with that generation's raw target, and the path as
--- the store spells it on disk (profiles.cc:61-96).
+-- the store spells it on disk (@createGeneration@ in profiles.cc).
 nextGeneration :: Maybe (Generation, OsPath) -> OsPath -> NextGeneration
 nextGeneration newest target = case newest of
   Just (generation, linked)
@@ -401,16 +404,18 @@ listGenerations profile = do
 -- A generation's store path
 -- ---------------------------------------------------------------------------
 
--- | The name a generation's store path has (profile.cc:261-263).
+-- | The name a generation's store path has (@ProfileManifest::build@ in
+-- profile.cc).
 generationStoreName :: Text
 generationStoreName = "profile"
 
--- | The file a generation's manifest is in (profile.cc:253).
+-- | The file a generation's manifest is in (@ProfileManifest::build@ in
+-- profile.cc).
 manifestFileName :: String
 manifestFileName = "manifest.json"
 
 -- | The file a profile @nix-env@ made holds its manifest in
--- (profile.cc:179).
+-- (the @ProfileManifest@ constructor in profile.cc).
 nixEnvManifestFileName :: String
 nixEnvManifestFileName = "manifest.nix"
 
@@ -441,10 +446,10 @@ narLinkTarget targets bytes = case targets of
 
 -- | The NAR of a generation: the tree, and @manifest.json@ holding the
 -- manifest's bytes, as upstream dumps the directory it makes
--- (profile.cc:236-259).  A name and a link target are the bytes the tree
--- holds for them ('hostPathBytes'), a target written as the host's
--- serialiser writes it ('narLinkTarget'), so the NAR is the one the tree
--- unpacked from it serialises to.  'Left' for a name with no UTF-8 form.
+-- (@ProfileManifest::build@ in profile.cc).  A name and a link target are the
+-- bytes the tree holds for them ('hostPathBytes'), a target written as the
+-- host's serialiser writes it ('narLinkTarget'), so the NAR is the one the
+-- tree unpacked from it serialises to.  'Left' for a name with no UTF-8 form.
 generationNar :: NarTargets -> Tree -> ByteString -> Either Text NAR.NarEntry
 generationNar targets tree manifest = NAR.NarDirectory . ((BS8.pack manifestFileName, NAR.NarRegular False manifest) :) <$> entries tree
   where
@@ -498,10 +503,10 @@ data Updated
 -- | How one attempt at a change ends.
 data Attempt = Restart | Finished !Updated
 
--- | Read a profile's manifest (profile.cc:123-192): @manifest.json@
--- through the profile's links, none for a profile that is not there or
--- holds neither manifest, and a refusal for one only @nix-env@'s
--- @manifest.nix@ describes.
+-- | Read a profile's manifest (the @ProfileManifest@ constructor in
+-- profile.cc): @manifest.json@ through the profile's links, none for a
+-- profile that is not there or holds neither manifest, and a refusal for one
+-- only @nix-env@'s @manifest.nix@ describes.
 readManifest :: OsPath -> IO (Either ProfileFailure Manifest)
 readManifest profile = do
   contents <- try (OP.decodeFS path >>= BS.readFile)
@@ -518,13 +523,13 @@ readManifest profile = do
 -- | Change a profile: read its link and its manifest, apply the change,
 -- make the new generation's store path, then under the profile's lock
 -- make and switch to the generation, starting again, with upstream's
--- line, when the link moved since it was read (user-env.cc:159-170).  A
--- profile whose current generation lies outside the store
--- ('checkProfileStore') is refused before anything is made: a generation
--- of another store read against this one would name paths it does not
--- hold.  The store directory is taken in the spelling the store's handle
--- keys it by ('canonicalStoreDir'), which the tree's links and the
--- generations' targets are written in.
+-- line, when the link moved since it was read (@createUserEnv@ in
+-- user-env.cc).  A profile whose current generation lies outside the store
+-- ('checkProfileStore') is refused before anything is made: a generation of
+-- another store read against this one would name paths it does not hold.  The
+-- store directory is taken in the spelling the store's handle keys it by
+-- ('canonicalStoreDir'), which the tree's links and the generations' targets
+-- are written in.
 updateProfile :: StoreOps IO -> StoreDir -> OsPath -> (Manifest -> IO Change) -> IO (Either ProfileFailure Updated)
 updateProfile ops givenStoreDir profile change = canonicalStoreDir givenStoreDir >>= attempting
   where
@@ -555,7 +560,7 @@ updateProfile ops givenStoreDir profile change = canonicalStoreDir givenStoreDir
                 pure (Finished (SwitchedTo generation))
 
 -- | What a profile's link names, its raw target, or 'Nothing' when there
--- is no link: upstream's @optimisticLockProfile@ (profiles.cc:277-280).
+-- is no link: upstream's @optimisticLockProfile@ in profiles.cc.
 profileToken :: OsPath -> IO (Either ProfileFailure (Maybe OsPath))
 profileToken profile = do
   absent <- try (linkAbsent profile)
@@ -597,9 +602,9 @@ resolvedStoreDir storeDir = StoreDir . fromRight (unStoreDir storeDir) <$> tryIO
 -- | Make a generation's store path from its manifest: the tree of its
 -- active elements' paths, with the warnings the tree gives printed, and
 -- @manifest.json@, added as 'generationStoreName' with every element's
--- paths as its references (profile.cc:236-281).  The tree's warnings
--- name entries under the profile's path.  A conflict is attributed under
--- the store directory as given and as the tree resolves it.
+-- paths as its references (@ProfileManifest::build@ in profile.cc).  The
+-- tree's warnings name entries under the profile's path.  A conflict is
+-- attributed under the store directory as given and as the tree resolves it.
 makeGeneration :: StoreOps IO -> StoreDir -> OsPath -> Manifest -> ExceptT ProfileFailure IO StorePath
 makeGeneration ops storeDir profile manifest = do
   packages <- liftIO (traverse package (manifestPackages manifest))
@@ -618,7 +623,7 @@ makeGeneration ops storeDir profile manifest = do
 
 -- | The generation a profile switches to for a store path: the newest,
 -- when it already names the path, or the next, linked and rooted as an
--- out-link is (profiles.cc:61-96).
+-- out-link is (@createGeneration@ in profiles.cc).
 createGeneration :: StoreOps IO -> StoreDir -> OsPath -> StorePath -> ExceptT ProfileFailure IO Generation
 createGeneration ops storeDir profile path = do
   generations <- ExceptT (listGenerations profile)
@@ -640,9 +645,9 @@ createGeneration ops storeDir profile path = do
         Right target -> pure (generation, target)
 
 -- | Run an action holding a profile's lock, @\<profile\>.lock@
--- (pathlocks.cc:84), with upstream's line when another holds it
--- (profiles.cc:271-275).  A lock file that cannot be opened, as in a
--- directory that is not there, is the failure.
+-- (@PathLocks::lockPaths@ in unix\/pathlocks.cc), with upstream's line
+-- when another holds it (@lockProfile@ in profiles.cc).  A lock file that
+-- cannot be opened, as in a directory that is not there, is the failure.
 withProfileLock :: OsPath -> IO (Either ProfileFailure a) -> IO (Either ProfileFailure a)
 withProfileLock profile action = do
   lockPath <- OP.decodeFS (profile <> ascii lockFileSuffix)
@@ -670,7 +675,7 @@ linkAbsent path = do
 -- leads to a directory, so on Windows each is a directory link whether
 -- or not its target exists yet.  On Unix the link is made under a
 -- temporary name beside it and renamed over the path, upstream's
--- @replaceSymlink@ (file-system.cc:557-581), which, as @rename@ does,
+-- @replaceSymlink@ in file-system.cc, which, as @rename@ does,
 -- replaces a link or a file there and fails on a directory.  On Windows a
 -- rename cannot replace a directory link, so a link there is removed and
 -- the new one made, as an out-link is replaced ("Nix.Store.GC"), and

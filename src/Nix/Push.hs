@@ -828,8 +828,8 @@ httpRequest manager method url headers body =
 -- | Run a request that is safe to send again under the push's retry
 -- policy: a 'TransientFailure' is sent again after upstream's backoff,
 -- which upstream's transfer layer applies to an upload as to a download
--- (@filetransfer.cc@ at 2.24.9, lines 421-509), and a 'FatalFailure', or
--- the last attempt's failure, fails the push.
+-- (@TransferItem::finish@ in @filetransfer.cc@ at 2.24.9), and a
+-- 'FatalFailure', or the last attempt's failure, fails the push.
 retrying :: PushConfig -> IO (Either AttemptFailure a) -> ExceptT Text IO a
 retrying cfg attempt =
   ExceptT (first attemptFailureMessage <$> retryTransient (pcRetry cfg) ioRetryEffects attempt)

@@ -1,30 +1,30 @@
 {-# LANGUAGE LambdaCase #-}
 
 -- | Realising a string's context before a path reader reads its path, as
--- upstream's @EvalState::realiseContext@ does (primops.cc:43-124 at
--- 2.24.9): what a context asks of the store, and what a session does
--- about it.
+-- upstream's @EvalState::realiseContext@ does (primops.cc): what a context
+-- asks of the store, and what a session does about it.
 --
 -- Every path the context names must be valid, checked in upstream's
 -- order, and the first that is not stops the read with upstream's
 -- @path \'...\' is not valid@.  Then, unless @allow-import-from-derivation@
 -- refuses a context that names an output, each output it names is built or
--- substituted (primops.cc:79-83 at 2.24.9, :108-117 at 2.34.9).
+-- substituted (@EvalState::realiseContext@ in primops.cc).
 --
 -- A read-write session, a build's, adds what evaluation has fetched,
 -- written or named and the store does not hold yet before that, so all
 -- of it counts as valid there.  A read-only session, an evaluation as
--- @nix-instantiate --eval@ runs one (nix-instantiate.cc:154-155), adds
--- nothing.  What evaluation computed (a coerced source, a
--- @builtins.toFile@, @builtins.path@ or @builtins.filterSource@ result, a
--- derivation) is not valid there unless the store already holds it, since
--- upstream's read-only evaluation computes those paths without writing
--- them (primops.cc:2310, eval.cc:2394 and primops.cc:2473 at 2.24.9).
--- What a fetcher fetched is valid there, since upstream's fetchers add
--- their results whatever the mode (fetchTree.cc:504-509, tarball.cc:86
--- and fetchers.cc:195 at 2.24.9).  A read-only session realises an output
--- as upstream's read-only evaluation does: every substitution is refused,
--- and an output that may not be substituted is built.
+-- @nix-instantiate --eval@ runs one (@main_nix_instantiate@ in
+-- nix-instantiate.cc), adds nothing.  What evaluation computed (a coerced
+-- source, a @builtins.toFile@, @builtins.path@ or @builtins.filterSource@
+-- result, a derivation) is not valid there unless the store already holds
+-- it, since upstream's read-only evaluation computes those paths without
+-- writing them (@prim_toFile@ and @addPath@ in primops.cc,
+-- @copyPathToStore@ in eval.cc).  What a fetcher fetched is valid there,
+-- since upstream's fetchers add their results whatever the mode (@fetch@ in
+-- fetchTree.cc, @downloadFile@ in tarball.cc and @Input::fetchToStore@ in
+-- fetchers.cc at 2.24.9).  A read-only session realises an output as
+-- upstream's read-only evaluation does: every substitution is refused, and
+-- an output that may not be substituted is built.
 module Nix.Eval.RealiseContext
   ( -- * Sessions
     SessionMode (..),
@@ -93,7 +93,7 @@ data PendingOrigin
 data ContextRequest = ContextRequest
   { -- | Each path that must be valid: a plain path, a derivation named
     -- whole, and the derivation of each output named, as upstream's
-    -- @ensureValid@ asks about each element in turn (primops.cc:48-75).
+    -- @ensureValid@ asks about each element in turn (primops.cc).
     crPaths :: ![StorePath],
     -- | Each output named, by its derivation and its name.
     crOutputs :: ![(StorePath, Text)]
@@ -115,8 +115,8 @@ data Plan = Plan
     -- refuses as upstream's worker does.
     planBuilds :: ![(StorePath, Set Text)],
     -- | Every output the context names, whose closures become readable
-    -- once they are realised, as upstream allows them (@allowClosure@,
-    -- primops.cc:152-156 at 2.34.9).
+    -- once they are realised, as upstream allows them (@allowClosure@ in
+    -- @EvalState::realiseContext@, primops.cc, at 2.34.9).
     planOutputs :: ![StorePath],
     -- | The warning @trace-import-from-derivation@ prints before anything
     -- is realised, where it is on and an output is named.
@@ -173,7 +173,7 @@ planRealisation imports mode pending valid outputPaths request =
 -- | The first path of the request that is not valid, in the request's
 -- order, given the session's mode, what evaluation has made and the
 -- store's answer for the paths asked about: what upstream's
--- @ensureValid@ refuses first (primops.cc:48-75 at 2.24.9).
+-- @ensureValid@ refuses first (@EvalState::realiseContext@ in primops.cc).
 firstInvalidPath :: SessionMode -> Map StorePath PendingOrigin -> Set StorePath -> ContextRequest -> Maybe StorePath
 firstInvalidPath mode pending valid = find (not . readableIn mode pending valid) . crPaths
 
@@ -217,7 +217,8 @@ data ContextRefusal
 
 -- | A refusal as upstream words it.  A path is named under the logical
 -- store directory, as upstream's @printStorePath@ names it
--- (eval-error.cc:9 at 2.35.4; 2.34.9 names the path's base name alone).
+-- (@InvalidPathError@ in eval-error.cc, 2.35.4 and later; 2.34.9 names the
+-- path's base name alone).
 contextRefusalMessage :: ContextRefusal -> Text
 contextRefusalMessage = \case
   PathNotValid path -> "path '" <> storePathToText defaultStoreDir path <> "' is not valid"
@@ -225,21 +226,21 @@ contextRefusalMessage = \case
   RealisationFailed message -> message
 
 -- | The warning @trace-import-from-derivation@ gives, naming the first
--- output a context names (primops.cc:115-116 at 2.34.9).
+-- output a context names (@EvalState::realiseContext@ in primops.cc at
+-- 2.34.9).
 importFromDerivationWarning :: StorePath -> Text -> Text
 importFromDerivationWarning drv output = "built '" <> builtText drv output <> "' during evaluation due to an import from derivation"
 
 -- | An output of a derivation as upstream renders a built derived path,
 -- the derivation's path, a caret and the output's name
--- (@DerivedPath::Built::to_string@, derived-path.cc:108-113 at 2.24.9,
--- :36-39 at 2.34.9).
+-- (@DerivedPath::Built::to_string@ in derived-path.cc).
 builtText :: StorePath -> Text -> Text
 builtText drv output = storePathToText defaultStoreDir drv <> "^" <> output
 
 -- | A refusal of a search path entry's context as @builtins.findFile@
 -- words it: a path that is not valid names the entry and the path's base
--- name (primops.cc:2192 at 2.35.4, where 2.24.9 names the whole path),
--- and any other refusal is worded as it is anywhere else.
+-- name (@prim_findFile@ in primops.cc, 2.34.9 and later, where 2.24.9 names
+-- the whole path), and any other refusal is worded as it is anywhere else.
 findFileRefusalMessage :: Text -> ContextRefusal -> Text
 findFileRefusalMessage entry refusal = case refusal of
   PathNotValid path -> "cannot find '" <> entry <> "', since path '" <> storePathBasename path <> "' is not valid"

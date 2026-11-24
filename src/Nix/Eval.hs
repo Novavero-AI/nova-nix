@@ -460,8 +460,8 @@ evalBcBinary env bcIdx0 = do
 -- | The operands of the chain of @//@ an operand starts, first to last:
 -- the operand itself, or, for an update, its two operands' own, as
 -- upstream's @evalForUpdate@ queues a chain, descending into an operand
--- only when it is an @ExprOpUpdate@ (eval.cc:2007-2025 at 2.34.9).
--- Parentheses make no node, so a chain however they group it is one.
+-- only when it is an @ExprOpUpdate@ (eval.cc at 2.34.9).  Parentheses make no
+-- node, so a chain however they group it is one.
 updateOperands :: (MonadCData m) => Word32 -> m (NonEmpty Word32)
 updateOperands bcIdx = do
   opcode <- cbcOpcode bcIdx
@@ -733,10 +733,9 @@ evalBcLambda env bcIdx0 = do
     Nothing -> corruptBytecode "formals type" flags_
 
 -- | Evaluate a select expression from bytecode, as upstream's
--- @ExprSelect::eval@ does (eval.cc:1364-1411 at 2.24.9): with no default,
--- a value the path goes into fails as one that is not a set, and a set
--- that lacks the next name fails naming it as a symbol prints
--- ('printSymbol').
+-- @ExprSelect::eval@ in eval.cc does: with no default, a value the path goes
+-- into fails as one that is not a set, and a set that lacks the next name
+-- fails naming it as a symbol prints ('printSymbol').
 evalBcSelect :: (MonadEval m) => Env -> Word32 -> m NixValue
 evalBcSelect env bcIdx0 = do
   targetIdx <- cbcArg1 bcIdx0
@@ -763,8 +762,8 @@ evalBcHasAttr env bcIdx0 = do
 -- | Resolve one attr-path element (two words at @off@) to the name it
 -- selects.  A static name is the symbol the bytecode holds.  A computed
 -- one is read and interned as upstream's select and has-attr read and
--- intern one (@getName@, eval.cc:203-213 at 2.24.9), null refused with
--- the rest ('internComputedName').
+-- intern one (@getName@ in eval.cc), null refused with the rest
+-- ('internComputedName').
 resolveBcAttrKey :: (MonadEval m) => Env -> Word32 -> m Symbol
 resolveBcAttrKey env off = do
   isExpr <- cbcData off
@@ -787,9 +786,9 @@ data PathWalk
 -- its name, interning one it computes, then forces the value it selects
 -- from, then looks the name up, and the value found is forced at the
 -- next step or at the end, the order upstream's @ExprSelect::eval@ keeps
--- (eval.cc:1383-1411 at 2.24.9), so a name that fails to evaluate fails
--- before the value it selects from, and a computed name takes its symbol
--- before any name that forcing the value interns.
+-- (eval.cc), so a name that fails to evaluate fails before the value it
+-- selects from, and a computed name takes its symbol before any name that
+-- forcing the value interns.
 walkBcAttrPath :: (MonadEval m) => Env -> Int -> Word32 -> m NixValue -> m PathWalk
 walkBcAttrPath _ 0 _ current = PathFound <$> current
 walkBcAttrPath env n off current = do
@@ -848,8 +847,7 @@ setKind kind
 -- | Evaluate a non-recursive attr set from bytecode bindings: its static
 -- attributes ('bindStaticAttrs'), then its dynamic ones
 -- ('bindDynamicAttrs'), whose names are evaluated in the enclosing env,
--- as upstream's @ExprAttrs::eval@ binds them (eval.cc:1247-1275 at
--- 2.24.9).
+-- as upstream's @ExprAttrs::eval@ in eval.cc binds them.
 --
 -- Values go through 'cheapThunkBc', so a constant or a variable becomes
 -- the value rather than a thunk over it, which is what upstream's
@@ -865,8 +863,8 @@ evalBcNonRecAttrs env bindings =
 -- dynamic ones bound in @dynamicEnv@ ('bindDynamicAttrs') when it has
 -- any.  It is sized as upstream sizes a literal's set, for one attribute
 -- per static name and one per dynamic binding (@attrs.size() +
--- dynamicAttrs.size()@, eval.cc:1193 at 2.24.9), so a literal whose
--- every name is a null @${...}@ makes an empty set of its own.
+-- dynamicAttrs.size()@ in eval.cc's @ExprAttrs::eval@), so a literal
+-- whose every name is a null @${...}@ makes an empty set of its own.
 literalSet :: (MonadEval m) => SetSite -> (Env -> Word32 -> m Thunk) -> Env -> BcBindings -> Map Symbol AttrEntry -> m AttrSet
 literalSet site mkValueThunk dynamicEnv bindings@(BcBindings (BcBindingCounts names dynamics) _ _ _) statics =
   withDynamics >>= attrSetFromSymbolEntriesSizedFor site (names + dynamics)
@@ -911,7 +909,7 @@ data FrameValues
     MaybeThunkValues
   | -- | As a thunk of its own, but for an inherited name's, as upstream
     -- makes the values of a recursive set that binds @__overrides@
-    -- (eval.cc:1214-1218 at 2.24.9).
+    -- (@ExprAttrs::eval@ in eval.cc).
     ThunkValues
 
 -- | The frame of a recursive attr set or a @let@ in @env@ whose names are
@@ -920,9 +918,8 @@ data FrameValues
 -- ('buildBcCaptureEnv'), whose with-scopes the frame sees.  Answers the env
 -- and the static attributes, their values made as @values@ says and
 -- filled into its table before any dynamic name is evaluated in it, as
--- upstream's @ExprAttrs::eval@ fills @env2@ first (eval.cc:1197-1221 at
--- 2.24.9).  Inlined, as 'tieBindingFrame' is, so that each caller's sites
--- are constants.
+-- upstream's @ExprAttrs::eval@ in eval.cc fills @env2@ first.  Inlined,
+-- as 'tieBindingFrame' is, so that each caller's sites are constants.
 {-# INLINE scopeBindingFrame #-}
 scopeBindingFrame :: (MonadEval m) => FrameKind -> FrameValues -> Env -> BcBindings -> BcCaptureInfo -> m (Env, Map Symbol AttrEntry)
 scopeBindingFrame kind values env bindings captureInfo = do
@@ -1006,7 +1003,7 @@ evalBcRecAttrs values env bindings captureInfo = case frameLayout bindings of
     -- in env2, so a dynamic name sees its static siblings and the
     -- enclosing variables, and no other dynamic name.  The table is
     -- filled by then, so a dynamic value is made as upstream's
-    -- @maybeThunk@ makes it (eval.cc:1273 at 2.24.9).
+    -- @maybeThunk@ makes it (eval.cc's @ExprAttrs::eval@).
     (recEnv, statics) <- scopeBindingFrame RecFrame values env bindings captureInfo
     VAttrs <$> literalSet SetRec cheapThunkBc recEnv bindings statics
 
@@ -1033,13 +1030,12 @@ evalBcLet env bcIdx0 = do
 
 -- | The cells of positional bytecode bindings' slots, in declaration
 -- order, as upstream's @ExprAttrs::eval@ and @ExprLet::eval@ fill
--- @env2@'s (eval.cc:1211-1221 and :1295-1300 at 2.24.9).  A name's value
--- is made in the frame as @values@ says: under 'MaybeThunkValues' as
--- 'frameThunkBc' makes it, a variable naming one of the frame's own
--- slots, none of which is filled yet, a thunk of its own.  An inherited
--- variable is read from the enclosing env, as upstream evaluates an
--- Inherited attribute there through @maybeThunk@; that env is fully
--- built, so the variable's own cell can be shared now.
+-- @env2@'s (eval.cc).  A name's value is made in the frame as @values@ says:
+-- under 'MaybeThunkValues' as 'frameThunkBc' makes it, a variable naming one
+-- of the frame's own slots, none of which is filled yet, a thunk of its own.
+-- An inherited variable is read from the enclosing env, as upstream evaluates
+-- an Inherited attribute there through @maybeThunk@; that env is fully built,
+-- so the variable's own cell can be shared now.
 buildBcSlotThunks :: (MonadEval m) => FrameValues -> Env -> Env -> BcBindings -> m [Thunk]
 buildBcSlotThunks values recEnv outerEnv bindings = reverse <$> foldBindings slotCell [] bindings
   where
@@ -1062,7 +1058,7 @@ buildBcSlotThunks values recEnv outerEnv bindings = reverse <$> foldBindings slo
 -- | The env an @inherit (from)@ clause's selects run in: the from-value's
 -- thunk at slot 0, one env for every name of the clause, as upstream's
 -- @ExprAttrs::buildInheritFromEnv@ makes one env for a binding set's
--- from-values (eval.cc:1179-1189 at 2.24.9).
+-- from-values (eval.cc).
 inheritFromEnv :: (MonadCData m) => Thunk -> m Env
 inheritFromEnv fromThunk = newEnv EnvInheritFrom Nothing [fromThunk]
 
@@ -1095,13 +1091,12 @@ staticAttrsFromSlots bindings thunks = (\(SlotWalk attrs _) -> attrs) <$> foldBi
     insertName walk _ = pure walk
 
 -- | The attributes bindings name statically, which upstream's
--- @ExprAttrs::eval@ binds before any dynamic one (eval.cc:1197-1254 at
--- 2.24.9): a static key, an inherited variable and each name of an
--- @inherit (from)@, each under the symbol the bytecode holds for it and
--- at its binding's position.  A dynamic key is left to
--- 'bindDynamicAttrs'.  A name bound twice, which only an AST built
--- outside the parser holds, keeps its last definition, as the resolver
--- keeps it.
+-- @ExprAttrs::eval@ in eval.cc binds before any dynamic one: a static
+-- key, an inherited variable and each name of an @inherit (from)@, each
+-- under the symbol the bytecode holds for it and at its binding's
+-- position.  A dynamic key is left to 'bindDynamicAttrs'.  A name bound
+-- twice, which only an AST built outside the parser holds, keeps its last
+-- definition, as the resolver keeps it.
 --
 -- How a named value becomes a thunk is the caller's decision: a
 -- non-recursive set makes a constant's value and shares an in-scope
@@ -1124,10 +1119,9 @@ bindStaticAttrs mkValueThunk thunkEnv outerEnv = foldBindings addBinding Map.emp
     addBinding !bound (BcInheritFrom fromBcIdx names) = do
       -- inherit (from) name selects name from the from-expr.  One thunk
       -- of the from-expr serves every name, as upstream's
-      -- ExprAttrs::buildInheritFromEnv makes one (eval.cc:1179-1189 at
-      -- 2.24.9), so the from-expr is evaluated once however many names
-      -- it gives.  Each name's select runs in the clause's env
-      -- ('inheritFromEnv').
+      -- ExprAttrs::buildInheritFromEnv in eval.cc makes one, so the
+      -- from-expr is evaluated once however many names it gives.  Each
+      -- name's select runs in the clause's env ('inheritFromEnv').
       fromEnv <- mkThunkBc thunkEnv fromBcIdx >>= inheritFromEnv
       let addInheritFrom !acc inherited@(BcInheritedName pos sym _) =
             bindAt acc pos sym <$> inheritedSelect fromEnv inherited
@@ -1136,7 +1130,7 @@ bindStaticAttrs mkValueThunk thunkEnv outerEnv = foldBindings addBinding Map.emp
 
 -- | Bind the dynamic attributes of bindings whose static ones are bound,
 -- one at a time in source order, as upstream's @ExprAttrs::eval@ does
--- (eval.cc:1256-1275 at 2.24.9).  Each name is evaluated in @dynamicEnv@
+-- (eval.cc).  Each name is evaluated in @dynamicEnv@
 -- ('resolveBcDynamicKey'), and binds nothing if it is null.  A name
 -- already bound, static or dynamic, raises upstream's error, which says
 -- where the name was defined, before the next name is evaluated.  Any
@@ -1159,8 +1153,7 @@ bindDynamicAttrs mkValueThunk dynamicEnv bindings statics = foldBindings bindDyn
 -- | The name a dynamic attribute binds, its expression evaluated in
 -- @env@: none for null, and any other value read as an attribute name and
 -- interned ('internComputedName'), as upstream's @ExprAttrs::eval@ skips
--- a null name and reads and interns any other (eval.cc:1259-1264 at
--- 2.24.9).
+-- a null name and reads and interns any other (eval.cc).
 resolveBcDynamicKey :: (MonadEval m) => Env -> Word32 -> m (Maybe Symbol)
 resolveBcDynamicKey env keyBcIdx =
   evalBytecode env keyBcIdx >>= \case
@@ -1169,7 +1162,7 @@ resolveBcDynamicKey env keyBcIdx =
 
 -- | A computed attribute name, read as a string without context and
 -- interned, as upstream's @getName@ and @ExprAttrs::eval@ read and intern
--- one (eval.cc:203-213 and :1263-1264 at 2.24.9).
+-- one (eval.cc).
 internComputedName :: (MonadEval m) => NixValue -> m Symbol
 internComputedName = attrNameOf "dynamic attribute key" >=> symbolIntern
 
@@ -1252,9 +1245,9 @@ matchFormals closureEnv (EFNamedSet lambdaName _ formals allowExtra) argThunk = 
   matchFormalSet closureEnv lambdaName formals allowExtra argVal (Just argThunk)
 
 -- | Match destructuring set pattern formals against an attrset value, as
--- upstream's @callFunction@ does (eval.cc:1531-1586 at 2.24.9): the
--- argument must be a set, then each formal the set lacks must have a
--- default, then, with no ellipsis, the set may hold nothing else.
+-- upstream's @callFunction@ in eval.cc does: the argument must be a set, then
+-- each formal the set lacks must have a default, then, with no ellipsis, the
+-- set may hold nothing else.
 --
 -- The env is a knot: a default is evaluated in it, where it may name
 -- another formal or the @-pattern, and its slots hold the defaults'
@@ -1281,19 +1274,19 @@ matchFormalSet closureEnv lambdaName formals allowExtra argVal atThunk =
         $ expectedFailure "a set" argVal
 
 -- | A failure of a call to a set pattern, with the line of context
--- upstream's @callFunction@ adds for the call (eval.cc:1535, 1554, 1580
--- at 2.24.9).  Upstream adds it to a non-set argument only when the call
--- has a position, which every call written in source has; this evaluator
--- records no call positions and adds it to every such failure.  Upstream
--- adds it as well where forcing the argument fails, which this does not
--- do, so that a call that succeeds installs no handler.  It adds it, and
--- a @while calling@ line, to a failure in the function's body only under
--- @show-trace@ (eval.cc:1603-1614), which this evaluator does not have.
+-- upstream's @callFunction@ in eval.cc adds for the call.  Upstream adds
+-- it to a non-set argument only when the call has a position, which every
+-- call written in source has; this evaluator records no call positions
+-- and adds it to every such failure.  Upstream adds it as well where
+-- forcing the argument fails, which this does not do, so that a call that
+-- succeeds installs no handler.  It adds it, and a @while calling@ line,
+-- to a failure in the function's body only under @show-trace@, which this
+-- evaluator does not have.
 callSiteError :: (MonadEval m) => m a -> m a
 callSiteError = addErrorTrace "from call site"
 
 -- | With no ellipsis, a set holding an attribute that no formal names
--- fails the call, as upstream checks it (eval.cc:1565-1586 at 2.24.9):
+-- fails the call, as upstream's @callFunction@ in eval.cc checks it:
 -- no two formals share a name, so the set holds one exactly when fewer of
 -- its attributes fill a formal than it holds, and only then is the set
 -- walked for the first such in symbol order, as upstream walks its
@@ -1326,9 +1319,9 @@ sharesSlot _ = False
 
 -- | The cell a formal's slot holds before a default naming a slot takes
 -- that slot's cell ('shareFormalSlots'), as upstream's @callFunction@
--- makes it (eval.cc:1546-1563 at 2.24.9): the argument's attribute, or a
--- default as 'frameThunkBc' makes it in the call's frame, a variable
--- naming a slot of the frame, which is not filled yet, a thunk of its own.
+-- makes it (eval.cc): the argument's attribute, or a default as
+-- 'frameThunkBc' makes it in the call's frame, a variable naming a slot of
+-- the frame, which is not filled yet, a thunk of its own.
 formalCell :: (MonadEval m) => Env -> FormalSlot -> m Thunk
 formalCell _ (Given thunk) = pure thunk
 formalCell frame (Defaulted defBcIdx) = frameThunkBc frame defBcIdx
@@ -1372,8 +1365,8 @@ shareFormalSlots frame firstFormal slots =
 -- | What fills each formal's slot, found by the formal's symbol.  A
 -- formal with neither an attribute nor a default fails the call, the
 -- first such in symbol order named, as upstream sorts a set pattern's
--- formals by symbol (@validateFormals@, parser-state.hh:186-189 at
--- 2.24.9) and stops at the first it cannot fill (eval.cc:1546-1557).
+-- formals by symbol (@validateFormals@ in parser-state.hh) and stops at
+-- the first it cannot fill (@callFunction@ in eval.cc).
 formalSlots :: (MonadEval m) => LambdaName -> AttrSet -> [EvalFormal] -> m [FormalSlot]
 formalSlots lambdaName attrs formals = do
   slots <- mapM formalSlot formals
@@ -1821,23 +1814,22 @@ builtinThrow :: (MonadEval m) => NixValue -> m NixValue
 builtinThrow (VStr msg _) = throwCatchableError (bytesToTextLossy msg)
 builtinThrow other = throwEvalError ("builtins.throw: expected a string, got " <> typeName other)
 
--- | Upstream's @prim_abort@ words the message it was given
--- (primops.cc:808 at 2.24.9).
+-- | Upstream's @prim_abort@ in primops.cc words the message it was
+-- given.
 builtinAbort :: (MonadEval m) => NixValue -> m NixValue
 builtinAbort (VStr msg _) = abortEvaluation ("evaluation aborted with the following error message: '" <> bytesToTextLossy msg <> "'")
 builtinAbort other = abortEvaluation ("builtins.abort: expected a string, got " <> typeName other)
 
 -- | @builtins.addErrorContext message value@: the value, forced, and when
 -- forcing it fails, the failure with the message as a line of its trace.
--- Upstream's @prim_addErrorContext@ (primops.cc:1027-1055 at 2.36.0)
--- forces the value inside a @catch@ and coerces the message only there,
--- so both are taken unforced: a message is never forced when the value
--- evaluates.  A message that fails to coerce leaves the value's failure
--- to escape, a throw still catchable by @builtins.tryEval@, with a line
--- naming the message's own failure; 2.35.4 and earlier let it escape in
--- place of the value's.  The message coerces as a string, a path or a set
--- with @__toString@ or @outPath@, with no store copy (@coerceMore@ and
--- @copyToStore@ false).
+-- Upstream's @prim_addErrorContext@ (primops.cc at 2.36.0) forces the value
+-- inside a @catch@ and coerces the message only there, so both are taken
+-- unforced: a message is never forced when the value evaluates.  A message
+-- that fails to coerce leaves the value's failure to escape, a throw still
+-- catchable by @builtins.tryEval@, with a line naming the message's own
+-- failure; 2.35.4 and earlier let it escape in place of the value's.  The
+-- message coerces as a string, a path or a set with @__toString@ or
+-- @outPath@, with no store copy (@coerceMore@ and @copyToStore@ false).
 builtinAddErrorContext :: (MonadEval m) => BuiltinArg -> BuiltinArg -> m NixValue
 builtinAddErrorContext message value = addEvaluatedTrace failedLine contextLine (argValue value)
   where
@@ -1864,7 +1856,7 @@ builtinAttrValues (VAttrs attrs) = attrSetElems attrs >>= thunksList
 builtinAttrValues other =
   throwEvalError ("builtins.attrValues: expected a set, got " <> typeName other)
 
--- | Upstream's @prim_listToAttrs@ (primops.cc:2881-2904 at 2.24.9): the
+-- | Upstream's @prim_listToAttrs@ (primops.cc at 2.24.9): the
 -- elements are read first to last, and the first element with a name
 -- gives its attribute, so a later element with the same name is read only
 -- as far as its name.  Each failure carries the line of context upstream
@@ -1878,10 +1870,10 @@ builtinListToAttrs other =
 -- | Add one element of @listToAttrs@'s list to the attributes the elements
 -- before it made, whose names are the names seen.  The element is forced
 -- to a set and its @name@ read and interned, before the next element is
--- read, as upstream interns it (primops.cc:2896 at 2.24.9), so names new
--- to the symbol table take their place in list order.  A name already
--- seen keeps its attribute, and a new one takes the element's @value@,
--- unforced, at that attribute's position, as upstream inserts it.
+-- read, as upstream interns it (@prim_listToAttrs@ in primops.cc), so
+-- names new to the symbol table take their place in list order.  A name
+-- already seen keeps its attribute, and a new one takes the element's
+-- @value@, unforced, at that attribute's position, as upstream inserts it.
 addListToAttrsElement :: (MonadEval m) => Map Symbol AttrEntry -> Thunk -> m (Map Symbol AttrEntry)
 addListToAttrsElement !made thunk = do
   attrs <-
@@ -1897,8 +1889,8 @@ addListToAttrsElement !made thunk = do
   Map.alterF (maybe (Just <$> newEntry) (pure . Just)) sym made
 
 -- | A @listToAttrs@ element without the attribute, refused as upstream's
--- @getAttr@ (primops.cc:641-651 at 2.24.9) refuses it: the message, and a
--- line of context naming the pair.
+-- @getAttr@ (primops.cc at 2.24.9, @EvalState::getAttr@ in eval.cc at
+-- 2.36.0) refuses it: the message, and a line of context naming the pair.
 missingPairAttr :: (MonadEval m) => Text -> m a
 missingPairAttr key = addErrorTrace "in a {name=...; value=...;} pair" (throwEvalError ("attribute '" <> key <> "' missing"))
 
@@ -1906,8 +1898,8 @@ missingPairAttr key = addErrorTrace "in a {name=...; value=...;} pair" (throwEva
 -- Builtin implementations - attr set (arity 2)
 -- ---------------------------------------------------------------------------
 
--- | Upstream's @prim_hasAttr@ (primops.cc:2800 at 2.24.9): the name, read
--- as an attribute name, then the set.
+-- | Upstream's @prim_hasAttr@ (primops.cc): the name, read as an attribute
+-- name, then the set.
 builtinHasAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinHasAttr nameVal setVal = do
   name <- attrNameOf "builtins.hasAttr" nameVal
@@ -1915,8 +1907,8 @@ builtinHasAttr nameVal setVal = do
     VAttrs attrs -> VBool <$> attrSetMember name attrs
     other -> throwEvalError ("builtins.hasAttr: expected a set, got " <> typeName other)
 
--- | Upstream's @prim_getAttr@ (primops.cc:2705 at 2.24.9): the name, read
--- as an attribute name, then the set.
+-- | Upstream's @prim_getAttr@ (primops.cc): the name, read as an attribute
+-- name, then the set.
 builtinGetAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinGetAttr nameVal setVal = do
   name <- attrNameOf "builtins.getAttr" nameVal
@@ -1960,8 +1952,8 @@ positionValue idx =
     Just (PosInText _ _) -> pure VNull
     Nothing -> pure VNull
 
--- | Upstream's @prim_removeAttrs@ (primops.cc:2844 at 2.24.9): each name
--- read as an attribute name, first to last.
+-- | Upstream's @prim_removeAttrs@ (primops.cc): each name read as an
+-- attribute name, first to last.
 builtinRemoveAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinRemoveAttrs (VAttrs attrs) (VList cl) = do
   keys <- listThunks cl >>= mapM (force >=> attrNameOf "builtins.removeAttrs")
@@ -1971,12 +1963,11 @@ builtinRemoveAttrs (VAttrs _) other =
 builtinRemoveAttrs other _ =
   throwEvalError ("builtins.removeAttrs: expected a set, got " <> typeName other)
 
--- | Upstream's @prim_intersectAttrs@ (primops.cc:2937-3001 at 2.24.9):
--- it walks the smaller set, the second when the two are one size, and
--- finds each name it meets in the other (:2985-2998).  Each attribute it
--- keeps is the second set's, position included.  The result is sized
--- for the smaller set, so two sets with attributes and no name in common
--- make an empty set of their own.
+-- | Upstream's @prim_intersectAttrs@ (primops.cc): it walks the smaller
+-- set, the second when the two are one size, and finds each name it meets
+-- in the other.  Each attribute it keeps is the second set's, position
+-- included.  The result is sized for the smaller set, so two sets with
+-- attributes and no name in common make an empty set of their own.
 builtinIntersectAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinIntersectAttrs (VAttrs left) (VAttrs right) = do
   sizeLeft <- attrSetSize left
@@ -1993,8 +1984,8 @@ builtinIntersectAttrs (VAttrs _) other =
 builtinIntersectAttrs other _ =
   throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
 
--- | Upstream's @prim_catAttrs@ (primops.cc:3017 at 2.24.9): the name, read
--- as an attribute name, then the list.
+-- | Upstream's @prim_catAttrs@ (primops.cc): the name, read as an attribute
+-- name, then the list.
 builtinCatAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinCatAttrs nameVal listVal = do
   name <- attrNameOf "builtins.catAttrs" nameVal
@@ -2026,9 +2017,8 @@ catAttrsCollect key = go []
 forceFunctionArg :: (MonadEval m) => BuiltinArg -> m NixValue
 forceFunctionArg = argValue >=> expectFunction
 
--- | Upstream's @forceFunction@ on a forced value (eval.cc:2202-2216 at
--- 2.24.9): a lambda, a builtin, or a set with @__functor@, and a failure
--- for anything else.
+-- | Upstream's @forceFunction@ on a forced value (eval.cc): a lambda, a
+-- builtin, or a set with @__functor@, and a failure for anything else.
 expectFunction :: (MonadEval m) => NixValue -> m NixValue
 expectFunction val = case val of
   VLambda {} -> pure val
@@ -2243,9 +2233,8 @@ partitionThunks predFn = go [] []
         VBool False -> go rs (thunk : ws) rest
         _ -> throwEvalError "builtins.partition: predicate must return a bool"
 
--- | Upstream's @prim_groupBy@ (primops.cc:3702-3728 at 2.24.9): each
--- element joins the group its function names, and each group holds its
--- elements in list order.
+-- | Upstream's @prim_groupBy@ (primops.cc): each element joins the group its
+-- function names, and each group holds its elements in list order.
 builtinGroupBy :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinGroupBy func (VList cl) = do
   thunks <- listThunks cl
@@ -2256,8 +2245,8 @@ builtinGroupBy _ other =
 
 -- | The groups, each holding its elements last first.  A group's name is
 -- interned before the function is called on the next element, as upstream
--- interns it (primops.cc:3713), so names new to the symbol table take
--- their place in list order.
+-- interns it (@prim_groupBy@ in primops.cc), so names new to the symbol
+-- table take their place in list order.
 groupByCollect ::
   (MonadEval m) =>
   NixValue ->
@@ -2399,11 +2388,11 @@ coerceToStringInterp = coerceToString False force applyValue coercePathToStore
 -- context - the copy-to-store coercion shared by interpolation,
 -- derivation arguments/env values, @concatStringsSep@ and
 -- @builtins.toJSON@.  Every path is copied under its base name, one
--- inside the store too: upstream's @copyPathToStore@ has no store case
--- (eval.cc:2381-2406 at 2.24.9), so a path that is exactly a store path
--- is copied under its @\<hash\>-\<name\>@ base name.  A string naming a
--- store path, as @builtins.storePath@ ('validateStorePath') and the
--- fetchers ('storePathString') give one, coerces to itself instead.
+-- inside the store too: upstream's @copyPathToStore@ in eval.cc has no
+-- store case, so a path that is exactly a store path is copied under its
+-- @\<hash\>-\<name\>@ base name.  A string naming a store path, as
+-- @builtins.storePath@ ('validateStorePath') and the fetchers
+-- ('storePathString') give one, coerces to itself instead.
 sourcePathWithContext :: (MonadEval m) => Text -> m (Text, StringContext)
 sourcePathWithContext p = do
   spText <- storeSourcePath p
@@ -2729,12 +2718,11 @@ formalsListToAttrs formals =
   traverse evaluated (Map.fromList [(efName f, VBool (hasDefault (efDefault f))) | f <- formals])
     >>= fmap VAttrs . attrSetFromSymbols SetFunctionArgs
 
--- | Upstream's @prim_zipAttrsWith@ (primops.cc:3123-3180 at 2.24.9): the
--- function is forced and checked as @forceFunction@ checks it before the
--- list is forced (:3145-3146), so it fails on a first argument that is
--- not a function whatever the list holds.  The list's sets are forced
--- first to last, and each name any of them binds gathers its values in
--- list order, under the name's symbol.
+-- | Upstream's @prim_zipAttrsWith@ (primops.cc): the function is forced and
+-- checked as @forceFunction@ checks it before the list is forced, so it
+-- fails on a first argument that is not a function whatever the list holds.
+-- The list's sets are forced first to last, and each name any of them binds
+-- gathers its values in list order, under the name's symbol.
 builtinZipAttrsWith :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
 builtinZipAttrsWith func listArg = do
   _ <- expectFunction func
@@ -2836,12 +2824,12 @@ builtinReplaceStrings _ _ other =
 -- lives: no value holds one, and @match@ and @split@ take their pattern
 -- as a string and compile it here on each call, as upstream keeps its
 -- compiled @std::regex@ in a cache keyed by the pattern rather than in
--- the value of a partial application (@RegexCache@, primops.cc:4187-4206
--- at 2.24.9).  Keyed by the raw pattern bytes (match and split share
--- entries).  A memo of a pure function, so the one process-wide table is
--- safe to create outside any monad: a pattern compiles to the same regex
--- whether the cache answers or the compiler does.  It holds no C memory,
--- so no root of the C data layer is in it.
+-- the value of a partial application (@RegexCache@ in primops.cc).  Keyed
+-- by the raw pattern bytes (match and split share entries).  A memo of a
+-- pure function, so the one process-wide table is safe to create outside
+-- any monad: a pattern compiles to the same regex whether the cache answers
+-- or the compiler does.  It holds no C memory, so no root of the C data
+-- layer is in it.
 {-# NOINLINE regexCacheRef #-}
 regexCacheRef :: IORef (Map BS.ByteString RE.Regex)
 regexCacheRef = unsafePerformIO (newIORef Map.empty)
@@ -2890,7 +2878,7 @@ builtinMatch patternVal subject = do
 
 -- | The pattern of @match@ or @split@, compiled.  Upstream reads the
 -- pattern with @forceStringNoCtx@ and compiles it before it forces the
--- subject (primops.cc:4216-4223 and :4293-4300 at 2.24.9), so a pattern
+-- subject (@prim_match@ and @prim_split@ in primops.cc), so a pattern
 -- with context is refused.
 compiledPattern :: (MonadEval m) => Text -> NixValue -> m RE.Regex
 compiledPattern reader patternVal = do
@@ -2936,8 +2924,8 @@ builtinSplit patternVal subject = do
 
 -- | The elements of @split@'s list for a subject.  A subject the pattern
 -- does not match is the one element, context and all, as upstream
--- returns its argument there (primops.cc:4309-4312 at 2.24.9); the
--- pieces of one it matches carry no context, as upstream's do.
+-- returns its argument there (@prim_split@ in primops.cc); the pieces of one
+-- it matches carry no context, as upstream's do.
 splitPieces :: (MonadCData m) => RE.Regex -> BS.ByteString -> StringContext -> m [NixValue]
 splitPieces compiled str ctx = case matchAllText compiled str of
   [] -> pure [VStr str ctx]
@@ -2964,7 +2952,7 @@ buildSplitResult remaining pos (match : rest) = do
   (\later -> mkStrBytes before : groups : later) <$> buildSplitResult remaining afterPos rest
 
 -- | Upstream reads both versions with @forceStringNoCtx@, the first
--- before the second (primops.cc:4536-4537 at 2.24.9).
+-- before the second (@prim_compareVersions@ in primops.cc).
 builtinCompareVersions :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinCompareVersions first second = do
   a <- structuredStringValue RefuseContext first
@@ -3169,13 +3157,14 @@ parseHex4 t
 readHex4 :: Text -> Int
 readHex4 = T.foldl' (\acc c -> acc * 16 + digitToInt c) 0
 
--- | The value upstream's SAX consumer, @JSONSax@ (json-to-value.cc at
--- 2.24.9), makes of each JSON value.  An object interns a member's name as
--- the parse reaches it, before the names in the member's value (:50-52),
--- so names new to the symbol table take their place in document order.
--- A name the object repeats keeps the symbol its first occurrence took
--- and takes its last value, as @insert_or_assign@ assigns it; the value it
--- replaces is still made, and the names in it interned.
+-- | The value upstream's SAX consumer, @JSONSax@ (json-to-value.cc), makes
+-- of each JSON value.  An object interns a member's name as the parse
+-- reaches it, before the names in the member's value
+-- (@JSONObjectState::key@), so names new to the symbol table take their
+-- place in document order.  A name the object repeats keeps the symbol its
+-- first occurrence took and takes its last value, as @insert_or_assign@
+-- assigns it; the value it replaces is still made, and the names in it
+-- interned.
 fromJSONBuilder :: (MonadCData m) => JsonBuilder (m NixValue)
 fromJSONBuilder =
   JsonBuilder
@@ -3194,8 +3183,8 @@ fromJSONBuilder =
       pure (Map.insert sym thunk made)
 
 -- | Upstream reads the algorithm with @forceStringNoCtx@ before it forces
--- the string hashed, whose context it discards (primops.cc:4070-4075 at
--- 2.24.9).
+-- the string hashed, whose context it discards (@prim_hashString@ in
+-- primops.cc).
 builtinHashString :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinHashString algoVal inputVal = do
   algo <- structuredStringValue RefuseContext algoVal
@@ -3224,19 +3213,18 @@ builtinDeepSeq first second = deepForce first >> argValue second
 
 -- | Force every value inside a value, through its lists and sets, as
 -- upstream's @forceValueDeep@ does for @builtins.deepSeq@ and
--- @nix-instantiate --eval --strict@ (eval.cc:2099-2131 at 2.24.9): a
--- list's elements first to last, and a set's values in the order the set
--- holds them, by the symbols of their names (:2110-2111), so of two
--- values that fail, the one whose name was interned first fails first.
--- Upstream enters each @Value@ once, so a value reached twice is forced
--- once and one that holds itself, as a derivation does through its @all@
--- and output attributes, is not entered without end.  The cell holding
--- a value is its identity here: every cell the walk enters is reached
--- from the value handed over, which is older than every force the walk
--- runs, so no close of one frees a cell the walk has entered
+-- @nix-instantiate --eval --strict@ (eval.cc): a list's elements first to
+-- last, and a set's values in the order the set holds them, by the symbols
+-- of their names, so of two values that fail, the one whose name was
+-- interned first fails first.  Upstream enters each @Value@ once, so a value
+-- reached twice is forced once and one that holds itself, as a derivation
+-- does through its @all@ and output attributes, is not entered without end.
+-- The cell holding a value is its identity here: every cell the walk enters
+-- is reached from the value handed over, which is older than every force the
+-- walk runs, so no close of one frees a cell the walk has entered
 -- ("Nix.Eval.CRegion"), and a cell is one value for the whole force.  The
--- value handed over has no cell, so it is not entered by one; what it
--- holds is.
+-- value handed over has no cell, so it is not entered by one; what it holds
+-- is.
 deepForce :: (MonadEval m) => NixValue -> m ()
 deepForce = void . forceInside Set.empty
   where
@@ -3389,14 +3377,13 @@ coerceToStringAsPath label val = do
 coerceToPath :: (MonadEval m) => Text -> NixValue -> m Text
 coerceToPath label val = fst <$> coerceToPathWithContext label val
 
--- | Upstream's @realisePath@ (primops.cc:126-143 at 2.24.9), which every
--- builtin that reads a path runs its argument through: the path the
--- argument coerces to, once the store paths its context names are
--- realised ('realiseContext'), which adds the line of context
--- @while realising the context of path \'...\'@ to a failure.  A refusal
--- is an evaluation error, which @builtins.tryEval@ does not catch, as
--- upstream's catches only an assertion (primops.cc:914).  A path value
--- has no context and is read as it is.
+-- | Upstream's @realisePath@ (primops.cc), which every builtin that reads a
+-- path runs its argument through: the path the argument coerces to, once the
+-- store paths its context names are realised ('realiseContext'), which adds
+-- the line of context @while realising the context of path \'...\'@ to a
+-- failure.  A refusal is an evaluation error, which @builtins.tryEval@ does
+-- not catch, as upstream's catches only an assertion (@prim_tryEval@ in
+-- primops.cc).  A path value has no context and is read as it is.
 realisePath :: (MonadEval m) => Text -> NixValue -> m Text
 realisePath label val = do
   (path, ctx) <- coerceToPathWithContext label val
@@ -3406,10 +3393,9 @@ realisePath label val = do
 
 -- | Upstream's @addPath@ around the copy @builtins.path@ and
 -- @builtins.filterSource@ make of a path, once their arguments are read
--- (primops.cc:2436-2492 at 2.24.9): a path in the store has its context
--- realised first, and any failure from there on, the realisation's, the
--- filter's and the copy's, carries the line of context
--- @while adding path \'...\'@.
+-- (primops.cc): a path in the store has its context realised first, and any
+-- failure from there on, the realisation's, the filter's and the copy's,
+-- carries the line of context @while adding path \'...\'@.
 addingPath :: (MonadEval m) => Text -> StringContext -> m a -> m a
 addingPath path ctx copy =
   addErrorTrace ("while adding path '" <> path <> "'") $ do
@@ -3465,11 +3451,10 @@ builtinPathExists val = do
 
 -- | @builtins.readDir@.  An entry the listing gives no type is bound to a
 -- deferred @builtins.readFileType@ of its path, as @prim_readDir@ binds
--- it (primops.cc:2041-2051 at 2.24.9), so only forcing that entry fails,
--- and it fails as @readFileType@ does.  The path is the entry's under the
--- directory with its symlinks resolved, as @prim_readDir@ realises the
--- directory before it reads it, so the lstat @readFileType@ makes meets
--- no symlink above the entry.
+-- it (primops.cc), so only forcing that entry fails, and it fails as
+-- @readFileType@ does.  The path is the entry's under the directory with its
+-- symlinks resolved, as @prim_readDir@ realises the directory before it reads
+-- it, so the lstat @readFileType@ makes meets no symlink above the entry.
 builtinReadDir :: (MonadEval m) => NixValue -> m NixValue
 builtinReadDir val = do
   p <- realisePath "builtins.readDir" val
@@ -3485,9 +3470,8 @@ builtinReadDir val = do
 -- | A listed entry's type, or for an entry the listing gives no type, the
 -- type an lstat of the entry reads, which fails as @builtins.readFileType@
 -- fails on it.  Upstream's tree walks lstat every entry they visit (the
--- path filter's @callPathFilter@, primops.cc:2405-2424 at 2.24.9, and
--- @dumpPath@, archive.cc:56-59), so an entry the listing cannot type
--- fails there.
+-- path filter's @callPathFilter@ in primops.cc, and @dumpPath@ in
+-- archive.cc), so an entry the listing cannot type fails there.
 entryFileType :: (MonadEval m) => Text -> Maybe Text -> m Text
 entryFileType path = maybe (getFileType path) pure
 
@@ -3524,9 +3508,9 @@ builtinStorePath val = do
     then throwEvalError "'builtins.storePath' is not allowed in pure evaluation mode"
     else validateStorePath =<< resolvedUnlessStorePath =<< coerceToPath "builtins.storePath" val
   where
-    -- prim_storePath resolves the path's symlinks unless the path is itself
-    -- a store path, a link directly in the store (primops.cc:1613 at
-    -- 2.24.9), so a link outside the store into it names its target.
+    -- prim_storePath in primops.cc resolves the path's symlinks unless the
+    -- path is itself a store path, a link directly in the store, so a link
+    -- outside the store into it names its target.
     resolvedUnlessStorePath path
       | isBareStorePath path = pure path
       | otherwise = resolveSymlinks path
@@ -3538,7 +3522,8 @@ builtinStorePath val = do
 -- returns a STRING carrying an Opaque (SCPlain) context entry for the enclosing
 -- store path, NOT a bare path: a string coerces to itself, so a derivation
 -- naming it depends on that store path, where a path value is copied to
--- the store again under its base name (primops.cc:1628-1636 at 2.24.9).
+-- the store again under its base name (the documentation of
+-- @primop_storePath@ in primops.cc).
 --
 -- A path outside the store is upstream's @isInStore@ refusal; one inside
 -- it whose component is no store path is its @StorePath@ constructor's
@@ -3558,7 +3543,7 @@ validateStorePath p = case T.stripPrefix storeDirPrefix p of
 -- ---------------------------------------------------------------------------
 
 -- | Upstream reads the looked-up name with @forceStringNoCtx@ once it
--- has read every entry (primops.cc:1799-1835 at 2.24.9), so an entry's
+-- has read every entry (@prim_findFile@ in primops.cc), so an entry's
 -- failure comes ahead of a name's.
 builtinFindFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinFindFile (VList cl) nameVal = do
@@ -3570,8 +3555,8 @@ builtinFindFile other _ =
 
 -- | The path a name is found at in a search path's entries, failing as a
 -- @\<name\>@ lookup does: upstream's @EvalState::findFile@, which both the
--- builtin and a command line's @\<name\>@ argument call (eval.cc:3043-3068
--- and common-eval-args.cc:188-191 at 2.24.9).
+-- builtin and a command line's @\<name\>@ argument call (eval.cc, and
+-- @lookupFileArg@ in common-eval-args.cc).
 findInSearchPath :: (MonadEval m) => [Thunk] -> BS.ByteString -> m Text
 findInSearchPath entryThunks name = mapM forceSearchEntry entryThunks >>= (`findFirst` name)
 
@@ -3604,7 +3589,7 @@ forceSearchEntry thunk = do
 
 -- | Realise the context of a search path entry's path before its lookup,
 -- as upstream's @builtins.findFile@ realises it, naming the entry when a
--- path its context names is not valid (primops.cc:1819-1826 at 2.24.9).
+-- path its context names is not valid (@prim_findFile@ in primops.cc).
 realiseSearchEntry :: (MonadEval m) => BS.ByteString -> StringContext -> m ()
 realiseSearchEntry path ctx =
   unless (contextIsEmpty ctx) $
@@ -3659,7 +3644,7 @@ searchPathSuffix prefix name
 -- ---------------------------------------------------------------------------
 
 -- | Upstream reads the name with @forceStringNoCtx@ before it forces the
--- contents (primops.cc:2293-2294 at 2.24.9).
+-- contents (@prim_toFile@ in primops.cc).
 builtinToFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinToFile nameVal contentsVal = do
   name <- structuredStringValue RefuseContext nameVal
@@ -3714,7 +3699,7 @@ builtinFetchurl (VStr url _) = do
 builtinFetchurl (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchurl" "url" attrs
   -- The pin is read with the arguments, before anything is fetched, as
-  -- upstream's fetch reads it (fetchTree.cc:443-444 at 2.24.9).
+  -- upstream's fetch in fetchTree.cc reads it.
   sha256 <- traverse decodeSha256Pin =<< forceOptionalAttrStr attrs "sha256"
   fetchUrlSimple url sha256
 builtinFetchurl other =
@@ -3976,7 +3961,7 @@ fetchGit args =
         throwEvalError ("in pure evaluation mode, 'fetchGit' will not fetch unlocked input '" <> inputUrl <> "'")
       checkUri inputUrl
       -- A declared narHash is parsed before anything is fetched, as
-      -- fetchToStore reads it first (fetchers.cc:176 at 2.24.9).
+      -- Input::fetchToStore reads it first (fetchers.cc at 2.24.9).
       declaredNarHash <- traverse (either throwEvalError pure . parseNarHash) (fgaNarHash args)
       -- Only a pinned rev is cached: a bare ref means "whatever this branch
       -- points at now", which a note taken earlier cannot answer.
@@ -4000,9 +3985,9 @@ fetchGit args =
       -- A declared narHash pins the tree; a mismatch is an error on the
       -- hit and fresh paths alike, never a silent recompute.  The hashes
       -- are compared, not their spellings, as checkLocks compares them
-      -- (fetchers.cc:214-222 at 2.24.9), and the pin is reported in SRI.
-      -- Upstream's orientation: "expected" is what the fetch produced,
-      -- "got" is the declared pin (observed from nix-instantiate 2.33.2).
+      -- (fetchers.cc), and the pin is reported in SRI.  Upstream's
+      -- orientation: "expected" is what the fetch produced, "got" is the
+      -- declared pin (observed from nix-instantiate 2.33.2).
       case declaredNarHash of
         Nothing -> pure ()
         Just declared ->
@@ -4430,15 +4415,16 @@ fetchUrlSimple url pin = do
       storePath <- addFixedOutputFile Fetched name bytes
       pure (storePathString storePath)
 
--- | Upstream's early exit for a fetch a sha256 pins (fetchTree.cc:484-496
--- at 2.24.9): the path the pin names, when the store holds it already,
--- which the fetch then returns without downloading or writing anything.
--- 2.34.9 ensures the path instead (fetchTree.cc:456-478 at 2.34.9): a
--- valid one returns at once (build/entry-points.cc:103), and one the
--- store lacks is substituted where a substituter has it, by a daemon,
--- which is not read-only (daemon.cc:669-675), or refused by a local store
--- in read-only mode (substitution-goal.cc:40) and then downloaded.
--- nova-nix downloads it.
+-- | Upstream's early exit for a fetch a sha256 pins (@fetch@ in
+-- fetchTree.cc at 2.24.9): the path the pin names, when the store holds
+-- it already, which the fetch then returns without downloading or writing
+-- anything.  2.34.9 ensures the path instead (@fetch@ in fetchTree.cc): a
+-- valid one returns at once (@Store::ensurePath@ in
+-- build\/entry-points.cc), and one the store lacks is substituted where a
+-- substituter has it, by a daemon, which is not read-only (the
+-- @EnsurePath@ case of @performOp@ in daemon.cc), or refused by a local
+-- store in read-only mode (@PathSubstitutionGoal::init@ in
+-- substitution-goal.cc) and then downloaded.  nova-nix downloads it.
 heldPinnedPath :: (MonadEval m) => Text -> FileIngestionMethod -> Maybe BS.ByteString -> m (Maybe Text)
 heldPinnedPath _ _ Nothing = pure Nothing
 heldPinnedPath name method (Just pin) = do
@@ -4488,7 +4474,7 @@ urlBaseName url =
    in if T.null base then "source" else base
 
 -- | Upstream's refusal of a fetch whose content has another SHA-256 hash
--- than its pin (fetchTree.cc:515-522 at 2.24.9), each hash in nix32 after
+-- than its pin (@fetch@ in fetchTree.cc), each hash in nix32 after
 -- its algorithm.
 fetchHashMismatch :: Text -> BS.ByteString -> BS.ByteString -> Text
 fetchHashMismatch url expected got =
@@ -4500,9 +4486,9 @@ fetchHashMismatch url expected got =
     <> Nix32.encode got
 
 -- | Decode a sha256 pin to raw bytes as upstream's @newHashAllowEmpty@
--- with SHA-256 reads it (hash.cc:271-281 at 2.24.9): SRI, prefixed or
--- bare, a spelling that carries its own tag naming sha256, or empty, the
--- digest whose every byte is zero, with upstream's warning.
+-- with SHA-256 reads it (hash.cc): SRI, prefixed or bare, a spelling that
+-- carries its own tag naming sha256, or empty, the digest whose every byte is
+-- zero, with upstream's warning.
 decodeSha256Pin :: (MonadEval m) => Text -> m BS.ByteString
 decodeSha256Pin s = snd <$> newHashAllowEmpty (Just "sha256") s
 
@@ -4644,9 +4630,9 @@ derivationAt sp = do
 
 -- | The filesystem closure of the @.drv@ files an all-outputs context
 -- names, as upstream's derivationStrict takes it for each
--- (@computeFSClosure@, primops.cc:1382 at 2.24.9): every @.drv@ reachable
--- through @inputDrvs@, every source in their @inputSrcs@, and the
--- references this session recorded for a source it wrote.
+-- (@computeFSClosure@ in @derivationStrictInternal@, primops.cc): every
+-- @.drv@ reachable through @inputDrvs@, every source in their @inputSrcs@,
+-- and the references this session recorded for a source it wrote.
 allOutputsClosure :: (MonadEval m) => [StorePath] -> m (Set.Set StorePath)
 allOutputsClosure = go Set.empty
   where
@@ -4676,9 +4662,9 @@ builtinDerivationStrict (VAttrs attrs) = do
   let nameTrace =
         traceIfPresent attrs "name" "while evaluating the derivation attribute 'name'"
           . traceIfPresent attrs "name" "while evaluating the `name` attribute passed to builtins.derivationStrict"
-  -- Read with forceStringNoCtx (primops.cc:1130 at 2.24.9): a string with
-  -- no context, never a value coerced to one.  An absent name is getAttr's
-  -- error.
+  -- Read with forceStringNoCtx (prim_derivationStrict in primops.cc): a
+  -- string with no context, never a value coerced to one.  An absent name
+  -- is getAttr's error.
   drvName <-
     nameTrace $
       attrSetLookup "name" attrs >>= \case
@@ -4732,8 +4718,8 @@ builtinDerivationStrict (VAttrs attrs) = do
     Map.fromList
       <$> mapM (\drvSp -> (,) drvSp <$> resolveAllOutputNames drvSp) (filter ((".drv" `T.isSuffixOf`) . spName) (Set.toList deepClosure))
   -- Upstream checks both once its pass and the closure are done, the
-  -- builder first, and an empty one counts as absent (primops.cc:1402-1411
-  -- at 2.24.9).
+  -- builder first, and an empty one counts as absent
+  -- (derivationStrictInternal in primops.cc).
   let requiredField key value = case value of
         Just bytes | not (BS.null bytes) -> pure bytes
         _ -> throwEvalError ("required attribute '" <> key <> "' missing")
@@ -4830,12 +4816,12 @@ builtinDerivationStrict other =
   throwEvalError ("derivation: expected a set, got " <> typeName other)
 
 -- | The output of a derivation whose pass read an @outputHash@, as
--- upstream's derivationStrict makes a fixed-output one (primops.cc:1425-1437
--- at 2.24.9): its outputs must be @out@ alone, and the hash is read with
--- 'newHashAllowEmpty' under the algorithm @outputHashAlgo@ names, so the
--- hash's own tag decides when that names none upstream knows.  Returns the
--- algorithm, the method the pass read from @outputHashMode@, flat when it
--- read none (primops.cc:1437), and the digest.
+-- upstream's derivationStrict makes a fixed-output one
+-- (@derivationStrictInternal@ in primops.cc): its outputs must be @out@
+-- alone, and the hash is read with 'newHashAllowEmpty' under the algorithm
+-- @outputHashAlgo@ names, so the hash's own tag decides when that names
+-- none upstream knows.  Returns the algorithm, the method the pass read
+-- from @outputHashMode@, flat when it read none, and the digest.
 fixedOutputOf :: (MonadEval m) => DrvFields -> BS.ByteString -> m (Text, FileIngestionMethod, BS.ByteString)
 fixedOutputOf fields rawHash = do
   unless (dfOutputs fields == "out" :| []) $
@@ -4896,10 +4882,10 @@ drvAttrUse key
 -- attribute names others, as upstream's set starts.  The hash is the
 -- string its attribute was read as, an empty one included: a derivation
 -- whose pass reads one is fixed-output, as upstream's is
--- (primops.cc:1425 at 2.24.9).  The algorithm is one upstream knows, or
--- none.  The mode is the method an @outputHashMode@ names, read in the
--- pass whether or not the derivation is fixed-output, as upstream's
--- @handleHashMode@ reads it.
+-- (@derivationStrictInternal@ in primops.cc).  The algorithm is one
+-- upstream knows, or none.  The mode is the method an @outputHashMode@
+-- names, read in the pass whether or not the derivation is fixed-output, as
+-- upstream's @handleHashMode@ reads it.
 data DrvFields = DrvFields
   { dfContext :: !StringContext,
     dfBuilder :: !(Maybe BS.ByteString),
@@ -4911,13 +4897,14 @@ data DrvFields = DrvFields
     dfOutputHashMode :: !(Maybe FileIngestionMethod)
   }
 
--- | Upstream's one pass over a derivation's attributes (primops.cc:1225-1365
--- at 2.24.9), given in name order: each is forced, a null one is left out
--- under @__ignoreNulls@, @args@ is read as the builder's command line, and
--- every other one is read by the mode's reader into its entry and any
--- field it is at the key of.  Each attribute is processed under upstream's
--- line naming it, and a failure fails the whole derivation, so the first
--- attribute by name that fails is the failure, whatever a later one holds.
+-- | Upstream's one pass over a derivation's attributes
+-- (@derivationStrictInternal@ in primops.cc), given in name order: each is
+-- forced, a null one is left out under @__ignoreNulls@, @args@ is read as
+-- the builder's command line, and every other one is read by the mode's
+-- reader into its entry and any field it is at the key of.  Each attribute
+-- is processed under upstream's line naming it, and a failure fails the
+-- whole derivation, so the first attribute by name that fails is the
+-- failure, whatever a later one holds.
 derivationPass ::
   (MonadEval m) =>
   Text ->
@@ -4937,10 +4924,10 @@ derivationPass drvName nulls readEntry = foldM step (Map.empty, initial)
           (entry, updated) <- readEntry role key val fields
           pure (maybe entries (\e -> Map.insert key e entries) entry, updated)
 
--- | @args@, each element coerced as an environment entry is (primops.cc:1293
--- at 2.24.9).  A path in it (stdenv's ./default-builder.sh, say) is copied
--- into the store, and its store path reaches inputSrcs through the
--- context.
+-- | @args@, each element coerced as an environment entry is
+-- (@derivationStrictInternal@ in primops.cc).  A path in it (stdenv's
+-- ./default-builder.sh, say) is copied into the store, and its store path
+-- reaches inputSrcs through the context.
 readCommandLine :: (MonadEval m) => NixValue -> DrvFields -> m DrvFields
 readCommandLine val fields = case val of
   VList cl -> do
@@ -4953,8 +4940,9 @@ readCommandLine val fields = case val of
 -- with @coerceMore@, a path copied to the store, whose bytes flow
 -- byte-exact into the ATerm env section (and its hash).  That string is
 -- the builder, the system, the outputs or a fixed-output field at those
--- keys, the outputs split at whitespace (primops.cc:1346-1356 at 2.24.9),
--- so an @outputHash@ that is not a string is the string it coerces to.
+-- keys, the outputs split at whitespace (@derivationStrictInternal@ in
+-- primops.cc), so an @outputHash@ that is not a string is the string it
+-- coerces to.
 readEnvEntry :: (MonadEval m) => DrvEntryRole -> Text -> NixValue -> DrvFields -> m (Maybe BS.ByteString, DrvFields)
 readEnvEntry role _ val fields = do
   (bytes, ctx) <- coerceToStoreString val
@@ -4973,8 +4961,9 @@ readEnvEntry role _ val fields = do
 -- converted as @builtins.toJSON@ converts it (upstream calls the same
 -- @printValueAsJSON@), with the builder (and its context), the system,
 -- the outputs and the fixed-output fields read as strings at their keys,
--- never as values coerced to them (primops.cc:1307-1345 at 2.24.9).  The
--- attribute that chooses structured attributes has no member.
+-- never as values coerced to them (@derivationStrictInternal@ in
+-- primops.cc).  The attribute that chooses structured attributes has no
+-- member.
 readStructuredEntry :: (MonadEval m) => Text -> Text -> DrvEntryRole -> Text -> NixValue -> DrvFields -> m (Maybe Json, DrvFields)
 readStructuredEntry drvName fieldContext role key val fields
   | key == structuredAttrsFlag = pure (Nothing, fields)
@@ -4996,7 +4985,7 @@ readStructuredEntry drvName fieldContext role key val fields
       pure (Just json, updated)
 
 -- | A fixed-output field read from its attribute's string.  The algorithm
--- is read with @parseHashAlgoOpt@ (primops.cc:1320, :1352 at 2.24.9),
+-- is read with @parseHashAlgoOpt@ (@derivationStrictInternal@ in primops.cc),
 -- which gives none for a name it does not know, and the mode with
 -- 'outputHashModeMethod', which refuses one it does not take.
 withFixedOutputField :: (MonadEval m) => FixedOutputField -> BS.ByteString -> DrvFields -> m DrvFields
@@ -5006,13 +4995,13 @@ withFixedOutputField field bytes fields = case field of
   OutputHashModeField -> either throwEvalError (\method -> pure fields {dfOutputHashMode = Just method}) (outputHashModeMethod bytes)
 
 -- | The method an @outputHashMode@ names, as upstream's @handleHashMode@
--- reads it (primops.cc:1230-1245 at 2.24.9) through
--- @ContentAddressMethod::parse@ (content-address.cc:60-66) and
--- @parseFileIngestionMethod@ (file-content-address.cc:29-40): @nar@, and
--- @recursive@ as its older name, hash a NAR, and @flat@ the file's bytes.
--- @text@ and @git@ parse there too but need the @dynamic-derivations@ and
--- @git-hashing@ experimental features, which nova-nix does not implement,
--- so each is refused as upstream refuses it with its feature off.
+-- reads it (primops.cc) through @ContentAddressMethod::parse@
+-- (content-address.cc) and @parseFileIngestionMethod@
+-- (file-content-address.cc): @nar@, and @recursive@ as its older name, hash
+-- a NAR, and @flat@ the file's bytes.  @text@ and @git@ parse there too but
+-- need the @dynamic-derivations@ and @git-hashing@ experimental features,
+-- which nova-nix does not implement, so each is refused as upstream refuses
+-- it with its feature off.
 outputHashModeMethod :: BS.ByteString -> Either Text FileIngestionMethod
 outputHashModeMethod mode = case mode of
   "nar" -> Right NarIngestion
@@ -5023,20 +5012,20 @@ outputHashModeMethod mode = case mode of
   _ -> Left ("invalid value '" <> bytesToTextLossy mode <> "' for 'outputHashMode' attribute")
 
 -- | Upstream's refusal of what an experimental feature that is off would
--- allow (@MissingExperimentalFeature@, experimental-features.cc:360-363 at
+-- allow (@MissingExperimentalFeature@ in experimental-features.cc at
 -- 2.24.9).
 experimentalFeatureDisabled :: Text -> Text
 experimentalFeatureDisabled feature =
   "experimental Nix feature '" <> feature <> "' is disabled; add '--extra-experimental-features " <> feature <> "' to enable it"
 
 -- | The algorithm a name names, as upstream's @parseHashAlgoOpt@ reads it
--- (hash.cc:426-433 at 2.24.9): one of the four it knows, or none.
+-- (hash.cc at 2.24.9): one of the four it knows, or none.
 knownHashAlgo :: BS.ByteString -> Maybe Text
 knownHashAlgo bytes = either (const Nothing) (\algo -> algo <$ hashAlgoBytes algo) (TE.decodeUtf8' bytes)
 
--- | Upstream's @handleOutputs@ (primops.cc:1247-1269 at 2.24.9): the names
--- in order, a repeated name and the name drvPath refused, as the result
--- set already carries a drvPath, then an empty list.
+-- | Upstream's @handleOutputs@ (primops.cc): the names in order, a repeated
+-- name and the name drvPath refused, as the result set already carries a
+-- drvPath, then an empty list.
 checkedOutputs :: (MonadEval m) => [Text] -> m (NonEmpty Text)
 checkedOutputs names = do
   foldM_ checkOutputName Set.empty names
@@ -5048,8 +5037,8 @@ checkedOutputs names = do
       | otherwise = pure (Set.insert outName seen)
 
 -- | The output names an environment's @outputs@ entry holds: its bytes
--- split at the separators of upstream's @tokenizeString@ (util.hh:34 at
--- 2.24.9), empty pieces dropped.
+-- split at the separators of upstream's @tokenizeString@ (util.hh at
+-- 2.24.9, strings.hh at 2.36.0), empty pieces dropped.
 outputTokens :: BS.ByteString -> [BS.ByteString]
 outputTokens = filter (not . BS.null) . BS.splitWith (`BS.elem` tokenSeparators)
   where
@@ -5082,8 +5071,8 @@ attrPassingOf attrs =
 
 -- | Whether a string read without coercion may carry context: one
 -- upstream reads with @forceString@, such as a structured derivation's
--- builder, may; one it reads with @forceStringNoCtx@ (eval.cc:2253-2258 at
--- 2.24.9), such as a derivation's name or a regex, may not.
+-- builder, may; one it reads with @forceStringNoCtx@ (eval.cc), such as a
+-- derivation's name or a regex, may not.
 data StringContextRule = AllowContext | RefuseContext
 
 -- | A string as upstream's @forceString@ reads it: a string, never a
@@ -5100,10 +5089,9 @@ structuredStringValue rule val = case (val, rule) of
     expectedFailure "a string" other
 
 -- | An attribute name a program computes, read as upstream reads every
--- one, with @forceStringNoCtx@ (eval.cc:2253 at 2.24.9): a string, never a
--- value coerced to one, and one with no context.  The text names the
--- reader in an invalid UTF-8 refusal, which upstream, holding bytes, never
--- makes.
+-- one, with @forceStringNoCtx@ (eval.cc): a string, never a value coerced to
+-- one, and one with no context.  The text names the reader in an invalid
+-- UTF-8 refusal, which upstream, holding bytes, never makes.
 attrNameOf :: (MonadEval m) => Text -> NixValue -> m Text
 attrNameOf reader = structuredStringValue RefuseContext >=> decodedText reader
 
@@ -5146,7 +5134,7 @@ traceIfPresent attrs key line action = do
   if present then addErrorTrace line action else action
 
 -- | A Boolean as upstream's @forceBool@ reads it, refused with its message
--- (eval.cc:2176-2193 at 2.24.9): a derivation's switches and the
+-- (eval.cc): a derivation's switches and the
 -- @recursive@ of @builtins.path@.
 expectBool :: (MonadEval m) => NixValue -> m Bool
 expectBool (VBool b) = pure b
@@ -5159,8 +5147,8 @@ expectBool other = expectedFailure "a Boolean" other
 -- | @builtins.hashFile algo path@ - hash raw bytes of a file on disk.
 -- Returns base-16 hex string, matching @builtins.hashString@ output format.
 -- The algorithm is read as upstream's @forceStringNoCtx@ reads it and
--- refused before the path is realised or read (primops.cc:1977-1982 at
--- 2.24.9).
+-- refused before the path is realised or read (@prim_hashFile@ in
+-- primops.cc).
 builtinHashFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinHashFile algoVal pathVal = do
   algoName <- decodedText "builtins.hashFile" =<< structuredStringValue RefuseContext algoVal
@@ -5196,8 +5184,8 @@ builtinConvertHash :: (MonadEval m) => NixValue -> m NixValue
 builtinConvertHash (VAttrs attrs) = do
   hashVal <- requireStrAttr "convertHash" "hash" attrs
   -- hashAlgo, when given, is parsed before the hash and handed to
-  -- Hash::parseAny (prim_convertHash, primops.cc:4100-4108 at 2.24.9), so
-  -- an unknown one is refused, and a tag naming another algorithm too.
+  -- Hash::parseAny (prim_convertHash in primops.cc), so an unknown one is
+  -- refused, and a tag naming another algorithm too.
   hasAlgo <- attrSetMember "hashAlgo" attrs
   expected <-
     if hasAlgo
@@ -5217,10 +5205,10 @@ builtinConvertHash (VAttrs attrs) = do
 builtinConvertHash other =
   throwEvalError ("builtins.convertHash: expected a set, got " <> typeName other)
 
--- | Read a hash as upstream's @newHashAllowEmpty@ does (hash.cc:271-281 at
--- 2.24.9): an empty one is the digest of @expected@ whose every byte is
--- zero, which upstream warns of, naming it in SRI, and is refused with no
--- @expected@; any other is read as 'parseAnyHash' reads it.
+-- | Read a hash as upstream's @newHashAllowEmpty@ does (hash.cc): an empty
+-- one is the digest of @expected@ whose every byte is zero, which upstream
+-- warns of, naming it in SRI, and is refused with no @expected@; any other
+-- is read as 'parseAnyHash' reads it.
 newHashAllowEmpty :: (MonadEval m) => Maybe Text -> Text -> m (Text, BS.ByteString)
 newHashAllowEmpty expected original
   | T.null original = case expected of
@@ -5231,18 +5219,17 @@ newHashAllowEmpty expected original
         pure (algo, zero)
   | otherwise = either throwEvalError pure (parseAnyHash expected original)
 
--- | Parse an SRI hash as upstream's @Hash::parseSRI@ does (hash.cc:137-147
--- at 2.24.9): the algorithm before the first @-@ and a base64 digest
--- after it.  A hash in any other spelling is refused.
+-- | Parse an SRI hash as upstream's @Hash::parseSRI@ does (hash.cc): the
+-- algorithm before the first @-@ and a base64 digest after it.  A hash in
+-- any other spelling is refused.
 parseSriHash :: Text -> Either Text (Text, BS.ByteString)
 parseSriHash original = case T.breakOn "-" original of
   (algo, rest) | Just digest <- T.stripPrefix "-" rest -> (algo,) <$> sriDigest algo digest
   _ -> Left ("hash '" <> original <> "' is not SRI")
 
 -- | A declared @narHash@'s SHA-256 digest, read as upstream's
--- @Input::getNarHash@ reads it (fetchers.cc:324-333 at 2.24.9): an SRI
--- hash, which must be SHA-256, or the empty string, which is a digest
--- whose every byte is zero.
+-- @Input::getNarHash@ reads it (fetchers.cc): an SRI hash, which must be
+-- SHA-256, or the empty string, which is a digest whose every byte is zero.
 parseNarHash :: Text -> Either Text BS.ByteString
 parseNarHash declared
   | T.null declared = Right (BS.replicate sha256DigestSize 0)
@@ -5977,23 +5964,23 @@ builtinPath :: (MonadEval m) => NixValue -> m NixValue
 builtinPath (VAttrs attrs) = do
   -- prim_path reads the arguments one at a time in the set's own order,
   -- refusing one it does not take at its turn, and checks for the path
-  -- once that loop is done (primops.cc:2569-2592 at 2.24.9).  The order
-  -- is by interned symbol, as upstream's attribute sets are sorted.  The
-  -- path's context is realised only after that, in addPath (:2596).
+  -- once that loop is done (primops.cc).  The order is by interned symbol,
+  -- as upstream's attribute sets are sorted.  The path's context is
+  -- realised only after that, in addPath.
   args <- attrSetFoldM readPathArgument noPathArguments attrs
   (pathStr, pathContext) <- maybe (throwEvalError "missing required 'path' attribute in the first argument to builtins.path") pure (paPath args)
-  -- An empty name is the path's base name, as upstream's is (:2593-2594).
+  -- An empty name is the path's base name, as prim_path's is.
   let name = fromMaybe (canonBaseName pathStr) (mfilter (not . T.null) (paName args))
       expectedDigest = paPin args
       -- Upstream compares the copy's store path with the one the pin
-      -- gives (primops.cc:2478-2482 at 2.24.9); under one name and one
-      -- method the two differ exactly when the digests do.
+      -- gives (addPath in primops.cc); under one name and one method the two
+      -- differ exactly when the digests do.
       mismatch = "store path mismatch in (possibly filtered) path added from '" <> pathStr <> "'"
   addingPath pathStr pathContext $ do
     -- A pinned copy's path follows from the pin.  Upstream's addPath
     -- builds it once the context is realised and before it reads the tree
-    -- (primops.cc:2462-2466 at 2.24.9), so a name it refuses is refused
-    -- under the pinned hash, before the filter is applied.
+    -- (primops.cc), so a name it refuses is refused under the pinned hash,
+    -- before the filter is applied.
     forM_ expectedDigest $ \expected ->
       storePathOrThrow (makeFixedOutputPath name "sha256" (paMethod args) expected)
     storePathText <- case (paMethod args, paFilter args) of
@@ -6011,7 +5998,7 @@ builtinPath other =
   throwEvalError ("builtins.path: expected an attribute set, got " <> typeName other)
 
 -- | What @builtins.path@ has read of its arguments, as @prim_path@'s
--- locals hold them (primops.cc:2560-2565 at 2.24.9): a NAR copy until
+-- locals hold them (primops.cc): a NAR copy until
 -- @recursive@ says otherwise.
 data PathArguments = PathArguments
   { paPath :: !(Maybe (Text, StringContext)),
@@ -6026,11 +6013,10 @@ noPathArguments :: PathArguments
 noPathArguments = PathArguments Nothing Nothing Nothing NarIngestion Nothing
 
 -- | One argument of @builtins.path@, read as @prim_path@ reads the one at
--- its key (primops.cc:2571-2587 at 2.24.9): @name@ as a string with no
--- context, @filter@ as a function, each refused otherwise under
--- upstream's line of context for it, @recursive@ as a Boolean choosing a
--- NAR or a flat copy, and any key it does not take refused with its
--- message.
+-- its key (primops.cc): @name@ as a string with no context, @filter@ as a
+-- function, each refused otherwise under upstream's line of context for it,
+-- @recursive@ as a Boolean choosing a NAR or a flat copy, and any key it does
+-- not take refused with its message.
 readPathArgument :: (MonadEval m) => PathArguments -> Symbol -> AttrEntry -> m PathArguments
 readPathArgument args name entry = case key of
   "path" -> (\path -> args {paPath = Just path}) <$> (coerceToPathWithContext "builtins.path" =<< force thunk)
@@ -6051,10 +6037,10 @@ readPathArgument args name entry = case key of
 -- | The copy @recursive = false@ makes: the bytes of the file at the
 -- path, its symlinks resolved, at their flat fixed-output path.
 -- Upstream's addPath hands fetchToStore the resolved path
--- (primops.cc:2470-2477 at 2.24.9), and a flat dump reads the file and
--- calls no filter (file-content-address.cc:77-80).  That read fails on a
--- directory with EISDIR (posix-source-accessor.cc:68-73), and this copy
--- refuses one with the message that read gives.
+-- (primops.cc), and a flat dump reads the file and calls no filter
+-- (@dumpPath@ in file-content-address.cc).  That read fails on a directory
+-- with EISDIR (@PosixSourceAccessor::readFile@ in posix-source-accessor.cc
+-- at 2.24.9), and this copy refuses one with the message that read gives.
 flatFileCopy :: (MonadEval m) => Text -> Text -> Maybe BS.ByteString -> Text -> m Text
 flatFileCopy rawPath name pin mismatch = do
   resolved <- resolveSymlinks rawPath
@@ -6067,10 +6053,10 @@ flatFileCopy rawPath name pin mismatch = do
     _ -> pure ()
   addFixedOutputFile Computed name bytes
 
--- | A store path as upstream's @mkStorePathString@ gives it (eval.cc:927-934
--- at 2.24.9): its text, carrying itself as context.  What the source
--- importers and the fetchers return, so a coercion names the store path
--- rather than copying it again as it would a path value.
+-- | A store path as upstream's @mkStorePathString@ gives it (eval.cc): its
+-- text, carrying itself as context.  What the source importers and the
+-- fetchers return, so a coercion names the store path rather than copying
+-- it again as it would a path value.
 storePathString :: Text -> NixValue
 storePathString storePathText =
   case parseStorePath defaultStoreDir storePathText of
@@ -6130,8 +6116,7 @@ filteredSourceNar filterFn rawRoot = do
 -- or @"unknown"@.  Equivalent to @builtins.path@ with a filter and the
 -- source's basename as the store name.  @prim_filterSource@ coerces the
 -- path before it forces the filter, and realises the path's context only
--- after both, in addPath (primops.cc:2493-2502 at 2.24.9), so the filter
--- is taken unforced.
+-- after both, in addPath (primops.cc), so the filter is taken unforced.
 builtinFilterSource :: (MonadEval m) => BuiltinArg -> NixValue -> m NixValue
 builtinFilterSource filterArg pathVal = do
   (path, ctx) <- coerceToPathWithContext "builtins.filterSource" pathVal

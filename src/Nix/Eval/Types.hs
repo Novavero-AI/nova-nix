@@ -499,10 +499,11 @@ attrSetKeys attrs = reverse <$> attrSetFoldM (\names name _ -> pure (symbolText 
 
 -- | Fold an action over a set's attributes, each its name and its entry,
 -- first to last by interned symbol, as upstream walks the @Attr@s of a
--- set's @Bindings@, which are sorted by @Symbol@ (attr-set.hh:30-33 and
--- :91-95 at 2.24.9), merging its layers' at 2.34.9.  It reads a flat set
--- one entry at a time, and a layered one from the entries 'cattrsetWalk'
--- copies out of its layers first, and forces the accumulator at each.
+-- set's @Bindings@, which are sorted by @Symbol@ (@Attr@'s comparison and
+-- the @Bindings@ iterators in attr-set.hh), merging its layers' at 2.34.9.
+-- It reads a flat set one entry at a time, and a layered one from the
+-- entries 'cattrsetWalk' copies out of its layers first, and forces the
+-- accumulator at each.
 {-# INLINE attrSetFoldM #-}
 attrSetFoldM :: (MonadCData m) => (a -> Symbol -> AttrEntry -> m a) -> a -> AttrSet -> m a
 attrSetFoldM step initial (AttrSet cset) = cattrsetWalk cset >>= go initial
@@ -576,11 +577,11 @@ attrSetToAscList attrs = Map.toAscList <$> attrSetToMap attrs
 
 -- | A set at a site binding each name of a set to what an action makes
 -- of the name and its value, as upstream's @mapAttrs@ builds its result
--- (primops.cc:3095-3105 at 2.24.9): the action runs on each attribute in
+-- (@prim_mapAttrs@ in primops.cc): the action runs on each attribute in
 -- the order the set holds them ('attrSetFoldM'), and the result is sized
 -- for the set and binds its names, each defined nowhere in source.  An
 -- empty set gives 'emptyAttrSet', as upstream's @allocBindings@ answers
--- a size of 0 with its shared bindings (attr-set.cc:16-17).
+-- a size of 0 with its shared bindings (attr-set.cc).
 attrSetMapWithKey :: (MonadCData m) => SetSite -> (Symbol -> Thunk -> m Thunk) -> AttrSet -> m AttrSet
 attrSetMapWithKey site f attrs =
   attrSetSize attrs >>= \case
@@ -594,8 +595,8 @@ attrSetMapWithKey site f attrs =
 -- | Remove a list of keys, returning a new CAttrSet made at a site.
 -- Uses the C-side @nn_attrset_remove_keys@, which scans the keys for
 -- each attribute.  Upstream
--- sizes the result for the set it removes from (primops.cc:2852 at
--- 2.24.9), so removing from an empty set gives 'emptyAttrSet' and
+-- sizes the result for the set it removes from (@prim_removeAttrs@ in
+-- primops.cc), so removing from an empty set gives 'emptyAttrSet' and
 -- removing every attribute of another gives an empty set of its own.
 -- Every key is interned either way, as upstream interns each name
 -- whatever the set holds.
@@ -609,13 +610,14 @@ attrSetRemoveKeys site keys (AttrSet cset) = do
 
 -- | The set with no attributes: a C static ('cattrsetEmpty'), one address
 -- for the life of the process, as upstream's @emptyBindings@ is one for
--- its evaluator (eval.hh:195 at 2.24.9).  Every set built with no
--- attributes is this one and is allocated nowhere, as upstream's
--- @allocBindings@ answers a size of 0 with @emptyBindings@
--- (attr-set.cc:16-17), except a set upstream sizes before it knows it
--- holds nothing ('attrSetFromSymbolEntriesSizedFor', 'attrSetRemoveKeys').
--- Upstream's printers enter a set by its bindings, so which empty sets
--- are this one shows where a value is printed.
+-- its evaluator (@EvalState@'s member in eval.hh at 2.24.9, a static of
+-- @Bindings@ in attr-set.hh at 2.36.0).  Every set built with no attributes
+-- is this one and is allocated nowhere, as upstream's @allocBindings@
+-- answers a size of 0 with @emptyBindings@ (attr-set.cc), except a set
+-- upstream sizes before it knows it holds nothing
+-- ('attrSetFromSymbolEntriesSizedFor', 'attrSetRemoveKeys').  Upstream's
+-- printers enter a set by its bindings, so which empty sets are this one
+-- shows where a value is printed.
 emptyAttrSet :: AttrSet
 emptyAttrSet = AttrSet cattrsetEmpty
 
@@ -645,13 +647,13 @@ attrSetFromSymbolEntries site m = AttrSet <$> newFrozenAttrSet site pure entryPo
 
 -- | 'attrSetFromSymbolEntries' for a set upstream sizes, before it knows
 -- what the set holds, for the given number of attributes, as it sizes a
--- literal for its names (eval.cc:1193 at 2.24.9) and @intersectAttrs@'s
--- result for the smaller of its arguments (primops.cc:2945).  Upstream's
--- @allocBindings@ shares its empty set only for a size of 0
--- (attr-set.cc:16-17), so such a set holding nothing is 'emptyAttrSet'
--- when sized for none and an empty set of its own otherwise.  A set
--- holding attributes is made with room for those alone, whatever the
--- size.
+-- literal for its names (@ExprAttrs::eval@ in eval.cc) and
+-- @intersectAttrs@'s result for the smaller of its arguments
+-- (@prim_intersectAttrs@ in primops.cc).  Upstream's @allocBindings@ shares
+-- its empty set only for a size of 0 (attr-set.cc), so such a set holding
+-- nothing is 'emptyAttrSet' when sized for none and an empty set of its own
+-- otherwise.  A set holding attributes is made with room for those alone,
+-- whatever the size.
 attrSetFromSymbolEntriesSizedFor :: (MonadCData m) => SetSite -> Int -> Map Symbol AttrEntry -> m AttrSet
 attrSetFromSymbolEntriesSizedFor site size m
   | Map.null m && size > 0 = ownEmptyAttrSet site
@@ -976,14 +978,14 @@ readPending ptr =
 
 -- | The cell a binding, a list element, a call's argument or a with's
 -- scope holds for the code at a bytecode index in an env, as upstream's
--- @maybeThunk@ makes it (eval.cc:1006-1046 at 2.24.9).  A variable is
--- its own cell, found by its slot or, when the resolver left it to a
--- name table, by its name ('envLookup'), so the binding and the variable
--- are one value, as @==@ shows of a function.  A constant is a cell of
--- its value.  Anything else is a pending thunk ('mkThunkBc'): a variable
--- only a with supplies among them, since upstream looks in no with until
--- the variable is forced (eval.cc:869-872), and a name no table binds,
--- which fails when the thunk is forced.
+-- @maybeThunk@ makes it (eval.cc).  A variable is its own cell, found by its
+-- slot or, when the resolver left it to a name table, by its name
+-- ('envLookup'), so the binding and the variable are one value, as @==@
+-- shows of a function.  A constant is a cell of its value.  Anything else is
+-- a pending thunk ('mkThunkBc'): a variable only a with supplies among them,
+-- since upstream looks in no with until the variable is forced
+-- (@EvalState::lookupVar@ in eval.cc), and a name no table binds, which
+-- fails when the thunk is forced.
 --
 -- Every slot and name table the variable is read from must be filled: a
 -- frame that is being tied makes its values with 'frameThunkBc'.
@@ -993,7 +995,7 @@ cheapThunkBc = maybeThunkBc OwnSlotsFilled
 -- | 'cheapThunkBc' for a value made in a frame that is being tied
 -- ('tieFrame'), whose own slots are not filled yet: a variable naming one
 -- of them is a thunk of its own, as upstream's @maybeThunk@ makes it for
--- a slot it has not filled (eval.cc:1014-1021 at 2.24.9).  The frame's
+-- a slot it has not filled (@ExprVar::maybeThunk@ in eval.cc).  The frame's
 -- shares then give it the slot's cell where upstream's would have it
 -- ('Nix.Eval.Compile.siblingShares').
 frameThunkBc :: (MonadCData m) => Env -> Word32 -> m Thunk
@@ -1087,7 +1089,7 @@ emptyBcList bcIdx = do
 -- since the lexer joins a run of characters and escapes into one chunk,
 -- and its value is that part's own string in the code, which the cell
 -- points at rather than a copy, as upstream's @ExprString@ hands out the
--- value it holds (@ExprString::maybeThunk@, eval.cc:1024-1028 at 2.24.9).
+-- value it holds (@ExprString::maybeThunk@ in eval.cc).
 --
 -- Upstream draws this line in the parser: a fully literal string folds into
 -- an @ExprString@ carrying a ready-made value, and only a string with
@@ -1412,7 +1414,7 @@ typeOfValue val = case val of
 -- ---------------------------------------------------------------------------
 
 -- | Upstream's @warn@ from its own code rather than an expression, which
--- its logger prefixes @warning:@ (logging.cc:34-37 at 2.24.9).
+-- its logger prefixes @warning:@ (@Logger::warn@ in logging.cc).
 warnMessage :: (MonadEval m) => Text -> m ()
 warnMessage = traceMessage . ("warning: " <>)
 
@@ -1470,8 +1472,8 @@ class (MonadCData m) => MonadEval m where
   -- line is made only on failure.  When making it fails, the action's
   -- failure still escapes, and gains @onFailedLine@ of that failure's
   -- message as its line instead, as upstream rethrows the error it caught
-  -- whatever evaluating its context does (@prim_addErrorContext@,
-  -- primops.cc:1027-1055 at 2.36.0).
+  -- whatever evaluating its context does (@prim_addErrorContext@ in
+  -- primops.cc at 2.36.0).
   addEvaluatedTrace :: (Text -> Text) -> m Text -> m a -> m a
 
   -- | Run an application one call frame deeper, or refuse it with
@@ -1493,7 +1495,7 @@ class (MonadCData m) => MonadEval m where
   -- @"unknown"@ (matching Nix's @builtins.readDir@ semantics), and
   -- 'Nothing' for an entry whose lstat is refused with @EACCES@ or
   -- @EPERM@, which upstream's @readDirectory@ gives no type
-  -- (posix-source-accessor.cc:138-149 at 2.24.9).
+  -- (posix-source-accessor.cc at 2.24.9).
   listDirectory :: Text -> m [(Text, Maybe Text)]
 
   importFile :: Text -> m NixValue
@@ -1594,7 +1596,7 @@ class (MonadCData m) => MonadEval m where
   -- | Whether the session's store already holds the path a pinned fetch
   -- names, admitting it as a fetch result is admitted when it does:
   -- upstream's early exit, which then neither downloads nor writes
-  -- (fetchTree.cc:484-496 at 2.24.9).
+  -- (@fetch@ in fetchTree.cc at 2.24.9).
   pinnedFetchHeld :: StorePath -> m Bool
 
   -- | Record a fetch under that key. Failing to record is not an error -

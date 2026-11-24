@@ -197,8 +197,8 @@ configureDB dir conn = do
     fromString = Query . T.pack
 
 -- | Have a connection wait up to an hour for a peer's lock, as upstream's
--- does (sqlite3_busy_timeout(db, 60 * 60 * 1000), sqlite.cc:78 at
--- 2.28.7), where SQLite's default timeout of zero fails at once with
+-- does (sqlite3_busy_timeout(db, 60 * 60 * 1000) in the @SQLite@ constructor,
+-- sqlite.cc), where SQLite's default timeout of zero fails at once with
 -- ErrorBusy.  The pragma reaches the same API, and writes nothing.
 waitWhileBusy :: Connection -> IO ()
 waitWhileBusy conn = execute_ conn "PRAGMA busy_timeout=3600000"
@@ -216,7 +216,7 @@ waitWhileBusy conn = execute_ conn "PRAGMA busy_timeout=3600000"
 -- immutable open creates neither, and it reads with no locks, so a
 -- concurrent writer can give it wrong answers or corruption errors;
 -- upstream opens immutably only a store it is told is read-only
--- (local-store.cc:499 at 2.34.9).
+-- (@LocalStore::openDB@ in local-store.cc).
 openStoreDBReadOnly :: StoreDir -> IO StoreDB
 openStoreDBReadOnly dir = bracketOnError opened close (\conn -> StoreDB dir conn <$ waitWhileBusy conn)
   where

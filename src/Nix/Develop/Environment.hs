@@ -62,7 +62,7 @@ import Nix.Json (Json (..), parseJson)
 -- ---------------------------------------------------------------------------
 
 -- | What @get-env.sh@ captured from a builder's bash: upstream's
--- @BuildEnvironment@ (develop.cc:41-220).
+-- @BuildEnvironment@ in develop.cc.
 data BuildEnvironment = BuildEnvironment
   { -- | Each variable, by name.
     beVariables :: !(Map Text Variable),
@@ -116,12 +116,12 @@ indexedArrayType = "array"
 associativeArrayType = "associative"
 
 -- | Read a captured environment as upstream's @BuildEnvironment::parseJSON@
--- does (develop.cc:64-97): the document as nlohmann parses it, which
--- refuses one that is not UTF-8, then each variable, each function and
--- the structured attributes' files.  A variable of a kind other than the
--- four is dropped, as upstream drops it: @get-env.sh@ writes
--- @\"unknown\"@ and no value for a readonly, integer or reference
--- variable.
+-- does (with @BuildEnvironment::fromJSON@, in develop.cc): the document as
+-- nlohmann parses it, which refuses one that is not UTF-8, then each
+-- variable, each function and the structured attributes' files.  A variable
+-- of a kind other than the four is dropped, as upstream drops it:
+-- @get-env.sh@ writes @\"unknown\"@ and no value for a readonly, integer or
+-- reference variable.
 --
 -- Upstream takes the document's shape on trust: a member it reads that is
 -- missing is undefined behaviour in nlohmann's lookup, and one of the
@@ -179,7 +179,7 @@ jsonString _ (JsonString s) = Right s
 jsonString what _ = Left (what <> " is not a JSON string")
 
 -- | A captured environment as upstream's @BuildEnvironment::toJSON@ writes
--- it (develop.cc:99-132), which 'parseBuildEnvironment' reads back as the
+-- it (develop.cc), which 'parseBuildEnvironment' reads back as the
 -- same environment.
 buildEnvironmentJson :: BuildEnvironment -> Json
 buildEnvironmentJson env =
@@ -203,8 +203,8 @@ buildEnvironmentJson env =
 -- ---------------------------------------------------------------------------
 
 -- | The variables the script leaves as the shell has them: upstream's
--- @ignoreVars@ (develop.cc:315-332), the build's home, terminal, log
--- descriptor and temporary directories among them.
+-- @ignoreVars@ (a member of @Common@ in develop.cc), the build's home,
+-- terminal, log descriptor and temporary directories among them.
 ignoreVars :: Set Text
 ignoreVars =
   Set.fromList
@@ -226,7 +226,7 @@ ignoreVars =
       "UID"
     ]
 
--- | Upstream's @escapeShellArgAlways@ (@src\/libutil\/util.cc@:216-228):
+-- | Upstream's @escapeShellArgAlways@ (@src\/libutil\/util.cc@):
 -- the bytes in single quotes, each single quote among them closed, escaped
 -- and reopened.  A POSIX shell reads the word back as the same bytes when
 -- they hold no NUL.
@@ -244,7 +244,7 @@ quotedWord s = "'" <> mconcat (intersperse "'\\''" (map BB.byteString (BS.split 
 data ScriptDirectories = ScriptDirectories
   { -- | The directory the shell runs in.  Each output's path becomes
     -- @outputs\/NAME@ under it, upstream's default @outputsDir@
-    -- (develop.cc:352).
+    -- (@Common::makeRcScript@ in develop.cc).
     workingDirectory :: !ByteString,
     -- | A directory the caller made for the structured attributes' files.
     temporaryDirectory :: !ByteString
@@ -272,17 +272,18 @@ data ScriptFile = ScriptFile
   deriving (Eq, Show)
 
 -- | The variables a script saves before setting the environment's and
--- appends again after (develop.cc:357-374): enough of the user's own for
--- the shell to stay usable.
+-- appends again after (@savedVars@ in @Common::makeRcScript@, develop.cc):
+-- enough of the user's own for the shell to stay usable.
 savedVariables :: [BB.Builder]
 savedVariables = ["PATH", "XDG_DATA_DIRS"]
 
 -- | The variables a script points at the fresh directory it makes in
--- place of the build's (develop.cc:376-378), @NIX_BUILD_TOP@ first.
+-- place of the build's (@Common::makeRcScript@ in develop.cc),
+-- @NIX_BUILD_TOP@ first.
 temporaryDirectoryVariables :: [BB.Builder]
 temporaryDirectoryVariables = ["TMP", "TMPDIR", "TEMP", "TEMPDIR"]
 
--- | Upstream's @makeRcScript@ (develop.cc:348-435), as @develop@ and
+-- | Upstream's @makeRcScript@ (develop.cc), as @develop@ and
 -- @print-dev-env@ both run it, with the outputs moved under the working
 -- directory:
 --
@@ -307,8 +308,8 @@ temporaryDirectoryVariables = ["TMP", "TMPDIR", "TEMP", "TEMPDIR"]
 -- Each replacement runs over the whole script, in the byte order of the
 -- paths, and after replacing an occurrence the search resumes where the
 -- replacement starts, as upstream's @rewriteStrings@ does
--- (@src\/libutil\/util.cc@:88-102), so a match the replacement completes
--- with the text after it is replaced too.
+-- (@src\/libutil\/util.cc@), so a match the replacement completes with the
+-- text after it is replaced too.
 --
 -- 'Left' in upstream's words for an environment with no @outputs@, an
 -- output variable that is not a string, and structured attributes whose
@@ -411,7 +412,8 @@ scriptBody env =
     saveVariable name = name <> "=${" <> name <> ":-}\n" <> "nix_saved_" <> name <> "=\"$" <> name <> "\"\n"
     restoreVariable name = name <> "=\"$" <> name <> "${nix_saved_" <> name <> ":+:$nix_saved_" <> name <> "}\"\n"
 
--- | Upstream's @toBash@ for one variable (develop.cc:151-171).
+-- | Upstream's @toBash@ for one variable (@BuildEnvironment::toBash@ in
+-- develop.cc).
 variableLines :: Text -> Variable -> BB.Builder
 variableLines name variable = case variable of
   ShellString s -> assignment s
@@ -424,11 +426,12 @@ variableLines name variable = case variable of
     assignment s = nameBytes <> "=" <> quoted s <> "\n"
     quoted = quotedWord . TE.encodeUtf8
 
--- | Upstream's @toBash@ for one function (develop.cc:173-175).
+-- | Upstream's @toBash@ for one function (@BuildEnvironment::toBash@ in
+-- develop.cc).
 functionLines :: Text -> Text -> BB.Builder
 functionLines name body = TE.encodeUtf8Builder name <> " ()\n{\n" <> TE.encodeUtf8Builder body <> "}\n"
 
--- | Upstream's @rewriteStrings@ (util.cc:88-102): each rewrite in the byte
+-- | Upstream's @rewriteStrings@ (util.cc): each rewrite in the byte
 -- order of the text it replaces, replacing every occurrence, the search
 -- resuming where each replacement starts.  When a replacement holds the
 -- text it replaces, and the script holds that text, upstream's loop never
@@ -482,8 +485,8 @@ data ShellMode
     RunPhase !ByteString
   deriving (Eq, Show)
 
--- | The @bash-prompt@ settings (develop.cc:26-35), each empty when unset,
--- as upstream defaults them.  An empty one writes nothing.
+-- | The @bash-prompt@ settings (@DevelopSettings@ in develop.cc), each empty
+-- when unset, as upstream defaults them.  An empty one writes nothing.
 data Prompt = Prompt
   { -- | @bash-prompt@: the prompt in place of the user's.
     bashPrompt :: !ByteString,
@@ -495,7 +498,7 @@ data Prompt = Prompt
   deriving (Eq, Show)
 
 -- | The rcfile @develop@ starts bash with, as upstream's @CmdDevelop::run@
--- writes it (develop.cc:591-691): the environment script, then a line
+-- writes it (develop.cc): the environment script, then a line
 -- removing the rcfile, then by mode
 --
 -- * 'RunPhase': @foundMakefile=1@ and the phase run through @runPhase@

@@ -270,7 +270,8 @@ offersFor asks = fmap sequence <$> runExceptT (traverse (\(path, ask) -> ExceptT
 -- unavailable, as a path no cache delivers and none failed to counts as one
 -- no cache offered: upstream's derivation fails only when a goal failed
 -- other than for want of a substitute or a reference
--- (@DerivationGoal::outputsSubstitutionTried@, derivation-goal.cc:281).
+-- (@DerivationGoal::outputsSubstitutionTried@ in derivation-goal.cc at
+-- 2.24.9).
 fetchRounds ::
   (Monad m) =>
   SubstEffects s m ->
@@ -370,18 +371,17 @@ referencesFirst effects visited (reference : rest)
 
 -- | The order upstream's worker runs the substitution goals of a batch in:
 -- by key, @a$@ then the path's name, @$@ and the path
--- (@PathSubstitutionGoal::key@, substitution-goal.hh:59-62 at 2.24.9 and
--- :52-55 at 2.34.9; @Worker::run@, worker.cc:318-333).  A @$@ sorts before
--- every character a store path name may hold, so the keys sort as the
--- names do and then as the paths do.
+-- (@PathSubstitutionGoal::key@ in substitution-goal.hh, @Worker::run@ in
+-- worker.cc).  A @$@ sorts before every character a store path name may
+-- hold, so the keys sort as the names do and then as the paths do.
 substitutionOrder :: StorePath -> (Text, StorePath)
 substitutionOrder path = (spName path, path)
 
 -- | Upstream's refusal to substitute a path where nothing may be written,
 -- which its substitution goal throws in a read-only evaluation before it
--- asks any cache (substitution-goal.cc:53-54 at 2.24.9, :40-42 at
--- 2.34.9).  The path is named under the logical store directory, as
--- upstream's @printStorePath@ names it.
+-- asks any cache (@PathSubstitutionGoal::init@ in substitution-goal.cc).
+-- The path is named under the logical store directory, as upstream's
+-- @printStorePath@ names it.
 noWriteAccessMessage :: StorePath -> Text
 noWriteAccessMessage path = "cannot substitute path '" <> storePathToText defaultStoreDir path <> "' - no write access to the Nix store"
 
@@ -436,13 +436,13 @@ allowSubstitutesAttr = "allowSubstitutes"
 environmentTrue :: ByteString
 environmentTrue = "1"
 
--- | Upstream's @ParsedDerivation::getBoolAttr@ at 2.24.9
--- (parsed-derivations.cc:44-62), for the derivation at a @.drv@ path: the
--- default when the derivation lacks the attribute.  In structured
--- attributes it is a JSON Boolean, and any other value there is an error;
--- in the environment only @1@ is true.  Structured attributes that are not
--- a JSON object hold no attribute, as nlohmann's @find@ finds nothing in
--- such a value.
+-- | Upstream's @ParsedDerivation::getBoolAttr@ in parsed-derivations.cc at
+-- 2.24.9 (@getBoolAttr@ in derivation-options.cc at 2.36.0), for the
+-- derivation at a @.drv@ path: the default when the derivation lacks the
+-- attribute.  In structured attributes it is a JSON Boolean, and any other
+-- value there is an error; in the environment only @1@ is true.  Structured
+-- attributes that are not a JSON object hold no attribute, as nlohmann's
+-- @find@ finds nothing in such a value.
 derivationBoolAttr :: StorePath -> Text -> Bool -> DerivationAttrs -> Either Text Bool
 derivationBoolAttr _ name def (AttrsInEnvironment env) =
   Right (maybe def (== environmentTrue) (Map.lookup name env))
@@ -535,10 +535,11 @@ data RealiseFailure
 -- its format string ends in, a check that cannot start as that function's
 -- other error, and a check that found a difference as the error upstream's
 -- @registerOutputs@ raises when neither @keep-failed@ nor @run-diff-hook@
--- is set (local-derivation-goal.cc:2713).  A root the graph does not hold
--- reads as upstream's goal for a derivation it cannot load
--- (@DerivationGoal::loadDerivation@), and an output asked of a derivation
--- that does not have it as upstream's @checkPathValidity@ refuses it.
+-- is set (local-derivation-goal.cc at 2.24.9, derivation-builder-impl.cc at
+-- 2.36.0).  A root the graph does not hold reads as upstream's goal for a
+-- derivation it cannot load (@DerivationGoal::loadDerivation@), and an output
+-- asked of a derivation that does not have it as upstream's
+-- @checkPathValidity@ refuses it.
 --
 -- A @.drv@ is named under the logical store directory, wherever the
 -- store's files live, as upstream's @printStorePath@ names it: a store
@@ -870,7 +871,8 @@ realiseAll settings effects graph realised (request : rest) = do
 -- ---------------------------------------------------------------------------
 
 -- | Why realising several requests stopped, as upstream's
--- @Store::buildPaths@ reports it (entry-points.cc:21-47 at 2.24.9).
+-- @Store::buildPaths@ reports it (entry-points.cc at 2.24.9,
+-- @Worker::buildPaths@ there at 2.36.0).
 data RequestsFailure
   = -- | The call failed with this, reported as it is: a failure that ends
     -- the whole call, as one upstream's goals throw does, or one that ended
@@ -898,10 +900,11 @@ requestsFailureMessage _ (FailedLeaving _ failed others) =
 -- | The exit status of a call that stopped with this failure: the
 -- failure's own ('realiseFailureStatus'), however it is reported.
 -- Upstream gives a failed request's report the status its worker composes
--- from what failed in the call (@Worker::failingExitStatus@,
--- worker.cc:495-513 at 2.24.9), and a call here stops at its first
--- failure, so that is the one failure's.  An error upstream's goals throw
--- keeps its own status, 1 (error.hh:94), which 'realiseFailureStatus'
+-- from what failed in the call (@Worker::failingExitStatus@ in worker.cc
+-- at 2.24.9, @ExitStatusFlags::failingExitStatus@ in build-result.cc at
+-- 2.36.0), and a call here stops at its first failure, so that is the one
+-- failure's.  An error upstream's goals throw keeps its own status, 1
+-- (@ErrorInfo@'s @status@ in error.hh), which 'realiseFailureStatus'
 -- gives each of them.
 requestsFailureStatus :: RequestsFailure -> Int
 requestsFailureStatus (FailedWith failure) = realiseFailureStatus failure
@@ -914,18 +917,18 @@ data FailureReach
     -- its worker left unrealised.
     EndsRequest
   | -- | It ends the call where it arises, as an error upstream's goals
-    -- throw does: its worker does not catch one (@Worker::run@,
-    -- worker.cc:328-331 at 2.24.9), so it leaves @buildPaths@ as it is.
+    -- throw does: its worker does not catch one (@Worker::run@ in
+    -- worker.cc), so it leaves @buildPaths@ as it is.
     EndsCall
 
 -- | How far a failure reaches.  A cache that cannot be asked is rethrown
--- (@PathSubstitutionGoal::init@, substitution-goal.cc:90-94 at 2.24.9),
--- and attributes that cannot be read, an output a derivation does not
--- have and a check of outputs that are not valid are thrown
--- (derivation-goal.cc:197, 249, 1500-1503 and 329-331).  A failed build
--- or check, a failed substitute and a derivation that cannot be loaded end
--- their goal (@buildDone@, :1030-1053; @outputsSubstitutionTried@,
--- :281-285; @loadDerivation@, :166-167).
+-- (@PathSubstitutionGoal::init@ in substitution-goal.cc at 2.24.9), and
+-- attributes that cannot be read, an output a derivation does not have and
+-- a check of outputs that are not valid are thrown (@haveDerivation@,
+-- @checkPathValidity@ and @outputsSubstitutionTried@ of @DerivationGoal@
+-- in derivation-goal.cc at 2.24.9).  A failed build or check, a failed
+-- substitute and a derivation that cannot be loaded end their goal
+-- (@buildDone@, @outputsSubstitutionTried@ and @loadDerivation@ there).
 failureReach :: RealiseFailure -> FailureReach
 failureReach failure = case failure of
   BuildFailed _ -> EndsRequest
@@ -941,40 +944,40 @@ failureReach failure = case failure of
 -- it, with one record of what is realised, so that a derivation is not
 -- realised again for outputs one request, or an input of one, has
 -- already realised.  Upstream's @Store::buildPaths@ makes a goal for each
--- request and runs them with one worker (entry-points.cc:11-19 at
--- 2.24.9), which keeps one goal for a derivation: requests that name the
--- same derivation share it, and it wants every output any of them asks
--- for (@Worker::makeDerivationGoalCommon@, worker.cc:46-61).  Such
+-- request and runs them with one worker (entry-points.cc at 2.24.9),
+-- which keeps one goal for a derivation: requests that name the same
+-- derivation share it, and it wants every output any of them asks for
+-- (@Worker::makeDerivationGoalCommon@ in worker.cc at 2.24.9).  Such
 -- requests are realised here as one request for all those outputs.
 --
 -- Every request is assessed before any is realised, as the worker's first
 -- pass works every goal until it waits for a substitute, an input or a
--- build (worker.cc:319-333): one whose outputs are valid is realised
--- there, and one whose derivation's attributes cannot be read, that asks
--- for an output the derivation does not have, or that has an output that
--- is not valid and an @allowSubstitutes@ that cannot be read stops the
--- call before any substitute or build has finished
--- (@DerivationGoal::haveDerivation@, derivation-goal.cc:193-272).
--- Both passes take the requests in the order upstream's worker takes
--- their goals, by the derivation's name and then its path
--- (@DerivationGoal::key@, derivation-goal.cc:97-104), so a failure two
+-- build (@Worker::run@ in worker.cc): one whose outputs are valid is realised
+-- there, and one whose derivation's attributes cannot be read, that asks for
+-- an output the derivation does not have, or that has an output that is not
+-- valid and an @allowSubstitutes@ that cannot be read stops the call before
+-- any substitute or build has finished (@DerivationGoal::haveDerivation@ in
+-- derivation-goal.cc at 2.24.9).  Both passes take the requests in the order
+-- upstream's worker takes their goals, by the derivation's name and then its
+-- path (@DerivationGoal::key@ in derivation-goal.cc), so a failure two
 -- requests could report is the one upstream's reports.
 --
 -- The first failure stops the call, as a failed goal ends every other
--- unless @keep-going@ is set (@Worker::removeGoal@, worker.cc:162-168),
+-- unless @keep-going@ is set (@Worker::removeGoal@ in worker.cc),
 -- which nova-nix does not offer.  One that upstream's goals throw, such
 -- as a cache that cannot be asked, is reported as it is.  Any other is
 -- reported as it is when every other request was realised, and otherwise
 -- with the request that failed and each after it whose outputs are not
--- valid, which upstream's worker had not finished (entry-points.cc:21-47).
--- That worker runs the goals that wait for substitutes and builds
--- together, so which of them it has finished when one fails depends on
--- how their work interleaves; realising them in turn answers as upstream
--- does when each request's work ends before the next one's begins.
+-- valid, which upstream's worker had not finished (@Store::buildPaths@ in
+-- entry-points.cc at 2.24.9).  That worker runs the goals that wait for
+-- substitutes and builds together, so which of them it has finished when one
+-- fails depends on how their work interleaves; realising them in turn answers
+-- as upstream does when each request's work ends before the next one's
+-- begins.
 --
 -- The requests are realised and never checked, as import from derivation
--- builds its requests under @bmNormal@ (@EvalState::realiseContext@,
--- primops.cc:88): a check is of one derivation, which 'realise' checks
+-- builds its requests under @bmNormal@ (@EvalState::realiseContext@ in
+-- primops.cc): a check is of one derivation, which 'realise' checks
 -- under 'BuildCheck'.  A derivation the graph does not hold has nothing
 -- to realise, as for 'realise', and the graph has to be acyclic.
 realiseRequests ::

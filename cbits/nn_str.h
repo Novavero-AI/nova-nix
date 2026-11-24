@@ -11,11 +11,12 @@
  *
  * Nothing here interns.  Two equal strings made twice are two objects, as
  * upstream copies a string value's bytes for each value it makes
- * (makeImmutableString and Value::mkString, eval.cc:88-96 and :827-850 at
- * 2.24.9).  The symbol table (nn_symbol.h) holds names alone, so a string
- * value never takes a symbol, and never moves the place of a name
- * interned after it.  Upstream hands every empty string the one static
- * "" (makeImmutableString); here every empty string is nn_str_empty().
+ * (makeImmutableString and Value::mkString in eval.cc at 2.24.9, and
+ * StringData::make at 2.36.0).  The symbol table (nn_symbol.h) holds
+ * names alone, so a string value never takes a symbol, and never moves
+ * the place of a name interned after it.  Upstream hands every empty
+ * string the one static "" (makeImmutableString); here every empty string
+ * is nn_str_empty().
  *
  * Strings are made in arenas: blocks a string is bumped from, freed
  * together.  An nn_str_t never moves.  A block can be walked: each string

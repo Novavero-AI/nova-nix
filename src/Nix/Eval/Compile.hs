@@ -249,8 +249,8 @@ compileWith recorder = go
 
     -- \| Emit an instruction whose only operand is a string of the code's:
     -- a URI or a path, each a value upstream's parser makes (an
-    -- @ExprString@ or an @ExprPath@, parser.y:301-309 and :340-357 at
-    -- 2.24.9), not a name it interns.
+    -- @ExprString@ or an @ExprPath@, in the @expr_simple@ and @path_start@
+    -- rules of parser.y), not a name it interns.
     compileTextOp :: Word8 -> Text -> IO Word32
     compileTextOp op text = do
       index <- cbcEmitText text
@@ -278,7 +278,7 @@ compileWith recorder = go
 
     -- \| A literal part's bytes are a string of the code's, which a value
     -- the part makes alone points at, as upstream's @ExprString@ holds
-    -- the value its bytes make (nixexpr.hh:122-129 at 2.24.9).
+    -- the value its bytes make (nixexpr.hh).
     compileOnePart :: StringPart -> IO (Word32, Word32)
     compileOnePart (StrLit bytes) = do
       index <- cbcEmitString bytes
@@ -354,7 +354,7 @@ compileWith recorder = go
 
     -- \| A function and, when its body is a function too, the body under
     -- the same name, as upstream's @ExprLambda::setName@ names the body
-    -- (nixexpr.cc:573-577 at 2.24.9).
+    -- (nixexpr.cc).
     compileLambda :: LambdaName -> Formals -> Expr -> CaptureInfo -> IO Word32
     compileLambda name formals body captureInfo = do
       bodyIdx <- compileNamed name body
@@ -439,11 +439,10 @@ compileWith recorder = go
 
     -- \| A function bound to a static name is named by it, as upstream's
     -- @addAttr@ names the value of an attribute path's last name
-    -- (parser-state.hh:176-177 at 2.24.9).  Upstream names a function
-    -- under a dynamic key too, with the name the key evaluates to, each
-    -- time it evaluates the set (@ExprAttrs::eval@, eval.cc:1271); a
-    -- name the compiler cannot know, so such a function is anonymous
-    -- here.
+    -- (parser-state.hh).  Upstream names a function under a dynamic key too,
+    -- with the name the key evaluates to, each time it evaluates the set
+    -- (@ExprAttrs::eval@ in eval.cc); a name the compiler cannot know, so
+    -- such a function is anonymous here.
     compileOneBinding :: Binding -> IO [Word32]
     compileOneBinding (NamedBinding pos (StaticKey name) expr) = do
       sym <- symbolIntern name
@@ -591,15 +590,15 @@ compileFormalsToEval (FormalNamedSet name formals ellipsis) =
 -- | The slot of a set pattern's frame its first formal fills, the rest
 -- following it: the first, or for a pattern with an \@-pattern the one
 -- after the \@-pattern's name, which upstream's @callFunction@ fills
--- first (eval.cc:1539-1540 at 2.24.9) and the resolver numbers first
+-- first (eval.cc) and the resolver numbers first
 -- ('Nix.Expr.Resolve.lexicalScopeFromFormals').
 setFirstFormalSlot, namedSetFirstFormalSlot :: Int
 setFirstFormalSlot = 0
 namedSetFirstFormalSlot = 1
 
 -- | A formal with its default compiled, its name interned after the
--- default's names, as upstream's parser interns them (parser.y:482-483
--- at 2.24.9).
+-- default's names, as upstream's parser interns them (the @formal@ rule
+-- of parser.y).
 compileOneFormal :: Formal -> IO PendingFormal
 compileOneFormal (Formal name defExpr) = do
   pending <- pendingDefault compileExpr defExpr
@@ -629,15 +628,14 @@ pendingDefault compileDefault (Just defExpr) = CompiledDefault <$> compileDefaul
 
 -- | Formals with their defaults decided, the first formal in the slot
 -- given, as upstream's @callFunction@ fills a set pattern's frame through
--- @maybeThunk@ (eval.cc:1539-1563 at 2.24.9): the @-pattern's slot first,
--- then the formals' in symbol order (@validateFormals@,
--- parser-state.hh:186-189).  A default that is a variable naming the
--- @-pattern, or a formal 'siblingShares' says is filled before its own,
--- shares that slot's cell ('SharedDefault'); one naming a formal filled
--- after its own is a variable of its own ('Default').  Either stays a
--- variable naming the slot it names: which cell a formal's slot holds
--- depends on whether a call's argument holds the formal, so a chain of
--- shared defaults ends where the call finds it.
+-- @maybeThunk@ (eval.cc): the @-pattern's slot first, then the formals'
+-- in symbol order (@validateFormals@ in parser-state.hh).  A default that
+-- is a variable naming the @-pattern, or a formal 'siblingShares' says is
+-- filled before its own, shares that slot's cell ('SharedDefault'); one
+-- naming a formal filled after its own is a variable of its own
+-- ('Default').  Either stays a variable naming the slot it names: which
+-- cell a formal's slot holds depends on whether a call's argument holds the
+-- formal, so a chain of shared defaults ends where the call finds it.
 shareFormalDefaults :: Int -> [PendingFormal] -> IO [EvalFormal]
 shareFormalDefaults firstFormal pending = mapM decide (zip [firstFormal ..] pending)
   where
@@ -844,7 +842,7 @@ bindingNameCounts = foldl' countOne (BcBindingCounts 0 0)
 
 -- | Whether a recursive set's bindings bind 'overridesName' statically,
 -- as upstream looks for it among a recursive set's static attributes, an
--- inherited one included (eval.cc:1205-1206 at 2.24.9).  Its instruction
+-- inherited one included (@ExprAttrs::eval@ in eval.cc).  Its instruction
 -- then holds 'attrsRecOverrides' rather than 'attrsRec'.
 bindsOverrides :: [Binding] -> Bool
 bindsOverrides = any bindsName
@@ -856,14 +854,15 @@ bindsOverrides = any bindsName
       InheritFrom _ inherited -> overridesName `elem` [name | InheritedName _ name <- inherited]
 
 -- | The attribute a recursive set overrides its own attributes with
--- upstream (@sOverrides@, eval.cc:233 at 2.24.9).
+-- upstream (@sOverrides@ in eval.cc at 2.24.9, @StaticEvalSymbols@'s
+-- @overrides@ in eval.hh at 2.36.0).
 overridesName :: Text
 overridesName = "__overrides"
 
 -- | Whether a binding list's values may share the cells of its own names:
 -- a recursive set's and a let's, but not a recursive set's that binds
 -- @__overrides@, whose values upstream makes thunks of their own
--- (eval.cc:1214-1218 at 2.24.9), or a plain set's, which binds no name
+-- (@ExprAttrs::eval@ in eval.cc), or a plain set's, which binds no name
 -- its values read.
 data FrameSharing = SiblingsShare | NothingShares
 
@@ -876,15 +875,15 @@ data SiblingVar k = SiblingVar !Symbol !k !k
 -- share a sibling's cell where upstream's do, each as its binding's key
 -- and the key of the binding whose cell it takes, in the order the frame
 -- fills them.  Upstream fills a frame's slots in symbol order, from an
--- env whose slots start empty (eval-inline.hh:78 at 2.24.9), and
+-- env whose slots start empty (@allocEnv@ in eval-inline.hh), and
 -- @ExprVar::maybeThunk@ binds a variable to its slot's cell when the slot
 -- is filled and to a thunk of its own when it is not
--- (eval.cc:1014-1021).  So a variable shares the cell of a sibling whose
--- name has the lesser symbol, and keeps its own thunk otherwise, as a
--- variable naming its own binding does.  A sibling that shares holds the
--- cell it takes, so each pair names the binding at the end of the chain,
--- whose cell is its own, and the pairs can be copied in any order.
--- @nameOf@ gives the name the binding under a key binds.
+-- (eval.cc).  So a variable shares the cell of a sibling whose name has the
+-- lesser symbol, and keeps its own thunk otherwise, as a variable naming its
+-- own binding does.  A sibling that shares holds the cell it takes, so each
+-- pair names the binding at the end of the chain, whose cell is its own, and
+-- the pairs can be copied in any order.  @nameOf@ gives the name the binding
+-- under a key binds.
 siblingShares :: (Ord k) => (k -> Maybe Symbol) -> [SiblingVar k] -> [(k, k)]
 siblingShares nameOf siblings = reverse shares
   where

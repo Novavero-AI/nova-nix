@@ -25,11 +25,11 @@ import qualified Data.Text as T
 -- nothing.
 --
 -- The base environment's names are those of the default settings:
--- impure, so the two @impureOnly@ constants are there (@addConstant@,
--- eval.cc:466-485 at 2.24.9), which @pure-eval@ leaves out; no
--- experimental feature; no native code.  Interning them under
--- @pure-eval@ as well places those four names before a program's where
--- upstream's interns them with the program.
+-- impure, so the two @impureOnly@ constants are there (@addConstant@ in
+-- eval.cc), which @pure-eval@ leaves out; no experimental feature; no
+-- native code.  Interning them under @pure-eval@ as well places those
+-- four names before a program's where upstream's interns them with the
+-- program.
 startupSymbols :: [Text]
 startupSymbols =
   staticSymbols
@@ -37,9 +37,9 @@ startupSymbols =
     ++ derivationWrapperNames
 
 -- | The symbols @EvalState@'s constructor interns, in the order its
--- members are declared (eval.hh:173-187 at 2.24.9; eval.cc:225-277), the
--- order C++ initializes them in: its @sWith@ to @sOutputSpecified@, then
--- its @exprSymbols@.
+-- members are declared (@EvalState@ in eval.hh and eval.cc at 2.24.9;
+-- @StaticEvalSymbols@ in eval.hh at 2.36.0), the order C++ initializes them
+-- in: its @sWith@ to @sOutputSpecified@, then its @exprSymbols@.
 staticSymbols :: [Text]
 staticSymbols =
   [ "<with>",
@@ -97,14 +97,14 @@ staticSymbols =
 
 -- | What @addConstant@ and @addPrimOp@ intern for a name they install: the
 -- name, then the name less a @__@ prefix, the one @builtins@ holds it
--- under (eval.cc:466-485 and :523-549 at 2.24.9).
+-- under (eval.cc).
 installedNames :: Text -> [Text]
 installedNames name = name : maybeToList (T.stripPrefix "__" name)
 
--- | The names @createBaseEnv@ installs, in order (primops.cc:4598-4873 at
--- 2.24.9): its constants, @__traceVerbose@ and @__nixPath@, whose
--- entries' @path@ and @prefix@ are static symbols; every registered
--- primop not gated on an experimental feature; then @derivation@.
+-- | The names @createBaseEnv@ installs, in order (primops.cc at 2.24.9):
+-- its constants, @__traceVerbose@ and @__nixPath@, whose entries' @path@
+-- and @prefix@ are static symbols; every registered primop not gated on
+-- an experimental feature; then @derivation@.
 --
 -- The primops register as their translation units initialize, each in
 -- the order it defines them: primops.cc, then the files of primops/ in
@@ -138,7 +138,7 @@ baseEnvNames =
     ++ ["fromTOML"]
     ++ ["derivation"]
   where
-    -- primops.cc:249-4580 at 2.24.9.
+    -- The RegisterPrimOp entries of primops.cc at 2.24.9.
     primopsCc =
       [ "scopedImport",
         "import",
@@ -244,12 +244,12 @@ baseEnvNames =
 
 -- | The names upstream's @derivation@ wrapper (primops/derivation.nix at
 -- 2.24.9) brings that nothing above interns, in the order its parser
--- interns them (parser.y:179-483): @strict@ and @drvAttrs@ from its first
--- binding, @commonAttrs@ and @outputsList@ from its second, @x@ from that
--- binding's @x: x.value@, then @outputToAttrListElement@.  Every other
--- name the wrapper reads is a static symbol or one the base environment
--- installs.  @createBaseEnv@ evaluates the file once it has installed
--- everything (primops.cc:4872).  This evaluator's own wrapper
+-- interns them (the grammar actions of parser.y): @strict@ and @drvAttrs@
+-- from its first binding, @commonAttrs@ and @outputsList@ from its second,
+-- @x@ from that binding's @x: x.value@, then @outputToAttrListElement@.
+-- Every other name the wrapper reads is a static symbol or one the base
+-- environment installs.  @createBaseEnv@ evaluates the file once it has
+-- installed everything (primops.cc).  This evaluator's own wrapper
 -- ("Nix.Builtins") names its values with these names, so compiling it
 -- interns none.
 derivationWrapperNames :: [Text]

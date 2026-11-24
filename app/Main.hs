@@ -250,14 +250,14 @@ reportWalkFailure failure = do
 -- | Run a write to stdout, dropping what is left of it once stdout's
 -- reader has gone ('readerGone'), as a write through upstream's
 -- @std::cout@ is dropped: upstream's main thread blocks SIGPIPE
--- (libutil/unix/signals.cc:136-144 at 2.24.9), so the write fails with
--- EPIPE, which only sets the stream's error state, and the command goes on
--- to its own exit status (nix-instantiate.cc:54-62).  A command that
--- writes as it works, as @store delete@ does, still does all of its work.
--- GHC's flush of stdout at exit meets the same failure when the write left
--- bytes in the buffer, and passes it to the finalizer exception handler;
--- this program sets none, and the default ignores it (@flushStdHandles@ in
--- ghc-internal at 9.14.1).
+-- (@unix::startSignalHandlerThread@ in libutil\/unix\/signals.cc), so the
+-- write fails with EPIPE, which only sets the stream's error state, and the
+-- command goes on to its own exit status (@processExpr@ in
+-- nix-instantiate.cc).  A command that writes as it works, as @store delete@
+-- does, still does all of its work.  GHC's flush of stdout at exit meets the
+-- same failure when the write left bytes in the buffer, and passes it to the
+-- finalizer exception handler; this program sets none, and the default
+-- ignores it (@flushStdHandles@ in ghc-internal at 9.14.1).
 toStdout :: IO () -> IO ()
 toStdout = handleJust readerGone pure
 
@@ -287,15 +287,14 @@ versionLine = "nova-nix " <> showVersion version
 
 -- | Canonicalize and read a source file, or the @default.nix@ of a
 -- directory, which upstream's @resolveExprPath@ appends to a path that is
--- one and resolves no further (eval.cc:2983-2985 at 2.24.9), so relative
--- paths in it resolve against the directory.  The canonicalization
--- matters: relative path literals inside the file resolve against the
--- file's directory ('esBaseDir'), and a relative base dir would be
--- re-prefixed on every resolution (doubling it).  An unreadable argument
--- (a missing file, a directory with no @default.nix@, no permission) is a
--- clean CLI error, never an uncaught exception.  Only 'IOException' is
--- caught: an interrupt or any other async exception must abort the run,
--- not print as a read failure.
+-- one and resolves no further (eval.cc), so relative paths in it resolve
+-- against the directory.  The canonicalization matters: relative path
+-- literals inside the file resolve against the file's directory
+-- ('esBaseDir'), and a relative base dir would be re-prefixed on every
+-- resolution (doubling it).  An unreadable argument (a missing file, a
+-- directory with no @default.nix@, no permission) is a clean CLI error, never
+-- an uncaught exception.  Only 'IOException' is caught: an interrupt or any
+-- other async exception must abort the run, not print as a read failure.
 readSourceFile :: FilePath -> IO (FilePath, BS.ByteString)
 readSourceFile rawPath = do
   attempt <- try $ do
@@ -336,7 +335,8 @@ evalPolicyFor opts config =
 
 -- | What @allow-import-from-derivation@ and @trace-import-from-derivation@
 -- say for this run.  Off, by the flag or the configuration, the trace is
--- moot, as upstream's has no effect then (eval-settings.hh:204 at 2.34.9).
+-- moot, as upstream's has no effect then (@traceImportFromDerivation@ in
+-- eval-settings.hh, from 2.34.9).
 importFromDerivationFor :: CliOpts -> NixConfig -> ImportFromDerivation
 importFromDerivationFor opts config
   | optNoAllowImportFromDerivation opts || not (ncAllowImportFromDerivation config) = RefuseImportFromDerivation
@@ -403,12 +403,12 @@ parseForEval :: CliOpts -> NixConfig -> FilePath -> SourceOrigin -> BS.ByteStrin
 parseForEval opts config = parseNixWithScope (rootScopeNames (evalPolicyFor opts config))
 
 -- | Run an action on a target in the evaluation session of one command,
--- in the order upstream's commands take them (nix-instantiate.cc:157-188
--- and nix-build.cc:289-368 at 2.24.9): the session, then the cells
--- @--arg@ and @--argstr@ give ('sessionAutoArgs'), then the target,
--- found, read and parsed.  The action runs with the target's directory
--- as the session's base, and gets the cells and the parsed target.  A
--- failure to find, read or parse is reported and exits.
+-- in the order upstream's commands take them (@main_nix_instantiate@ in
+-- nix-instantiate.cc and @main_nix_build@ in nix-build.cc): the session, then
+-- the cells @--arg@ and @--argstr@ give ('sessionAutoArgs'), then the target,
+-- found, read and parsed.  The action runs with the target's directory as the
+-- session's base, and gets the cells and the parsed target.  A failure to
+-- find, read or parse is reported and exits.
 withTarget :: NixConfig -> CliOpts -> StoreDir -> SessionStore -> FilePath -> Regions -> Target -> (EvalState -> AutoArgs -> ParsedSource -> IO a) -> IO a
 withTarget config opts storeDir store dataDir regions target action = do
   cwd <- getCurrentDirectory
@@ -421,14 +421,14 @@ withTarget config opts storeDir store dataDir regions target action = do
 
 -- | The cells a target's function is called with, made in name order,
 -- each name interned after its expression, as upstream's @getAutoArgs@
--- makes them (common-eval-args.cc:146-168 at 2.24.9).  An @--arg@
--- expression is parsed from the argument's bytes, relative paths against
--- the working directory, before anything else is read, and evaluated in
--- the root environment only when the function uses it; an @--argstr@
--- value is a string of the argument's bytes.  A name is an attribute
--- name, which is text here, so one whose bytes have no UTF-8 reading is
--- refused where upstream keeps the bytes.  Each cell outlives the step
--- that makes it, so it is registered as a root ("Nix.Eval.CRoots").
+-- makes them (common-eval-args.cc).  An @--arg@ expression is parsed from the
+-- argument's bytes, relative paths against the working directory, before
+-- anything else is read, and evaluated in the root environment only when the
+-- function uses it; an @--argstr@ value is a string of the argument's bytes.
+-- A name is an attribute name, which is text here, so one whose bytes have no
+-- UTF-8 reading is refused where upstream keeps the bytes.  Each cell
+-- outlives the step that makes it, so it is registered as a root
+-- ("Nix.Eval.CRoots").
 sessionAutoArgs :: CliOpts -> NixConfig -> FilePath -> EvalState -> IO AutoArgs
 sessionAutoArgs opts config cwd st = do
   prepared <- traverse prepare (Map.toAscList (optAutoArgs opts))
@@ -490,13 +490,14 @@ evalOrExit st action =
 
 -- | Evaluate a target and print its value.  A function is called first
 -- when an argument is given, as @nix-instantiate --eval@ calls it only
--- then (nix-instantiate.cc:47-52 at 2.24.9).  The session is read-only,
--- as @nix-instantiate --eval@'s is ('withReadOnlySession'), unless
--- @--read-write-mode@ asks for a read-write one, as it asks
--- @nix-instantiate@'s (nix-instantiate.cc:154-155): then what evaluation
--- made is added to the store once evaluation succeeds, where upstream
--- adds each object as it makes it.  An evaluation that made nothing adds
--- nothing, so it asks nothing of a store upstream Nix manages.
+-- then (the @--eval@ branch of @processExpr@ in nix-instantiate.cc).  The
+-- session is read-only, as @nix-instantiate --eval@'s is
+-- ('withReadOnlySession'), unless @--read-write-mode@ asks for a read-write
+-- one, as it asks @nix-instantiate@'s (@main_nix_instantiate@ in
+-- nix-instantiate.cc): then what evaluation made is added to the store once
+-- evaluation succeeds, where upstream adds each object as it makes it.  An
+-- evaluation that made nothing adds nothing, so it asks nothing of a store
+-- upstream Nix manages.
 evalCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> IO ()
 evalCommand config opts storeDir dataDir target = do
   regions <- regionsWanted
@@ -614,10 +615,10 @@ writeRegionCensus = do
 -- contents), for diffing nova-nix's serialization against upstream Nix.
 -- A function is called first, whether or not an argument is given, as
 -- @nix-instantiate@ calls one before it writes a derivation
--- (get-drvs.cc:360 at 2.24.9).  The session is read-write, as plain
+-- (@getDerivations@ in get-drvs.cc).  The session is read-write, as plain
 -- @nix-instantiate@'s is, which runs read-only only under @--eval@
--- (nix-instantiate.cc:154-155): what an import from derivation names is
--- added and built.
+-- (@main_nix_instantiate@ in nix-instantiate.cc): what an import from
+-- derivation names is added and built.
 evalAterm :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> IO ()
 evalAterm config opts storeDir dataDir target = do
   buildConfig <- buildConfigFor config opts storeDir
@@ -657,9 +658,9 @@ derivationAttrKeys = ["type", "drvPath", "outputName"]
 -- and the selected value.  A function is called with the command line's
 -- arguments before each component of the path is selected from it, and
 -- once the path has selected it, as @nix-build@ calls one
--- (attr-path.cc:58 and get-drvs.cc:360 at 2.24.9).  The action reads what
--- the command needs out of them: the session's end frees the value.  A
--- failure is reported and exits.
+-- (@findAlongAttrPath@ in attr-path.cc and @getDerivations@ in get-drvs.cc).
+-- The action reads what the command needs out of them: the session's end
+-- frees the value.  A failure is reported and exits.
 evalTarget :: NixConfig -> CliOpts -> StoreDir -> SessionStore -> FilePath -> Target -> Maybe T.Text -> (EvalState -> NixValue -> IO a) -> IO a
 evalTarget config opts storeDir store dataDir target attrPath action =
   withTarget config opts storeDir store dataDir RegionsCollect target $ \st autoArgs parsed -> do
@@ -766,13 +767,13 @@ buildConfigFor config opts storeDir = do
 
 -- | Run an action with a read-only session's store for the store in a
 -- directory, as @nix-instantiate --eval@ runs read-only
--- (nix-instantiate.cc:154-155 at 2.24.9).  Its queries make no store and
--- write no row ('localQueries', beside whose database SQLite can make its
+-- (@main_nix_instantiate@ in nix-instantiate.cc).  Its queries make no store
+-- and write no row ('localQueries', beside whose database SQLite can make its
 -- wal-index files).  The store's operations open it only to add what a
 -- fetcher fetched, as upstream's fetchers add theirs in any mode, or to
--- build: an output a context names is realised by a build that refuses
--- every substitution ('RefuseSubstitution'), which in a store upstream
--- Nix manages opens nothing.
+-- build: an output a context names is realised by a build that refuses every
+-- substitution ('RefuseSubstitution'), which in a store upstream Nix manages
+-- opens nothing.
 withReadOnlySession :: NixConfig -> CliOpts -> StoreDir -> (SessionStore -> IO a) -> IO a
 withReadOnlySession config opts storeDir action = do
   buildConfig <- buildConfigFor config opts storeDir
@@ -822,10 +823,11 @@ trustCommand config opts storeDir dataDir target attrPath = do
 -- there is no build here to choose.  The first fetch that fails stops
 -- the command, as a build stops, and so does the first substitution that
 -- fails, as upstream's goal for substituting a path fails when a
--- substituter fails, whatever @fallback@ says (@PathSubstitutionGoal::init@,
--- substitution-goal.cc:142-159 at 2.24.9): @--fallback@ passes over only
--- a cache that cannot be asked, there (:91-94) and here.  An input no
--- cache holds is one the report names as not read.
+-- substituter fails, whatever @fallback@ says (@PathSubstitutionGoal::init@
+-- in substitution-goal.cc at 2.24.9, @PathSubstitutionGoal::substitute@ at
+-- 2.36.0): @--fallback@ passes over only a cache that cannot be asked, there
+-- (its catch around @queryPathInfo@) and here.  An input no cache holds is
+-- one the report names as not read.
 fetchAndScan :: NixConfig -> CliOpts -> Store -> [(DepNode, StorePath)] -> IO (Map.Map StorePath ContentFacts)
 fetchAndScan config opts store inputs = do
   mapM_ (fetch . fst) fetched
@@ -976,15 +978,18 @@ buildModeFor opts
 -- | How builds are sandboxed on this run: nix.conf's settings under the
 -- sandbox flag, with upstream's defaults where a setting is unset that
 -- take the platform or IO to find.  @sandbox@ is on by default on Linux
--- alone (globals.hh:597-604 at 2.24.9).  @sandbox-paths@ keeps a
--- release archive's bundled shell as @\/bin\/sh@ unless a plain
--- assignment replaces it, as upstream's default names the shell a
--- package was built with (globals.cc:89-91).
--- @require-drop-supplementary-groups@ is on for root (globals.hh:655).
--- @ssl-cert-file@ comes from @NIX_SSL_CERT_FILE@, else @SSL_CERT_FILE@,
--- else the first bundle that exists (globals.cc:76-78 and 267-272).  The
--- helper is beside the executable, as a release archive and a
--- @cabal install@ put it, or in Cabal's install directory.
+-- alone (@sandboxMode@ in globals.hh at 2.24.9, local-settings.hh from
+-- 2.34.9).  @sandbox-paths@ keeps a release archive's bundled shell as
+-- @\/bin\/sh@ unless a plain assignment replaces it, as upstream's default
+-- names the shell a package was built with (the @Settings@ constructor in
+-- globals.cc).  @require-drop-supplementary-groups@ is on for root
+-- (@requireDropSupplementaryGroups@ in globals.hh at 2.24.9,
+-- local-settings.hh from 2.34.9).  @ssl-cert-file@ comes from
+-- @NIX_SSL_CERT_FILE@, else @SSL_CERT_FILE@, else the first bundle that
+-- exists (the @Settings@ constructor and @Settings::getDefaultSSLCertFile@ in
+-- globals.cc at 2.24.9, the @FileTransferSettings@ ones in filetransfer.cc
+-- from 2.34.9).  The helper is beside the executable, as a release archive
+-- and a @cabal install@ put it, or in Cabal's install directory.
 sandboxConfigFor :: NixConfig -> CliOpts -> IO SandboxConfig
 sandboxConfigFor config opts = do
   exeDir <- takeDirectory <$> getExecutablePath
@@ -1061,7 +1066,9 @@ defaultSslCertFile = do
       traverse filePathBytes (listToMaybe present)
 
 -- | Upstream's bundle paths, in the order it tries them
--- (globals.cc:269).
+-- (@Settings::getDefaultSSLCertFile@ in globals.cc at 2.24.9,
+-- @FileTransferSettings::getDefaultSSLCertFile@ in filetransfer.cc from
+-- 2.34.9).
 sslCertFileDefaults :: [FilePath]
 sslCertFileDefaults = ["/etc/ssl/certs/ca-certificates.crt", "/nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt"]
 
@@ -1234,19 +1241,19 @@ checkExecWrappers = Map.traverseWithKey check
 -- ---------------------------------------------------------------------------
 
 -- | Start @bash@ with the build environment of the target's derivation,
--- as @nix develop@ does (@CmdDevelop::run@, develop.cc:587-722 at 2.35.4):
--- capture the environment ('captureEnvironment'), make the script that
--- sets it, refuse what upstream refuses only once it has, in its words
--- and order, write the structured attributes' files and the rcfile, and
--- replace this process with the shell ("Nix.Develop.Shell").  Upstream
--- makes the rcfile, the files' directory and the files before its three
--- refusals (develop.cc:591-595, then :603 and command.cc:392 and 396),
--- and when one is made leaves the rcfile behind, empty; here the
--- directory is removed then, and the rcfile and the files are written
--- only once all three have passed.  The directory is removed too when
--- there are no files to write, where upstream leaves it empty.  The
--- files it holds under structured attributes outlive the shell, as
--- upstream's do, since nothing is left after the exec to remove them.
+-- as @nix develop@ does (@CmdDevelop::run@ in develop.cc): capture the
+-- environment ('captureEnvironment'), make the script that sets it, refuse
+-- what upstream refuses only once it has, in its words and order, write the
+-- structured attributes' files and the rcfile, and replace this process with
+-- the shell ("Nix.Develop.Shell").  Upstream makes the rcfile, the files'
+-- directory and the files before its three refusals (@CmdDevelop::run@, the
+-- last two in @MixEnvironment::setEnviron@ in command.cc), and when one is
+-- made leaves the rcfile behind, empty; here the directory is removed then,
+-- and the rcfile and the files are written only once all three have passed.
+-- The directory is removed too when there are no files to write, where
+-- upstream leaves it empty.  The files it holds under structured attributes
+-- outlive the shell, as upstream's do, since nothing is left after the exec
+-- to remove them.
 developCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> DevelopArgs -> IO ()
 developCommand config opts storeDir dataDir target attrPath args = do
   host <- hostOrRefuse
@@ -1271,10 +1278,10 @@ developCommand config opts storeDir dataDir target attrPath args = do
 
 -- | Print the script that sets the build environment of the target's
 -- derivation, or with @--json@ the environment, as @nix print-dev-env@
--- does (develop.cc:725-757 at 2.35.4).  The script names the structured
+-- does (@CmdPrintDevEnv@ in develop.cc).  The script names the structured
 -- attributes' files in a temporary directory that is removed once it is
--- printed, as upstream removes it.  The script is followed by a newline,
--- as upstream's @writeToStdout@ writes it, and the JSON is printed as
+-- printed, as upstream removes it.  The script is followed by a newline, as
+-- upstream's @writeToStdout@ writes it, and the JSON is printed as
 -- 'printJson' prints it.
 printDevEnvCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> DevEnvFormat -> JsonLayout -> IO ()
 printDevEnvCommand config opts storeDir dataDir target attrPath format layout = do
@@ -1290,7 +1297,8 @@ printDevEnvCommand config opts storeDir dataDir target attrPath format layout = 
         toStdout (BS.putStr (scriptText script <> "\n"))
 
 -- | What upstream names the directories of the structured attributes'
--- files, for @develop@ and for @print-dev-env@ (develop.cc:593 and 753).
+-- files, for @develop@ and for @print-dev-env@ (@CmdDevelop::run@ and
+-- @CmdPrintDevEnv::run@ in develop.cc).
 developDirectoryPrefix, printDirectoryPrefix :: BS.ByteString
 developDirectoryPrefix = "nix-develop"
 printDirectoryPrefix = "nix-dev-env"
@@ -1326,15 +1334,14 @@ bytesHostPath :: BS.ByteString -> IO OsPath
 bytesHostPath path = maybe (failWith ("error: '" <> TE.decodeUtf8Lenient path <> "' is not valid UTF-8, so it names no Windows path")) pure (hostPathFromBytes path)
 
 -- | The build environment of the target's derivation, captured as
--- upstream's @nix develop@ captures it (@getDerivationEnvironment@,
--- develop.cc:233-311 at 2.35.4), and the store path of the output it was
--- read from.  The target is evaluated in a read-write session as @build@
--- evaluates it; the capture of its derivation is made in that session
--- ('recordCapture'), and what the session made is added and every output
--- of the capture realised, as @build@ adds and realises, so its inputs
--- are built or substituted, and a capture already valid is not built
--- again.  A failure stops the command as it stops @build@.  The store
--- has closed by the time this returns.
+-- upstream's @nix develop@ captures it (@getDerivationEnvironment@ in
+-- develop.cc), and the store path of the output it was read from.  The target
+-- is evaluated in a read-write session as @build@ evaluates it; the capture
+-- of its derivation is made in that session ('recordCapture'), and what the
+-- session made is added and every output of the capture realised, as @build@
+-- adds and realises, so its inputs are built or substituted, and a capture
+-- already valid is not built again.  A failure stops the command as it stops
+-- @build@.  The store has closed by the time this returns.
 captureEnvironment :: T.Text -> NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> IO (StorePath, BuildEnvironment)
 captureEnvironment commandName config opts storeDir dataDir target attrPath = do
   upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ((commandName <> ": ") <>))
@@ -1362,8 +1369,8 @@ captureEnvironment commandName config opts storeDir dataDir target attrPath = do
 -- ('captureDerivation'), with @get-env.sh@ written to the store and the
 -- capture's @.drv@ recorded, so that adding what the session made adds
 -- both, as upstream adds the script and writes the capture
--- (develop.cc:241-290 at 2.35.4).  A derivation the capture refuses
--- writes nothing, as upstream refuses its builder before adding the
+-- (@getDerivationEnvironment@ in develop.cc).  A derivation the capture
+-- refuses writes nothing, as upstream refuses its builder before adding the
 -- script.  The input derivations' modulo hashes are the session's, which
 -- evaluating the target computed.
 recordCapture :: BS.ByteString -> StorePath -> T.Text -> Derivation -> EvalIO (Either CaptureFailure DrvFile)
@@ -1391,8 +1398,7 @@ getEnvScriptFile = "develop" </> "get-env.sh"
 
 -- | The environment a built capture holds, and the store path of the
 -- output it is read from: the one 'environmentOutput' picks, read and
--- parsed as upstream's @getBuildEnvironment@ reads it
--- (develop.cc:497-509 at 2.35.4).
+-- parsed as upstream's @getBuildEnvironment@ reads it (develop.cc).
 readEnvironment :: StoreDir -> Derivation -> IO (StorePath, BuildEnvironment)
 readEnvironment storeDir capture = do
   objects <- traverse (\output -> (,) (doName output) <$> outputObject (storePathToFilePath storeDir (doPath output))) (drvOutputs capture)
@@ -1516,9 +1522,9 @@ profileLinkPlace config
 -- | The profile a profile command works on.  The default profile is
 -- resolved first, its directory and its link made when they are missing,
 -- whether or not @--profile@ names another, as upstream's
--- @MixDefaultProfile@ resolves it (command.cc:326-329 at 2.35.4); a
--- profile @--profile@ names is made absolute without reading a link
--- (command.cc:295).
+-- @MixDefaultProfile@ resolves it (command.cc); a profile @--profile@ names
+-- is made absolute without reading a link (@MixProfile::updateProfile@ in
+-- command.cc).
 chosenProfile :: NixConfig -> ProfileSelection -> IO OsPath
 chosenProfile config selection = do
   env <- readProfileEnvironment >>= either failError pure
@@ -1543,9 +1549,9 @@ profileAddCommand config opts storeDir dataDir target attrPath selection priorit
   profile <- chosenProfile config selection
   -- The profile's store and its manifest are checked before anything is
   -- evaluated, as upstream reads the manifest before it builds
-  -- (profile.cc:365-368), so another store's profile, nix-env's, or a
-  -- manifest that cannot be read is refused before a build.  Each
-  -- attempt at the change checks them again.
+  -- (CmdProfileAdd::run in profile.cc), so another store's profile,
+  -- nix-env's, or a manifest that cannot be read is refused before a build.
+  -- Each attempt at the change checks them again.
   checkProfileStore storeDir profile >>= either (failError . profileFailureText storeDir) pure
   readManifest profile >>= either (failError . profileFailureText storeDir) (const (pure ()))
   buildConfig <- buildConfigFor config opts storeDir
@@ -1556,9 +1562,9 @@ profileAddCommand config opts storeDir dataDir target attrPath selection priorit
   either (failError . profileFailureText storeDir) (const (pure ())) outcome
 
 -- | A @--priority@ value: an int, with an optional sign, as upstream reads
--- one (@string2IntWithUnitPrefix@, util.hh:104-127 at 2.35.4), refused in
--- its words otherwise.  Upstream also takes a binary unit suffix and
--- narrows a 64-bit value into an int; neither is taken here.
+-- one (@string2IntWithUnitPrefix@ in util.hh), refused in its words
+-- otherwise.  Upstream also takes a binary unit suffix and narrows a 64-bit
+-- value into an int; neither is taken here.
 priorityValue :: String -> IO Int
 priorityValue raw = maybe (failError ("'" <> T.pack raw <> "' is not an integer")) pure parsed
   where
@@ -1574,9 +1580,9 @@ priorityValue raw = maybe (failError ("'" <> T.pack raw <> "' is not an integer"
 
 -- | The store paths @profile add@ adds: the store path a file argument
 -- leads to, in itself or through its links, when no attribute is selected
--- (upstream's @followLinksToStorePath@, store-api.cc:145-173 at 2.35.4),
--- which must be valid; otherwise the outputs the target's derivation
--- installs ('installedOutputs'), built.
+-- (upstream's @followLinksToStorePath@ in store-api.cc), which must be valid;
+-- otherwise the outputs the target's derivation installs
+-- ('installedOutputs'), built.
 addedPaths :: NixConfig -> CliOpts -> StoreDir -> FilePath -> StoreOps IO -> Target -> Maybe T.Text -> IO (Set.Set StorePath)
 addedPaths config opts storeDir dataDir ops target attrPath = do
   inStore <- case (target, attrPath) of
@@ -1591,7 +1597,7 @@ addedPaths config opts storeDir dataDir ops target attrPath = do
     Nothing -> builtOutputs config opts storeDir dataDir ops target attrPath
 
 -- | How many links 'storePathLedTo' follows before it gives up, as
--- upstream's @followLinksToStore@ does (store-api.cc:149-158 at 2.35.4).
+-- upstream's @followLinksToStore@ does (store-api.cc, from 2.34.9).
 maxLinkFollows :: Int
 maxLinkFollows = 1024
 
@@ -1636,12 +1642,12 @@ builtOutputs config opts storeDir dataDir ops target attrPath = do
   either reportStop (const (pure (Set.fromList paths))) outcome
 
 -- | The outputs @profile add@ installs of a derivation, as upstream's
--- @queryOutputs(false, true)@ chooses them (get-drvs.cc:107-177 at
--- 2.35.4), and @out@ when that chooses none
--- (installable-attr-path.cc:62-68): the output @outputName@ names when
--- @outputSpecified@ is true; else those @meta.outputsToInstall@ names,
--- when it passes upstream's @checkMeta@ (get-drvs.cc:213-242); else every
--- output @outputs@ lists, or @out@ when there is no @outputs@.
+-- @queryOutputs(false, true)@ chooses them (get-drvs.cc), and @out@ when that
+-- chooses none (@InstallableAttrPath::toDerivedPaths@ in
+-- installable-attr-path.cc): the output @outputName@ names when
+-- @outputSpecified@ is true; else those @meta.outputsToInstall@ names, when
+-- it passes upstream's @checkMeta@ (through @queryMeta@ in get-drvs.cc); else
+-- every output @outputs@ lists, or @out@ when there is no @outputs@.
 installedOutputs :: NixValue -> EvalIO (Set.Set T.Text)
 installedOutputs val = case val of
   VAttrs attrs -> do
@@ -1690,10 +1696,9 @@ installedOutputs val = case val of
       VStr bytes _ | Right decoded <- TE.decodeUtf8' bytes -> pure decoded
       other -> throwEvalError ("expected a string but found " <> typeName other <> " while evaluating " <> what)
 
--- | Whether a @meta@ value is one upstream reads (@checkMeta@,
--- get-drvs.cc:213-232 at 2.35.4): an int, a Boolean, a string or a float,
--- or a list of such values, or a set of them that is not a derivation,
--- which has an @outPath@.
+-- | Whether a @meta@ value is one upstream reads (@checkMeta@ in
+-- get-drvs.cc): an int, a Boolean, a string or a float, or a list of such
+-- values, or a set of them that is not a derivation, which has an @outPath@.
 checkMeta :: NixValue -> EvalIO Bool
 checkMeta value = case value of
   VList items -> clistThunks items >>= allChecked . map Thunk
@@ -1724,8 +1729,8 @@ profileRemoveCommand config storeDir selection removals = do
   either (failError . profileFailureText storeDir) (const (pure ())) outcome
   where
     warn = TIO.hPutStrLn stderr . ("warning: " <>)
-    -- Upstream's lines (profile.cc:680-687): each element taken off, then
-    -- the counts.
+    -- Upstream's lines (CmdProfileRemove::run in profile.cc): each element
+    -- taken off, then the counts.
     removing selector manifest@(Manifest elements) = do
       let Selection names warnings = selectElements selector manifest
       mapM_ warn warnings
@@ -1737,13 +1742,13 @@ profileRemoveCommand config storeDir selection removals = do
           TIO.hPutStrLn stderr ("removed " <> T.pack (show (Map.size elements - Map.size kept)) <> " packages, kept " <> T.pack (show (Map.size kept)) <> " packages")
           pure (Changed (Manifest kept))
 
--- | What a @profile remove@ selector matches (profile.cc:597-614 at
--- 2.35.4): a number is refused, as upstream refuses an index, in words of
--- nova-nix's own, since upstream's say it no longer takes one, which
--- describes upstream's history and not nova-nix's; a store path,
--- in the canonical spelling or the store's own, selects the elements
--- holding it; any other word, the element of that name.  A pattern that
--- does not compile is refused before the profile is read.
+-- | What a @profile remove@ selector matches (the @MixProfileElementMatchers@
+-- constructor in profile.cc): a number is refused, as upstream refuses an
+-- index, in words of nova-nix's own, since upstream's say it no longer takes
+-- one, which describes upstream's history and not nova-nix's; a store path,
+-- in the canonical spelling or the store's own, selects the elements holding
+-- it; any other word, the element of that name.  A pattern that does not
+-- compile is refused before the profile is read.
 removalMatcher :: StoreDir -> RemoveMatcher -> IO Matcher
 removalMatcher storeDir removal = case removal of
   RemoveRegex raw -> do
@@ -1756,7 +1761,7 @@ removalMatcher storeDir removal = case removal of
       Nothing -> pure (maybe (MatchName named) MatchStorePath (parseStorePath storeDir named <|> parseStorePath defaultStoreDir named))
   where
     -- Upstream's string2Int<size_t>: digits after an optional '+', within
-    -- 64 bits (util.cc:104-114).
+    -- 64 bits (util.cc).
     indexNumber arg = do
       value <- case arg of
         '+' : digits -> decimal digits
@@ -1785,9 +1790,9 @@ profileListCommand config storeDir selection format = do
     ListText -> toStdout (mapM_ TIO.putStrLn (listLines storeDir manifest))
 
 -- | Print JSON as upstream's @printJSON@ prints it
--- (common-args.cc:99-107 at 2.35.4): indented or on one line as the
--- layout says, by default indented when stdout is a terminal, and
--- followed by a newline, as @writeToStdout@ ends what it writes.
+-- (common-args.cc, from 2.34.9): indented or on one line as the layout says,
+-- by default indented when stdout is a terminal, and followed by a newline,
+-- as @writeToStdout@ ends what it writes.
 printJson :: JsonLayout -> Json -> IO ()
 printJson layout json = do
   indented <- case layout of
@@ -1802,12 +1807,12 @@ ansiBold = "\ESC[1m"
 ansiRed = "\ESC[31;1m"
 ansiNormal = "\ESC[0m"
 
--- | What @profile list@ prints (profile.cc:818-843 at 2.35.4): for each
--- element its name in bold, with @(inactive)@ in red after an inactive
--- one's, its flake's lines for one a flake made, and its paths as the
--- store spells them, with a blank line between elements.  Upstream's
--- logger writes the escapes to stdout whatever stdout is
--- (@Logger::writeToStdout@, logging.cc:48-53).
+-- | What @profile list@ prints (@CmdProfileList::run@ in profile.cc): for
+-- each element its name in bold, with @(inactive)@ in red after an inactive
+-- one's, its flake's lines for one a flake made, and its paths as the store
+-- spells them, with a blank line between elements.  Upstream's logger writes
+-- the escapes to stdout whatever stdout is (@Logger::writeToStdout@ in
+-- logging.cc at 2.35.4).
 listLines :: StoreDir -> Manifest -> [T.Text]
 listLines storeDir (Manifest elements) = intercalate [""] (map elementLines (Map.toAscList elements))
   where
@@ -1824,7 +1829,8 @@ listLines storeDir (Manifest elements) = intercalate [""] (map elementLines (Map
       ]
 
 -- | A profile's failure in words.  A conflict is upstream's, with
--- nova-nix's commands in its hints (profile.cc:443-468 at 2.35.4).
+-- nova-nix's commands in its hints (the @BuildEnvFileConflictError@ handler
+-- of @CmdProfileAdd::run@ in profile.cc).
 profileFailureText :: StoreDir -> ProfileFailure -> T.Text
 profileFailureText storeDir failure = case failure of
   ProfileIOFailed reason -> reason
@@ -1920,12 +1926,12 @@ failSource (UndefinedVariable name) = failWith ("error: " <> undefinedVariableMe
 -- ---------------------------------------------------------------------------
 
 -- | With @--strict@, force everything inside the result before it prints,
--- as nix-instantiate does (nix-instantiate.cc:59 at 2.24.9).  The value
+-- as nix-instantiate does (@processExpr@ in nix-instantiate.cc).  The value
 -- itself is what prints: the IO evaluator keeps each forced value in its
--- cell, where the printer reads it, so a set or list the result holds
--- twice is still one set or list, and prints as repeated the second
--- time.  Without @--strict@, an element or attribute never forced prints
--- as upstream's thunk marker.
+-- cell, where the printer reads it, so a set or list the result holds twice
+-- is still one set or list, and prints as repeated the second time.  Without
+-- @--strict@, an element or attribute never forced prints as upstream's thunk
+-- marker.
 finalize :: Bool -> NixValue -> EvalIO NixValue
 finalize True val = val <$ deepForce val
 finalize False val = pure val

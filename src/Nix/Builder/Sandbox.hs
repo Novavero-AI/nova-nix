@@ -9,7 +9,7 @@
 -- namespaces, and a network namespace of its own unless it is
 -- fixed-output, with a chroot that holds its inputs, as upstream's
 -- @LocalDerivationGoal@ builds one (local-derivation-goal.cc at 2.24.9,
--- cited here as LDG).  The work is split three ways: this module decides
+-- called LDG here).  The work is split three ways: this module decides
 -- and plans; "Nix.Builder.Sandbox.Spawn" makes the chroot's skeleton,
 -- probes the system and runs the helper; and the helper, a C program of
 -- its own, carries the plan out.  The helper's core
@@ -111,7 +111,8 @@ import Text.Read (readMaybe)
 -- Settings
 -- ---------------------------------------------------------------------------
 
--- | Upstream's @sandbox@ setting (globals.hh:597-630 at 2.24.9).
+-- | Upstream's @sandbox@ setting (@sandboxMode@ in globals.hh at 2.24.9,
+-- local-settings.hh from 2.34.9).
 data SandboxMode
   = -- | Every build is sandboxed, and @__noChroot@ is an error.
     SandboxEnabled
@@ -127,7 +128,7 @@ data SandboxMode
 sandboxSettingName :: ByteString
 sandboxSettingName = "sandbox"
 
--- | Upstream's @BaseSetting\<SandboxMode\>::parse@ (globals.cc:282-288):
+-- | Upstream's @BaseSetting\<SandboxMode\>::parse@ (globals.cc):
 -- @true@, @relaxed@ or @false@, and nothing else, not even the other
 -- Boolean spellings.
 parseSandboxMode :: ByteString -> Either Text SandboxMode
@@ -172,10 +173,10 @@ data SandboxPath = SandboxPath
   }
   deriving (Eq, Show)
 
--- | Upstream's reading of @sandbox-paths@ (LDG 624-636): in the set's
--- order, an empty entry skipped, a trailing @?@ making the source
--- optional, and @target=source@ split at the first @=@, a bare path
--- binding itself.  A later entry for a target replaces an earlier one
+-- | Upstream's reading of @sandbox-paths@ (@startBuilder@ in LDG): in the
+-- set's order, an empty entry skipped, a trailing @?@ making the source
+-- optional, and @target=source@ split at the first @=@, a bare path binding
+-- itself.  A later entry for a target replaces an earlier one
 -- ('sandboxPlan').
 parseSandboxPaths :: Set ByteString -> [SandboxPath]
 parseSandboxPaths = concatMap entry . Set.toAscList
@@ -242,19 +243,20 @@ data Network
   deriving (Eq, Show)
 
 -- | A fixed-output derivation reaches the host's network, as upstream's
--- derivation type leaves it unsandboxed (derivations.cc:99-112 and
--- 734-748 at 2.24.9); every other build gets a network of its own
--- (LDG 937-938).  'fixedOutput' is the rule the @impureEnvVars@ carve-out
--- follows too.
+-- derivation type leaves it unsandboxed (@DerivationType::isSandboxed@ and
+-- @BasicDerivation::type@ in derivations.cc at 2.24.9,
+-- @derivation::Type::isSandboxed@ and @derivation::type@ there at 2.36.0);
+-- every other build gets a network of its own (@startBuilder@ in LDG).
+-- 'fixedOutput' is the rule the @impureEnvVars@ carve-out follows too.
 buildNetwork :: Derivation -> Network
 buildNetwork drv = case fixedOutput drv of
   Just _ -> HostNetwork
   Nothing -> PrivateNetwork
 
--- | Upstream's choice of a chroot build (LDG 196-214), for the derivation
--- at a @.drv@ path.  Under @sandbox = true@ every build is sandboxed and a
--- derivation setting @__noChroot@ is refused; under @relaxed@ one that is
--- fixed-output or sets @__noChroot@ is not sandboxed.
+-- | Upstream's choice of a chroot build (@tryLocalBuild@ in LDG), for the
+-- derivation at a @.drv@ path.  Under @sandbox = true@ every build is
+-- sandboxed and a derivation setting @__noChroot@ is refused; under @relaxed@
+-- one that is fixed-output or sets @__noChroot@ is not sandboxed.
 sandboxUse :: SandboxMode -> StorePath -> Derivation -> Either Text SandboxUse
 sandboxUse mode drvPath drv = case mode of
   SandboxDisabled -> Right Unsandboxed
@@ -280,14 +282,16 @@ noChrootAttr = "__noChroot"
 -- ---------------------------------------------------------------------------
 
 -- | The ids a build runs as in its user namespace, which upstream uses
--- when it has no build users (local-derivation-goal.hh:140-141).
+-- when it has no build users (@sandboxUid@ and @sandboxGid@ in
+-- local-derivation-goal.hh at 2.24.9, linux-derivation-builder.cc at
+-- 2.36.0).
 sandboxUid, sandboxGid :: Word32
 sandboxUid = 1000
 sandboxGid = 100
 
 -- | The @HOME@ a sandboxed build is told of, upstream's, which does not
 -- exist, so a program looking for its settings there finds none
--- (LDG 105 and 1142-1148).
+-- (@homeDir@ and @initEnv@ in LDG).
 sandboxHome :: FilePath
 sandboxHome = "/homeless-shelter"
 
@@ -333,7 +337,7 @@ data BindAccess = ReadOnlyBind | ReadWriteBind
 
 -- | Whether the helper resolves a source's symlinks before it binds it, as
 -- upstream's @canonPath(path, true)@ does for the device nodes and host
--- files it adds (LDG 1863-1868).
+-- files it adds (@runChild@ in LDG).
 data SourceResolution = SourceAsGiven | SourceResolved
   deriving (Eq, Show)
 
@@ -365,17 +369,17 @@ data SandboxPlan = SandboxPlan
   deriving (Eq, Show)
 
 -- | The device nodes a build sees when nothing binds @\/dev@ whole
--- (LDG 1823-1838).  @\/dev\/kvm@ joins them upstream only for a store
+-- (@runChild@ in LDG).  @\/dev\/kvm@ joins them upstream only for a store
 -- with the @kvm@ system feature, which nova-nix has no setting for.
 deviceNodes :: [ByteString]
 deviceNodes = ["/dev/full", "/dev/null", "/dev/random", "/dev/tty", "/dev/urandom", "/dev/zero"]
 
 -- | The host files a fixed-output build sees, where they exist
--- (LDG 1853-1855).
+-- (@runChild@ in LDG).
 hostNetworkFiles :: [ByteString]
 hostNetworkFiles = ["/etc/resolv.conf", "/etc/services", "/etc/hosts"]
 
--- | Where a fixed-output build sees the CA bundle (LDG 1857-1860).
+-- | Where a fixed-output build sees the CA bundle (@runChild@ in LDG).
 caBundleTarget :: ByteString
 caBundleTarget = "/etc/ssl/certs/ca-certificates.crt"
 
@@ -384,7 +388,7 @@ devDir :: ByteString
 devDir = "/dev"
 
 -- | The binds of a sandboxed build, built up as upstream builds
--- @pathsInChroot@ (LDG 618-772 and 1820-1868): the @sandbox-paths@
+-- @pathsInChroot@ (@startBuilder@ and @runChild@ in LDG): the @sandbox-paths@
 -- entries, a later one for a target replacing an earlier; the build
 -- directory; the closure of the entries in the store; the input closure;
 -- then no output.  Then, without replacing an entry already there, the
@@ -392,7 +396,7 @@ devDir = "/dev"
 -- build the host's network files and the CA bundle, each optional.
 --
 -- Every host path is bound read-only, the build directory alone writable,
--- where upstream binds them plainly (LDG 402-433): the builder runs as the
+-- where upstream binds them plainly (@doBind@ in LDG): the builder runs as the
 -- invoking user, so a writable bind would let a build change a valid store
 -- path, the bundled shell later builds run, an @--exec-wrapper@ launcher,
 -- or any file of the user's a @sandbox-paths@ entry names.  A bind is
@@ -401,12 +405,12 @@ devDir = "/dev"
 -- one host path the helper binds writable is outside the plan: where the
 -- kernel will not mount a devpts of the sandbox's own, it binds the
 -- host's @\/dev\/pts@ and @\/dev\/ptmx@ instead, as upstream does
--- (LDG 1912-1928).
+-- (@runChild@ in LDG).
 --
 -- A build directory that holds the store directory is upstream's error
--- (LDG 637-640).  A target that is not absolute, or has a @..@ component,
--- is refused, since joined to the chroot's root it names a path outside
--- it; upstream joins its targets as they are (LDG 1887).
+-- (@startBuilder@ in LDG).  A target that is not absolute, or has a @..@
+-- component, is refused, since joined to the chroot's root it names a path
+-- outside it; upstream joins its targets as they are (@runChild@ in LDG).
 sandboxPlan :: PlanInputs -> Either Text SandboxPlan
 sandboxPlan inputs
   | piBuildDirSeen inputs `BS.isPrefixOf` piStoreDir inputs = Left "`sandbox-build-dir` must not contain the storeDir"
@@ -509,12 +513,12 @@ data SkeletonEntry
     SkeletonLink !ByteString !ByteString
   deriving (Eq, Show)
 
--- | Upstream's chroot before the binds (LDG 711-748 and 1018-1022): a
+-- | Upstream's chroot before the binds (@startBuilder@ in LDG): a
 -- writable @\/tmp@, @\/etc@ with the build user's @passwd@ and @group@ and,
 -- for a build with a network of its own, @hosts@, or for a fixed-output
 -- one @nsswitch.conf@; the store directory, writable by its owner and
 -- sticky; @\/proc@; and unless @\/dev@ is bound whole, @\/dev\/shm@,
--- @\/dev\/pts@ and the links into @\/proc\/self\/fd@ (LDG 1823-1837).  A
+-- @\/dev\/pts@ and the links into @\/proc\/self\/fd@ (@runChild@ in LDG).  A
 -- directory above the store directory is created with the default mode.
 -- The helper gives @\/etc@ upstream's mode, 0555, once its binds are in
 -- place.
@@ -543,8 +547,8 @@ chrootSkeleton storeDir buildDirSeen network paths =
     stickyGroupWritable = 0o1775
     plainDir = 0o755
 
--- | Upstream's @\/etc\/passwd@ for a build (LDG 1018-1022), whose home is
--- the build directory as the builder sees it.
+-- | Upstream's @\/etc\/passwd@ for a build (@startBuilder@ in LDG), whose
+-- home is the build directory as the builder sees it.
 passwdFile :: ByteString -> ByteString
 passwdFile home =
   BS.concat
@@ -561,7 +565,7 @@ passwdFile home =
       "nobody:x:65534:65534:Nobody:/:/noshell\n"
     ]
 
--- | Upstream's @\/etc\/group@ for a build (LDG 730-733).
+-- | Upstream's @\/etc\/group@ for a build (@startBuilder@ in LDG).
 groupFile :: ByteString
 groupFile = BS.concat ["root:x:0:\n", "nixbld:!:", BS8.pack (show sandboxGid), ":\n", "nogroup:x:65534:\n"]
 
@@ -737,7 +741,9 @@ data Unavailability
   deriving (Eq, Show)
 
 -- | The cause, in a line.  Upstream logs its probe's at debug level
--- (namespaces.cc:21-91 at 2.24.9); these are its words.
+-- (@userNamespacesSupported@ and @mountAndPidNamespacesSupported@ in
+-- namespaces.cc at 2.24.9, linux-namespaces.cc at 2.36.0); these are its
+-- words.
 unavailabilityCause :: Unavailability -> Text
 unavailabilityCause cause = case cause of
   PlatformUnsupported -> "sandboxing builds is not supported on this platform"
@@ -755,8 +761,8 @@ unavailabilityCause cause = case cause of
     ProbeProcRemount -> "PID namespaces do not work on this system: cannot remount /proc"
 
 -- | Upstream's refusal of a sandboxed build on a system without the
--- namespaces, with @sandbox-fallback@ off (LDG 228-229), or for a cause
--- upstream has no probe for, that cause.
+-- namespaces, with @sandbox-fallback@ off (@tryLocalBuild@ in LDG), or for a
+-- cause upstream has no probe for, that cause.
 unavailableMessage :: Unavailability -> Text
 unavailableMessage cause = case cause of
   ProbeFailed _ -> namespacesUnsupported
@@ -766,18 +772,18 @@ unavailableMessage cause = case cause of
     namespacesUnsupported = "this system does not support the kernel namespaces that are required for sandboxing; use '--no-sandbox' to disable sandboxing"
 
 -- | The one warning a process prints when its builds fall back to running
--- unsandboxed, naming why.  Upstream says nothing there (LDG 225-231),
--- but its root daemon rarely falls back, where nova-nix without one falls
--- back on every stock Ubuntu.
+-- unsandboxed, naming why.  Upstream says nothing there (@tryLocalBuild@ in
+-- LDG), but its root daemon rarely falls back, where nova-nix without one
+-- falls back on every stock Ubuntu.
 fallbackWarning :: Unavailability -> Text
 fallbackWarning cause = "warning: building without a sandbox, since " <> unavailabilityCause cause
 
 -- | A failed setup step: the words of the @SysError@ upstream's
 -- @startBuilder@ or @runChild@ throws for the step (LDG), with errno's
 -- text after them, behind the line of context upstream adds to a failure
--- from the child (LDG 1075).  Upstream prints that context as a trace line
--- and then the error after an @error:@ of its own; here the two are one
--- line.  The plan names the bind an index points at and the host
+-- from the child (@startBuilder@ in LDG).  Upstream prints that context as a
+-- trace line and then the error after an @error:@ of its own; here the two
+-- are one line.  The plan names the bind an index points at and the host
 -- directory bound as the build directory, and the program is the one the
 -- helper executes.
 setupFailureMessage :: SandboxPlan -> ByteString -> StatusRecord SetupStage -> Text
@@ -828,7 +834,8 @@ setupFailureMessage plan program record =
   where
     sys message = message <> errnoSuffix (recordErrno record)
     bind = recordIndex record >>= \index -> lookup index (zip [0 ..] (planBinds plan))
-    -- Upstream names the build directory on the host there (LDG 1986).
+    -- Upstream names the build directory on the host there (@runChild@ in
+    -- LDG).
     hostBuildDir = maybe (planBuildDir plan) bindSource (find ((== planBuildDir plan) . bindTarget) (planBinds plan))
     procFile name = "/proc/" <> maybe "" (T.pack . show) (recordIndex record) <> "/" <> name
     inRoot path = shown (planRoot plan <> path)

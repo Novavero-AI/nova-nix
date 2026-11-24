@@ -1,8 +1,8 @@
 {-# LANGUAGE CPP #-}
 
 -- | The shell @nova-nix develop@ starts, as upstream Nix 2.35.4's
--- @CmdDevelop::run@ starts it (@src\/nix\/develop.cc@:587-722) through
--- @execProgramInStore@ (@src\/nix\/run.cc@:38-107).
+-- @CmdDevelop::run@ starts it (@src\/nix\/develop.cc@) through
+-- @execProgramInStore@ (@src\/nix\/run.cc@).
 --
 -- What the shell runs, its arguments and the environment it starts with
 -- are pure: 'shellModeFor', 'shellArguments' and 'shellEnvironment', each
@@ -73,10 +73,9 @@ import Text.Read (readMaybe)
 
 -- | What the shell does once the environment is set, from the words
 -- @--command@ took and the phase the phase flags named last, as
--- upstream's @CmdDevelop::run@ decides it (develop.cc:602-637): the
--- phase, the command, or else an interactive shell with the prompt
--- settings.  Upstream refuses the two together once the environment is
--- built, in these words.
+-- upstream's @CmdDevelop::run@ decides it (develop.cc): the phase, the
+-- command, or else an interactive shell with the prompt settings.  Upstream
+-- refuses the two together once the environment is built, in these words.
 shellModeFor :: Maybe (NonEmpty ByteString) -> Maybe ByteString -> Prompt -> Either Text ShellMode
 shellModeFor command phase prompt = case (command, phase) of
   (Just _, Just _) -> Left "you cannot use both '--command' and '--phase'"
@@ -85,16 +84,16 @@ shellModeFor command phase prompt = case (command, phase) of
   (Nothing, Nothing) -> Right (Interactive prompt)
 
 -- | The shell upstream starts when @nixpkgs#bashInteractive@ does not
--- resolve, as it cannot without flakes (develop.cc:643-682): @bash@,
--- found on the @PATH@ of the environment the shell starts with.  It is
--- also what @SHELL@ holds.
+-- resolve, as it cannot without flakes (@CmdDevelop::run@ in develop.cc):
+-- @bash@, found on the @PATH@ of the environment the shell starts with.  It
+-- is also what @SHELL@ holds.
 bashProgram :: ByteString
 bashProgram = "bash"
 
--- | The shell's arguments after its name (develop.cc:697-700): the rcfile
--- alone for a command or a phase, which bash then runs as a script, so
--- that an interrupt ends it rather than leaving an interactive shell
--- behind; @--rcfile@ and the rcfile for an interactive shell.
+-- | The shell's arguments after its name (@CmdDevelop::run@ in develop.cc):
+-- the rcfile alone for a command or a phase, which bash then runs as a
+-- script, so that an interrupt ends it rather than leaving an interactive
+-- shell behind; @--rcfile@ and the rcfile for an interactive shell.
 shellArguments :: ShellMode -> ByteString -> [ByteString]
 shellArguments mode rcfile = case mode of
   Interactive _ -> ["--rcfile", rcfile]
@@ -114,8 +113,8 @@ data EnvironmentBase
   deriving (Eq, Show)
 
 -- | How the command line changes the shell's environment, upstream's
--- @MixEnvironment@ (@src\/libcmd\/command.cc@:333-388 at 2.35.4).  A
--- variable is named by its bytes.
+-- @MixEnvironment@ (its constructor in @src\/libcmd\/command.cc@, from
+-- 2.34.9).  A variable is named by its bytes.
 data EnvironmentChanges = EnvironmentChanges
   { -- | Where it starts: @--ignore-env@.
     ecBase :: !EnvironmentBase,
@@ -131,13 +130,12 @@ data EnvironmentChanges = EnvironmentChanges
 
 -- | The environment the shell starts with, given the store path of the
 -- environment the capture built and the caller's environment: upstream's
--- @setEnviron@ (command.cc:390-412), the variables @--set-env-var@ sets
--- replacing the caller's and those @--unset-env-var@ names removed after,
--- then @NIX_GCROOT@ naming the store path and @SHELL@ the shell, whatever
--- the flags said of either (develop.cc:639-686).  Upstream replaces the
--- process's environment through @setenv@, which refuses a name that is
--- empty or holds @=@, and goes on without it; such a name is left out
--- here.
+-- @setEnviron@ (command.cc), the variables @--set-env-var@ sets replacing the
+-- caller's and those @--unset-env-var@ names removed after, then @NIX_GCROOT@
+-- naming the store path and @SHELL@ the shell, whatever the flags said of
+-- either (@CmdDevelop::run@ in develop.cc).  Upstream replaces the process's
+-- environment through @setenv@, which refuses a name that is empty or holds
+-- @=@, and goes on without it; such a name is left out here.
 --
 -- 'Left' in upstream's words for @--unset-env-var@ under
 -- @--ignore-env@, and for @--keep-env-var@ without it.
@@ -158,7 +156,8 @@ shellEnvironment changes gcroot caller = case ecBase changes of
 
 -- | The variable naming the environment's store path, which upstream's
 -- collector on Linux keeps while a process's environment holds it
--- (@src\/libstore\/local-gc.cc@:105-111 at 2.35.4).
+-- (@findRuntimeRootsUnchecked@ in @src\/libstore\/local-gc.cc@ from 2.34.9,
+-- @LocalStore::findRuntimeRoots@ in gc.cc at 2.24.9).
 gcrootVariable :: ByteString
 gcrootVariable = "NIX_GCROOT"
 
@@ -177,14 +176,14 @@ shellVariable = "SHELL"
 data DevelopHost = DevelopHost
   { -- | Make a fresh directory @PREFIX-PID-N@, mode 0755 less the umask,
     -- in the temporary root with its links resolved, as upstream's
-    -- @createTempDir@ makes one (@src\/libutil\/file-system.cc@:443-473
-    -- and 540-547 at 2.35.4), @N@ counting up from a random number past
-    -- each name that exists, and give its path's bytes.
+    -- @createTempDir@ makes one (with @makeTempPath@, in
+    -- @src\/libutil\/file-system.cc@ from 2.34.9), @N@ counting up from a
+    -- random number past each name that exists, and give its path's bytes.
     makeTemporaryDirectory :: !(ByteString -> IO ByteString),
     -- | Make a fresh file @nix-shell.XXXXXX@ in the temporary root, mode
     -- 0600, as upstream's @createTempFile@ makes the rcfile
-    -- (file-system.cc:518-538), write to it what the function makes of
-    -- its path, close it and give the path's bytes.
+    -- (file-system.cc), write to it what the function makes of its path,
+    -- close it and give the path's bytes.
     createRcfile :: !((ByteString -> ByteString) -> IO ByteString),
     -- | The process's environment, as upstream's @getEnv@ reads it: an
     -- entry without @=@ is passed over, and of two entries with one name
@@ -203,8 +202,9 @@ developHost = Left "develop and print-dev-env do not run on Windows yet"
 #else
 developHost = Right (DevelopHost posixTemporaryDirectory posixRcfile posixEnvironment posixReplace)
 
--- | Upstream's @defaultTempDir@ (@src\/libutil\/unix\/file-system.cc@:76-79
--- at 2.35.4): @TMPDIR@ when it is set and not empty, else @\/tmp@.
+-- | Upstream's @defaultTempDir@ (@src\/libutil\/unix\/file-system.cc@ from
+-- 2.34.9, file-system.cc at 2.24.9): @TMPDIR@ when it is set and not empty,
+-- else @\/tmp@.
 temporaryRoot :: IO ByteString
 temporaryRoot = fromMaybe "/tmp" . (>>= nonEmpty) <$> PosixEnv.getEnv "TMPDIR"
   where
@@ -253,23 +253,23 @@ posixEnvironment = Map.fromListWith (\_ earlier -> earlier) . concatMap entry <$
 
 -- | 'replaceProcess': the standard handles flushed, every variable unset
 -- and the new ones set, as upstream's @replaceEnv@ does
--- (@src\/libutil\/environment-variables.cc@:29-40 at 2.35.4), every
--- other descriptor marked close-on-exec ('closeOnExec'), then @execvp@,
--- which finds the shell on the new environment's @PATH@, as upstream's
--- does (run.cc:99-104).  unix's @executeFile@ with no environment is that
--- call; given one it is @execvpe@, which searches the old @PATH@.  An
--- entry @unsetenv@ refuses, one with an empty name, stays, as upstream
--- goes on past the refusal.
+-- (with @clearEnv@, in @src\/libutil\/environment-variables.cc@), every other
+-- descriptor marked close-on-exec ('closeOnExec'), then @execvp@, which finds
+-- the shell on the new environment's @PATH@, as upstream's does
+-- (@execProgramInStore@ in run.cc).  unix's @executeFile@ with no environment
+-- is that call; given one it is @execvpe@, which searches the old @PATH@.  An
+-- entry @unsetenv@ refuses, one with an empty name, stays, as upstream goes
+-- on past the refusal.
 --
 -- GHC's runtime installs its own handlers for SIGINT, SIGPIPE, SIGQUIT
 -- and SIGTSTP at start, whatever the process inherited, an ignored
--- signal included (@initDefaultHandlers@ and @set_sigtstp_action@,
--- rts\/posix\/Signals.c:627-749 at 9.14.1), and the exec resets a handled
+-- signal included (@initDefaultHandlers@ and @set_sigtstp_action@ in
+-- rts\/posix\/Signals.c at 9.14.1), and the exec resets a handled
 -- signal to its default.  So the shell starts with those four at their
 -- defaults even where nova-nix was started with one ignored.  Upstream
 -- leaves them as it found them on Linux, so an ignored one stays ignored
 -- in its shell, and sets SIGINT, SIGPIPE and SIGQUIT to their defaults on
--- macOS (@src\/libmain\/shared.cc@:203-214 at 2.35.4).
+-- macOS (@initNix@ in @src\/libmain\/shared.cc@ at 2.35.4).
 posixReplace :: [ByteString] -> Map ByteString ByteString -> IO Void
 posixReplace arguments variables = do
   hFlush stdout

@@ -138,7 +138,7 @@ isCanonicalStoreText txt = case T.stripPrefix defaultStoreDirText txt of
 -- | Whether path text names something in the canonical store dir, as
 -- upstream's @isInStore@ asks: the store dir followed by a separator and
 -- at least one more character, so not the store dir itself
--- (@isInDir@, file-system.cc:151-157 at 2.24.9).
+-- (@isInDir@ in file-system.cc).
 isInStoreText :: Text -> Bool
 isInStoreText txt = case T.stripPrefix defaultStoreDirText txt >>= T.uncons of
   Just (separator, rest) -> (separator == '/' || separator == '\\') && not (T.null rest)

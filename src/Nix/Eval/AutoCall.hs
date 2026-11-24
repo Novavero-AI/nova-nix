@@ -2,7 +2,7 @@
 
 -- | Calling the function a command line's target evaluates to, with the
 -- values @--arg@ and @--argstr@ give: upstream's @autoCallFunction@
--- (eval.cc:1767-1814 at 2.24.9).
+-- (eval.cc).
 --
 -- Only a function with a set pattern is called.  One with an ellipsis is
 -- passed every argument; any other is passed the arguments its formals
@@ -59,13 +59,13 @@ autoCallFunction args fun = case fun of
       argSet <- attrSetFromMap SetRoot passed
       evaluated (VAttrs argSet) >>= deferApply fun >>= force
     -- Upstream walks the formals in symbol order and fails at the first
-    -- it cannot fill (eval.cc:1798-1810).
+    -- it cannot fill (autoCallFunction in eval.cc).
     taken formals = case [efName formal | formal <- formals, not (Map.member (symbolText (efName formal)) args), not (hasDefault (efDefault formal))] of
       [] -> pure (Map.restrictKeys args (Set.fromList (map (symbolText . efName) formals)))
       missing : more -> throwEvalError (missingArgumentMessage (symbolText (minimum (missing :| more))))
 
 -- | Upstream's @MissingArgumentError@ for a formal no argument or default
--- fills (eval.cc:1803-1807 at 2.24.9).
+-- fills (@autoCallFunction@ in eval.cc at 2.24.9).
 missingArgumentMessage :: Text -> Text
 missingArgumentMessage name =
   T.intercalate

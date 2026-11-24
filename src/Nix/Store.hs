@@ -159,11 +159,10 @@ import System.Posix.Types (Fd)
 #endif
 
 -- | Give the process upstream's file-creation mask, 0022, as every
--- upstream command does (@initNix@, shared.cc:172-175 at 2.24.9): what it
--- writes, and what a builder it starts writes, is then readable by
--- everybody and writable by its owner alone, so no build's output is
--- refused as one others could have changed (@registerOutputs@).  Windows
--- has no such mask.
+-- upstream command does (@initNix@ in shared.cc): what it writes, and what a
+-- builder it starts writes, is then readable by everybody and writable by its
+-- owner alone, so no build's output is refused as one others could have
+-- changed (@registerOutputs@).  Windows has no such mask.
 useStoreFileMask :: IO ()
 #if defined(mingw32_HOST_OS)
 useStoreFileMask = pure ()
@@ -272,15 +271,14 @@ registrationFor store sp deriver refs = do
       }
 
 -- | Move a file or directory, by a rename, as upstream's @movePath@
--- does (local-derivation-goal.cc:276-293 at 2.24.9): a directory its
--- owner may not write, as a canonical one is, is given owner write for
--- the rename, which needs it to change the directory's @..@, and its mode
--- back after.  A rename that fails fails the move, so a tree keeps its
--- inodes and hard links, except across volumes, where the move copies
--- and removes ('copyPathInto', which keeps symlinks as symlinks: a
--- dereferencing copy would make the stored bytes, and the NAR hash a
--- cache signs, depend on where the source was).  On Windows every
--- failure copies.
+-- does (local-derivation-goal.cc at 2.24.9, unix\/file-system.cc at 2.36.0):
+-- a directory its owner may not write, as a canonical one is, is given owner
+-- write for the rename, which needs it to change the directory's @..@, and
+-- its mode back after.  A rename that fails fails the move, so a tree keeps
+-- its inodes and hard links, except across volumes, where the move copies and
+-- removes ('copyPathInto', which keeps symlinks as symlinks: a dereferencing
+-- copy would make the stored bytes, and the NAR hash a cache signs, depend on
+-- where the source was).  On Windows every failure copies.
 moveOutput :: FilePath -> FilePath -> IO ()
 moveOutput src dest
   -- A build writes into its own output path, so the usual case is a move
@@ -426,12 +424,13 @@ writeWhole fd bytes
 #endif
 
 -- | Replace a node with a fresh copy of itself, as upstream replaces a
--- fixed-output output before it hashes one (local-derivation-goal.cc:
--- 2594-2600 at 2.24.9): a descriptor the builder passed out of its build
--- names the old inode, which the copy leaves behind, so nothing written
--- through it reaches what is registered.  The copy is made beside the
--- node ('freshCopyPath'), then renamed over it, and removed should the
--- replacement fail.
+-- fixed-output output before it hashes one (the @CAFixed@ case of
+-- @registerOutputs@ in local-derivation-goal.cc at 2.24.9,
+-- @moveOutputToTempDir@ in derivation-builder-impl.cc at 2.36.0): a
+-- descriptor the builder passed out of its build names the old inode, which
+-- the copy leaves behind, so nothing written through it reaches what is
+-- registered.  The copy is made beside the node ('freshCopyPath'), then
+-- renamed over it, and removed should the replacement fail.
 replaceWithCopy :: FilePath -> IO ()
 replaceWithCopy path = do
   let copy = freshCopyPath path
@@ -533,13 +532,12 @@ foldlIO z (x : xs) f = do
 -- | Write an already-serialized derivation ATerm to its store path and make
 -- its metadata canonical ('canonicalizeMetadata'), as upstream's
 -- @writeDerivation@ adds a @.drv@ through @addToStoreFromDump@
--- (derivations.cc:137-157 and local-store.cc:1342 at 2.24.9).  Used to
--- materialize the input @.drv@ closure (root plus every transitive input)
--- before a dependency-aware build: evaluation computes these ATerms but does
--- no store IO, so the build driver writes them here.  A file that already
--- holds exactly these bytes is kept as it is, read-only from the write that
--- made it; one holding anything else, which an interrupted write can leave,
--- is replaced.
+-- (derivations.cc and local-store.cc).  Used to materialize the input @.drv@
+-- closure (root plus every transitive input) before a dependency-aware build:
+-- evaluation computes these ATerms but does no store IO, so the build driver
+-- writes them here.  A file that already holds exactly these bytes is kept as
+-- it is, read-only from the write that made it; one holding anything else,
+-- which an interrupted write can leave, is replaced.
 writeDrvAterm :: Store -> StorePath -> BS.ByteString -> IO ()
 writeDrvAterm store sp aterm = do
   let destPath = storePathToFilePath (stDir store) sp
@@ -1275,15 +1273,15 @@ materializeEvalStoreWrites store storeWrites = do
 -- name and the store paths it references make ('makeSourcePath'), and
 -- answer the path: upstream's @addToStore@ of a dump under @NixArchive@
 -- and SHA-256 with those references, which @nix profile@ adds each
--- generation by (profile.cc:255-278 at 2.35.4).  A valid path is passed
--- over.  Otherwise, under the path's lock, what is at the path is
+-- generation by (@ProfileManifest::build@ in profile.cc).  A valid path is
+-- passed over.  Otherwise, under the path's lock, what is at the path is
 -- cleared, the NAR is unpacked there as a substituted one is
--- ('unpackNarEntry') and its metadata made canonical, and it is
--- registered only once it serialises back to the NAR it came from, since
--- the volume decides the final spelling of every name; a tree that does
--- not is removed and refused.  The references must be valid.  A store
--- upstream Nix's database may also manage is refused before anything is
--- looked at ("Nix.Store.Upstream").
+-- ('unpackNarEntry') and its metadata made canonical, and it is registered
+-- only once it serialises back to the NAR it came from, since the volume
+-- decides the final spelling of every name; a tree that does not is removed
+-- and refused.  The references must be valid.  A store upstream Nix's
+-- database may also manage is refused before anything is looked at
+-- ("Nix.Store.Upstream").
 addSourceTree :: Store -> Text -> Set StorePath -> NAR.NarEntry -> IO (Either Text StorePath)
 addSourceTree store name refs entry =
   case makeSourcePath name (sha256Digest nar) refs of

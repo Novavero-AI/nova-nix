@@ -18,11 +18,11 @@
  * A set nn_attrset_update makes can be a layer: its own arrays hold the
  * right operand's entries, and it sits on the left operand, its base,
  * which it binds the rest of, as upstream 2.34's Bindings layer on one
- * another (attr-set.hh:56-112 at 2.34.9).  A lookup searches the layers
- * top first, and the set binds each name once, to its topmost entry, in
- * symbol order.  A set's size counts every name it binds; the functions
- * that take an index read a flat set alone, one with no base, as a name
- * table always is.
+ * another (attr-set.hh).  A lookup searches the layers top first, and
+ * the set binds each name once, to its topmost entry, in symbol order.
+ * A set's size counts every name it binds; the functions that take an
+ * index read a flat set alone, one with no base, as a name table always
+ * is.
  *
  * Values are the nn_thunk_t * of each attribute, or NULL in a frame's
  * name table until the frame fills it.  The set never dereferences them;
@@ -44,8 +44,8 @@
  * One set is not allocated: nn_attrset_empty, the set with no entries
  * the evaluator gives wherever upstream gives its one emptyBindings,
  * which its allocBindings hands out for a capacity of 0
- * (attr-set.cc:14-17 at 2.24.9).  The constructors here make a new set
- * whenever they are called.
+ * (attr-set.cc).  The constructors here make a new set whenever they are
+ * called.
  *
  * Counts and indices are uint32_t.  A set holds at most
  * NN_ATTRSET_MAX_ENTRIES entries, the ceiling upstream's Bindings has
@@ -74,13 +74,14 @@ typedef struct nn_attrset nn_attrset_t;
 #define NN_ATTRSET_NOT_FOUND UINT32_MAX
 
 /* The most sets one chain of layers holds, the set and its bases,
- * upstream's Bindings::maxLayers (attr-set.hh:117 at 2.34.9). */
+ * upstream's Bindings::maxLayers (attr-set.hh at 2.34.9). */
 #define NN_ATTRSET_MAX_LAYERS 8u
 
 /* The most entries a right operand of nn_attrset_update has for the
  * result to be a layer on the left: upstream's default for
- * eval-attrset-update-layer-rhs-threshold (eval-settings.hh:451-453 at
- * 2.34.9), which is larger where a pointer takes 4 bytes. */
+ * eval-attrset-update-layer-rhs-threshold (bindingsUpdateLayerRhsSizeThreshold
+ * in eval-settings.hh at 2.34.9), which is larger where a pointer takes 4
+ * bytes. */
 #define NN_ATTRSET_LAYER_RHS_MAX (sizeof(void *) == 4 ? 8192u : 16u)
 
 /* --- Lifecycle --- */
@@ -185,7 +186,7 @@ nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b,
                                uint32_t site);
 
 /* `a // b` at `site`, as upstream's ExprOpUpdate::eval makes it
- * (eval.cc:1916-1989 at 2.34.9): while a's chain holds fewer than
+ * (eval.cc at 2.34.9): while a's chain holds fewer than
  * NN_ATTRSET_MAX_LAYERS sets and b at most NN_ATTRSET_LAYER_RHS_MAX
  * entries, a layer on `a` holding b's entries, else the set
  * nn_attrset_union makes.  While the census counts sites (nn_stats.h),

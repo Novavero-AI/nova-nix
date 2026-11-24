@@ -86,8 +86,8 @@ parseAttrPath path = go path T.empty []
 -- | Follow an attribute path into an evaluated value, forcing each step.
 -- Before each component, the value it indexes is passed through @call@,
 -- as upstream's @findAlongAttrPath@ calls it with the command line's
--- arguments (attr-path.cc:56-60 at 2.24.9, "Nix.Eval.AutoCall"); a
--- caller with nothing to call passes 'pure'.
+-- arguments (attr-path.cc, "Nix.Eval.AutoCall"); a caller with nothing to
+-- call passes 'pure'.
 --
 -- Only the components named are forced: selecting one attribute leaves its
 -- siblings as thunks, so naming one package does not evaluate the rest of

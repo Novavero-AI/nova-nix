@@ -18,11 +18,12 @@
  *
  * The probe checks that this system lets an unprivileged process make the
  * namespaces, as upstream's userNamespacesSupported and
- * mountAndPidNamespacesSupported do (namespaces.cc:16-98 at Nix 2.24.9).
+ * mountAndPidNamespacesSupported do (namespaces.cc at Nix 2.24.9,
+ * linux-namespaces.cc at 2.36.0).
  *
  * The steps follow upstream's LocalDerivationGoal::startBuilder and
- * runChild (local-derivation-goal.cc at 2.24.9), which this file cites by
- * line as LDG.
+ * runChild (local-derivation-goal.cc at 2.24.9, which this file calls LDG;
+ * chroot-derivation-builder.cc and linux-derivation-builder.cc at 2.36.0).
  */
 
 #define _GNU_SOURCE
@@ -88,12 +89,13 @@ struct mount_setattr_attributes {
 #define PROBE_PRIVATE_FAILED 1
 #define PROBE_PROC_FAILED 2
 
-/* The hostname and domain name a build sees (LDG 1781-1786).  Upstream
+/* The hostname and domain name a build sees (runChild in LDG).  Upstream
  * passes sizeof, so the kernel holds the terminating NUL too. */
 static const char sandbox_hostname[] = "localhost";
 static const char sandbox_domainname[] = "(none)";
 
-/* What a devpts instance of the sandbox's own is mounted with (LDG 1916). */
+/* What a devpts instance of the sandbox's own is mounted with (runChild in
+ * LDG). */
 static const char devpts_options[] = "newinstance,mode=0620";
 
 /* The mount table of the process reading it. */
@@ -434,7 +436,7 @@ static int enter_directory(int parent, const char *name)
  * without following a link, so a target whose path crosses one, such as
  * the skeleton's /dev/fd or a link an earlier entry copied in, fails with
  * ELOOP where joining it to the root and following what is there would
- * lead out of the chroot; upstream joins and follows (LDG 402-433).
+ * lead out of the chroot; upstream joins and follows (doBind in LDG).
  * Answers the directory's descriptor and points *NAME at the target's last
  * component, in *COMPONENTS, which the caller frees, or at nothing when
  * TARGET is the root itself; or -1 with errno set. */
@@ -483,7 +485,7 @@ static int walk_to_parent(const char *root, const char *target, char **component
 /* Make, in PARENT at NAME, the place for a bind of SOURCE, whose lstat is
  * ST: a directory or an empty file to mount on, opened without following
  * a link, or for a symlink source a copy of the link, which cannot be
- * bound (LDG 422-427).  NAME is nothing for the root itself, which only a
+ * bound (doBind in LDG).  NAME is nothing for the root itself, which only a
  * directory binds.  Answers a descriptor of what to mount on,
  * TARGET_IS_COPIED_LINK, or -1 with errno set. */
 static int make_point(int parent, const char *name, const struct stat *st, const char *source)
@@ -532,7 +534,7 @@ static int bind_onto(const char *source, int mount_point)
     return mount(source, path, "", MS_BIND | MS_REC, NULL) < 0 ? errno : 0;
 }
 
-/* Bind one plan entry into the chroot, as upstream's doBind (LDG 402-433),
+/* Bind one plan entry into the chroot, as upstream's doBind (in LDG),
  * and make it read-only when the plan says so.  Fails the process. */
 static void bind_entry(const struct plan *plan, size_t index)
 {
@@ -556,7 +558,7 @@ static void bind_entry(const struct plan *plan, size_t index)
         }
         source = resolved;
     }
-    /* Upstream leaves /proc to the procfs it mounts (LDG 1874). */
+    /* Upstream leaves /proc to the procfs it mounts (runChild in LDG). */
     if (strcmp(source, "/proc") == 0) {
         free(resolved);
         return;
@@ -604,7 +606,7 @@ static int plan_binds(const struct plan *plan, const char *target)
 }
 
 /* Bind a host device directory or node the devpts fallback needs
- * (LDG 1926-1927), as doBind binds it: writable, the one host path the
+ * (runChild in LDG), as doBind binds it: writable, the one host path the
  * sandbox binds so, since a terminal is written through it, and only where
  * the kernel will not mount a devpts of the sandbox's own. */
 static void bind_host(const struct plan *plan, const char *source, const char *stage)
@@ -624,7 +626,7 @@ static void bind_host(const struct plan *plan, const char *source, const char *s
     if (mount_point == -1)
         status_fail(stage, errno, NO_INDEX);
     /* A host node that is a link is copied, as upstream's doBind copies
-     * one (LDG 411-433), and nothing is left to bind. */
+     * one (in LDG), and nothing is left to bind. */
     if (mount_point != TARGET_IS_COPIED_LINK) {
         error = bind_onto(source, mount_point);
         close(mount_point);
@@ -635,7 +637,7 @@ static void bind_host(const struct plan *plan, const char *source, const char *s
         status_fail(stage, error, NO_INDEX);
 }
 
-/* /proc, /dev/shm and /dev/pts of the sandbox's own (LDG 1890-1929). */
+/* /proc, /dev/shm and /dev/pts of the sandbox's own (runChild in LDG). */
 static void mount_filesystems(const struct plan *plan)
 {
     char *proc = joined(plan->root, "/proc");
@@ -660,7 +662,8 @@ static void mount_filesystems(const struct plan *plan)
         if (mount("none", pts, "devpts", 0, devpts_options) == 0) {
             if (symlink("/dev/pts/ptmx", ptmx) < 0)
                 status_fail("devpts", errno, NO_INDEX);
-            /* With some kernels ptmx is created with mode 0 (LDG 1920-1922). */
+            /* With some kernels ptmx is created with mode 0 (runChild in
+             * LDG). */
             if (chmod(pts_ptmx, 0666) < 0)
                 status_fail("devpts", errno, NO_INDEX);
         } else {
@@ -681,7 +684,7 @@ static void mount_filesystems(const struct plan *plan)
  * The child: PID 1 of the new namespaces
  * ------------------------------------------------------------------------ */
 
-/* Bring the private network's loopback interface up (LDG 1767-1778). */
+/* Bring the private network's loopback interface up (runChild in LDG). */
 static void loopback_up(void)
 {
     struct ifreq request;
@@ -697,7 +700,7 @@ static void loopback_up(void)
 }
 
 /* Close every descriptor from 3 up but the status pipe, which closes when
- * the builder starts (LDG 1989). */
+ * the builder starts (runChild in LDG). */
 static void close_descriptors(int keep)
 {
     DIR *dir = opendir("/proc/self/fd");
@@ -745,8 +748,8 @@ static void close_descriptors(int keep)
 }
 
 /* Die with the helper, as upstream's child dies with its parent
- * (processes.cc:206).  A credential change can clear the setting, so it is
- * made again once the ids are final. */
+ * (startProcess in processes.cc).  A credential change can clear the
+ * setting, so it is made again once the ids are final. */
 static void die_with_helper(void)
 {
     if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0)
@@ -755,7 +758,7 @@ static void die_with_helper(void)
 
 /* clone(2) as fork makes a child, with no stack of its own: without
  * CLONE_VM the child runs on its copy of this process's stack.  Upstream
- * clones onto a stack it maps (processes.cc:223-236), a switch the
+ * clones onto a stack it maps (startProcess in processes.cc), a switch the
  * address sanitizer cannot follow (google/sanitizers issue 189), so its
  * reports from such a child may be false; on its copy of a stack the
  * sanitizer knows, the child's are true.  The raw system call, as
@@ -785,7 +788,7 @@ static int child_main(const struct child_context *context)
     die_with_helper();
 
     /* Wait until the helper has mapped this namespace's ids; end of file
-     * means it failed and has reported why (LDG 1760-1765). */
+     * means it failed and has reported why (runChild in LDG). */
     close(context->sync_write);
     do {
         got = read(context->sync_read, &release, 1);
@@ -794,7 +797,8 @@ static int child_main(const struct child_context *context)
         _exit(EXIT_FAILURE);
     close(context->sync_read);
 
-    /* No controlling terminal, and no terminal signals (child.cc:17-22). */
+    /* No controlling terminal, and no terminal signals (commonChildInit in
+     * child.cc). */
     if (setsid() < 0)
         status_fail("setsid", errno, NO_INDEX);
 
@@ -806,11 +810,12 @@ static int child_main(const struct child_context *context)
     if (setdomainname(sandbox_domainname, sizeof sandbox_domainname) < 0)
         status_fail("domainname", errno, NO_INDEX);
 
-    /* Mounts made below must not propagate out (LDG 1788-1797). */
+    /* Mounts made below must not propagate out (runChild in LDG). */
     if (mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL) < 0)
         status_fail("private", errno, NO_INDEX);
 
-    /* pivot_root needs the new root to be a mount of its own (LDG 1799-1802). */
+    /* pivot_root needs the new root to be a mount of its own (runChild in
+     * LDG). */
     if (mount(plan->root, plan->root, NULL, MS_BIND, NULL) < 0)
         status_fail("bind-root", errno, NO_INDEX);
 
@@ -819,9 +824,9 @@ static int child_main(const struct child_context *context)
 
     mount_filesystems(plan);
 
-    /* Upstream's mode for /etc once its files are in place (LDG 1931-1933).
-     * Upstream's /etc belongs to root (LDG 721-723); this one belongs to
-     * the user who made the chroot, as whom the builder runs, so the
+    /* Upstream's mode for /etc once its files are in place (runChild in LDG).
+     * Upstream's /etc belongs to root (startBuilder in LDG); this one belongs
+     * to the user who made the chroot, as whom the builder runs, so the
      * builder can make it writable again.  It is the build's own copy,
      * removed with the chroot, and its host files are read-only binds. */
     etc = joined(plan->root, "/etc");
@@ -829,7 +834,7 @@ static int child_main(const struct child_context *context)
         status_fail("etc", errno, NO_INDEX);
     free(etc);
 
-    /* Make the chroot the root and detach the old one (LDG 1954-1971). */
+    /* Make the chroot the root and detach the old one (runChild in LDG). */
     if (chdir(plan->root) < 0)
         status_fail("chdir-root", errno, NO_INDEX);
     if (mkdir("real-root", 0) < 0)
@@ -843,7 +848,7 @@ static int child_main(const struct child_context *context)
     if (rmdir("real-root") < 0)
         status_fail("rmdir", errno, NO_INDEX);
 
-    /* The sandbox's ids, which map to the invoking user (LDG 1973-1979). */
+    /* The sandbox's ids, which map to the invoking user (runChild in LDG). */
     if (setgid((gid_t)plan->sandbox_gid) < 0)
         status_fail("setgid", errno, NO_INDEX);
     if (setuid((uid_t)plan->sandbox_uid) < 0)
@@ -862,25 +867,28 @@ static int child_main(const struct child_context *context)
      * namespaces, and with it possession of every key linked from it.
      * The join stops that inheritance and nothing more (security/keys at
      * Linux 6.8): /proc/keys lists the keys of every uid the namespace
-     * maps, the builder's own among them (proc.c:60-75); the user keyring
-     * gives its owner's uid every permission (process_keys.c:86); and a
-     * key's owner gets those permissions whatever namespace asks
-     * (permission.c:52-55).  So the builder can link the user keyring into
-     * its own (keyctl.c:515-532), possess it, and read what it holds.
-     * Only a filter refusing keyctl, add_key and request_key closes that.
-     * A kernel without keyrings has none to inherit, and a filter that
-     * refuses the join refuses the builder's keyctl too. */
+     * maps, the builder's own among them (key_serial_next in proc.c); the
+     * user keyring gives its owner's uid every permission
+     * (look_up_user_keyrings in process_keys.c); and a key's owner gets those
+     * permissions whatever namespace asks (key_task_permission in
+     * permission.c).  So the builder can link the user keyring into its own
+     * (keyctl_keyring_link in keyctl.c), possess it, and read what it holds.
+     * Only a filter refusing keyctl, add_key and request_key closes that.  A
+     * kernel without keyrings has none to inherit, and a filter that refuses
+     * the join refuses the builder's keyctl too. */
     if (syscall(SYS_keyctl, KEYCTL_JOIN_SESSION_KEYRING, (char *)NULL) < 0 && errno != ENOSYS && errno != EPERM)
         status_fail("keyring", errno, NO_INDEX);
 
     /* No privileges gained through the exec, from a setuid program or file
      * capabilities a sandbox-paths entry makes reachable, as upstream's
-     * builder gains none unless allow-new-privileges is set (globals.hh:
-     * 1076-1090, LDG 1718-1719). */
+     * builder gains none unless allow-new-privileges is set
+     * (allowNewPrivileges in globals.hh and setupSeccomp in
+     * local-derivation-goal.cc at 2.24.9, local-settings.hh and
+     * linux-derivation-builder.cc at 2.36.0). */
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
         status_fail("no-new-privs", errno, NO_INDEX);
 
-    /* No core dumps (LDG 1995-1997).  Upstream also raises the hard limit
+    /* No core dumps (runChild in LDG).  Upstream also raises the hard limit
      * to infinity, which an unprivileged process may not; the hard limit is
      * left as it is. */
     if (getrlimit(RLIMIT_CORE, &core) == 0) {
@@ -898,8 +906,8 @@ static int child_main(const struct child_context *context)
  * The helper: outside the new namespaces
  * ------------------------------------------------------------------------ */
 
-/* Write a namespace's id map from outside it (LDG 994-1009).  Answers 0,
- * or an errno value. */
+/* Write a namespace's id map from outside it (startBuilder in LDG).  Answers
+ * 0, or an errno value. */
 static int write_proc_file(pid_t pid, const char *name, const char *contents)
 {
     char path[64];
@@ -932,9 +940,9 @@ static void fail_after_clone(pid_t child, const char *stage, int error)
 }
 
 /* Put SIGCHLD back to its default, as upstream's initNix does
- * (shared.cc:130-137 at 2.24.9): a SIGCHLD ignored where this program was
- * started would have the kernel reap the builder unasked, leaving nothing
- * to wait for.  Answers 0, or an errno value. */
+ * (shared.cc): a SIGCHLD ignored where this program was started would have
+ * the kernel reap the builder unasked, leaving nothing to wait for.  Answers
+ * 0, or an errno value. */
 static int reset_sigchld(void)
 {
     struct sigaction action;
@@ -1035,7 +1043,7 @@ int backend_prepare_run(void)
     int error;
     /* The status pipe moves to a descriptor the builder's exec closes, and
      * standard output becomes the log, as upstream's child gets standard
-     * error on both (child.cc:24-26). */
+     * error on both (commonChildInit in child.cc). */
     int moved = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
     if (moved < 0)
         return -1;
@@ -1063,7 +1071,7 @@ int backend_run(const struct plan *plan, char **argv)
     int wait_status = 0;
 
     /* Standard input, past the plan, is the lifeline; the builder reads
-     * /dev/null (child.cc:28-34). */
+     * /dev/null (commonChildInit in child.cc). */
     lifeline_fd = fcntl(STDIN_FILENO, F_DUPFD_CLOEXEC, 3);
     null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
     if (lifeline_fd < 0 || null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0)
@@ -1071,7 +1079,7 @@ int backend_run(const struct plan *plan, char **argv)
     close(null_fd);
 
     /* Supplementary groups cannot be dropped inside the new user namespace
-     * (LDG 955-962). */
+     * (startBuilder in LDG). */
     if (setgroups(0, NULL) < 0) {
         if (errno != EPERM || plan->require_drop_groups)
             status_fail("setgroups", errno, NO_INDEX);
@@ -1098,7 +1106,10 @@ int backend_run(const struct plan *plan, char **argv)
     context.sync_write = sync_pipe[1];
 
     /* No CLONE_PARENT, so the builder stays this process's child and its
-     * exit is this process's to relay (processes.cc:223-236, LDG 965-969). */
+     * exit is this process's to relay (startProcess in processes.cc, and
+     * LocalDerivationGoal::startBuilder in local-derivation-goal.cc at
+     * 2.24.9, ChrootLinuxDerivationBuilder::startChild in
+     * linux-derivation-builder.cc at 2.36.0). */
     flags = CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | SIGCHLD;
     if (plan->private_network)
         flags |= CLONE_NEWNET;
@@ -1113,7 +1124,7 @@ int backend_run(const struct plan *plan, char **argv)
     if (signals_fd < 0)
         fail_after_clone(child, "signals", errno);
 
-    /* The sandbox's ids map to the invoking user's (LDG 994-1009). */
+    /* The sandbox's ids map to the invoking user's (startBuilder in LDG). */
     snprintf(map, sizeof map, "%lu %lu 1", (unsigned long)plan->sandbox_uid, (unsigned long)getuid());
     if ((error = write_proc_file(child, "uid_map", map)) != 0)
         fail_after_clone(child, "uid-map", error);
@@ -1140,7 +1151,8 @@ int backend_run(const struct plan *plan, char **argv)
     close(signals_fd);
     if (error != 0) {
         /* The status pipe is closed, so the reason goes to the build log,
-         * in upstream's words for a wait that fails (processes.cc:98). */
+         * in upstream's words for a wait that fails (Pid::wait in
+         * processes.cc). */
         fprintf(stderr, "nova-nix-sandbox: cannot get exit status of PID %ld: %s\n", (long)child, strerror(error));
         return EXIT_FAILURE;
     }
@@ -1152,8 +1164,9 @@ int backend_run(const struct plan *plan, char **argv)
  * ------------------------------------------------------------------------ */
 
 /* Compare a sysctl's contents, its trailing newlines and spaces trimmed as
- * upstream trims them (namespaces.cc:25-39), with EXPECTED: 1 when they
- * match, 0 when they do not, and -1 when the file cannot be read. */
+ * upstream trims them (userNamespacesSupported in namespaces.cc at 2.24.9,
+ * linux-namespaces.cc at 2.36.0), with EXPECTED: 1 when they match, 0 when
+ * they do not, and -1 when the file cannot be read. */
 static int sysctl_is(const char *path, const char *expected)
 {
     char contents[32];
