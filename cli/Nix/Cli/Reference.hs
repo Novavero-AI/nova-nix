@@ -96,6 +96,9 @@ data CommandName
   | PushCommand
   | StoreDeleteCommand
   | StoreGcCommand
+  | ProfileAddCommand
+  | ProfileRemoveCommand
+  | ProfileListCommand
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | What the reference says about a command, or about the global form.
@@ -159,6 +162,9 @@ commandWords name = case name of
   PushCommand -> ["push"]
   StoreDeleteCommand -> ["store", "delete"]
   StoreGcCommand -> ["store", "gc"]
+  ProfileAddCommand -> ["profile", "add"]
+  ProfileRemoveCommand -> ["profile", "remove"]
+  ProfileListCommand -> ["profile", "list"]
 
 -- | A command as it is invoked, @nova-nix store gc@.
 commandInvocation :: CommandName -> Text
@@ -190,7 +196,7 @@ globalForm =
   CommandEntry
     { commandForms = Form "COMMAND [FLAG...]" "Run one command, with the flags it takes" :| [],
       commandDescription =
-        "nova-nix evaluates Nix expressions, builds derivations, reports what a derivation's closure relies on, pushes store paths to a binary cache and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` alone has another status, 104, for an output that differs.",
+        "nova-nix evaluates Nix expressions, builds derivations, reports what a derivation's closure relies on, pushes store paths to a binary cache, keeps profiles of packages and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` alone has another status, 104, for an output that differs.",
       commandExamples =
         Example "Print the release this binary was built from." ("--version" :| []) []
           :| [Example "Print the commands, flags and settings." ("--help" :| []) []]
@@ -336,11 +342,70 @@ command name = case name of
     CommandEntry
       { commandForms = Form "" "Remove every store path not reachable from a root" :| [],
         commandDescription =
-          "Deletes every store path no root keeps, directly or through the paths that reference it, and prints how many it deleted and the space it freed, as `nix-store --gc` does. The roots are the links `build` made to its outputs, while they stay, and the links and files under the store's `.nova-nix/gcroots` directory; a path a running program has open is not a root, and a rooted output does not keep the `.drv` that built it. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused. With `--print-roots` it lists the roots and deletes nothing.",
+          "Deletes every store path no root keeps, directly or through the paths that reference it, and prints how many it deleted and the space it freed, as `nix-store --gc` does. The roots are the links `build` made to its outputs and each generation of a profile, while they stay, and the links and files under the store's `.nova-nix/gcroots` directory; a path a running program has open is not a root, and a rooted output does not keep the `.drv` that built it. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused. With `--print-roots` it lists the roots and deletes nothing.",
         commandExamples =
           Example "Delete everything no root keeps." ("store" :| ["gc"]) []
             :| [Example "List the roots, each as the link that names it and the path it keeps." ("store" :| ["gc", "--print-roots"]) []]
       }
+  ProfileAddCommand ->
+    CommandEntry
+      { commandForms =
+          Form "PATH" "Add a derivation from a .nix file, or the store path a path leads to, to a profile"
+            :| [ Form "'<NAME>'" "Add a derivation from the file the search path finds for NAME to a profile",
+                 Form "--expr 'EXPR'" "Add a derivation from an inline expression to a profile"
+               ],
+        commandDescription =
+          "Adds a package to a profile and switches the profile to a new generation that holds it, as `nix profile add` does. A `PATH` that is in the store, or a link that leads into it, as the `./result` a build links does, adds the store path it is in, which must be valid. Any other `PATH`, a `<NAME>` or `--expr` is evaluated as `build` evaluates its target, and its derivation built for the outputs it installs: the one the value selects when its `outputSpecified` is true, else those its `meta.outputsToInstall` names, else every output. "
+            <> targetCalls
+            <> " The package is named after the names of its paths without their versions, with `-1`, `-2` and on appended to a name the profile already holds, and has the priority `--priority` gives, 5 unless it gives another. Where two packages hold a file at one path, the profile links the one with the lower number, and two with one number fail the command, which names both files and the commands that would resolve it. "
+            <> profileRules
+            <> " A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is evaluated.",
+        commandExamples =
+          Example
+            "Build GNU Hello for Windows from the directory a release unpacks to and add it to the default profile, which puts `hello` under `~/.nix-profile/bin`."
+            ("profile" :| ["add", "pkgs/windows/hello.nix"])
+            []
+            :| [ Example
+                   "Add what a build linked from `./result` to the default profile."
+                   ("profile" :| ["add", "./result"])
+                   [],
+                 Example
+                   "Add a package whose files the profile links in place of those of one at the default priority."
+                   ("profile" :| ["add", "--priority", "4", "./result"])
+                   []
+               ]
+      }
+  ProfileRemoveCommand ->
+    CommandEntry
+      { commandForms =
+          Form "NAME..." "Take packages off a profile, by name or by a store path they hold"
+            :| [ Form "--regex PATTERN" "Take off a profile the packages whose names a regular expression matches",
+                 Form "--all" "Take every package off a profile"
+               ],
+        commandDescription =
+          "Takes packages off a profile and switches the profile to a new generation without them, as `nix profile remove` does. A `NAME` selects the package of that name, and a store path every package that holds it; `--regex` selects every package whose name, or for a package a flake added its flake reference and attribute, a POSIX extended regular expression matches whole, ignoring case; and `--all`, which takes nothing beside it, every package. Each package taken off is named, and then how many were taken off and kept; a selector that selects nothing is warned of, and when nothing is selected the profile is left as it is. A number is refused, as upstream refuses one in place of a name, and so is a line that selects nothing, or `--all` beside another selector. "
+            <> profileRules
+            <> " A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused.",
+        commandExamples =
+          Example "Take GNU Hello off the default profile." ("profile" :| ["remove", "hello"]) []
+            :| [Example "Take every package off a profile other than the default." ("profile" :| ["remove", "--all", "--profile", "./my-profile"]) []]
+      }
+  ProfileListCommand ->
+    CommandEntry
+      { commandForms =
+          Form "" "Print the packages in a profile"
+            :| [Form "--json" "Print a profile's manifest as JSON"],
+        commandDescription =
+          "Prints each package in a profile, as `nix profile list` does: its name, in bold, and its store paths, with a blank line between packages, and for a package a flake added its flake attribute and its original and locked flake references. With `--json` it prints the profile's `manifest.json` instead, indented when stdout is a terminal unless `--pretty` or `--no-pretty` says otherwise, the later of them winning. A profile with no manifest holds no packages. The default profile and its link are made when they are missing, and a profile whose current generation is outside the store is refused, as for every profile command.",
+        commandExamples =
+          Example "List the packages in the default profile." ("profile" :| ["list"]) []
+            :| [Example "Print the default profile's manifest, indented." ("profile" :| ["list", "--json", "--pretty"]) []]
+      }
+
+-- | What a profile is and where it is, as the descriptions of the
+-- commands that change one say.
+profileRules :: Text
+profileRules = "A profile is a link to one of its generations, `PROFILE-1-link`, `PROFILE-2-link` and on beside it, each a store path holding the packages' files linked into one tree and a `manifest.json` that lists the packages, and each a root the garbage collector keeps. The default profile is `profiles/profile` in the state directory, which is `$NIX_STATE_HOME`, else `$XDG_STATE_HOME/nix`, else `~/.local/state/nix`, or on Windows `nix\\state` in the Local AppData folder; `~/.nix-profile`, or with `use-xdg-base-directories` on `profile` in the state directory, links to it, and both are made when they are missing, whichever profile `--profile` names. A profile whose current generation is outside the store, as one upstream Nix keeps in `/nix/store` is while nova-nix uses another store, is refused. A change that finds the profile changed by another command since it began starts again. On Windows each link is a symlink, which needs Developer Mode or an elevated shell."
 
 -- | What a command that takes a target evaluates, as its description
 -- names it.
@@ -391,6 +456,12 @@ data FlagName
   | SecretKeyFileFlag
   | CompressionFlag
   | PrintRootsFlag
+  | ProfileFlag
+  | PriorityFlag
+  | RegexFlag
+  | JsonFlag
+  | PrettyFlag
+  | NoPrettyFlag
   | StoreFlag
   | HelpFlag
   | VersionFlag
@@ -448,9 +519,9 @@ globalFlags = filter ((== GlobalFlag) . flagScope . flag) flagNames
 flag :: FlagName -> FlagEntry
 flag name = case name of
   ExprFlag ->
-    long "expr" (Just "EXPR") "Evaluate `EXPR` in place of a file; a relative path in it resolves against the working directory" evalBuildAndTrust
+    long "expr" (Just "EXPR") "Evaluate `EXPR` in place of a file; a relative path in it resolves against the working directory" evaluating
   AttrFlag ->
-    short 'A' "attr" (Just "ATTRPATH") "Select a dotted attribute path (`a.b.c`)" buildAndTrust
+    short 'A' "attr" (Just "ATTRPATH") "Select a dotted attribute path (`a.b.c`)" selecting
   OutLinkFlag ->
     short 'o' "out-link" (Just "PATH") "Link the output from `PATH` in place of `./result`" buildOnly
   NoOutLinkFlag ->
@@ -462,39 +533,39 @@ flag name = case name of
   ReadWriteModeFlag ->
     long "read-write-mode" Nothing "Write what evaluation makes (`builtins.toFile`, `builtins.path` and the like) to the store and register it, and build or substitute what a path's context names, as `build` does; without it `eval` computes those paths and writes only what a fetcher fetches" evalOnly
   NixPathFlag ->
-    long "nix-path" (Just "NAME=PATH") "Add search path (repeatable, merged with `NIX_PATH`)" evalBuildAndTrust
+    long "nix-path" (Just "NAME=PATH") "Add search path (repeatable, merged with `NIX_PATH`)" evaluating
   ArgFlag ->
-    long "arg" (Just "NAME EXPR") "Pass the value of `EXPR` as the argument `NAME` to a function the target evaluates to" evalBuildAndTrust
+    long "arg" (Just "NAME EXPR") "Pass the value of `EXPR` as the argument `NAME` to a function the target evaluates to" evaluating
   ArgStrFlag ->
-    long "argstr" (Just "NAME STRING") "Pass `STRING`, as a string, as the argument `NAME` to a function the target evaluates to" evalBuildAndTrust
+    long "argstr" (Just "NAME STRING") "Pass `STRING`, as a string, as the argument `NAME` to a function the target evaluates to" evaluating
   RestrictEvalFlag ->
-    long "restrict-eval" Nothing "Confine reads to the search path roots and what the evaluation itself writes; fetch only `allowed-uris`" evalBuildAndTrust
+    long "restrict-eval" Nothing "Confine reads to the search path roots and what the evaluation itself writes; fetch only `allowed-uris`" evaluating
   PureEvalFlag ->
-    long "pure-eval" Nothing "Confine reads as `--restrict-eval` does, with no search path but the bundled `<nix/*>`, no `currentTime`, `currentSystem` or `storePath`, and pinned fetches only (`allowed-uris` applies only under `--restrict-eval`)" evalBuildAndTrust
+    long "pure-eval" Nothing "Confine reads as `--restrict-eval` does, with no search path but the bundled `<nix/*>`, no `currentTime`, `currentSystem` or `storePath`, and pinned fetches only (`allowed-uris` applies only under `--restrict-eval`)" evaluating
   TraceVerboseFlag ->
-    long "trace-verbose" Nothing "Make `builtins.traceVerbose` behave as `builtins.trace`; without it, the first argument is never forced" evalBuildAndTrust
+    long "trace-verbose" Nothing "Make `builtins.traceVerbose` behave as `builtins.trace`; without it, the first argument is never forced" evaluating
   NoAllowImportFromDerivationFlag ->
-    long "no-allow-import-from-derivation" Nothing "Refuse to build or substitute what a path's context names when `import` or another builtin reads the path, even an output already valid" evalBuildAndTrust
+    long "no-allow-import-from-derivation" Nothing "Refuse to build or substitute what a path's context names when `import` or another builtin reads the path, even an output already valid" evaluating
   SubstituterFlag ->
-    long "substituter" (Just "URL") "Try this binary cache before building" evalBuildAndTrust
+    long "substituter" (Just "URL") "Try this binary cache before building" evaluating
   TrustedKeyFlag ->
-    long "trusted-key" (Just "KEY") "Trust signatures by this public key (`NAME:BASE64`) from any substituter" evalBuildAndTrust
+    long "trusted-key" (Just "KEY") "Trust signatures by this public key (`NAME:BASE64`) from any substituter" evaluating
   FallbackFlag ->
-    long "fallback" Nothing "Build from source if substitution fails" evalBuildAndTrust
+    long "fallback" Nothing "Build from source if substitution fails" evaluating
   CheckFlag ->
     long "check" Nothing "Build the derivation again beside its valid outputs, and fail with status 104 if an output comes out different" buildOnly
   SandboxFlag ->
-    long "sandbox" Nothing "Enable sandboxing" evalBuildAndTrust
+    long "sandbox" Nothing "Enable sandboxing" evaluating
   NoSandboxFlag ->
-    long "no-sandbox" Nothing "Disable sandboxing" evalBuildAndTrust
+    long "no-sandbox" Nothing "Disable sandboxing" evaluating
   RelaxedSandboxFlag ->
-    long "relaxed-sandbox" Nothing "Enable sandboxing, but allow builds to disable it" evalBuildAndTrust
+    long "relaxed-sandbox" Nothing "Enable sandboxing, but allow builds to disable it" evaluating
   ExecWrapperFlag ->
-    long "exec-wrapper" (Just "S=PATH") "Run system `S`'s derivations through `PATH` (repeatable), e.g. `x86_64-windows=/usr/bin/wine`" evalAndBuild
+    long "exec-wrapper" (Just "S=PATH") "Run system `S`'s derivations through `PATH` (repeatable), e.g. `x86_64-windows=/usr/bin/wine`" (CommandFlag (EvalCommand :| [BuildCommand, ProfileAddCommand]))
   CacheFlag ->
     long "cache" (Just "URL") "The cache to push to: a nova-cache server's `http://` or `https://` URL, or a directory's `file://` URL (required)" pushOnly
   AllFlag ->
-    long "all" Nothing "Select every valid path except derivations, in place of `PATH...`" pushOnly
+    long "all" Nothing "Select every valid path except derivations, in place of `PATH...`; for `profile remove`, every package" (CommandFlag (PushCommand :| [ProfileRemoveCommand]))
   KeyFileFlag ->
     long "key-file" (Just "PATH") "File holding a nova-cache server's API key" pushOnly
   SecretKeyFileFlag ->
@@ -503,8 +574,20 @@ flag name = case name of
     long "compression" (Just "KIND") ("Artifact packaging (" <> pushCompressionValues <> "; default none)") pushOnly
   PrintRootsFlag ->
     long "print-roots" Nothing "List the roots as `LINK -> PATH` and delete nothing" (CommandFlag (StoreGcCommand :| []))
+  ProfileFlag ->
+    long "profile" (Just "PATH") "Work on the profile at `PATH` in place of the default profile" (CommandFlag (ProfileAddCommand :| [ProfileRemoveCommand, ProfileListCommand]))
+  PriorityFlag ->
+    long "priority" (Just "N") "Give the package priority `N` (default 5): of two files at one path, the profile links the one with the lower number" (CommandFlag (ProfileAddCommand :| []))
+  RegexFlag ->
+    long "regex" (Just "PATTERN") "Select the packages whose names a POSIX extended regular expression matches whole, ignoring case" (CommandFlag (ProfileRemoveCommand :| []))
+  JsonFlag ->
+    long "json" Nothing "Print the profile's `manifest.json` in place of its packages' lines" (CommandFlag (ProfileListCommand :| []))
+  PrettyFlag ->
+    long "pretty" Nothing "With `--json`, indent the JSON, as when stdout is a terminal" (CommandFlag (ProfileListCommand :| []))
+  NoPrettyFlag ->
+    long "no-pretty" Nothing "With `--json`, print the JSON on one line, as when stdout is not a terminal" (CommandFlag (ProfileListCommand :| []))
   StoreFlag ->
-    long "store" (Just "DIR") "Use `DIR` as the store (default: the platform store)" (CommandFlag (EvalCommand :| [BuildCommand, TrustCommand, PushCommand, StoreDeleteCommand, StoreGcCommand]))
+    long "store" (Just "DIR") "Use `DIR` as the store (default: the platform store)" (CommandFlag (EvalCommand :| [BuildCommand, TrustCommand, PushCommand, StoreDeleteCommand, StoreGcCommand, ProfileAddCommand, ProfileRemoveCommand, ProfileListCommand]))
   HelpFlag ->
     long "help" Nothing "Print the commands, flags and settings, and exit" GlobalFlag
   VersionFlag ->
@@ -516,9 +599,10 @@ flag name = case name of
     evalOnly = CommandFlag (EvalCommand :| [])
     buildOnly = CommandFlag (BuildCommand :| [])
     pushOnly = CommandFlag (PushCommand :| [])
-    buildAndTrust = CommandFlag (BuildCommand :| [TrustCommand])
-    evalAndBuild = CommandFlag (EvalCommand :| [BuildCommand])
-    evalBuildAndTrust = CommandFlag (EvalCommand :| [BuildCommand, TrustCommand])
+    -- The commands that select an attribute of what they evaluate, and
+    -- those that evaluate.
+    selecting = CommandFlag (BuildCommand :| [TrustCommand, ProfileAddCommand])
+    evaluating = CommandFlag (EvalCommand :| [BuildCommand, TrustCommand, ProfileAddCommand])
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -567,6 +651,7 @@ configuration =
                Setting "sandbox-build-dir" "Where a sandboxed build sees its build directory (default `/build`)" Nothing,
                Setting "sandbox-dev-shm-size" "The size of a sandboxed build's `/dev/shm`, as `tmpfs` takes it (default `50%`)" Nothing,
                Setting "require-drop-supplementary-groups" "Fail a sandboxed build when the user's supplementary groups cannot be dropped (default: on for root)" Nothing,
+               Setting "use-xdg-base-directories" "Link the default profile from `profile` in the state directory in place of `~/.nix-profile` (default `false`)" Nothing,
                Setting "ssl-cert-file" "The CA bundle a sandboxed fixed-output build sees (default: `$NIX_SSL_CERT_FILE`, `$SSL_CERT_FILE`, or the first that exists of `/etc/ssl/certs/ca-certificates.crt` and `etc/ssl/certs/ca-bundle.crt` under `/nix/var/nix/profiles/default`)" Nothing
              ],
       configDescription =

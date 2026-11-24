@@ -23,6 +23,7 @@
 -- name no Windows file.
 module Nix.HostPath
   ( hostPathFromBytes,
+    hostPathBytes,
     hostPathText,
   )
 where
@@ -50,6 +51,17 @@ hostPathFromBytes bytes = either (const Nothing) (OP.encodeUtf . T.unpack) (TE.d
 -- character to the unit's width, which loses nothing on characters drawn
 -- from bytes.
 hostPathFromBytes = Just . OP.pack . map OP.unsafeFromChar . BS8.unpack
+#endif
+
+-- | The bytes nova-nix holds for a host path, the inverse of
+-- 'hostPathFromBytes': on POSIX the path's own bytes, on Windows the
+-- UTF-8 of its UTF-16, or 'Nothing' for one holding an unpaired
+-- surrogate, which has no UTF-8 form.
+hostPathBytes :: OsPath -> Maybe ByteString
+#if defined(mingw32_HOST_OS)
+hostPathBytes path = TE.encodeUtf8 . T.pack <$> OP.decodeUtf path
+#else
+hostPathBytes = Just . BS8.pack . map OP.toChar . OP.unpack
 #endif
 
 -- | A host path as a message shows it, for display only: its UTF-8

@@ -133,6 +133,8 @@ library
     Nix.Daemon.Wire
     Nix.Environment
     Nix.HostPath
+    Nix.Profile.Generation
+    Nix.Profile.Manifest
     Nix.Profile.Tree
     Nix.Push
     Nix.Push.Directory

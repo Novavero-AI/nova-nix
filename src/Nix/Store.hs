@@ -50,6 +50,7 @@ module Nix.Store
 
     -- * Store operations
     addToStore,
+    addSourceTree,
     copyPathInto,
     placeInStore,
     registrationFor,
@@ -108,12 +109,13 @@ import Data.List (inits, stripPrefix)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes)
+import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Derivation (Derivation (..), fromATerm, toATerm)
-import Nix.Hash (FileIngestionMethod (..), makeFixedOutputPath, makeTextPath, sha256Digest)
+import Nix.Hash (FileIngestionMethod (..), makeFixedOutputPath, makeSourcePath, makeTextPath, sha256Digest)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), pathCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB
 import Nix.Store.EntryName (checkEntryName, entryNamePath, hostNameRules, linkTargetPath, shownBytes)
@@ -1268,6 +1270,45 @@ materializeEvalStoreWrites store storeWrites = do
                       )
                   canonicalizeMetadata dest
                   Just <$> registrationFor store sp Nothing refs
+
+-- | Add a tree, given as its NAR, as the path the SHA-256 of the NAR, a
+-- name and the store paths it references make ('makeSourcePath'), and
+-- answer the path: upstream's @addToStore@ of a dump under @NixArchive@
+-- and SHA-256 with those references, which @nix profile@ adds each
+-- generation by (profile.cc:255-278 at 2.35.4).  A valid path is passed
+-- over.  Otherwise, under the path's lock, what is at the path is
+-- cleared, the NAR is unpacked there as a substituted one is
+-- ('unpackNarEntry') and its metadata made canonical, and it is
+-- registered only once it serialises back to the NAR it came from, since
+-- the volume decides the final spelling of every name; a tree that does
+-- not is removed and refused.  The references must be valid.  A store
+-- upstream Nix's database may also manage is refused before anything is
+-- looked at ("Nix.Store.Upstream").
+addSourceTree :: Store -> Text -> Set StorePath -> NAR.NarEntry -> IO (Either Text StorePath)
+addSourceTree store name refs entry =
+  case makeSourcePath name (sha256Digest nar) refs of
+    Left bad -> pure (Left (badStorePathText bad))
+    Right sp -> do
+      refusal <- upstreamManagedRefusal ReplacesUpstreamPaths (stDir store)
+      case refusal of
+        Just reason -> pure (Left reason)
+        Nothing -> withPathLock (stDir store) sp $ \_ -> do
+          valid <- isValid store sp
+          if valid then pure (Right sp) else place sp
+  where
+    nar = NAR.serialise entry
+    place sp = do
+      let dest = storePathToFilePath (stDir store) sp
+      Dir.removePathForcibly dest
+      placed <- (unpackNarEntry (stCaseSensitivity store) dest entry >>= traverse (const (sealed sp dest))) `onException` Dir.removePathForcibly dest
+      case placed of
+        Right (Just reg) -> Right sp <$ registerPath (stDB store) reg
+        Right Nothing -> Left (storePathToText defaultStoreDir sp <> ": the unpacked tree does not serialise to the NAR it was unpacked from") <$ Dir.removePathForcibly dest
+        Left reason -> Left reason <$ Dir.removePathForcibly dest
+    sealed sp dest = do
+      canonicalizeMetadata dest
+      reg <- registrationFor store sp Nothing (Set.toAscList refs)
+      pure (if prNarHash reg == Hash.formatNixHash (Hash.hashBytes nar) then Just reg else Nothing)
 
 -- | Whether on-disk content re-derives exactly the store path it is
 -- about to be registered under, under the scheme that named the write.

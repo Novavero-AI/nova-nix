@@ -116,6 +116,7 @@ inSession action = withEvalSession settings (const action)
       StoreOps
         { soQueries = queries,
           soAddEvalObjects = const (pure (Left refusal)),
+          soAddSourceTree = \_ _ _ -> pure (Left refusal),
           soBuild = const (pure (Left (BuildStop refusal 1))),
           soCheck = const (pure (Left (BuildStop refusal 1))),
           soAddOutLinkRoot = \_ _ -> pure (Left refusal)

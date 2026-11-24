@@ -16,10 +16,16 @@ module Nix.Cli.Args
     OutLink (..),
     outLinkFor,
     PushArgs (..),
+    ProfileSelection (..),
+    RemoveSelection (..),
+    RemoveMatcher (..),
+    ListFormat (..),
+    JsonLayout (..),
     parseArgs,
   )
 where
 
+import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
@@ -82,6 +88,15 @@ data Command
   | CmdStoreDelete ![String]
   | -- | @store gc@: collect, or with the flag only list the roots.
     CmdStoreGc !Bool
+  | -- | @profile add@: add the target's derivation, built, or a store
+    -- path a file argument leads to, to a profile, with the attribute
+    -- path when one is given, and the priority @--priority@ gives, as the
+    -- command line spells it.
+    CmdProfileAdd !Target !(Maybe T.Text) !ProfileSelection !(Maybe String)
+  | -- | @profile remove@: take what the selection selects off a profile.
+    CmdProfileRemove !ProfileSelection !RemoveSelection
+  | -- | @profile list@: print what a profile holds.
+    CmdProfileList !ProfileSelection !ListFormat
   | -- | No command given.  Usage on stderr, non-zero: a bare invocation is
     -- a usage error, and a caller testing the exit status must see one.
     CmdUsage
@@ -165,18 +180,80 @@ outLinkFor outLink outputName = case outLink of
     | outputName == unsuffixedOutput -> Just path
     | otherwise -> Just (path <> "-" <> T.unpack outputName)
 
+-- | The profile a profile command works on.
+data ProfileSelection
+  = -- | The default profile.
+    DefaultProfile
+  | -- | The profile @--profile@ names, as the command line spells it.
+    ProfileAt !FilePath
+  deriving (Eq, Show)
+
+-- | What @profile remove@ takes off.  Upstream refuses a line that
+-- selects nothing, and @--all@ beside any other selector, as usage errors
+-- (profile.cc:617-628), so neither is a selection.
+data RemoveSelection
+  = -- | @--all@: every element.
+    RemoveAll
+  | -- | The elements any of these select, the flags' first.
+    RemoveSome !(NonEmpty RemoveMatcher)
+  deriving (Eq, Show)
+
+-- | One selector of @profile remove@, as the command line spells it.
+data RemoveMatcher
+  = -- | An element's name or a store path an element holds.
+    RemoveNamed !String
+  | -- | @--regex@: the elements whose identifier a pattern matches.
+    RemoveRegex !String
+  deriving (Eq, Show)
+
+-- | How @profile list@ prints.
+data ListFormat
+  = -- | Upstream's lines for each element.
+    ListText
+  | -- | @--json@: the manifest's JSON, laid out so.
+    ListJson !JsonLayout
+  deriving (Eq, Show)
+
+-- | How JSON is laid out, as upstream's @MixPrintJSON@ chooses
+-- (common-args.hh:46-72 at 2.35.4).
+data JsonLayout
+  = -- | Indented when stdout is a terminal, on one line otherwise.
+    IndentedOnTerminal
+  | -- | @--pretty@: indented.
+    Indented
+  | -- | @--no-pretty@: on one line.
+    Compact
+  deriving (Eq, Show)
+
+-- | What @profile list@ is printing while its line is parsed.
+data ListOutput = TextOutput | JsonOutput
+
+-- | A selector of @profile remove@ while its line is parsed.
+data Selected = SelectedAll | Selected !RemoveMatcher
+
 -- | A command that evaluates one target to a derivation.
 data TargetCommand
   = -- | @build@, which builds it.
     BuildsTarget
   | -- | @trust@, which reports what its closure relies on.
     TrustsTarget
+  | -- | @profile add@, which builds it and adds it to a profile.
+    AddsToProfile
 
--- | The word that selects a target command.
+-- | The words that select a target command.
 targetWord :: TargetCommand -> String
 targetWord kind = case kind of
   BuildsTarget -> "build"
   TrustsTarget -> "trust"
+  AddsToProfile -> "profile add"
+
+-- | Whether a target command builds what it evaluates, and so takes the
+-- launchers @--exec-wrapper@ names.
+buildsTarget :: TargetCommand -> Bool
+buildsTarget kind = case kind of
+  BuildsTarget -> True
+  AddsToProfile -> True
+  TrustsTarget -> False
 
 -- | Arguments to a target command, while the target is still unknown.
 data BuildArgs = BuildArgs
@@ -184,12 +261,18 @@ data BuildArgs = BuildArgs
     baAttrPath :: !(Maybe T.Text),
     -- | Where @build@ links its output.  Only @build@ takes a flag that
     -- sets it.
-    baOutLink :: !OutLink
+    baOutLink :: !OutLink,
+    -- | The profile @profile add@ adds to.  Only @profile add@ takes a
+    -- flag that sets it.
+    baProfile :: !ProfileSelection,
+    -- | The priority @profile add@ gives what it adds.  Only
+    -- @profile add@ takes a flag that sets it.
+    baPriority :: !(Maybe String)
   }
 
 -- | Target command arguments before any flag is parsed.
 emptyBuildArgs :: BuildArgs
-emptyBuildArgs = BuildArgs Nothing Nothing defaultOutLink
+emptyBuildArgs = BuildArgs Nothing Nothing defaultOutLink DefaultProfile Nothing
 
 -- | Arguments to the push command.
 data PushArgs = PushArgs
@@ -251,6 +334,7 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     go opts ("trust" : rest) = goTarget TrustsTarget opts emptyBuildArgs rest
     go opts ("push" : rest) = goPush opts emptyPushArgs rest
     go opts ("store" : rest) = goStore opts rest
+    go opts ("profile" : rest) = goProfile opts rest
     go _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     go _ (flag : _)
@@ -316,8 +400,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       goTarget kind (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) targetArgs rest
     goTarget kind opts targetArgs (flag : name : value : rest)
       | Just arg <- autoArg flag value = goTarget kind (withAutoArg name arg opts) targetArgs rest
-    goTarget BuildsTarget opts targetArgs ("--exec-wrapper" : spec : rest) =
-      goTarget BuildsTarget (opts {optExecWrappers = optExecWrappers opts ++ [spec]}) targetArgs rest
+    goTarget kind opts targetArgs ("--exec-wrapper" : spec : rest)
+      | buildsTarget kind = goTarget kind (opts {optExecWrappers = optExecWrappers opts ++ [spec]}) targetArgs rest
     goTarget kind opts targetArgs ("--restrict-eval" : rest) =
       goTarget kind (opts {optRestrictEval = True}) targetArgs rest
     goTarget kind opts targetArgs ("--pure-eval" : rest) =
@@ -345,6 +429,10 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       | flag `elem` outLinkFlags = goTarget BuildsTarget opts (targetArgs {baOutLink = OutLinkAt path}) rest
     goTarget BuildsTarget opts targetArgs (flag : rest)
       | flag `elem` noOutLinkFlags = goTarget BuildsTarget opts (targetArgs {baOutLink = NoOutLink}) rest
+    goTarget AddsToProfile opts targetArgs ("--profile" : path : rest) =
+      goTarget AddsToProfile opts (targetArgs {baProfile = ProfileAt path}) rest
+    goTarget AddsToProfile opts targetArgs ("--priority" : priority : rest) =
+      goTarget AddsToProfile opts (targetArgs {baPriority = Just priority}) rest
     goTarget _ _ _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     goTarget _ _ _ (flag : _)
@@ -361,6 +449,7 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       (Nothing, _) -> Left (targetWord kind ++ " requires a PATH, <NAME> or --expr EXPR")
       (Just target, BuildsTarget) -> Right opts {optCommand = CmdBuild target (baAttrPath targetArgs) (baOutLink targetArgs)}
       (Just target, TrustsTarget) -> Right opts {optCommand = CmdTrust target (baAttrPath targetArgs)}
+      (Just target, AddsToProfile) -> Right opts {optCommand = CmdProfileAdd target (baAttrPath targetArgs) (baProfile targetArgs) (baPriority targetArgs)}
     -- Sub-parser for push: flags and explicit store paths in any order.
     goPush opts pushArgs [] = Right opts {optCommand = CmdPush pushArgs}
     goPush opts _ (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
@@ -406,6 +495,59 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     goStoreGc _ _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     goStoreGc _ _ (arg : _) = Left ("unknown store gc argument: " ++ arg)
+    -- Sub-parser for profile verbs.
+    goProfile _ [] = Left "profile: expected a subcommand (add, remove, list)"
+    goProfile opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
+    goProfile opts ("add" : rest) = goTarget AddsToProfile opts emptyBuildArgs rest
+    goProfile opts ("remove" : rest) = goProfileRemove opts DefaultProfile [] [] rest
+    goProfile opts ("list" : rest) = goProfileList opts DefaultProfile TextOutput IndentedOnTerminal rest
+    goProfile _ (sub : _) = Left ("unknown profile subcommand: " ++ sub ++ " (expected: add, remove, list)")
+    -- The flags' matchers come before the arguments', each in the order
+    -- given, as upstream runs a flag's handler as it reads the flag and
+    -- the arguments' once the line is read.
+    goProfileRemove opts profile flagged named [] =
+      (\selection -> opts {optCommand = CmdProfileRemove profile selection}) <$> removeSelection (flagged ++ map (Selected . RemoveNamed) named)
+    goProfileRemove opts _ _ _ (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
+    goProfileRemove opts profile flagged named ("--store" : dir : rest) =
+      goProfileRemove (opts {optStore = Just dir}) profile flagged named rest
+    goProfileRemove opts _ flagged named ("--profile" : path : rest) =
+      goProfileRemove opts (ProfileAt path) flagged named rest
+    goProfileRemove opts profile flagged named ("--regex" : regex : rest) =
+      goProfileRemove opts profile (flagged ++ [Selected (RemoveRegex regex)]) named rest
+    goProfileRemove opts profile flagged named ("--all" : rest) =
+      goProfileRemove opts profile (flagged ++ [SelectedAll]) named rest
+    goProfileRemove _ _ _ _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goProfileRemove _ _ _ _ (arg@('-' : _) : _) = Left ("unknown profile remove flag: " ++ arg)
+    goProfileRemove opts profile flagged named (element : rest) =
+      goProfileRemove opts profile flagged (named ++ [element]) rest
+    goProfileList opts profile output layout [] = Right opts {optCommand = CmdProfileList profile (listFormat output layout)}
+    goProfileList opts _ _ _ (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
+    goProfileList opts profile output layout ("--store" : dir : rest) =
+      goProfileList (opts {optStore = Just dir}) profile output layout rest
+    goProfileList opts _ output layout ("--profile" : path : rest) =
+      goProfileList opts (ProfileAt path) output layout rest
+    goProfileList opts profile _ layout ("--json" : rest) = goProfileList opts profile JsonOutput layout rest
+    -- Each sets the layout, the later winning, and has no effect without
+    -- --json, as upstream's flags of these names (common-args.hh:46-72).
+    goProfileList opts profile output _ ("--pretty" : rest) = goProfileList opts profile output Indented rest
+    goProfileList opts profile output _ ("--no-pretty" : rest) = goProfileList opts profile output Compact rest
+    goProfileList _ _ _ _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goProfileList _ _ _ _ (arg : _) = Left ("unknown profile list argument: " ++ arg)
+    listFormat output layout = case output of
+      TextOutput -> ListText
+      JsonOutput -> ListJson layout
+    -- Upstream's two usage errors, in this parser's words.
+    removeSelection selected = case selected of
+      [] -> Left "profile remove: no packages specified"
+      [SelectedAll] -> Right RemoveAll
+      _ -> case traverse selectedMatcher selected of
+        Just (first : rest) -> Right (RemoveSome (first :| rest))
+        _ -> Left "profile remove: --all cannot be used with package names or regular expressions"
+    selectedMatcher entry = case entry of
+      Selected matcher -> Just matcher
+      SelectedAll -> Nothing
     -- What --help and --version answer.  Every parser takes them where a
     -- flag may stand and leaves the rest of the line unparsed: --version
     -- must report the build even when the command after it is one this
@@ -428,7 +570,7 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     sandboxFlag _ = Nothing
     -- Flags that consume the following argument as their value.
     valueFlags =
-      ["--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--secret-key-file", "--compression"]
+      ["--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--secret-key-file", "--compression", "--profile", "--priority", "--regex"]
         ++ attrFlags
         ++ outLinkFlags
     -- Attribute selection, under both of upstream's spellings.
