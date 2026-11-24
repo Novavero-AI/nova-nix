@@ -129,6 +129,7 @@ module Nix.Eval.Types
 
     -- * Evaluation monad
     MonadEval (..),
+    addErrorTrace,
     warnMessage,
     PathExistence (..),
     EvalPolicy (..),
@@ -1460,16 +1461,18 @@ class (MonadCData m) => MonadEval m where
   -- failed fetch is an eval error.
   onEvalError :: m a -> m () -> m a
 
-  -- | @addErrorTrace line action@ runs the action; a failure escaping it
-  -- (a throw, an eval error or an abort) runs @line@ for a line of context
-  -- and gains that line outside the lines it already carries, as
-  -- upstream's @Error::addTrace@ adds one where a @catch@ rethrows.
-  -- Nothing else about the failure changes: its message stays the same,
-  -- and a throw stays catchable by @builtins.tryEval@.  The line is made
-  -- only on failure, and a failure making it escapes in place of the
-  -- action's, as an exception thrown inside upstream's @catch@ replaces
-  -- the one caught (@prim_addErrorContext@, primops.cc:831-844 at 2.24.9).
-  addErrorTrace :: m Text -> m a -> m a
+  -- | @addEvaluatedTrace onFailedLine line action@ runs the action; a
+  -- failure escaping it (a throw, an eval error or an abort) runs @line@
+  -- for a line of context and gains that line outside the lines it
+  -- already carries, as upstream's @Error::addTrace@ adds one where a
+  -- @catch@ rethrows.  Nothing else about the failure changes: its message
+  -- stays the same, and a throw stays catchable by @builtins.tryEval@.  The
+  -- line is made only on failure.  When making it fails, the action's
+  -- failure still escapes, and gains @onFailedLine@ of that failure's
+  -- message as its line instead, as upstream rethrows the error it caught
+  -- whatever evaluating its context does (@prim_addErrorContext@,
+  -- primops.cc:1027-1055 at 2.36.0).
+  addEvaluatedTrace :: (Text -> Text) -> m Text -> m a -> m a
 
   -- | Run an application one call frame deeper, or refuse it with
   -- upstream's "stack overflow; max-call-depth exceeded" when the frames
@@ -1712,6 +1715,11 @@ class (MonadCData m) => MonadEval m where
 storePathOrThrow :: (MonadEval m) => Either BadStorePath a -> m a
 storePathOrThrow = either (throwEvalError . badStorePathText) pure
 
+-- | 'addEvaluatedTrace' with a line that is already made, which cannot
+-- fail.
+addErrorTrace :: (MonadEval m) => Text -> m a -> m a
+addErrorTrace line = addEvaluatedTrace (const line) (pure line)
+
 -- | Error raised during pure evaluation.  'PThrow' (@builtins.throw@, a
 -- failed @assert@) is the only kind @tryEval@ catches; 'PError' (type
 -- errors, missing attributes) and 'PAbort' (@abort@, infinite recursion)
@@ -1788,10 +1796,12 @@ instance MonadEval PureEval where
   -- 'runPureEval' reports a failure's message alone, so a line of context
   -- has nowhere to go.  The line is still made, since a failure making it
   -- replaces the action's.
-  addErrorTrace (PureEval line) (PureEval action) =
+  -- A pure failure carries no trace: the line is made, as upstream makes
+  -- it, and the action's failure escapes whatever making it does.
+  addEvaluatedTrace _ (PureEval line) (PureEval action) =
     PureEval $ \depth ->
       action depth >>= \case
-        Left failure -> (>> Left failure) <$> line depth
+        Left failure -> Left failure <$ line depth
         Right a -> pure (Right a)
 
   -- The reader scopes the frame: the action runs one deeper, and whatever

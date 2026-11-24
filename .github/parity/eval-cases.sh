@@ -479,8 +479,14 @@ echo "== when builtins.addErrorContext forces its message =="
 check "not when its value evaluates" 'builtins.addErrorContext (throw "a") 1'
 check "a throw inside it stays catchable" '(builtins.tryEval (builtins.addErrorContext "c" (throw "x"))).success'
 refused "a throw inside it is the failure, with the message a line of its trace" 'builtins.addErrorContext "ctx-marker" (throw "x")' ctx-marker
-refused "a message that throws is the failure in its place" 'builtins.addErrorContext (throw "a") (throw "b")'
-refused "a message that does not coerce escapes tryEval" 'builtins.tryEval (builtins.addErrorContext 1 (throw "x"))'
+# 2.36.0 keeps the value's failure whatever evaluating the message does,
+# with a line naming the message's own failure (primops.cc:1027-1055 at
+# 2.36.0), as nova-nix does; earlier releases let the message's failure
+# escape in its place.
+if upstreamAtLeast 2.36.0; then
+  refused "a message that throws leaves the failure, with a line naming its own" 'builtins.addErrorContext (throw "a") (throw "b")' "another error occurred: a"
+  check "a message that does not coerce leaves a throw catchable" 'builtins.tryEval (builtins.addErrorContext 1 (throw "x"))'
+fi
 echo
 
 echo "== what fromJSON reads =="

@@ -5990,10 +5990,11 @@ testDerivationTraceIO = do
     ]
 
 -- | @builtins.addErrorContext@ forces its value and coerces its message
--- only when that fails, in the catch around the force
--- (@prim_addErrorContext@, primops.cc:831-844 at 2.24.9).  The pure
--- evaluator reports a failure's message alone, so these see which
--- failure escapes, not the line it carries.
+-- only when that fails, in the catch around the force, and the value's
+-- failure escapes whatever the message does (@prim_addErrorContext@,
+-- primops.cc:1027-1055 at 2.36.0).  The pure evaluator reports a
+-- failure's message alone, so these see which failure escapes, not the
+-- line it carries.
 testErrorContext :: IO [Bool]
 testErrorContext = do
   putStrLn "eval/error-context"
@@ -6005,11 +6006,11 @@ testErrorContext = do
       yields "let f = builtins.addErrorContext (throw \"a\"); in f 1" (VInt 1),
       yields "builtins.elemAt (map (builtins.addErrorContext (throw \"a\")) [ 1 ]) 0" (VInt 1),
       fails "builtins.addErrorContext \"ctx-marker\" (throw \"x\")" "x",
-      fails "builtins.addErrorContext (throw \"a\") (throw \"b\")" "a",
-      fails "builtins.addErrorContext 1 (throw \"b\")" "cannot coerce an integer to a string: 1",
+      fails "builtins.addErrorContext (throw \"a\") (throw \"b\")" "b",
+      fails "builtins.addErrorContext 1 (throw \"b\")" "b",
       yields "(builtins.tryEval (builtins.addErrorContext \"c\" (throw \"x\"))).success" (VBool False),
-      -- The type error replaces the throw, and tryEval does not catch it.
-      fails "builtins.tryEval (builtins.addErrorContext 1 (throw \"x\"))" "cannot coerce an integer to a string: 1"
+      -- The message's type error leaves the throw, which tryEval catches.
+      yields "(builtins.tryEval (builtins.addErrorContext 1 (throw \"x\"))).success" (VBool False)
     ]
 
 -- | The line @builtins.addErrorContext@ adds to a failure's trace under
@@ -6050,19 +6051,23 @@ testErrorContextIO = do
         "a message coerces as a set with __toString"
         "builtins.addErrorContext { __toString = _: \"set-ctx\"; } (throw \"x\")"
         (EvalFailure ["set-ctx"] "x"),
-      failsWith "a message that throws replaces the failure" "builtins.addErrorContext (throw \"a\") (throw \"b\")" (EvalFailure [] "a"),
       failsWith
-        "a message that does not coerce replaces the failure"
+        "a message that throws leaves the failure, with a line naming the message's own"
+        "builtins.addErrorContext (throw \"a\") (throw \"b\")"
+        (EvalFailure ["while evaluating the error message passed to builtins.addErrorContext, another error occurred: a"] "b"),
+      failsWith
+        "a message that does not coerce leaves the failure, with a line naming the message's own"
         "builtins.addErrorContext 1 (throw \"b\")"
-        (EvalFailure [] "cannot coerce an integer to a string: 1"),
+        (EvalFailure ["while evaluating the error message passed to builtins.addErrorContext, another error occurred: cannot coerce an integer to a string: 1"] "b"),
+      runTestIO "a message that does not coerce leaves a throw catchable" tmpBase "(builtins.tryEval (builtins.addErrorContext 1 (throw \"x\"))).success" (VBool False),
       reports "an empty message adds no line of its own" "builtins.addErrorContext \"\" (throw \"x\")" "error:\n       error: x",
       runTestIO "a throw inside it stays catchable" tmpBase "(builtins.tryEval (builtins.addErrorContext \"c\" (throw \"x\"))).success" (VBool False),
       runTestM "an abort inside it gains the line and escapes tryEval" $
         failure "builtins.tryEval (builtins.addErrorContext \"c\" (builtins.abort \"x\"))" (assertEqual "abort-trace" ["c"] . failureTrace),
       failsWith
-        "a message that does not coerce escapes tryEval"
-        "builtins.tryEval (builtins.addErrorContext 1 (throw \"x\"))"
-        (EvalFailure [] "cannot coerce an integer to a string: 1")
+        "a message that does not coerce leaves an abort escaping tryEval, with a line naming the message's own"
+        "builtins.tryEval (builtins.addErrorContext 1 (builtins.abort \"x\"))"
+        (EvalFailure ["while evaluating the error message passed to builtins.addErrorContext, another error occurred: cannot coerce an integer to a string: 1"] "evaluation aborted with the following error message: 'x'")
     ]
 
 -- | The lines of context a failure gathers in listToAttrs, upstream's from
@@ -33374,9 +33379,9 @@ instance MonadEval StubStoreEval where
       caught (Left other) = Left other
       caught (Right val) = Right (Right val)
   onEvalError (StubStoreEval action) _ = StubStoreEval action
-  addErrorTrace (StubStoreEval line) (StubStoreEval action) = StubStoreEval $ \env ->
+  addEvaluatedTrace _ (StubStoreEval line) (StubStoreEval action) = StubStoreEval $ \env ->
     action env >>= \case
-      Left failure -> (>> Left failure) <$> line env
+      Left failure -> Left failure <$ line env
       Right val -> pure (Right val)
 
   -- The stub keeps no call depth: it exists to answer store questions,

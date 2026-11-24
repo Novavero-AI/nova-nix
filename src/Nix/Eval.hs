@@ -167,6 +167,7 @@ import Nix.Eval.Types
     StringContext (..),
     StringContextElement (..),
     Thunk (..),
+    addErrorTrace,
     attrSetElems,
     attrSetFindName,
     attrSetFoldM,
@@ -742,7 +743,7 @@ evalBcSelect env bcIdx0 = do
   case result of
     PathFound val -> pure val
     PathMissing name -> orDefault (throwEvalError ("attribute '" <> printSymbol (symbolText name) <> "' missing"))
-    PathNotASet val -> orDefault (addErrorTrace (pure "while selecting an attribute") (expectedFailure "a set" val))
+    PathNotASet val -> orDefault (addErrorTrace "while selecting an attribute" (expectedFailure "a set" val))
   where
     orDefault failure = do
       hasDef <- (/= 0) <$> cbcFlags bcIdx0
@@ -1273,7 +1274,7 @@ matchFormalSet closureEnv lambdaName formals allowExtra argVal atThunk =
       pure formalEnv
     _ ->
       callSiteError
-        $ addErrorTrace (pure "while evaluating the value passed for the lambda argument")
+        $ addErrorTrace "while evaluating the value passed for the lambda argument"
         $ expectedFailure "a set" argVal
 
 -- | A failure of a call to a set pattern, with the line of context
@@ -1286,7 +1287,7 @@ matchFormalSet closureEnv lambdaName formals allowExtra argVal atThunk =
 -- a @while calling@ line, to a failure in the function's body only under
 -- @show-trace@ (eval.cc:1603-1614), which this evaluator does not have.
 callSiteError :: (MonadEval m) => m a -> m a
-callSiteError = addErrorTrace (pure "from call site")
+callSiteError = addErrorTrace "from call site"
 
 -- | With no ellipsis, a set holding an attribute that no formal names
 -- fails the call, as upstream checks it (eval.cc:1565-1586 at 2.24.9):
@@ -1825,18 +1826,22 @@ builtinAbort other = abortEvaluation ("builtins.abort: expected a string, got " 
 
 -- | @builtins.addErrorContext message value@: the value, forced, and when
 -- forcing it fails, the failure with the message as a line of its trace.
--- Upstream's @prim_addErrorContext@ (primops.cc:831-844 at 2.24.9) forces
--- the value inside a @catch@ and coerces the message only there, so both
--- are taken unforced: a message is never forced when the value
--- evaluates, and one that fails to coerce fails in place of the value.
--- The message coerces as a string, a path or a set with @__toString@ or
--- @outPath@, with no store copy (@coerceMore@ and @copyToStore@ false).
+-- Upstream's @prim_addErrorContext@ (primops.cc:1027-1055 at 2.36.0)
+-- forces the value inside a @catch@ and coerces the message only there,
+-- so both are taken unforced: a message is never forced when the value
+-- evaluates.  A message that fails to coerce leaves the value's failure
+-- to escape, a throw still catchable by @builtins.tryEval@, with a line
+-- naming the message's own failure; 2.35.4 and earlier let it escape in
+-- place of the value's.  The message coerces as a string, a path or a set
+-- with @__toString@ or @outPath@, with no store copy (@coerceMore@ and
+-- @copyToStore@ false).
 builtinAddErrorContext :: (MonadEval m) => BuiltinArg -> BuiltinArg -> m NixValue
-builtinAddErrorContext message value = addErrorTrace contextLine (argValue value)
+builtinAddErrorContext message value = addEvaluatedTrace failedLine contextLine (argValue value)
   where
     contextLine = do
       (bytes, _) <- argValue message >>= coerceToString False force applyValue coercePathVerbatim
       pure $! bytesToTextLossy bytes
+    failedLine reason = "while evaluating the error message passed to builtins.addErrorContext, another error occurred: " <> reason
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - attr set (arity 1)
@@ -1865,7 +1870,7 @@ builtinListToAttrs :: (MonadEval m) => NixValue -> m NixValue
 builtinListToAttrs (VList cl) =
   listThunks cl >>= foldM addListToAttrsElement Map.empty >>= fmap VAttrs . attrSetFromSymbolEntries SetListToAttrs
 builtinListToAttrs other =
-  addErrorTrace (pure "while evaluating the argument passed to builtins.listToAttrs") (expectedFailure "a list" other)
+  addErrorTrace "while evaluating the argument passed to builtins.listToAttrs" (expectedFailure "a list" other)
 
 -- | Add one element of @listToAttrs@'s list to the attributes the elements
 -- before it made, whose names are the names seen.  The element is forced
@@ -1879,10 +1884,10 @@ addListToAttrsElement !made thunk = do
   attrs <-
     force thunk >>= \case
       VAttrs attrs -> pure attrs
-      other -> addErrorTrace (pure "while evaluating an element of the list passed to builtins.listToAttrs") (expectedFailure "a set" other)
+      other -> addErrorTrace "while evaluating an element of the list passed to builtins.listToAttrs" (expectedFailure "a set" other)
   nameThunk <- attrSetLookup "name" attrs >>= maybe (missingPairAttr "name") pure
   name <-
-    addErrorTrace (pure "while evaluating the `name` attribute of an element of the list passed to builtins.listToAttrs") $
+    addErrorTrace "while evaluating the `name` attribute of an element of the list passed to builtins.listToAttrs" $
       force nameThunk >>= attrNameOf "builtins.listToAttrs: attribute name"
   sym <- symbolIntern name
   let newEntry = attrSetLookupEntry "value" attrs >>= maybe (missingPairAttr "value") pure
@@ -1892,7 +1897,7 @@ addListToAttrsElement !made thunk = do
 -- @getAttr@ (primops.cc:641-651 at 2.24.9) refuses it: the message, and a
 -- line of context naming the pair.
 missingPairAttr :: (MonadEval m) => Text -> m a
-missingPairAttr key = addErrorTrace (pure "in a {name=...; value=...;} pair") (throwEvalError ("attribute '" <> key <> "' missing"))
+missingPairAttr key = addErrorTrace "in a {name=...; value=...;} pair" (throwEvalError ("attribute '" <> key <> "' missing"))
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - attr set (arity 2)
@@ -3393,7 +3398,7 @@ realisePath :: (MonadEval m) => Text -> NixValue -> m Text
 realisePath label val = do
   (path, ctx) <- coerceToPathWithContext label val
   unless (contextIsEmpty ctx) $
-    addErrorTrace (pure ("while realising the context of path '" <> path <> "'")) (realisedOrRefused ctx)
+    addErrorTrace ("while realising the context of path '" <> path <> "'") (realisedOrRefused ctx)
   pure path
 
 -- | Upstream's @addPath@ around the copy @builtins.path@ and
@@ -3404,7 +3409,7 @@ realisePath label val = do
 -- @while adding path \'...\'@.
 addingPath :: (MonadEval m) => Text -> StringContext -> m a -> m a
 addingPath path ctx copy =
-  addErrorTrace (pure ("while adding path '" <> path <> "'")) $ do
+  addErrorTrace ("while adding path '" <> path <> "'") $ do
     when (isInStoreText path && not (contextIsEmpty ctx)) (realisedOrRefused ctx)
     copy
 
@@ -4679,7 +4684,7 @@ builtinDerivationStrict (VAttrs attrs) = do
       throwEvalError ("invalid derivation name: " <> storePathNameUpstreamText err <> ". Please pass a different 'name'.")
     Right () -> pure ()
   passing <-
-    addErrorTrace (pure "while evaluating the `__structuredAttrs` attribute passed to builtins.derivationStrict") $
+    addErrorTrace "while evaluating the `__structuredAttrs` attribute passed to builtins.derivationStrict" $
       attrPassingOf attrs
   -- __ignoreNulls: when true, null-valued attrs are dropped from the
   -- derivation env (stdenv.mkDerivation sets it); when absent or false,
@@ -4688,7 +4693,7 @@ builtinDerivationStrict (VAttrs attrs) = do
     attrSetLookup ignoreNullsFlag attrs >>= \case
       Nothing -> pure KeepNullAttrs
       Just thunk ->
-        addErrorTrace (pure "while evaluating the `__ignoreNulls` attribute passed to builtins.derivationStrict") $ do
+        addErrorTrace "while evaluating the `__ignoreNulls` attribute passed to builtins.derivationStrict" $ do
           ignore <- force thunk >>= expectBool
           pure (if ignore then IgnoreNullAttrs else KeepNullAttrs)
   let fieldContext = "derivation \"" <> drvName <> "\""
@@ -4914,7 +4919,7 @@ derivationPass ::
 derivationPass drvName nulls readEntry = foldM step (Map.empty, initial)
   where
     initial = DrvFields mempty Nothing Nothing ("out" :| []) [] Nothing Nothing Nothing
-    step (!entries, !fields) (key, thunk) = addErrorTrace (pure (derivationAttrTrace drvName key)) $ do
+    step (!entries, !fields) (key, thunk) = addErrorTrace (derivationAttrTrace drvName key) $ do
       val <- force thunk
       case (val, nulls, drvAttrUse key) of
         (VNull, IgnoreNullAttrs, _) -> pure (entries, fields)
@@ -5129,7 +5134,7 @@ derivationAttrTrace drvName key = "while evaluating attribute '" <> key <> "' of
 traceIfPresent :: (MonadEval m) => AttrSet -> Text -> Text -> m a -> m a
 traceIfPresent attrs key line action = do
   present <- attrSetMember key attrs
-  if present then addErrorTrace (pure line) action else action
+  if present then addErrorTrace line action else action
 
 -- | A Boolean as upstream's @forceBool@ reads it, refused with its message
 -- (eval.cc:2176-2193 at 2.24.9): a derivation's switches and the
@@ -6028,7 +6033,7 @@ readPathArgument args name entry = case key of
   where
     key = symbolText name
     thunk = entryThunk entry
-    checked what check value = addErrorTrace (pure ("while evaluating the " <> what <> " passed to builtins.path")) (check value)
+    checked what check value = addErrorTrace ("while evaluating the " <> what <> " passed to builtins.path") (check value)
     nameOf value = decodedText "builtins.path" =<< structuredStringValue RefuseContext value
     pathPin pinVal = case pinVal of
       VStr pin _ -> decodeSha256Pin =<< decodedText "builtins.path" pin
