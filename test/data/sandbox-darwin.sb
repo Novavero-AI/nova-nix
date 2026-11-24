@@ -1,0 +1,129 @@
+(version 1)
+(deny default (with no-log))
+; Scratch space: /tmp itself and the build's own directory, where the
+; build may also use Unix sockets.
+(define TMPDIR (param "_GLOBAL_TMP_DIR"))
+(allow file* process-exec network-outbound network-inbound
+	(literal "/tmp")
+	(subpath (param "_NIX_BUILD_TOP")))
+; Processes: the build may start them and signal its own, and may
+; make no file setuid or setgid.
+(allow process-fork)
+(allow signal (target same-sandbox))
+(deny file-write-setugid)
+; System information, POSIX semaphores, sockets, and user and group
+; lookups.
+(allow sysctl-read)
+(allow ipc-posix-sem)
+(allow system-socket)
+(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))
+; Devices: the standard ones and DTrace's helper.
+(allow file*
+	(literal "/dev/null")
+	(literal "/dev/zero")
+	(literal "/dev/random")
+	(literal "/dev/urandom")
+	(literal "/dev/tty")
+	(literal "/dev/stdin")
+	(literal "/dev/stdout")
+	(literal "/dev/stderr")
+	(subpath "/dev/fd")
+	(literal "/dev/dtracehelper"))
+; The shell /bin/sh selects.
+(allow file* (literal "/private/var/select/sh"))
+; System files programs read: the system's version, time zones,
+; locales, and Rosetta, which runs a program built for the other
+; architecture.
+(allow file-read*
+	(literal "/System/Library/CoreServices/SystemVersion.plist")
+	(literal "/System/Library/CoreServices/SystemVersionCompat.plist")
+	(subpath "/usr/share/zoneinfo")
+	(subpath "/usr/share/locale")
+	(subpath "/Library/Apple/usr/libexec/oah")
+	(subpath "/System/Library/Apple/usr/libexec/oah")
+	(subpath "/System/Library/LaunchDaemons/com.apple.oahd.plist")
+	(subpath "/Library/Apple/System/Library/LaunchDaemons/com.apple.oahd.plist"))
+; The attributes of /dev, and of /etc and /var, links a path through
+; them follows.
+(allow file-read-metadata
+	(literal "/dev")
+	(literal "/etc")
+	(literal "/var")
+	(literal "/private/var/tmp"))
+; Loopback networking, with the name lookups it takes, for a build
+; that asks for it.
+(if (param "_ALLOW_LOCAL_NETWORKING")
+    (begin
+      (allow network* (remote ip "localhost:*"))
+      (allow network-inbound (local ip "*:*"))
+      (allow file-read-metadata
+	(literal "/etc/resolv.conf")
+	(literal "/private/etc/resolv.conf")
+	(literal "/etc/hosts"))
+      (allow file-read*
+	(literal "/private/var/run/resolv.conf")
+	(literal "/private/etc/hosts"))
+      (allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))))
+; The network, for a fixed-output build, with name lookups and
+; certificate checks.
+(allow network* (local ip) (remote ip))
+(allow file-read-metadata
+	(literal "/etc/resolv.conf")
+	(literal "/private/etc/resolv.conf"))
+(allow file-read* (literal "/private/var/run/resolv.conf"))
+(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
+(allow mach-lookup
+	(global-name "com.apple.SystemConfiguration.DNSConfiguration")
+	(global-name "com.apple.trustd")
+	(global-name "com.apple.trustd.agent"))
+; The store, which no rule above opens to writes, and the build
+; directory within it, opened again.
+(deny file-write* (subpath "/nix/store"))
+(allow file-read* file-write* process-exec network-outbound network-inbound (subpath (param "_NIX_BUILD_TOP")))
+; The outputs the build writes.
+(allow file-read* file-write* process-exec
+	(subpath "/nix/store/oooooooooooooooooooooooooooooooo-x")
+)
+; The host paths the build reads and runs.
+(allow file-read* process-exec
+	(literal "/bin/sh")
+	(subpath "/private/state/builds/h")
+	(literal "/srv/a \"quoted\" \\ name")
+	(subpath "/usr/lib")
+)
+; The store paths the build reads and runs, a form for each first
+; character of their hash.
+(allow file-read* process-exec
+	(require-all
+		(prefix "/nix/store/a")
+		(require-any
+			(subpath "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dep")
+		)))
+(allow file-read* process-exec
+	(require-all
+		(prefix "/nix/store/b")
+		(require-any
+			(literal "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-file")
+		)))
+; The directories above them, so a path to them resolves.
+(allow file-read*
+	(literal "/")
+	(literal "/bin")
+	(literal "/nix")
+	(literal "/nix/store")
+	(literal "/private")
+	(literal "/private/state")
+	(literal "/private/state/builds")
+	(literal "/srv")
+	(literal "/usr")
+)
+; Terminals, which are the user's.
+(deny file-read* file-write*
+	(literal "/dev/ptmx")
+	(regex #"^/dev/pty")
+	(regex #"^/dev/tty.")
+	(literal "/dev/console"))
+(allow file-read* (literal "/etc/extra"))
+; The build's mark, which the helper finds its processes by.
+(allow mach-lookup (global-name (param "_NOVA_NIX_BUILD_TOKEN")))
+(deny mach-lookup (global-name (param "_NOVA_NIX_BUILD_DECOY")))

@@ -49,6 +49,8 @@ module Nix.Realise
     DerivationAttrs (..),
     derivationAttrs,
     derivationBoolAttr,
+    derivationStringAttr,
+    derivationStringsAttr,
     SubstitutesSetting (..),
     Substitutes (..),
     substitutesAllowed,
@@ -77,6 +79,7 @@ import Control.Monad (filterM, void)
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import Data.List (sortOn)
 import Data.List.NonEmpty (NonEmpty)
 import qualified Data.List.NonEmpty as NE
@@ -90,7 +93,7 @@ import qualified Data.Text.Encoding as TE
 import Nix.DependencyGraph (DepGraph (..), DepNode (..))
 import Nix.Derivation (Derivation (..), DerivationOutput (..))
 import Nix.Derivation.StructuredAttrs (structuredAttrsKey)
-import Nix.Json (Json (..), parseJson)
+import Nix.Json (Json (..), expectJson, parseJson)
 import Nix.Store.Path (StoreDir, StorePath (spName), defaultStoreDir, storePathBasename, storePathToFilePath, storePathToText)
 
 -- ---------------------------------------------------------------------------
@@ -453,6 +456,54 @@ derivationBoolAttr drvPath name def (AttrsInJson (JsonObject members)) =
     fromJson _ =
       Left ("attribute '" <> name <> "' of derivation '" <> storePathBasename drvPath <> "' must be a Boolean")
 derivationBoolAttr _ _ def (AttrsInJson _) = Right def
+
+-- | Upstream's @getStringAttr@ (derivation-options.cc at 2.36.0), for
+-- the derivation at a @.drv@ path: 'Nothing' when the derivation lacks
+-- the attribute.  In the environment it is the variable's bytes; in
+-- structured attributes it is a JSON string, its UTF-8 bytes, and any
+-- other value there is upstream's refusal ('attributeRefusal').
+derivationStringAttr :: StorePath -> Text -> DerivationAttrs -> Either Text (Maybe ByteString)
+derivationStringAttr _ name (AttrsInEnvironment env) = Right (Map.lookup name env)
+derivationStringAttr drvPath name (AttrsInJson (JsonObject members)) =
+  traverse (first (attributeRefusal drvPath name) . fmap TE.encodeUtf8 . expectJson "string" jsonString) (Map.lookup name members)
+derivationStringAttr _ _ (AttrsInJson _) = Right Nothing
+
+-- | Upstream's @getStringSetAttr@ (derivation-options.cc at 2.36.0), for
+-- the derivation at a @.drv@ path: 'Nothing' when the derivation lacks
+-- the attribute.  In the environment it is the variable's bytes split at
+-- spaces, tabs, carriage returns and newlines, upstream's
+-- @tokenizeString@ separators, with no empty token; in structured
+-- attributes it is a JSON array of strings, and anything else there is
+-- upstream's refusal of the first value of the wrong type
+-- ('attributeRefusal').
+derivationStringsAttr :: StorePath -> Text -> DerivationAttrs -> Either Text (Maybe [ByteString])
+derivationStringsAttr _ name (AttrsInEnvironment env) =
+  Right (filter (not . BS.null) . BS.splitWith (`BS.elem` tokenSeparators) <$> Map.lookup name env)
+  where
+    tokenSeparators = " \t\n\r"
+derivationStringsAttr drvPath name (AttrsInJson (JsonObject members)) =
+  traverse (first (attributeRefusal drvPath name) . strings) (Map.lookup name members)
+  where
+    strings value = expectJson "array" jsonArray value >>= traverse (fmap TE.encodeUtf8 . expectJson "string" jsonString)
+    jsonArray value = case value of
+      JsonArray items -> Just items
+      _ -> Nothing
+derivationStringsAttr _ _ (AttrsInJson _) = Right Nothing
+
+-- | A JSON value's text, when it is a string.
+jsonString :: Json -> Maybe Text
+jsonString value = case value of
+  JsonString text -> Just text
+  _ -> Nothing
+
+-- | Upstream's refusal of an attribute of the wrong type in structured
+-- attributes, with the two lines of context upstream puts before it, the
+-- derivation's and the attribute's (@derivationOptionsFromStructuredAttrs@
+-- and its caller in derivation-building-goal.cc at 2.36.0), on one line
+-- as nova-nix reports such context.
+attributeRefusal :: StorePath -> Text -> Text -> Text
+attributeRefusal drvPath name refusal =
+  "while parsing derivation '" <> storePathToText defaultStoreDir drvPath <> "': while parsing attribute \"" <> name <> "\": " <> refusal
 
 -- | Upstream's @ParsedDerivation::substitutesAllowed@ at 2.24.9, for the
 -- derivation at a @.drv@ path.  Under 'AlwaysAllowSubstitutes' every

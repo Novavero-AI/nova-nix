@@ -18,6 +18,10 @@ module Nix.Json
     renderJson,
     renderJsonWith,
     formatJsonFloat,
+    jsonText,
+
+    -- * Refusals
+    expectJson,
 
     -- * Parsing
     IntegerRange (..),
@@ -72,6 +76,29 @@ data Json
 -- ---------------------------------------------------------------------------
 -- Rendering
 -- ---------------------------------------------------------------------------
+
+-- | A JSON value as nlohmann's @dump@ writes it ('renderJson'), for a
+-- message.  'renderJson' writes UTF-8, so the decoding is exact.
+jsonText :: Json -> Text
+jsonText = TE.decodeUtf8Lenient . renderJson
+
+-- | A JSON value of the type upstream's @ensureType@ expects, or its
+-- refusal (json-utils.cc at 2.36.0), given the name nlohmann gives that
+-- type and the match that takes the value when it has it.
+expectJson :: Text -> (Json -> Maybe a) -> Json -> Either Text a
+expectJson expected match value =
+  maybe (Left ("Expected JSON value to be of type '" <> expected <> "' but it is of type '" <> jsonTypeName value <> "': " <> jsonText value)) Right (match value)
+
+-- | The name nlohmann gives a JSON value's type.
+jsonTypeName :: Json -> Text
+jsonTypeName value = case value of
+  JsonNull -> "null"
+  JsonBool _ -> "boolean"
+  JsonInt _ -> "number"
+  JsonFloat _ -> "number"
+  JsonString _ -> "string"
+  JsonArray _ -> "array"
+  JsonObject _ -> "object"
 
 -- | nlohmann's @dump()@: no whitespace, members in name order, strings
 -- escaped as 'escapeJsonString' describes, floats as 'formatJsonFloat'.

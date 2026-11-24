@@ -9,8 +9,8 @@ says how to install and use nova-nix.
 ## The parts
 
 nova-nix is a Haskell library with a C data layer under its evaluator,
-the `nova-nix` executable over that library, and on Linux a small C
-program, `nova-nix-sandbox`, that sandboxed builds run through.
+the `nova-nix` executable over that library, and on Linux and macOS a
+small C program, `nova-nix-sandbox`, that sandboxed builds run through.
 
 - **The command line.** [`app/Main.hs`] reads the arguments
   ([`cli/Nix/Cli/Args.hs`]), the `nix.conf` files
@@ -41,8 +41,9 @@ program, `nova-nix-sandbox`, that sandboxed builds run through.
 - **Realisation.** [`src/Nix/Realise.hs`] decides, for each derivation a
   build needs, whether to download its outputs or build it.
   [`src/Nix/Substituter.hs`] downloads from binary caches, and
-  [`src/Nix/Builder.hs`] runs builders, in a sandbox on Linux
-  ([`src/Nix/Builder/Sandbox.hs`], [`sandbox/`]).
+  [`src/Nix/Builder.hs`] runs builders, in a sandbox on Linux, and on
+  macOS when `sandbox` is on ([`src/Nix/Builder/Sandbox.hs`],
+  [`sandbox/`]).
 - **Profiles.** [`src/Nix/Profile/`] keeps a user's profiles:
   generations of packages linked into one tree, each a garbage-collector
   root.

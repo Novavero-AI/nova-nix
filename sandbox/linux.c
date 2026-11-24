@@ -28,7 +28,6 @@
 
 #define _GNU_SOURCE
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -59,6 +58,7 @@
 #include "backend.h"
 #include "mountinfo.h"
 #include "plan.h"
+#include "posix.h"
 
 /* mount_setattr and what it takes, from the kernel's UAPI at Linux 5.12
  * (include/uapi/linux/mount.h, include/uapi/linux/fcntl.h and the syscall
@@ -101,6 +101,9 @@ static const char devpts_options[] = "newinstance,mode=0620";
 /* The mount table of the process reading it. */
 static const char mountinfo_path[] = "/proc/self/mountinfo";
 
+/* The open descriptors of the process reading it. */
+static const char descriptor_listing[] = "/proc/self/fd";
+
 /* What the read of a file with no size, such as one in /proc, starts with. */
 #define PROC_READ_START_BYTES ((size_t)16 * 1024)
 
@@ -114,47 +117,8 @@ struct child_context {
     sigset_t original_mask;
 };
 
-/* ------------------------------------------------------------------------
- * The channels
- * ------------------------------------------------------------------------ */
-
-/* The status channel's descriptor: standard output until
- * backend_prepare_run moves it, and -1 once the builder is released, when
- * nothing is left to report on it.  It is the process's, so it lives at
- * file scope: every failure of the setup is reported on it, the cloned
- * child's included. */
-static int status_fd = STDOUT_FILENO;
-
-void backend_write_status(const char *bytes, size_t length)
-{
-    while (length > 0) {
-        ssize_t written = write(status_fd, bytes, length);
-        if (written < 0) {
-            if (errno == EINTR)
-                continue;
-            return;
-        }
-        bytes += written;
-        length -= (size_t)written;
-    }
-}
-
-int backend_read_input(char *bytes, size_t length)
-{
-    size_t got = 0;
-    while (got < length) {
-        ssize_t read_now = read(STDIN_FILENO, bytes + got, length - got);
-        if (read_now < 0) {
-            if (errno == EINTR)
-                continue;
-            return errno;
-        }
-        if (read_now == 0)
-            return EPIPE;
-        got += (size_t)read_now;
-    }
-    return 0;
-}
+/* The backend this file is. */
+const enum plan_backend backend_plan = PLAN_LINUX;
 
 /* ------------------------------------------------------------------------
  * Paths
@@ -699,54 +663,6 @@ static void loopback_up(void)
     close(fd);
 }
 
-/* Close every descriptor from 3 up but the status pipe, which closes when
- * the builder starts (runChild in LDG). */
-static void close_descriptors(int keep)
-{
-    DIR *dir = opendir("/proc/self/fd");
-    if (dir != NULL) {
-        int own = dirfd(dir);
-        int fds[1024];
-        size_t count = 0;
-        size_t i;
-        struct dirent *entry;
-        int more = 1;
-        while (more) {
-            count = 0;
-            more = 0;
-            rewinddir(dir);
-            while ((entry = readdir(dir)) != NULL) {
-                long fd;
-                char *rest = NULL;
-                if (entry->d_name[0] < '0' || entry->d_name[0] > '9')
-                    continue;
-                fd = strtol(entry->d_name, &rest, 10);
-                if (rest == NULL || *rest != '\0' || fd < 3 || fd == own || fd == keep)
-                    continue;
-                if (count == sizeof fds / sizeof fds[0]) {
-                    more = 1;
-                    break;
-                }
-                fds[count++] = (int)fd;
-            }
-            for (i = 0; i < count; i++)
-                close(fds[i]);
-        }
-        closedir(dir);
-        return;
-    }
-    {
-        struct rlimit limit;
-        int fd;
-        int top = 1024;
-        if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY && limit.rlim_cur < (rlim_t)INT_MAX)
-            top = (int)limit.rlim_cur;
-        for (fd = 3; fd < top; fd++)
-            if (fd != keep)
-                close(fd);
-    }
-}
-
 /* Die with the helper, as upstream's child dies with its parent
  * (startProcess in processes.cc).  A credential change can clear the
  * setting, so it is made again once the ids are final. */
@@ -858,7 +774,9 @@ static int child_main(const struct child_context *context)
     if (chdir(plan->build_dir) < 0)
         status_fail("chdir", errno, NO_INDEX);
 
-    close_descriptors(status_fd);
+    /* Every descriptor but the status pipe, which closes when the builder
+     * starts (runChild's closeExtraFDs). */
+    posix_close_descriptors(descriptor_listing, posix_status_fd());
 
     /* A session keyring of the builder's own, anonymous and empty, which
      * upstream does not make: its builder runs as a build user, with no
@@ -939,31 +857,6 @@ static void fail_after_clone(pid_t child, const char *stage, int error)
     status_fail(stage, error, (long)child);
 }
 
-/* Put SIGCHLD back to its default, as upstream's initNix does
- * (shared.cc): a SIGCHLD ignored where this program was started would have
- * the kernel reap the builder unasked, leaving nothing to wait for.  Answers
- * 0, or an errno value. */
-static int reset_sigchld(void)
-{
-    struct sigaction action;
-    memset(&action, 0, sizeof action);
-    sigemptyset(&action.sa_mask);
-    action.sa_handler = SIG_DFL;
-    return sigaction(SIGCHLD, &action, NULL) < 0 ? errno : 0;
-}
-
-/* Reap the builder, blocking.  Answers 0, or the errno of a wait that
- * failed. */
-static int reap_builder(pid_t child, int *wait_status)
-{
-    for (;;) {
-        if (waitpid(child, wait_status, 0) == child)
-            return 0;
-        if (errno != EINTR)
-            return errno;
-    }
-}
-
 /* Wait for the builder, killing it on a terminating signal or when the
  * lifeline closes.  Answers 0 with how it ended in *WAIT_STATUS, or the
  * errno of a wait that failed, which ends the build: the builder is
@@ -986,7 +879,7 @@ static int wait_for_builder(pid_t child, int signals_fd, int lifeline_fd, int *w
                 continue;
             /* With nothing left to watch, the builder is ended and reaped. */
             kill(child, SIGKILL);
-            return reap_builder(child, wait_status);
+            return posix_reap(child, wait_status);
         }
         if (watched[1].revents != 0) {
             char discard[64];
@@ -1012,48 +905,6 @@ static int wait_for_builder(pid_t child, int signals_fd, int lifeline_fd, int *w
             return error;
         }
     }
-}
-
-/* End this process as the builder ended: with its exit status, or by the
- * signal that killed it, with no core dump of this process's own. */
-static int relay(int wait_status)
-{
-    if (WIFEXITED(wait_status))
-        return WEXITSTATUS(wait_status);
-    if (WIFSIGNALED(wait_status)) {
-        int signal_number = WTERMSIG(wait_status);
-        sigset_t just_this;
-        struct rlimit core;
-        if (getrlimit(RLIMIT_CORE, &core) == 0) {
-            core.rlim_cur = 0;
-            setrlimit(RLIMIT_CORE, &core);
-        }
-        signal(signal_number, SIG_DFL);
-        sigemptyset(&just_this);
-        sigaddset(&just_this, signal_number);
-        sigprocmask(SIG_UNBLOCK, &just_this, NULL);
-        raise(signal_number);
-        return 128 + signal_number;
-    }
-    return EXIT_FAILURE;
-}
-
-int backend_prepare_run(void)
-{
-    int error;
-    /* The status pipe moves to a descriptor the builder's exec closes, and
-     * standard output becomes the log, as upstream's child gets standard
-     * error on both (commonChildInit in child.cc). */
-    int moved = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
-    if (moved < 0)
-        return -1;
-    status_fd = moved;
-    if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0)
-        status_fail("stdout", errno, NO_INDEX);
-
-    if ((error = reset_sigchld()) != 0)
-        status_fail("sigchld", error, NO_INDEX);
-    return 0;
 }
 
 int backend_run(const struct plan *plan, char **argv)
@@ -1144,8 +995,7 @@ int backend_run(const struct plan *plan, char **argv)
             fail_after_clone(child, "release", written < 0 ? errno : EIO);
     }
     close(sync_pipe[1]);
-    close(status_fd);
-    status_fd = -1;
+    posix_close_status();
 
     error = wait_for_builder(child, signals_fd, lifeline_fd, &wait_status);
     close(signals_fd);
@@ -1156,7 +1006,7 @@ int backend_run(const struct plan *plan, char **argv)
         fprintf(stderr, "nova-nix-sandbox: cannot get exit status of PID %ld: %s\n", (long)child, strerror(error));
         return EXIT_FAILURE;
     }
-    return relay(wait_status);
+    return posix_relay(wait_status);
 }
 
 /* ------------------------------------------------------------------------
@@ -1243,7 +1093,7 @@ static const char *probe_namespaces(int *error)
 
 const char *backend_probe(int *error)
 {
-    if ((*error = reset_sigchld()) != 0)
+    if ((*error = posix_reset_sigchld()) != 0)
         return "sigchld";
     if (!path_exists("/proc/self/ns/user"))
         return "userns-missing";

@@ -229,13 +229,12 @@ import qualified NovaCache.NAR as NAR
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getTemporaryDirectory, removeDirectoryRecursive)
 import qualified System.Directory as Dir
 import System.Environment (getEnvironment, getExecutablePath, lookupEnv, setEnv, unsetEnv)
-import qualified System.Environment.Blank as Blank
 import System.Exit (ExitCode (..))
 import System.FilePath (dropDrive, makeRelative, takeDirectory, takeFileName, (</>))
 import qualified System.Info as SI
 import qualified System.Process as Proc
 import System.Timeout (timeout)
-import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertEval, assertEvalError, assertEvalErrorIO, assertEvalFail, assertLeft, assertParse, assertParseFail, assertRight, bytesText, canonicalAs, censusStoreHash, compiledBindings, decodeFormals, emits, envSpelling, evalAndBuild, evalDerivationIO, evalDerivationIOStore, evalNix, evalNixIO, evalNixIOIn, evalNixIOStore, evalNixIOStoreDir, evalNixInFile, evalNixWith, fetchedStorePath, findTestShell, fixtureGit, forceRemoveIfExists, inTestSession, jsonInFile, makeGitFixture, nixQuotedPath, positionJson, positionsFile, purePolicy, removeIfExists, repeatedMarker, restrictedPolicy, runTest, runTestIO, runTestM, selfHoldingDerivation, selfHoldingPrinted, selfHoldingPrintedStrict, setLayerRhsMax, setMaxLayers, sitesAdded, storePathStringValue, symlinksAvailable, testBaseDir, testEvalState, testOrigin, testPos, testSessionStore, unexpectedOps, upstreamBaseEnvNames, walkWatchdogMicros, withGlobals)
+import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertEval, assertEvalError, assertEvalErrorIO, assertEvalFail, assertLeft, assertParse, assertParseFail, assertRight, bytesText, canonicalAs, censusStoreHash, compiledBindings, decodeFormals, emits, envSpelling, evalAndBuild, evalDerivationIO, evalDerivationIOStore, evalNix, evalNixIO, evalNixIOIn, evalNixIOStore, evalNixIOStoreDir, evalNixInFile, evalNixWith, fetchedStorePath, findTestShell, fixtureGit, forceRemoveIfExists, inTestSession, jsonInFile, makeGitFixture, nixQuotedPath, positionJson, positionsFile, purePolicy, removeIfExists, repeatedMarker, restrictedPolicy, runTest, runTestIO, runTestM, selfHoldingDerivation, selfHoldingPrinted, selfHoldingPrintedStrict, setLayerRhsMax, setMaxLayers, sitesAdded, storePathStringValue, symlinksAvailable, testBaseDir, testEvalState, testOrigin, testPos, testSessionStore, unexpectedOps, upstreamBaseEnvNames, walkWatchdogMicros, withEnvVar, withGlobals)
 import qualified Test.QuickCheck as QC
 
 -- ---------------------------------------------------------------------------
@@ -5516,14 +5515,6 @@ withEnvBytes label name value check = do
   case (,) <$> spelledName <*> spelledValue of
     Nothing -> True <$ putStrLn ("  SKIP  " <> T.unpack label <> ": a Windows environment cannot hold a byte with no UTF-8 reading")
     Just (nameSpelling, valueSpelling) -> runTestM label (withEnvVar nameSpelling valueSpelling check)
-
--- | Run an action with a variable set (to an empty value too, which
--- 'setEnv' would unset), restoring what the variable held afterwards.
-withEnvVar :: String -> String -> IO a -> IO a
-withEnvVar name value action =
-  bracket (lookupEnv name) restore (const (Blank.setEnv name value True >> action))
-  where
-    restore = maybe (unsetEnv name) (\saved -> Blank.setEnv name saved True)
 
 -- | A Windows value holding an unpaired UTF-16 surrogate has no UTF-8
 -- form, so getEnv refuses it rather than substituting U+FFFD.

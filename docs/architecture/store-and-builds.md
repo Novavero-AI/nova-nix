@@ -215,36 +215,55 @@ inputs, the paths `sandbox-paths` binds and its build directory at
 paths inside it. It runs as uid 1000 and gid 100 in its user namespace,
 with `HOME` at `/homeless-shelter`, which does not exist.
 
+On macOS a sandboxed build runs under a profile of macOS's sandbox. It
+sees its build directory and its outputs where they are on disk, with
+`HOME` at `/homeless-shelter`. It may read and run its inputs and the
+paths `sandbox-paths` names, write only its outputs and its build
+directory, and reach the network only when its derivation is
+fixed-output. There `sandbox-paths` defaults to upstream's system
+frameworks, libraries and shells. The builder runs as the invoking user,
+so the profile grants nothing that would reach that user's own files,
+sockets, terminals or shared memory, and when the build ends the helper
+stops and kills every process that carries the build's mark, a name only
+that build's profile allows, including one that left the builder's
+process group, and reports the build as it ended only once a listing of
+the user's processes finds none of them left. The builder writes its
+output to a pipe the helper copies into the build log. A build can still read the command lines of the user's
+other processes and create System V IPC objects it cannot remove; both
+need builds to run as build users.
+
 The work is split three ways:
 
 - [`src/Nix/Builder/Sandbox.hs`] decides, in pure functions, whether a
-  build is sandboxed and what its plan is.
+  build is sandboxed and what its plan is, and on macOS renders its
+  profile.
 - [`src/Nix/Builder/Sandbox/Spawn.hs`] probes whether the system can make
-  the namespaces, makes the root's skeleton beside the build directory,
-  and runs the helper.
+  the sandbox, makes the Linux root's skeleton beside the build
+  directory, looks at the paths a macOS profile names, and runs the
+  helper.
 - The helper, `nova-nix-sandbox` ([`sandbox/`]), is a C program started
-  with an empty environment. It reads the plan on its standard input,
-  makes the namespaces, the mounts and the root, and executes the builder.
-  That work falls between the namespaces' creation and the builder's
-  exec, where a child of GHC's threaded runtime may make only
-  async-signal-safe calls and the process library offers no hook. A step
-  that fails is reported as one record on the helper's standard output.
-  Its standard input stays open after the plan as a lifeline: when
-  nova-nix closes it, the builder is killed.
+  with an empty environment. It reads the plan on its standard input and
+  executes the builder: on Linux it first makes the namespaces, the
+  mounts and the root, and on macOS it applies the profile. That work
+  falls just before the builder's exec, where a child of GHC's threaded
+  runtime may make only async-signal-safe calls and the process library
+  offers no hook. A step that fails is reported as one record on the
+  helper's standard output. Its standard input stays open after the plan
+  as a lifeline: when nova-nix closes it, the builder is killed.
 
 nova-nix finds the helper beside its executable, or in Cabal's install
 directory. The Linux release archive also carries a shell,
 `libexec/nova-nix/sh`, which `sandbox-paths` binds as `/bin/sh` by
-default. A system that cannot make the namespaces builds
+default. A Linux system that cannot make the namespaces builds
 unsandboxed after a warning, or fails the build with `sandbox-fallback`
-off. A sandboxed build as root is refused, whatever `sandbox-fallback`
-says, since nova-nix has no build users to run it as.
+off; on macOS a sandbox that cannot be made fails the build, as
+upstream's does. A sandboxed build as root is refused, whatever
+`sandbox-fallback` says, since nova-nix has no build users to run it as.
 
 Differences from upstream's Linux sandbox are open issues, among them its
 seccomp filter ([#678]) and the personality it sets for the derivation's
-system ([#712]). macOS builds are not sandboxed; a `sandbox-exec` profile,
-as upstream uses there, is [#511]. Windows builds run in a job object and
-nothing more ([Windows](windows.md#how-a-build-runs)).
+system ([#712]). Windows builds run in a job object and nothing more
+([Windows](windows.md#how-a-build-runs)).
 
 ## Garbage collection and roots
 
@@ -326,7 +345,6 @@ its pieces are in the library.
 [#341]: https://github.com/Novavero-AI/nova-nix/issues/341
 [#432]: https://github.com/Novavero-AI/nova-nix/issues/432
 [#476]: https://github.com/Novavero-AI/nova-nix/issues/476
-[#511]: https://github.com/Novavero-AI/nova-nix/issues/511
 [#512]: https://github.com/Novavero-AI/nova-nix/issues/512
 [#633]: https://github.com/Novavero-AI/nova-nix/issues/633
 [#635]: https://github.com/Novavero-AI/nova-nix/issues/635

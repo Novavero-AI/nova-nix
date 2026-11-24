@@ -1,11 +1,13 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 
 -- | The build sandbox's IO: whether this system can sandbox a build, the
 -- run of the @nova-nix-sandbox@ helper that carries a build's plan out,
--- the chroot a sandboxed build runs in, and the one warning a process
--- prints when its builds fall back to running unsandboxed.  What is
--- decided is "Nix.Builder.Sandbox"; this module only carries it out.
+-- the chroot a sandboxed build runs in on Linux, the paths a macOS
+-- build's profile names, and the one warning a process prints when its
+-- builds fall back to running unsandboxed.  What is decided is
+-- "Nix.Builder.Sandbox"; this module only carries it out.
 --
 -- == The helper
 --
@@ -13,14 +15,15 @@
 -- same whichever backend it links, so probing it and running it are
 -- written once here.  What a backend needs around the run is not: on
 -- Linux, a chroot made from its skeleton before the run, sealed after it,
--- and removed.
+-- and removed; on macOS, the paths its profile names, each looked at
+-- ('profileFilters') and resolved ('resolvedPath').
 --
 -- == Where it runs
 --
--- The helper is built for Linux alone ('sandboxSupported'), and nothing
--- probes or runs it elsewhere.  The chroot code is POSIX, so it runs in
--- the test suite on macOS as well; Windows has no chroot, and there
--- making or sealing one refuses.
+-- The helper is built for Linux and macOS ('hostSandboxBackend'), and
+-- nothing probes or runs it elsewhere.  The chroot code is POSIX, so it
+-- runs in the test suite on macOS as well; Windows has no chroot, and
+-- there making or sealing one, or looking at a profile's paths, refuses.
 --
 -- == Process state
 --
@@ -34,7 +37,6 @@
 -- print the warning once per derivation.
 module Nix.Builder.Sandbox.Spawn
   ( -- * Availability
-    sandboxSupported,
     sandboxAvailability,
     warnFallback,
     processIsRoot,
@@ -48,6 +50,10 @@ module Nix.Builder.Sandbox.Spawn
     withChroot,
     mountPointsWithin,
     sealChroot,
+
+    -- * The macOS profile's paths
+    profileFilters,
+    resolvedPath,
 
     -- * Paths as bytes
     filePathBytes,
@@ -70,19 +76,21 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
-import Nix.Builder.Sandbox (SkeletonEntry (..), Unavailability (..), fallbackWarning, parseStatus, probeStageName)
 import System.Exit (ExitCode (..))
 import System.IO (Handle, hClose, hFlush, stderr)
 import System.IO.Unsafe (unsafePerformIO)
-import qualified System.Info
 import qualified System.Process as Proc
 #if defined(mingw32_HOST_OS)
-import Nix.Builder.Sandbox (unavailabilityCause)
+import Nix.Builder.Sandbox (DarwinPath, ProfileFilter, SandboxBackend, SkeletonEntry (..), Unavailability (..), fallbackWarning, hostSandboxBackend, parseStatus, probeStageName, unavailabilityCause)
+import System.Directory (canonicalizePath)
 #else
+import Data.Maybe (catMaybes)
+import GHC.IO.Exception (IOException (ioe_errno))
+import Nix.Builder.Sandbox (DarwinPath, PathFound (..), ProfileFilter, SandboxBackend, SkeletonEntry (..), Unavailability (..), darwinPathTarget, fallbackWarning, hostSandboxBackend, parseStatus, probeStageName, profileFilter)
 import qualified Data.Set as Set
 import qualified GHC.Foreign as GHC
 import GHC.IO.Encoding (getFileSystemEncoding)
-import System.Directory (createDirectoryIfMissing, listDirectory, removePathForcibly)
+import System.Directory (canonicalizePath, createDirectoryIfMissing, listDirectory, removePathForcibly)
 import System.FilePath (splitDirectories, (</>))
 import System.Posix.Directory (createDirectory)
 import System.Posix.Files (createSymbolicLink, fileOwner, getSymbolicLinkStatus, isDirectory, setFileMode)
@@ -95,11 +103,6 @@ import System.Posix.User (getEffectiveUserID, getRealUserID)
 -- ---------------------------------------------------------------------------
 -- Availability
 -- ---------------------------------------------------------------------------
-
--- | Whether the helper is built for this platform, which has a backend
--- for Linux alone.
-sandboxSupported :: Bool
-sandboxSupported = System.Info.os == "linux"
 
 -- | What the probe found for a helper, and whether the fallback warning
 -- has been printed.
@@ -116,20 +119,21 @@ probeCache :: MVar ProbeState
 probeCache = unsafePerformIO (newMVar (ProbeState Map.empty False))
 {-# NOINLINE probeCache #-}
 
--- | Whether a sandboxed build can run here, and which helper runs it: on
--- a platform with a sandbox, with the helper found, its probe passing.
--- The probe runs once per process for each helper, the first time a
--- sandboxed build asks.
-sandboxAvailability :: Maybe FilePath -> IO (Either Unavailability FilePath)
-sandboxAvailability helper
-  | not sandboxSupported = pure (Left PlatformUnsupported)
-  | otherwise = case helper of
-      Nothing -> pure (Left HelperNotFound)
-      Just path -> modifyMVar probeCache $ \state -> case Map.lookup path (psAnswers state) of
-        Just answer -> pure (state, answer)
-        Nothing -> do
-          answer <- probe path
-          pure (state {psAnswers = Map.insert path answer (psAnswers state)}, answer)
+-- | Whether a sandboxed build can run here, with which backend, and which
+-- helper runs it: on a platform with a backend ('hostSandboxBackend'),
+-- with the helper found, its probe passing.  The probe runs once per
+-- process for each helper, the first time a sandboxed build asks.
+sandboxAvailability :: Maybe FilePath -> IO (Either Unavailability (SandboxBackend, FilePath))
+sandboxAvailability helper = case (hostSandboxBackend, helper) of
+  (Nothing, _) -> pure (Left PlatformUnsupported)
+  (Just _, Nothing) -> pure (Left HelperNotFound)
+  (Just backend, Just path) -> fmap (backend,) <$> probeOnce path
+  where
+    probeOnce path = modifyMVar probeCache $ \state -> case Map.lookup path (psAnswers state) of
+      Just answer -> pure (state, answer)
+      Nothing -> do
+        answer <- probe path
+        pure (state {psAnswers = Map.insert path answer (psAnswers state)}, answer)
 
 -- | Run the helper's probe.
 probe :: FilePath -> IO (Either Unavailability FilePath)
@@ -180,18 +184,29 @@ data HelperRun = HelperRun
 -- loader reads no variable a derivation set; the plan on its standard
 -- input, which stays open after it as the lifeline the helper kills the
 -- build on the end of; its standard output the status channel; and
--- standard error the log, which the builder writes its standard output to
--- as well.  The status is read once the log ends and the helper is gone,
--- since it holds at most one short record, which the pipe buffers.
+-- standard error the log.  On Linux the builder writes its own output to
+-- the log as well; on macOS it writes to a pipe of the helper's, which
+-- the helper copies into the log, so the log ends when the helper does.
+-- The status is read once the log ends and the helper is gone, since it
+-- holds at most one short record, which the pipe buffers.
 --
--- Whatever ends the run early, an interrupt included, the helper is
--- terminated ('Proc.terminateProcess') and waited for before this
--- returns, with asynchronous exceptions masked so a second one cannot cut
--- the wait short.  On Linux that is @SIGTERM@, which the helper answers by
--- killing the builder, and it exits only once it has reaped it: the
--- builder is PID 1 of its namespace, which the kernel empties before
--- PID 1 can be reaped, so when this returns no process of the build is
--- left to write into its directory or chroot.
+-- Whatever ends the run early, an interrupt included, the end of the log
+-- this reads is closed first, so that a helper or builder writing to the
+-- log fails rather than waits on a reader that has stopped; then the
+-- helper is terminated ('Proc.terminateProcess'), with @SIGTERM@, which it
+-- answers by killing the builder, and waited for before this returns,
+-- with asynchronous exceptions masked so a second one cannot cut the wait
+-- short.  However the build ends, the helper ends its processes before it
+-- exits.  On Linux the builder is PID 1 of its
+-- namespace, which the kernel empties before PID 1 can be reaped, so no
+-- process of the build is left.  On macOS the helper stops and kills
+-- every process carrying the build's mark, which its profile alone
+-- allows, including one that left the builder's group, and reports the
+-- build as it ended only once a listing of the user's processes, taken
+-- after every one of the build's it found had ended, finds none of the
+-- build's left; where it cannot get there it fails the build, and a
+-- process of the build may be left.  Neither holds if the helper is
+-- killed by a signal no process can handle.
 runHelper :: Handle -> FilePath -> ByteString -> FilePath -> [String] -> IO HelperRun
 runHelper buildLog helper plan workDir command =
   bracket openLogPipe closePipe $ \(fromBuilder, toLog) ->
@@ -208,7 +223,7 @@ runHelper buildLog helper plan workDir command =
               status <- maybe (pure BS.empty) BS.hGetContents stdoutEnd
               pure (HelperRun delivered exitCode status)
           )
-          `E.onException` (stop *> release)
+          `E.onException` (hCloseQuietly fromBuilder *> stop *> release)
       release
       pure outcome
   where
@@ -417,6 +432,39 @@ materialize root entry = case entry of
   where
     inRoot path = (root <>) <$> bytesFilePath path
 #endif
+
+-- ---------------------------------------------------------------------------
+-- The macOS profile's paths
+-- ---------------------------------------------------------------------------
+
+-- | What each of a macOS build's paths adds to its profile
+-- ('profileFilter'), in order, each looked at with @lstat@ once its
+-- target is known to be its source ('darwinPathTarget'): the first
+-- refusal is the build's.
+profileFilters :: [DarwinPath] -> IO (Either Text [ProfileFilter])
+#if defined(mingw32_HOST_OS)
+profileFilters _ = pure (Left (unavailabilityCause PlatformUnsupported))
+#else
+profileFilters paths = fmap catMaybes . sequence <$> traverse filterFor paths
+  where
+    filterFor path = case darwinPathTarget path of
+      Left refusal -> pure (Left refusal)
+      Right target -> profileFilter path <$> found target
+    found target = do
+      at <- bytesFilePath target
+      status <- E.try (getSymbolicLinkStatus at)
+      pure $ case status of
+        Right present
+          | isDirectory present -> FoundDirectory
+          | otherwise -> FoundOther
+        Left (failure :: IOException) -> LstatFailed (maybe 0 fromIntegral (ioe_errno failure))
+#endif
+
+-- | A path with its links, and its @.@ and @..@ components, resolved, as
+-- a profile has to name it: macOS's sandbox matches the path a file
+-- resolves to, not the one it was reached by.
+resolvedPath :: ByteString -> IO ByteString
+resolvedPath path = bytesFilePath path >>= canonicalizePath >>= filePathBytes
 
 -- ---------------------------------------------------------------------------
 -- Paths as bytes

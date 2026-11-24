@@ -8,10 +8,11 @@
 -- @builtins.traceVerbose@ traces (@trace-verbose@), whether a path
 -- reader may build what its argument's context names
 -- (@allow-import-from-derivation@, @trace-import-from-derivation@), how
--- builds are sandboxed (@sandbox@ and the settings beside it), where
--- the link to the default profile is (@use-xdg-base-directories@), and
--- the prompt of a @develop@ shell (@bash-prompt@ and its prefix and
--- suffix).
+-- builds are sandboxed (@sandbox@ and the settings beside it, macOS's
+-- @allowed-impure-host-deps@ and @darwin-log-sandbox-violations@ among
+-- them), where the link to the default profile is
+-- (@use-xdg-base-directories@), and the prompt of a @develop@ shell
+-- (@bash-prompt@ and its prefix and suffix).
 --
 -- == The format
 --
@@ -212,13 +213,19 @@ data NixConfig = NixConfig
     -- | Upstream's @bash-prompt-prefix@: text before that prompt.
     ncBashPromptPrefix :: !ByteString,
     -- | Upstream's @bash-prompt-suffix@: text after it.
-    ncBashPromptSuffix :: !ByteString
+    ncBashPromptSuffix :: !ByteString,
+    -- | Upstream's @allowed-impure-host-deps@, as bytes.  Its default is
+    -- macOS's alone, the caller's to apply.
+    ncAllowedImpureHostDeps :: !PathSetValue,
+    -- | Upstream's @darwin-log-sandbox-violations@.
+    ncDarwinLogSandboxViolations :: !Bool
   }
   deriving (Eq, Show)
 
 -- | A set of paths whose default is the caller's: upstream's
 -- @sandbox-paths@ defaults to the sandbox shell a binary was built with,
--- which is where it was installed.  An @extra-@ assignment adds to the
+-- which is where it was installed, and on macOS to system paths, as its
+-- @allowed-impure-host-deps@ does.  An @extra-@ assignment adds to the
 -- default, and a plain one replaces it.
 data PathSetValue = PathSetValue
   { psvDefault :: !DefaultUse,
@@ -268,7 +275,9 @@ defaultNixConfig =
       ncUseXdgBaseDirectories = False,
       ncBashPrompt = "",
       ncBashPromptPrefix = "",
-      ncBashPromptSuffix = ""
+      ncBashPromptSuffix = "",
+      ncAllowedImpureHostDeps = PathSetValue KeepsDefault Set.empty,
+      ncDarwinLogSandboxViolations = False
     }
 
 -- ---------------------------------------------------------------------------
@@ -656,8 +665,8 @@ applyAssignment config (ConfigAssignment name value) =
     Just (ModeSetting, _) ->
       (\mode -> config {ncSandbox = Just mode}) <$> parseSandboxMode value
     Just (BytesSetting field, _) -> Right (setBytes field value config)
-    Just (PathSetSetting, mode) ->
-      Right (config {ncSandboxPaths = combinePaths mode (ncSandboxPaths config) (Set.fromList (configTokens value))})
+    Just (PathSetSetting field, mode) ->
+      Right (setPathSet field (combinePaths mode (getPathSet field config) (Set.fromList (configTokens value))) config)
   where
     combine ReplaceMode _ new = new
     combine AppendMode old new = old ++ new
@@ -688,7 +697,7 @@ resolveName name =
   case BS.stripPrefix extraPrefix name of
     Just base -> case baseSetting base of
       Just setting@(ListSetting _) -> Just (setting, AppendMode)
-      Just PathSetSetting -> Just (PathSetSetting, AppendMode)
+      Just setting@(PathSetSetting _) -> Just (setting, AppendMode)
       _ -> Nothing
     Nothing -> case baseSetting name of
       Just setting -> Just (setting, ReplaceMode)
@@ -709,7 +718,9 @@ resolveName name =
       | n == coresKey || n == coresAlias = Just (ScalarSetting CoresField)
       | n == sandboxKey || n `elem` sandboxAliases = Just ModeSetting
       | n == sandboxFallbackKey = Just (BoolSetting SandboxFallbackField)
-      | n == sandboxPathsKey || n `elem` sandboxPathsAliases = Just PathSetSetting
+      | n == sandboxPathsKey || n `elem` sandboxPathsAliases = Just (PathSetSetting SandboxPathsField)
+      | n == allowedImpureHostDepsKey = Just (PathSetSetting AllowedImpureHostDepsField)
+      | n == darwinLogSandboxViolationsKey = Just (BoolSetting DarwinLogSandboxViolationsField)
       | n == sandboxBuildDirKey = Just (BytesSetting SandboxBuildDirField)
       | n == sandboxDevShmSizeKey = Just (BytesSetting SandboxDevShmSizeField)
       | n == requireDropGroupsKey = Just (BoolSetting RequireDropGroupsField)
@@ -722,14 +733,18 @@ resolveName name =
 
 -- | A setting this layer resolves, by the shape of its value: a list of
 -- text, a Boolean, an unsigned integer, @sandbox@'s mode, a string kept as
--- bytes, or @sandbox-paths@' set of paths.
+-- bytes, or a set of paths.
 data Setting
   = ListSetting !ListField
   | BoolSetting !BoolField
   | ScalarSetting !ScalarField
   | ModeSetting
   | BytesSetting !BytesField
-  | PathSetSetting
+  | PathSetSetting !PathSetField
+  deriving (Eq, Show)
+
+-- | The settings whose value is a set of paths, kept as bytes.
+data PathSetField = SandboxPathsField | AllowedImpureHostDepsField
   deriving (Eq, Show)
 
 -- | The list settings.
@@ -748,6 +763,7 @@ data BoolField
   | SandboxFallbackField
   | RequireDropGroupsField
   | UseXdgBaseDirectoriesField
+  | DarwinLogSandboxViolationsField
   deriving (Eq, Show)
 
 -- | The settings whose value is a string, kept as bytes.
@@ -802,6 +818,7 @@ boolFieldKey TraceImportFromDerivationField = traceImportFromDerivationKey
 boolFieldKey SandboxFallbackField = sandboxFallbackKey
 boolFieldKey RequireDropGroupsField = requireDropGroupsKey
 boolFieldKey UseXdgBaseDirectoriesField = useXdgBaseDirectoriesKey
+boolFieldKey DarwinLogSandboxViolationsField = darwinLogSandboxViolationsKey
 
 setBool :: BoolField -> Bool -> NixConfig -> NixConfig
 setBool FallbackField v config = config {ncFallback = v}
@@ -814,6 +831,15 @@ setBool TraceImportFromDerivationField v config = config {ncTraceImportFromDeriv
 setBool SandboxFallbackField v config = config {ncSandboxFallback = v}
 setBool RequireDropGroupsField v config = config {ncRequireDropSupplementaryGroups = Just v}
 setBool UseXdgBaseDirectoriesField v config = config {ncUseXdgBaseDirectories = v}
+setBool DarwinLogSandboxViolationsField v config = config {ncDarwinLogSandboxViolations = v}
+
+getPathSet :: PathSetField -> NixConfig -> PathSetValue
+getPathSet SandboxPathsField = ncSandboxPaths
+getPathSet AllowedImpureHostDepsField = ncAllowedImpureHostDeps
+
+setPathSet :: PathSetField -> PathSetValue -> NixConfig -> NixConfig
+setPathSet SandboxPathsField v config = config {ncSandboxPaths = v}
+setPathSet AllowedImpureHostDepsField v config = config {ncAllowedImpureHostDeps = v}
 
 -- | Upstream's @Setting\<std::string\>@: the value as it reads, its tokens
 -- joined by single spaces.
@@ -909,6 +935,10 @@ bashPromptKey, bashPromptPrefixKey, bashPromptSuffixKey :: ByteString
 bashPromptKey = "bash-prompt"
 bashPromptPrefixKey = "bash-prompt-prefix"
 bashPromptSuffixKey = "bash-prompt-suffix"
+
+allowedImpureHostDepsKey, darwinLogSandboxViolationsKey :: ByteString
+allowedImpureHostDepsKey = "allowed-impure-host-deps"
+darwinLogSandboxViolationsKey = "darwin-log-sandbox-violations"
 
 -- | Upstream's older names for @sandbox@ and @sandbox-paths@
 -- (the aliases of @sandboxMode@ and @sandboxPaths@ in globals.hh at

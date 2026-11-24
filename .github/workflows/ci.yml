@@ -200,10 +200,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The sources that build on Linux: test/cbits/nn_test_dacl.c builds on
-      # Windows alone, against headers this runner does not have.
+      # Windows alone, and sandbox/darwin.c on macOS alone, against headers
+      # this runner does not have.  The macOS build checks the latter.
       - name: Compile C99 with strict warnings
         run: |
           for f in cbits/*.c sandbox/*.c test/cbits/sandbox_check.c test/cbits/keyring.c; do
+            [ "$f" = sandbox/darwin.c ] && continue
             echo "Checking $f ..."
             gcc -std=c99 -Wall -Wextra -pedantic -Werror -fsyntax-only -Icbits -Isandbox "$f"
           done
@@ -472,6 +474,18 @@ jobs:
       - name: Let the built sandbox helper make namespaces (Linux)
         if: runner.os == 'Linux'
         uses: ./.github/actions/sandbox-helper
+
+      # The macOS sandbox backend builds against macOS's headers alone, so
+      # the C99 Strict job, on Linux, leaves it to this step.
+      - name: Compile the macOS sandbox backend as C99 with strict warnings (macOS)
+        if: runner.os == 'macOS'
+        run: cc -std=c99 -Wall -Wextra -pedantic -Werror -fsyntax-only -Icbits -Isandbox sandbox/darwin.c
+
+      # The suite's macOS sandbox group runs the helper this job built, and
+      # skips where nothing names it.
+      - name: Name the built sandbox helper (macOS)
+        if: runner.os == 'macOS'
+        run: echo "NOVA_NIX_TEST_SANDBOX_HELPER=$(cabal list-bin exe:nova-nix-sandbox)" >> "$GITHUB_ENV"
 
       # Upstream's worker-protocol fixtures are the bytes its own
       # serialiser tests read and write.  They are LGPL-2.1, so they are
@@ -747,7 +761,7 @@ jobs:
         run: |
           set -euo pipefail
           targets=(exe:nova-nix)
-          if [ "$RUNNER_OS" = Linux ]; then targets+=(exe:nova-nix-sandbox); fi
+          if [ "$RUNNER_OS" != Windows ]; then targets+=(exe:nova-nix-sandbox); fi
           cabal install "${targets[@]}" --install-method=copy --installdir=staged/bin --overwrite-policy=always
           mkdir -p staged/share/nova-nix/nix staged/share/nova-nix/develop
           cp data/nix/fetchurl.nix staged/share/nova-nix/nix/

@@ -92,14 +92,14 @@ jobs:
           ghc-version: "9.14.1"
           cabal-version: "latest"
 
-      # On Linux the sandbox's helper ships beside nova-nix, which finds it
-      # there.
+      # On Linux and macOS the sandbox's helper ships beside nova-nix, which
+      # finds it there.
       - name: Build the executable
         shell: bash
         run: |
           set -euo pipefail
           targets=(exe:nova-nix)
-          if [ "$RUNNER_OS" = Linux ]; then targets+=(exe:nova-nix-sandbox); fi
+          if [ "$RUNNER_OS" != Windows ]; then targets+=(exe:nova-nix-sandbox); fi
           cabal install "${targets[@]}" --install-method=copy --installdir=staged --overwrite-policy=always
 
       # bin/ beside share/ is the layout resolveDataDir looks for, so the

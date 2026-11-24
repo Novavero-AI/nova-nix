@@ -124,7 +124,7 @@ static int parse_choice(const char *value, const char *yes, const char *no, int 
     return 1;
 }
 
-static int parse_singletons(struct tokens *cursor, struct plan *plan)
+static int parse_linux_singletons(struct tokens *cursor, struct plan *plan)
 {
     char *value;
     if (!read_value(cursor, "root", &value) || value[0] != '/')
@@ -145,18 +145,66 @@ static int parse_singletons(struct tokens *cursor, struct plan *plan)
     return read_value(cursor, "drop-groups", &value) && parse_choice(value, "require", "tolerate", &plan->require_drop_groups);
 }
 
-/* Count the binds and the entries after the singletons, checking that
- * nothing but those follows. */
-static int count_sections(struct tokens cursor, size_t *binds, size_t *entries)
+static int parse_darwin_singletons(struct tokens *cursor, struct plan *plan)
+{
+    char *value;
+    if (!read_value(cursor, "build-dir", &value) || value[0] != '/')
+        return 0;
+    plan->build_dir = value;
+    if (!read_value(cursor, "profile", &value))
+        return 0;
+    plan->profile = value;
+    return 1;
+}
+
+static int parse_singletons(struct tokens *cursor, struct plan *plan)
+{
+    char *value;
+    if (!read_value(cursor, "backend", &value))
+        return 0;
+    if (strcmp(value, "linux") == 0) {
+        plan->backend = PLAN_LINUX;
+        return parse_linux_singletons(cursor, plan);
+    }
+    if (strcmp(value, "darwin") == 0) {
+        plan->backend = PLAN_DARWIN;
+        return parse_darwin_singletons(cursor, plan);
+    }
+    return 0;
+}
+
+/* The entries a backend's plan repeats before the environment: binds on
+ * Linux, each three tokens after its key, and params on Darwin, each two. */
+struct section {
+    const char *key;
+    size_t width;
+};
+
+static struct section backend_section(enum plan_backend backend)
+{
+    struct section section;
+    if (backend == PLAN_LINUX) {
+        section.key = "bind";
+        section.width = 3;
+    } else {
+        section.key = "param";
+        section.width = 2;
+    }
+    return section;
+}
+
+/* Count the backend's entries and the environment's after the singletons,
+ * checking that nothing but those follows. */
+static int count_sections(struct tokens cursor, struct section section, size_t *repeated, size_t *entries)
 {
     char *key = NULL;
     enum token_read read = read_token(&cursor, &key);
-    *binds = 0;
+    *repeated = 0;
     *entries = 0;
-    while (read == TOKEN_FOUND && strcmp(key, "bind") == 0) {
-        if (!skip_tokens(&cursor, 3))
+    while (read == TOKEN_FOUND && strcmp(key, section.key) == 0) {
+        if (!skip_tokens(&cursor, section.width))
             return 0;
-        (*binds)++;
+        (*repeated)++;
         read = read_token(&cursor, &key);
     }
     while (read == TOKEN_FOUND && strcmp(key, "env") == 0) {
@@ -183,35 +231,73 @@ static int parse_bind(struct tokens *cursor, struct bind *bind)
     return parse_bind_flags(flags, bind);
 }
 
+/* A param's name, which is not empty, and its value. */
+static int parse_parameter(struct tokens *cursor, const char **name, const char **value)
+{
+    char *read_name;
+    char *read_value_token;
+    if (!read_value(cursor, "param", &read_name) || read_token(cursor, &read_value_token) != TOKEN_FOUND
+        || read_name[0] == '\0')
+        return 0;
+    *name = read_name;
+    *value = read_value_token;
+    return 1;
+}
+
+/* Allocate what the counted entries are parsed into. */
+static int allocate_sections(struct plan *plan, size_t repeated, size_t entries)
+{
+    if (plan->backend == PLAN_LINUX && repeated > 0) {
+        plan->binds = calloc(repeated, sizeof *plan->binds);
+        if (plan->binds == NULL)
+            return 0;
+    }
+    if (plan->backend == PLAN_DARWIN) {
+        plan->parameters = calloc(2 * repeated + 1, sizeof *plan->parameters);
+        if (plan->parameters == NULL)
+            return 0;
+    }
+    plan->environment = calloc(entries + 1, sizeof *plan->environment);
+    return plan->environment != NULL;
+}
+
+static int parse_repeated(struct tokens *cursor, struct plan *plan, size_t repeated)
+{
+    size_t i;
+    for (i = 0; i < repeated; i++) {
+        if (plan->backend == PLAN_LINUX) {
+            if (!parse_bind(cursor, &plan->binds[i]))
+                return 0;
+            plan->bind_count++;
+        } else {
+            if (!parse_parameter(cursor, &plan->parameters[2 * i], &plan->parameters[2 * i + 1]))
+                return 0;
+            plan->parameter_count++;
+        }
+    }
+    return 1;
+}
+
 int plan_parse(char *bytes, size_t length, struct plan *plan)
 {
     struct tokens cursor;
-    size_t binds;
+    size_t repeated;
     size_t entries;
     size_t i;
 
     memset(plan, 0, sizeof *plan);
     cursor.next = bytes;
     cursor.end = bytes + length;
-    if (!parse_singletons(&cursor, plan) || !count_sections(cursor, &binds, &entries))
+    if (!parse_singletons(&cursor, plan) || !count_sections(cursor, backend_section(plan->backend), &repeated, &entries))
         return EINVAL;
 
-    if (binds > 0) {
-        plan->binds = calloc(binds, sizeof *plan->binds);
-        if (plan->binds == NULL)
-            return ENOMEM;
-    }
-    plan->environment = calloc(entries + 1, sizeof *plan->environment);
-    if (plan->environment == NULL) {
+    if (!allocate_sections(plan, repeated, entries)) {
         plan_release(plan);
         return ENOMEM;
     }
-    for (i = 0; i < binds; i++) {
-        if (!parse_bind(&cursor, &plan->binds[i])) {
-            plan_release(plan);
-            return EINVAL;
-        }
-        plan->bind_count++;
+    if (!parse_repeated(&cursor, plan, repeated)) {
+        plan_release(plan);
+        return EINVAL;
     }
     for (i = 0; i < entries; i++) {
         char *entry;
@@ -227,9 +313,12 @@ int plan_parse(char *bytes, size_t length, struct plan *plan)
 void plan_release(struct plan *plan)
 {
     free(plan->binds);
+    free(plan->parameters);
     free(plan->environment);
     plan->binds = NULL;
     plan->bind_count = 0;
+    plan->parameters = NULL;
+    plan->parameter_count = 0;
     plan->environment = NULL;
     plan->environment_count = 0;
 }

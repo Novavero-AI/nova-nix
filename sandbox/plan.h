@@ -6,9 +6,17 @@
  * After the header the plan holds tokens, each its length in decimal, a
  * colon, that many bytes and a NUL, so a token's bytes cannot end it early
  * or start another.  The tokens are keys and their values in one fixed
- * shape: root, build-dir, dev-shm-size, sandbox-uid, sandbox-gid, network
- * and drop-groups, each once and in that order, then any number of binds,
- * then any number of environment entries.
+ * shape.  The first is backend, naming the backend the plan is for; the
+ * rest are that backend's:
+ *
+ *   linux: root, build-dir, dev-shm-size, sandbox-uid, sandbox-gid,
+ *   network and drop-groups, each once and in that order, then any number
+ *   of binds;
+ *
+ *   darwin: build-dir and profile, each once and in that order, then any
+ *   number of params, each a name and its value;
+ *
+ * then, for either, any number of environment entries.
  */
 
 #ifndef NOVA_NIX_SANDBOX_PLAN_H
@@ -17,7 +25,13 @@
 #include <stddef.h>
 
 /* The first line of every plan; a plan of another version is refused. */
-#define PLAN_VERSION_LINE "nova-nix-sandbox-plan 3\n"
+#define PLAN_VERSION_LINE "nova-nix-sandbox-plan 4\n"
+
+/* The backend a plan is for, named as the OS that backend runs on. */
+enum plan_backend {
+    PLAN_LINUX,
+    PLAN_DARWIN
+};
 
 struct bind {
     const char *target;
@@ -28,8 +42,11 @@ struct bind {
 };
 
 struct plan {
-    const char *root;
+    enum plan_backend backend;
     const char *build_dir;
+
+    /* Linux's. */
+    const char *root;
     const char *dev_shm_size;
     unsigned long sandbox_uid;
     unsigned long sandbox_gid;
@@ -37,6 +54,14 @@ struct plan {
     int require_drop_groups;
     struct bind *binds;
     size_t bind_count;
+
+    /* Darwin's: the profile's text, and its parameters as
+     * sandbox_init_with_parameters takes them, each name followed by its
+     * value, the whole NULL-terminated. */
+    const char *profile;
+    const char **parameters;
+    size_t parameter_count;
+
     /* NAME=VALUE entries, NULL-terminated, for the builder's execve. */
     char **environment;
     size_t environment_count;
