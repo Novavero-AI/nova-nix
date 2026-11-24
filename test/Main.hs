@@ -1017,16 +1017,20 @@ testEvalAttrs = do
         assertEvalError "update-int-left" "1 // {}" "expected a set but found an integer: 1",
       runTest "update with a string right operand" $
         assertEvalError "update-string-right" "{} // \"x\"" "expected a set but found a string: \"x\"",
-      -- 2.24.9's ExprOpUpdate::eval evaluates and checks the left operand
-      -- before it evaluates the right; 2.33.2 does the right first.
-      runTest "update with two non-set operands reports the left" $
-        assertEvalError "update-both" "1 // \"x\"" "expected a set but found an integer: 1",
-      runTest "update refuses a non-set left before evaluating the right" $
-        assertEvalError "update-left-first" "builtins.tryEval (null // throw \"b\")" "expected a set but found null: null",
+      -- The update queue of 2.34 and later evaluates and checks the right
+      -- operand before it evaluates the left (evalForUpdate,
+      -- eval.cc:2014-2019 at 2.34.9, the same at 2.35.4); 2.24.9 does the
+      -- left first.
+      runTest "update with two non-set operands reports the right" $
+        assertEvalError "update-both" "1 // \"x\"" "expected a set but found a string: \"x\"",
+      runTest "update evaluates a throwing right before checking the left" $
+        assertEval "update-right-first" "(builtins.tryEval (null // throw \"b\")).success" (VBool False),
       runTest "update with a set left evaluates a throwing right" $
         assertEval "update-right-throws" "(builtins.tryEval ({} // throw \"b\")).success" (VBool False),
-      runTest "update evaluates a throwing left first" $
-        assertEvalError "update-left-throws" "throw \"a\" // null" "a",
+      runTest "update refuses a non-set right before evaluating a throwing left" $
+        assertEvalError "update-left-throws" "throw \"a\" // null" "expected a set but found null: null",
+      runTest "a chain of updates fails at the last operand that fails" $
+        assertEvalError "update-chain-last" "throw \"first\" // { a = 1; } // throw \"last\"" "last",
       -- builtins.warn forces its message with forceString (prim_warn,
       -- primops.cc at 2.24.9); final lines as nix-instantiate 2.33.2
       -- prints them, and tryEval does not catch the refusal.
@@ -2652,20 +2656,20 @@ testRegionCensus = do
        in assertEqual "tenure collectors with no budget and with budgets of 1, 16 and 256 MiB" [0, 2 ^ (20 :: Int), 2 ^ (24 :: Int), 2 ^ (28 :: Int)] [budget | budget : _ <- tenures]
             `andThen` foldr (andThen . check) Pass tenures
 
--- | A chain of @//@: its operands evaluated first to last, as 2.24.9's
--- right-nested updates evaluate them, and merged from the first, as
--- upstream 2.34's update queue folds them (eval.cc:1991-2029 at 2.34.9).
+-- | A chain of @//@: its operands evaluated last to first and merged from
+-- the first, as upstream 2.34's update queue gathers and folds them
+-- (eval.cc:1991-2029 at 2.34.9, the same at 2.35.4).
 testUpdateChains :: IO [Bool]
 testUpdateChains = do
   putStrLn "eval/update-chains"
   tmpBase <- getTemporaryDirectory
   sequence
     [ emits
-        "a chain of updates evaluates its operands first to last"
+        "a chain of updates evaluates its operands last to first"
         "builtins.trace (builtins.attrNames (builtins.trace \"a\" { za = 1; } // builtins.trace \"b\" { zb = 1; } // builtins.trace \"c\" { zc = 1; })) null"
-        ["trace: a", "trace: b", "trace: c", "trace: [ \"za\" \"zb\" \"zc\" ]"],
-      runTest "a chain of updates refuses its first operand that is not a set, and evaluates none after it" $
-        assertEvalError "update-chain-first-refusal" "{ } // 1 // throw \"later\"" "expected a set but found an integer: 1",
+        ["trace: c", "trace: b", "trace: a", "trace: [ \"za\" \"zb\" \"zc\" ]"],
+      runTest "a chain of updates refuses its last operand that is not a set, and evaluates none before it" $
+        assertEvalError "update-chain-last-refusal" "throw \"earlier\" // 1 // { }" "expected a set but found an integer: 1",
       -- The flat copy is removeAttrs of nothing, which makes a set of its
       -- own; the model merges the operands' attributes, the later winning.
       -- Operands of up to 20 attributes cross the 16 a layer takes, and

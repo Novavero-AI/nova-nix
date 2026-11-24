@@ -26,6 +26,7 @@ where
 import Control.Monad (foldM)
 import Data.Int (Int64)
 import Data.List.NonEmpty (NonEmpty (..))
+import qualified Data.List.NonEmpty as NE
 import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval.AllocSite (SetSite (SetUpdate))
@@ -391,28 +392,28 @@ evalUpdate evalLeft evalRight = evalUpdateChain (evalLeft :| [evalRight])
 
 -- | A chain of @//@, given its operands first to last.
 --
--- Each operand is evaluated and checked for a set in turn, first to last,
--- as 2.24.9's @ExprOpUpdate::eval@ calls @evalAttrs@ on its left operand
--- and then on its right (eval.cc at 2.24.9), which visits a right-nested
--- chain's operands in that order: a non-set fails before an operand after
--- it is evaluated at all, and the refusal is @evalAttrs@'s message.
--- 2.33.2 checks the right first, and 2.34's update queue evaluates a
--- chain's operands last to first (eval.cc:2014-2025 at 2.34.9); 2.24.9 is
--- followed.  Upstream adds a trace line naming the operand ("in the left
--- operand of the update (//) operator") above the message; nova-nix's
--- errors carry no trace, so only the final line is reproduced.
+-- Each operand is evaluated and checked for a set in turn, last to
+-- first, as the update queue of 2.34 and later gathers a chain: each
+-- update evaluates its right operand and then its left, through
+-- @evalAttrs@ (@evalForUpdate@, eval.cc:2014-2025 at 2.34.9, the same at
+-- 2.35.4).  A non-set fails before an operand before it is evaluated at
+-- all, and the refusal is @evalAttrs@'s message.  2.24.9 evaluates and
+-- checks the left operand first; the newest pinned release is followed.
+-- Upstream adds a trace line naming the operand ("in the left operand of
+-- the update (//) operator") above the message; nova-nix's errors carry
+-- no trace, so only the final line is reproduced.
 --
 -- Once every operand is a set, the sets are merged from the first, each
--- into the result of those before it, as 2.34's update queue folds a
--- chain from its leftmost operand once it has evaluated them all
+-- into the result of those before it, as the update queue folds a chain
+-- from its leftmost operand once it has evaluated them all
 -- (eval.cc:1991-2005 at 2.34.9): each small operand layers on the sets
 -- before it ('mergeAttrSets'), and a chain one of whose operands fails
 -- merges none.
 evalUpdateChain :: (MonadEval m) => NonEmpty (m NixValue) -> m NixValue
-evalUpdateChain (first :| rest) = do
-  start <- first >>= expectSet
-  sets <- traverse (>>= expectSet) rest
-  VAttrs <$> foldM mergeAttrSets start sets
+evalUpdateChain operands = do
+  lastFirst <- traverse (>>= expectSet) (NE.reverse operands)
+  case NE.reverse lastFirst of
+    start :| rest -> VAttrs <$> foldM mergeAttrSets start rest
   where
     expectSet (VAttrs set) = pure set
     expectSet other = expectedFailure "a set" other
