@@ -7,8 +7,9 @@
 -- may reach (@restrict-eval@, @pure-eval@, @allowed-uris@), whether
 -- @builtins.traceVerbose@ traces (@trace-verbose@), whether a path
 -- reader may build what its argument's context names
--- (@allow-import-from-derivation@, @trace-import-from-derivation@), and
--- how builds are sandboxed (@sandbox@ and the settings beside it).
+-- (@allow-import-from-derivation@, @trace-import-from-derivation@), how
+-- builds are sandboxed (@sandbox@ and the settings beside it), and where
+-- the link to the default profile is (@use-xdg-base-directories@).
 --
 -- == The format
 --
@@ -199,7 +200,10 @@ data NixConfig = NixConfig
     -- | Upstream's @ssl-cert-file@, when a source sets it.  Its default
     -- comes from the environment and the files there are, which only IO
     -- can find.
-    ncSslCertFile :: !(Maybe ByteString)
+    ncSslCertFile :: !(Maybe ByteString),
+    -- | Upstream @use-xdg-base-directories@: the link to the default
+    -- profile is in the state directory, not the home.
+    ncUseXdgBaseDirectories :: !Bool
   }
   deriving (Eq, Show)
 
@@ -221,9 +225,9 @@ data DefaultUse = KeepsDefault | ReplacesDefault
 -- no fallback, @allowSubstitutes@ heeded, @cores@ unset so that the
 -- machine's default applies, upstream's call-depth ceiling, no allowed
 -- URIs, both evaluation modes off, @trace-verbose@ off, an import from
--- derivation allowed and not traced, and upstream's sandbox settings,
+-- derivation allowed and not traced, upstream's sandbox settings,
 -- those whose defaults take the platform or IO unset or kept for the
--- caller.  The empty
+-- caller, and the default profile's link in the home.  The empty
 -- substituter list is nova-nix's existing default (nothing is substituted
 -- unless configured), a deliberate divergence from upstream's
 -- cache.nixos.org default: turning a cache on for every machine is the
@@ -250,7 +254,8 @@ defaultNixConfig =
       ncSandboxBuildDir = "/build",
       ncSandboxDevShmSize = "50%",
       ncRequireDropSupplementaryGroups = Nothing,
-      ncSslCertFile = Nothing
+      ncSslCertFile = Nothing,
+      ncUseXdgBaseDirectories = False
     }
 
 -- ---------------------------------------------------------------------------
@@ -696,6 +701,7 @@ resolveName name =
       | n == sandboxDevShmSizeKey = Just (BytesSetting SandboxDevShmSizeField)
       | n == requireDropGroupsKey = Just (BoolSetting RequireDropGroupsField)
       | n == sslCertFileKey = Just (BytesSetting SslCertFileField)
+      | n == useXdgBaseDirectoriesKey = Just (BoolSetting UseXdgBaseDirectoriesField)
       | otherwise = Nothing
 
 -- | A setting this layer resolves, by the shape of its value: a list of
@@ -725,6 +731,7 @@ data BoolField
   | TraceImportFromDerivationField
   | SandboxFallbackField
   | RequireDropGroupsField
+  | UseXdgBaseDirectoriesField
   deriving (Eq, Show)
 
 -- | The settings whose value is a string, kept as bytes.
@@ -772,6 +779,7 @@ boolFieldKey AllowImportFromDerivationField = allowImportFromDerivationKey
 boolFieldKey TraceImportFromDerivationField = traceImportFromDerivationKey
 boolFieldKey SandboxFallbackField = sandboxFallbackKey
 boolFieldKey RequireDropGroupsField = requireDropGroupsKey
+boolFieldKey UseXdgBaseDirectoriesField = useXdgBaseDirectoriesKey
 
 setBool :: BoolField -> Bool -> NixConfig -> NixConfig
 setBool FallbackField v config = config {ncFallback = v}
@@ -783,6 +791,7 @@ setBool AllowImportFromDerivationField v config = config {ncAllowImportFromDeriv
 setBool TraceImportFromDerivationField v config = config {ncTraceImportFromDerivation = v}
 setBool SandboxFallbackField v config = config {ncSandboxFallback = v}
 setBool RequireDropGroupsField v config = config {ncRequireDropSupplementaryGroups = Just v}
+setBool UseXdgBaseDirectoriesField v config = config {ncUseXdgBaseDirectories = v}
 
 -- | Upstream's @Setting\<std::string\>@: the value as it reads, its tokens
 -- joined by single spaces.
@@ -865,6 +874,9 @@ sandboxBuildDirKey = "sandbox-build-dir"
 sandboxDevShmSizeKey = "sandbox-dev-shm-size"
 requireDropGroupsKey = "require-drop-supplementary-groups"
 sslCertFileKey = "ssl-cert-file"
+
+useXdgBaseDirectoriesKey :: ByteString
+useXdgBaseDirectoriesKey = "use-xdg-base-directories"
 
 -- | Upstream's older names for @sandbox@ and @sandbox-paths@
 -- (globals.hh:630 and 649 at 2.24.9).

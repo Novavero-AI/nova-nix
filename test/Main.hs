@@ -131,6 +131,8 @@ import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), d
 import Nix.Json (IntegerRange (..), Json (..), JsonBuilder (..), parseJson, parseJsonInto, renderJson)
 import Nix.Parser (ParseError (..), SourceError (..), parseNix, parseNixWithScope, parsedExpr, parsedNames)
 import Nix.Parser.Lexer (Located (..), Token (..), tokenize)
+import qualified Nix.Profile.Generation as Gen
+import qualified Nix.Profile.Manifest as Manifest
 import Nix.Profile.Tree (BuildEnvFailure (..), Built (..), EntryKind (..), Listing (..), Node (..), Package (..), ReadFailure (..), Tree, TreeReader (..), Warning (..), buildEnvFailureText, buildProfile, propagatedTokens, warningText)
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), PushSummary (..), checkRecordedNarHash, computeClosure, defaultPartSize, isDerivationPath, loadKeyFile, mkNarInfo, mkPartSize, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, partSizeBytes, planMissing, preparePath, pushPaths, splitParts, storePathBasename, stripHashPrefix)
 import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), cacheInfoFileName, cacheInfoText, checkCacheInfo, ed25519SeedBytes, loadSecretKeyFile, pushTarget, pushToDirectory, signNarInfo)
@@ -5539,6 +5541,7 @@ eachOpening config =
             sqReferences = \path -> withLocalStore config (\ops -> sqReferences (soQueries ops) path)
           },
       soAddEvalObjects = \objects -> withLocalStore config (`soAddEvalObjects` objects),
+      soAddSourceTree = \name refs entry -> withLocalStore config (\ops -> soAddSourceTree ops name refs entry),
       soBuild = \requests -> withLocalStore config (`soBuild` requests),
       soCheck = \drvPath -> withLocalStore config (`soCheck` drvPath),
       soAddOutLinkRoot = \link path -> withLocalStore config (\ops -> soAddOutLinkRoot ops link path)
@@ -17001,6 +17004,656 @@ testBuildenvBuildIO = do
               runTestM "its output references the packages and the manifest" $ do
                 references <- queryReferences (stDB store) built
                 pure (assertEqual "references" (Set.fromList (map (T.pack . storePathToFilePath storeDir) [hello, world, manifest])) (Set.fromList references))
+            ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: profiles
+-- ---------------------------------------------------------------------------
+
+-- | A store path of a test's own, by the letter its hash ends in and its
+-- name.
+profileFixture :: Char -> Text -> StorePath
+profileFixture letter = StorePath (T.replicate 31 "0" <> T.singleton letter)
+
+-- | An active element holding paths, at the default priority.
+manifestElement :: [StorePath] -> Manifest.Element
+manifestElement paths = Manifest.Element (Set.fromList paths) Active Manifest.defaultPriority Nothing
+
+-- | A manifest of elements, each added under its name.
+manifestOf :: [(Text, Manifest.Element)] -> Manifest.Manifest
+manifestOf = foldl' (\manifest (name, element) -> Manifest.addElement name element manifest) Manifest.emptyManifest
+
+-- | Whether a QuickCheck property holds, as a test's result.
+propertyHolds :: (QC.Testable prop) => prop -> IO TestResult
+propertyHolds prop = do
+  result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} prop
+  pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+
+-- | A manifest's elements: names, paths, activity, priority, and for
+-- some a flake source with each kind of outputs.
+genManifest :: QC.Gen Manifest.Manifest
+genManifest = manifestOf <$> QC.resize 4 (QC.listOf ((,) <$> genElementName <*> genElement))
+  where
+    genElementName = genTextOf 1 "abc" >>= \first -> (first <>) <$> genTextOf 2 "xyz-1"
+    genElement =
+      Manifest.Element . Set.fromList
+        <$> QC.resize 3 (QC.listOf (genFixturePath ""))
+        <*> QC.elements [Active, Inactive]
+        <*> QC.chooseInt (-10, 2000)
+        <*> QC.oneof [pure Nothing, Just <$> genSource]
+    genSource =
+      Manifest.FlakeSource
+        <$> QC.elements ["github:o/r", "path:/x"]
+        <*> QC.elements ["github:o/r/0123abc", "path:/x?narHash=sha256-x"]
+        <*> QC.elements ["packages.x86_64-linux.hello", "hello"]
+        <*> QC.elements [Nothing, Just Proto.AllOutputs, Proto.namedOutputs (Set.fromList [Proto.OutputName "out", Proto.OutputName "dev"])]
+
+-- | The manifest: upstream's names, its version 3 bytes, the versions it
+-- reads, and what selects its elements.
+testProfileManifest :: IO [Bool]
+testProfileManifest = do
+  putStrLn "profile/manifest"
+  let hello = profileFixture 'a' "hello-2.12.1"
+      helloMan = profileFixture 'b' "hello-2.12.1-man"
+      world = profileFixture 'c' "world-1.0"
+      canonical = storePathToText defaultStoreDir
+      helloWorld = manifestOf [("hello", manifestElement [hello]), ("world", manifestElement [world])]
+      flake =
+        Manifest.Element
+          (Set.singleton hello)
+          Active
+          Manifest.defaultPriority
+          (Just (Manifest.FlakeSource "github:o/r" "github:o/r/0123abc" "packages.x86_64-linux.hello" (Just Proto.AllOutputs)))
+      names manifest = Map.keys (Manifest.manifestElements manifest)
+      parsed text = Manifest.parseManifest (TE.encodeUtf8 text)
+      selectedBy selector manifest = case Manifest.selectElements selector manifest of
+        Manifest.Selection picked warnings -> (Set.toAscList picked, warnings)
+      -- Nothing when a pattern does not compile, which no case expects.
+      selected matchers manifest = (`selectedBy` manifest) . Manifest.SelectSome <$> NE.nonEmpty matchers
+      regex = maybeToList . Manifest.regexMatcher
+      removal args = fmap Cli.optCommand (Cli.parseArgs ("profile" : "remove" : args))
+  sequence
+    [ runTest "the name part of a derivation name ends at the first dash a non-letter follows, as upstream's DrvName reads one" $
+        assertEqual
+          "names"
+          ["hello", "apache-httpd", "foo", "foo", "foo-", "", "foo-bar", "hello"]
+          (map Manifest.drvNameName ["hello-2.12.1", "apache-httpd-2.0.48", "foo-.bar", "foo--bar", "foo-", "-1", "foo-bar", "hello"]),
+      runTest "an element is identified by its paths' names, each once, in byte order, an empty one left out" $
+        assertEqual "one name" "hello" (Manifest.elementIdentifier (manifestElement [hello, helloMan]))
+          `andThen` assertEqual "two names" "hello, world" (Manifest.elementIdentifier (manifestElement [world, hello]))
+          `andThen` assertEqual "an empty name" "hello" (Manifest.elementIdentifier (manifestElement [hello, profileFixture 'd' "-1"])),
+      runTest "an element a flake made is identified by its reference, attribute and outputs" $
+        assertEqual "every output" "github:o/r#packages.x86_64-linux.hello^*" (Manifest.elementIdentifier flake)
+          `andThen` assertEqual
+            "named outputs"
+            "github:o/r#packages.x86_64-linux.hello^dev,out"
+            (Manifest.elementIdentifier flake {Manifest.elementSource = (\source -> source {Manifest.sourceOutputs = Proto.namedOutputs (Set.fromList [Proto.OutputName "out", Proto.OutputName "dev"])}) <$> Manifest.elementSource flake}),
+      runTest "a name already taken gets -1, -2 and on, as upstream's addElement names it" $
+        assertEqual "names" ["hello", "hello-1", "hello-2"] (names (manifestOf (replicate 3 ("hello", manifestElement [hello])))),
+      runTest "manifest.json is version 3 as nlohmann's dump writes it: members in name order, paths canonical" $
+        assertEqual
+          "bytes"
+          ( TE.encodeUtf8
+              ( "{\"elements\":{\"hello\":{\"active\":true,\"priority\":5,\"storePaths\":[\""
+                  <> canonical hello
+                  <> "\"]},\"world\":{\"active\":true,\"priority\":5,\"storePaths\":[\""
+                  <> canonical world
+                  <> "\"]}},\"version\":3}"
+              )
+          )
+          (Manifest.renderManifest helloWorld)
+          `andThen` assertEqual
+            "a flake element"
+            ( TE.encodeUtf8
+                ( "{\"elements\":{\"hello\":{\"active\":true,\"attrPath\":\"packages.x86_64-linux.hello\",\"originalUrl\":\"github:o/r\",\"outputs\":[\"*\"],\"priority\":5,\"storePaths\":[\""
+                    <> canonical hello
+                    <> "\"],\"url\":\"github:o/r/0123abc\"}},\"version\":3}"
+                )
+            )
+            (Manifest.renderManifest (manifestOf [("hello", flake)])),
+      runTestM "a version 3 manifest reads back as itself" $
+        propertyHolds $
+          QC.forAll genManifest $ \manifest ->
+            Manifest.parseManifest (Manifest.renderManifest manifest) QC.=== Right manifest,
+      runTest "versions 1 and 2 are read, their elements named by their paths" $
+        assertEqual
+          "version 1"
+          (Right (manifestOf [("hello", (manifestElement [hello]) {Manifest.elementPriority = 4})]))
+          (parsed ("{\"version\":1,\"elements\":[{\"active\":true,\"priority\":4,\"storePaths\":[\"" <> canonical hello <> "\"],\"uri\":\"\"}]}"))
+          `andThen` assertEqual
+            "version 2, priority defaulted"
+            (Right (manifestOf [("hello", manifestElement [hello]), ("hello-1", (manifestElement [helloMan]) {Manifest.elementActivity = Inactive})]))
+            (parsed ("{\"version\":2,\"elements\":[{\"active\":true,\"storePaths\":[\"" <> canonical hello <> "\"]},{\"active\":false,\"storePaths\":[\"" <> canonical helloMan <> "\"]}]}"))
+          `andThen` assertEqual
+            "version 1's flake element, named from its URL upstream"
+            (Left (Manifest.UnnamedFlakeElement "0"))
+            (parsed "{\"version\":1,\"elements\":[{\"active\":true,\"storePaths\":[],\"uri\":\"github:o/r\",\"originalUri\":\"github:o/r\",\"attrPath\":\"x\",\"outputs\":null}]}"),
+      runTest "a version other than 1 to 3, a missing one included, is refused in upstream's words" $
+        assertEqual "4" (Left (Manifest.UnsupportedVersion 4)) (parsed "{\"version\":4,\"elements\":{}}")
+          `andThen` assertEqual "missing" (Left (Manifest.UnsupportedVersion 0)) (parsed "{\"elements\":{}}")
+          `andThen` assertEqual
+            "words"
+            "profile manifest \"p/manifest.json\" has unsupported version 4"
+            (Manifest.manifestErrorText (asciiOsPath "p/manifest.json") (Manifest.UnsupportedVersion 4)),
+      runTest "no elements is an empty profile, and an element must say whether it is active and hold store paths" $
+        assertEqual "no elements" (Right Manifest.emptyManifest) (parsed "{\"version\":3}")
+          `andThen` assertEqual "no active" (Left (Manifest.MalformedElement "a" "its active is not a Boolean")) (parsed "{\"version\":3,\"elements\":{\"a\":{\"storePaths\":[]}}}")
+          `andThen` assertEqual
+            "a path outside the store"
+            (Left (Manifest.MalformedElement "a" "path '/elsewhere/x' is not in the Nix store"))
+            (parsed "{\"version\":3,\"elements\":{\"a\":{\"active\":true,\"storePaths\":[\"/elsewhere/x\"]}}}"),
+      runTest "the tree takes the active elements' paths, and the generation references every element's" $
+        let manifest = manifestOf [("hello", manifestElement [hello]), ("world", (manifestElement [world]) {Manifest.elementActivity = Inactive, Manifest.elementPriority = 3})]
+         in assertEqual "packages" [(hello, Manifest.defaultPriority)] (Manifest.manifestPackages manifest)
+              `andThen` assertEqual "references" (Set.fromList [hello, world]) (Manifest.manifestReferences manifest),
+      runTest "a name, a store path, a pattern matching the whole identifier ignoring case, or --all selects, as upstream's matchers do" $
+        assertEqual "a name" (Just (["world"], [])) (selected [Manifest.MatchName "world"] helloWorld)
+          `andThen` assertEqual "a store path" (Just (["hello"], [])) (selected [Manifest.MatchStorePath hello] helloWorld)
+          `andThen` assertEqual "a pattern" (Just (["hello"], [])) (selected (regex "HEL+O") helloWorld)
+          `andThen` assertEqual "--all" (["hello", "world"], []) (selectedBy Manifest.SelectAll helloWorld)
+          `andThen` assertEqual
+            "part of an identifier"
+            (Just ([], ["Regex 'ell' does not match any packages in the profile.", "Package name 'nope' does not match any packages in the profile.", "Store path '" <> storePathBasename helloMan <> "' does not match any packages in the profile."]))
+            (selected (regex "ell" ++ [Manifest.MatchName "nope", Manifest.MatchStorePath helloMan]) helloWorld)
+          `andThen` assertEqual "a pattern that does not compile" [] (map Manifest.matcherTitle (regex "(")),
+      runTest "an empty profile selects nothing, with upstream's warning" $
+        assertEqual "empty" ([], ["There are no packages in the profile."]) (selectedBy Manifest.SelectAll Manifest.emptyManifest),
+      runTest "profile remove refuses a line that selects nothing, and --all beside a selector, as usage errors" $
+        assertEqual "nothing" (Left "profile remove: no packages specified") (removal [])
+          `andThen` assertEqual "--all and a name" (Left "profile remove: --all cannot be used with package names or regular expressions") (removal ["--all", "hello"])
+          `andThen` assertEqual "--all twice" (Left "profile remove: --all cannot be used with package names or regular expressions") (removal ["--all", "--all"])
+          `andThen` assertEqual "--all" (Right (Cli.CmdProfileRemove Cli.DefaultProfile Cli.RemoveAll)) (removal ["--all"])
+          `andThen` assertEqual
+            "flags' selectors first, each in order"
+            (Right (Cli.CmdProfileRemove Cli.DefaultProfile (Cli.RemoveSome (Cli.RemoveRegex "b" :| [Cli.RemoveRegex "c", Cli.RemoveNamed "a"]))))
+            (removal ["a", "--regex", "b", "--regex", "c"]),
+      runTest "profile list --json is indented on a terminal unless --pretty or --no-pretty says otherwise, the later winning" $
+        let listing args = fmap Cli.optCommand (Cli.parseArgs ("profile" : "list" : args))
+            listed format = Right (Cli.CmdProfileList Cli.DefaultProfile format)
+         in assertEqual "default" (listed (Cli.ListJson Cli.IndentedOnTerminal)) (listing ["--json"])
+              `andThen` assertEqual "--pretty" (listed (Cli.ListJson Cli.Indented)) (listing ["--no-pretty", "--json", "--pretty"])
+              `andThen` assertEqual "--no-pretty" (listed (Cli.ListJson Cli.Compact)) (listing ["--pretty", "--no-pretty", "--json"])
+              `andThen` assertEqual "without --json" (listed Cli.ListText) (listing ["--pretty"]),
+      runTest "a conflict names the first element in name order holding either file as the existing one, and the last as the new one" $
+        let other = profileFixture 'e' "other-1"
+            storeDir = StoreDir "/s"
+            manifest = manifestOf [("hello", manifestElement [hello]), ("other", manifestElement [other])]
+            inStore path rest = asciiOsPath (storePathToFilePath storeDir path <> rest)
+            fileA = inStore hello "/bin/x"
+            fileB = inStore other "/bin/x"
+            spelled = Set.singleton . T.pack . storePathToFilePath storeDir
+            resolvedDir = StoreDir "/r"
+            resolvedA = asciiOsPath (storePathToFilePath resolvedDir hello <> "/bin/x")
+         in assertEqual
+              "conflict"
+              (Just (Manifest.Conflict (Manifest.ConflictSide fileA "hello" (spelled hello)) (Manifest.ConflictSide fileB "other" (spelled other)) 5))
+              (Manifest.attributeConflict storeDir storeDir manifest fileA fileB 5)
+              `andThen` assertEqual "neither held" Nothing (Manifest.attributeConflict storeDir storeDir manifest (asciiOsPath "/t/x") (asciiOsPath "/t/y") 5)
+              `andThen` assertEqual
+                "a file in a directory the tree expanded, under the store resolved through its links"
+                (Just (Manifest.Conflict (Manifest.ConflictSide resolvedA "hello" (spelled hello)) (Manifest.ConflictSide fileB "other" (spelled other)) 5))
+                (Manifest.attributeConflict storeDir resolvedDir manifest resolvedA fileB 5)
+    ]
+
+-- | Generations and where profiles are: names, numbering, the location
+-- from the environment, and a generation's NAR.
+testProfileGenerations :: IO [Bool]
+testProfileGenerations = do
+  putStrLn "profile/generations"
+  base <- Dir.getTemporaryDirectory >>= OP.encodeFS
+  let profileName = asciiOsPath "profile"
+      profile = base OP.</> profileName
+      number = Gen.GenerationNumber
+      at = (base OP.</>) . asciiOsPath
+      home = at "home"
+      environment stateHome = Gen.ProfileEnvironment stateHome home
+      generation n = Gen.Generation (number n) (at ("profile-" <> show n <> "-link"))
+      target = at "store-path"
+  sequence
+    [ runTestM "a generation's name reads back as its number" $
+        propertyHolds $
+          QC.forAll (QC.arbitrary :: QC.Gen Word64) $ \n ->
+            Gen.parseGenerationName profileName (OP.takeFileName (Gen.generationName profile (number n))) QC.=== Just (number n),
+      runTest "a name is the profile's, a dash, and a number before the first -link, as upstream's parseName reads one" $
+        assertEqual
+          "names"
+          [Just (number 3), Just (number 3), Just (number 3), Just (number 3), Nothing, Nothing, Nothing, Nothing, Nothing, Nothing]
+          ( map
+              (Gen.parseGenerationName profileName . asciiOsPath)
+              ["profile-3-link", "profile-3-link.tmp", "profile-+3-link", "profile-03-link", "profile--3-link", "profile-3", "profile-x-link", "profiles-3-link", "profile-18446744073709551616-link", "profile--link"]
+          ),
+      runTest "a profile's generations are the names of its directory it parses, in order of number" $
+        assertEqual
+          "generations"
+          [generation 1, generation 2, generation 10]
+          (Gen.generationsIn profile (map asciiOsPath ["profile-10-link", "profile", "profile.lock", "profile-2-link", "other-1-link", "profile-1-link"])),
+      runTest "the next generation is one past the newest, or the newest when it already names the path" $
+        assertEqual "first" (Gen.NewGeneration (number 1)) (Gen.nextGeneration Nothing target)
+          `andThen` assertEqual "the same path" (Gen.ReuseGeneration (generation 3)) (Gen.nextGeneration (Just (generation 3, target)) target)
+          `andThen` assertEqual "another path" (Gen.NewGeneration (number 4)) (Gen.nextGeneration (Just (generation 3, at "other")) target),
+      runTest "the state directory is NIX_STATE_HOME's, else XDG_STATE_HOME's nix, else the home's .local/state/nix, and on Windows Local AppData's nix\\state" $
+        assertEqual "NIX_STATE_HOME" (at "s") (Gen.stateDirectory (environment (Gen.NixStateHome (at "s"))))
+          `andThen` assertEqual "XDG_STATE_HOME" (at "x" OP.</> asciiOsPath "nix") (Gen.stateDirectory (environment (Gen.XdgStateHome (Just (at "x")))))
+          `andThen` assertEqual "the home" (home OP.</> asciiOsPath ".local" OP.</> asciiOsPath "state" OP.</> asciiOsPath "nix") (Gen.stateDirectory (environment (Gen.XdgStateHome Nothing)))
+          `andThen` assertEqual "Local AppData" (at "l" OP.</> asciiOsPath "nix" OP.</> asciiOsPath "state") (Gen.stateDirectory (environment (Gen.LocalAppDataHome (at "l")))),
+      runTest "profiles are in the state directory's profiles, the default one profile, linked from ~/.nix-profile or with XDG directories <state>/profile" $
+        let env = environment (Gen.NixStateHome (at "s"))
+         in assertEqual "profiles" (at "s" OP.</> asciiOsPath "profiles") (Gen.profilesDirectory env)
+              `andThen` assertEqual "default" (at "s" OP.</> asciiOsPath "profiles" OP.</> asciiOsPath "profile") (Gen.defaultProfilePath env)
+              `andThen` assertEqual "home link" (home OP.</> asciiOsPath ".nix-profile") (Gen.profileLinkPath Gen.HomeProfileLink env)
+              `andThen` assertEqual "state link" (at "s" OP.</> asciiOsPath "profile") (Gen.profileLinkPath Gen.StateProfileLink env),
+      runTest "a path is made absolute and collapsed without reading a link, as upstream's absPath makes one" $
+        assertEqual "relative" (at "d") (Gen.absolutePath base (asciiOsPath "c" OP.</> asciiOsPath ".." OP.</> asciiOsPath "d"))
+          `andThen` assertEqual "a dot" (at "c") (Gen.absolutePath base (asciiOsPath "." OP.</> asciiOsPath "c"))
+          `andThen` assertEqual "absolute" (at "x") (Gen.absolutePath (at "elsewhere") (at "x" OP.</> asciiOsPath "y" OP.</> asciiOsPath ".."))
+          -- Windows' temporary directory ends in a separator, which
+          -- takeDirectory alone would drop instead of the last component.
+          `andThen` assertEqual "up" (OP.takeDirectory (OP.dropTrailingPathSeparator base)) (Gen.absolutePath base (asciiOsPath "..")),
+      runTest "a generation's NAR is its tree and manifest.json, each link's target as the NAR spells it" $
+        let tree =
+              Map.fromList
+                [ (asciiOsPath "bin", Directory (Map.fromList [(asciiOsPath "hello", Link (asciiOsPath "/s/a/bin/hello") 5)])),
+                  (asciiOsPath "share", Link (asciiOsPath "/s/b/share") 5)
+                ]
+            expected =
+              NAR.NarDirectory
+                [ ("bin", NAR.NarDirectory [("hello", NAR.NarSymlink "/s/a/bin/hello")]),
+                  ("manifest.json", NAR.NarRegular False "{}"),
+                  ("share", NAR.NarSymlink "/s/b/share")
+                ]
+         in assertEqual "NAR" (Right (NAR.serialise expected)) (NAR.serialise <$> Gen.generationNar Gen.TargetBytes tree "{}"),
+      runTest "on Windows a link target's backslashes are written as slashes, as nova-cache's serialiser writes one, and elsewhere its bytes are kept" $
+        let windowsTree = Map.fromList [(asciiOsPath "bin", Link (asciiOsPath "C:\\nix\\store\\a\\bin") 5)]
+            windowsNar = NAR.NarDirectory [("bin", NAR.NarSymlink "C:/nix/store/a/bin"), ("manifest.json", NAR.NarRegular False "{}")]
+         in assertEqual "slashed" "C:/nix/store/a/bin" (Gen.narLinkTarget Gen.SlashedTargets "C:\\nix\\store\\a\\bin")
+              `andThen` assertEqual "bytes" "a\\b" (Gen.narLinkTarget Gen.TargetBytes "a\\b")
+              `andThen` assertEqual "a Windows generation" (Right (NAR.serialise windowsNar)) (NAR.serialise <$> Gen.generationNar Gen.SlashedTargets windowsTree "{}")
+              `andThen` assertEqual "this host" (if SI.os == "mingw32" then Gen.SlashedTargets else Gen.TargetBytes) Gen.hostNarTargets
+    ]
+
+-- | A profile changed through the library against a store on disk: the
+-- default profile's directory and link made, generations made and
+-- switched to and rooted, an add that finds the profile changed started
+-- again, and a profile of another store, or one only nix-env's manifest
+-- describes, refused.
+testProfileUpdateIO :: IO [Bool]
+testProfileUpdateIO = do
+  putStrLn "profile/update"
+  canLink <- symlinksAvailable
+  tmpBase <- getTemporaryDirectory
+  let root = tmpBase </> "nova-nix-test-profile-update"
+  if not canLink
+    then [] <$ putStrLn "  SKIP  a profile's links need symlink privilege (Windows needs Developer Mode or elevation)"
+    else bracket_ (forceRemoveIfExists root >> createDirectoryIfMissing True root) (forceRemoveIfExists root) $ do
+      rootPath <- OP.encodeFS root
+      store <- openStore (StoreDir (root </> "store"))
+      let storeDir = stDir store
+          stage name = root </> "stage" </> name
+          hello = profileFixture 'a' "hello-1.0"
+          world = profileFixture 'b' "world-1.0"
+          writeStaged path bytes = createDirectoryIfMissing True (takeDirectory path) *> BS.writeFile path bytes
+          env = Gen.ProfileEnvironment (Gen.NixStateHome (rootPath OP.</> asciiOsPath "state")) (rootPath OP.</> asciiOsPath "home")
+          adding name path manifest = pure (Gen.Changed (Manifest.addElement name (manifestElement [path]) manifest))
+          names = fmap (Map.keys . Manifest.manifestElements)
+      writeStaged (stage "hello" </> "bin" </> "hello") "hello"
+      writeStaged (stage "world" </> "bin" </> "world") "world"
+      addToStore store (stage "hello") hello Nothing []
+      addToStore store (stage "world") world Nothing []
+      closeStore store
+      createDirectoryIfMissing True (root </> "home")
+      defaulted <- Gen.resolveDefaultProfile Gen.HomeProfileLink env
+      firstChanged <- newIORef True
+      let osLinkIfThere path = either (\(_ :: IOException) -> Nothing) Just <$> try (OsDir.getSymbolicLinkTarget path)
+          profile = Gen.defaultProfilePath env
+          otherProfile = rootPath OP.</> asciiOsPath "other" OP.</> asciiOsPath "profile"
+          nixEnvProfile = rootPath OP.</> asciiOsPath "nix-env-profile"
+          sourceNar = fromRight (NAR.NarDirectory []) (Gen.generationNar Gen.hostNarTargets Map.empty "{}")
+          generations = fmap (map (\(Gen.Generation (Gen.GenerationNumber n) _) -> n))
+      linkTarget <- osLinkIfThere (rootPath OP.</> asciiOsPath "home" OP.</> asciiOsPath ".nix-profile")
+      (added, restarted, reused, firstManifest, lastManifest, sourceAdds, sourceRefs) <- withLocalStore (defaultBuildConfig storeDir) $ \ops -> do
+        let -- The first add the store is asked for runs another change of
+            -- the profile to completion before it answers, as a command
+            -- running beside this one would.
+            interrupted =
+              ops
+                { soAddSourceTree = \name refs entry -> do
+                    first <- atomicModifyIORef' firstChanged (False,)
+                    when first (void (Gen.updateProfile ops storeDir profile (adding "world" world)))
+                    soAddSourceTree ops name refs entry
+                }
+        added <- Gen.updateProfile ops storeDir profile (adding "hello" hello)
+        restarted <- Gen.updateProfile interrupted storeDir profile (adding "again" hello)
+        -- The same manifest again, under a spelling of the store directory
+        -- that collapses to the store's own.  A spelling through a link is
+        -- another store to the database, which keys rows by the spelling
+        -- ('Nix.Store.Handle.canonicalStoreDir').
+        reused <- Gen.updateProfile ops (StoreDir (unStoreDir storeDir </> ".")) profile (pure . Gen.Changed)
+        firstManifest <- Gen.readManifest (Gen.generationName profile (Gen.GenerationNumber 1))
+        lastManifest <- Gen.readManifest profile
+        sourceAdds <- replicateM 2 (soAddSourceTree ops Gen.generationStoreName (Set.fromList [hello, world]) sourceNar)
+        sourceRefs <- either (pure . Left) (sqReferences (soQueries ops)) (fromMaybe (Left "no add") (listToMaybe sourceAdds))
+        pure (added, restarted, reused, firstManifest, lastManifest, sourceAdds, sourceRefs)
+      createDirectoryIfMissing True (root </> "other")
+      refusedOther <- withLocalStore (defaultBuildConfig (StoreDir (root </> "other-store"))) $ \otherOps -> do
+        made <- Gen.updateProfile otherOps (StoreDir (root </> "other-store")) otherProfile (\_ -> pure (Gen.Changed Manifest.emptyManifest))
+        withLocalStore (defaultBuildConfig storeDir) $ \ops -> (,) made <$> Gen.updateProfile ops storeDir otherProfile (adding "hello" hello)
+      missingDirectory <- withLocalStore (defaultBuildConfig storeDir) $ \ops ->
+        Gen.updateProfile ops storeDir (rootPath OP.</> asciiOsPath "missing" OP.</> asciiOsPath "profile") (\_ -> pure (Gen.Changed Manifest.emptyManifest))
+      createDirectoryIfMissing True (root </> "nix-env-tree")
+      BS.writeFile (root </> "nix-env-tree" </> "manifest.nix") "[ ]"
+      Dir.createDirectoryLink (root </> "nix-env-tree") (root </> "nix-env-profile")
+      nixEnv <- Gen.readManifest nixEnvProfile
+      Dir.createDirectoryLink (root </> "store") (root </> "store-link")
+      throughLink <- Gen.checkProfileStore (StoreDir (root </> "store-link")) profile
+      elsewhere <- Gen.checkProfileStore (StoreDir (root </> "other-store")) profile
+      -- A store opened through a linked directory: the tree links a
+      -- directory it expands at its resolved spelling and everything else
+      -- at the store's, so a conflict's files are under both.
+      createDirectoryIfMissing True (root </> "real")
+      Dir.createDirectoryLink (root </> "real") (root </> "via")
+      viaStore <- openStore (StoreDir (root </> "via" </> "store"))
+      let viaDir = stDir viaStore
+          alpha = profileFixture 'c' "alpha-1.0"
+          beta = profileFixture 'd' "beta-1.0"
+          viaProfile = rootPath OP.</> asciiOsPath "via-profiles" OP.</> asciiOsPath "profile"
+      writeStaged (stage "alpha" </> "bin" </> "hello") "alpha"
+      writeStaged (stage "alpha" </> "bin" </> "a") "a"
+      writeStaged (stage "beta" </> "bin" </> "hello") "beta"
+      addToStore viaStore (stage "alpha") alpha Nothing []
+      addToStore viaStore (stage "beta") beta Nothing []
+      closeStore viaStore
+      createDirectoryIfMissing True (root </> "via-profiles")
+      (viaAdded, viaAgain, viaConflict) <- withLocalStore (defaultBuildConfig viaDir) $ \ops -> do
+        viaAdded <- Gen.updateProfile ops viaDir viaProfile (adding "alpha" alpha)
+        viaAgain <- Gen.updateProfile ops viaDir viaProfile (pure . Gen.Changed)
+        viaConflict <- Gen.updateProfile ops viaDir viaProfile (adding "beta" beta)
+        pure (viaAdded, viaAgain, viaConflict)
+      linked <- osLinkIfThere profile
+      helloRun <- either (\(_ :: IOException) -> Nothing) Just <$> try (BS.readFile (root </> "home" </> ".nix-profile" </> "bin" </> "hello"))
+      gens <- Gen.listGenerations profile
+      sequence
+        [ runTest "the default profile's directory and link are made, the link naming profiles/profile" $
+            assertEqual "default" (Right profile) defaulted
+              `andThen` assertEqual "link" (Just profile) linkTarget,
+          runTest "a change makes generation 1 and links the profile to it by its bare name" $
+            assertEqual "switched" (Right (Gen.SwitchedTo (Gen.Generation (Gen.GenerationNumber 1) (Gen.generationName profile (Gen.GenerationNumber 1))))) added
+              `andThen` assertEqual "generation 1 holds hello" (Right ["hello"]) (names firstManifest),
+          runTest "an add that finds the profile changed while it worked starts again, keeping the other change" $
+            case restarted of
+              Right (Gen.SwitchedTo (Gen.Generation (Gen.GenerationNumber 3) _)) ->
+                assertEqual "link" (Just (asciiOsPath "profile-3-link")) linked
+                  `andThen` assertEqual "generations" (Right [1, 2, 3]) (generations gens)
+                  `andThen` assertEqual "elements" (Right ["again", "hello", "world"]) (names lastManifest)
+              other -> Fail (T.pack (show other)),
+          runTest "the same manifest again keeps the newest generation, under a spelling of the store directory that collapses to its own" $
+            case reused of
+              Right (Gen.SwitchedTo (Gen.Generation (Gen.GenerationNumber 3) _)) -> assertEqual "generations" (Right [1, 2, 3]) (generations gens)
+              other -> Fail (T.pack (show other)),
+          runTest "a store opened through a linked directory keeps the newest generation for the same manifest" $
+            case (viaAdded, viaAgain) of
+              (Right (Gen.SwitchedTo first), Right (Gen.SwitchedTo again)) -> assertEqual "generation" first again
+              other -> Fail (T.pack (show other)),
+          runTest "a conflict in a store opened through a linked directory names the package already there as the existing one" $
+            case viaConflict of
+              Left (Gen.TreeConflict (Manifest.Conflict (Manifest.ConflictSide _ existing _) (Manifest.ConflictSide _ new _) _)) ->
+                assertEqual "existing, new" ("alpha", "beta") (existing, new)
+              other -> Fail (T.pack (show other)),
+          runTest "the profile's tree is in ~/.nix-profile" $ assertEqual "bin/hello" (Just "hello") helloRun,
+          runTest "a tree added by its NAR is the source path its references make, added again as itself, its references recorded" $
+            case sourceAdds of
+              [Right first, Right second] ->
+                assertEqual "path" (Hash.makeSourcePath "profile" (sha256Digest (NAR.serialise sourceNar)) (Set.fromList [hello, world])) (Right first)
+                  `andThen` assertEqual "again" first second
+                  `andThen` assertEqual "references" (Right (Set.fromList [hello, world])) sourceRefs
+              other -> Fail (T.pack (show other)),
+          runTest "a profile whose current generation is in another store is refused" $
+            case refusedOther of
+              (Right (Gen.SwitchedTo _), Left (Gen.ForeignGeneration refused _)) -> assertEqual "profile" otherProfile refused
+              other -> Fail (T.pack (show other)),
+          runTest "a store reached through a linked directory is the profile's own, and another store is not" $
+            assertEqual "through a link" (Right ()) throughLink
+              `andThen` case elsewhere of
+                Left (Gen.ForeignGeneration refused _) -> assertEqual "profile" profile refused
+                other -> Fail (T.pack (show other)),
+          runTest "a profile only nix-env's manifest.nix describes is refused" $
+            assertEqual "nix-env" (Left (Gen.NixEnvProfile nixEnvProfile)) nixEnv,
+          runTest "a profile whose directory is not there fails as a value, at its lock file" $
+            case missingDirectory of
+              Left (Gen.ProfileIOFailed reason) | "opening lock file" `T.isPrefixOf` reason -> Pass
+              other -> Fail (T.pack (show other))
+        ]
+
+-- | The profile commands through the real CLI, in an environment whose
+-- every home, state and configuration directory is under the test's own
+-- root, which the test checks before it runs anything: adding puts a
+-- program under ~/.nix-profile/bin, listing prints upstream's lines and
+-- JSON, each generation is a root the collector keeps, removing takes the
+-- program off, and a profile of another store or a store upstream Nix
+-- manages is refused.
+testProfileCLI :: IO [Bool]
+testProfileCLI = do
+  putStrLn "cli/profile"
+  canLink <- symlinksAvailable
+  shell <- findTestShell
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-profile"
+  if not canLink
+    then [] <$ putStrLn "  SKIP  a profile's links need symlink privilege (Windows needs Developer Mode or elevation)"
+    else bracket_ (forceRemoveIfExists root >> mapM_ (createDirectoryIfMissing True . (root </>)) ["work", "home", "home-xdg", "home-state-link", "real"]) (forceRemoveIfExists root) $ do
+      -- Built, if it is not, with the ambient environment cabal needs, then
+      -- run by its path, so the isolated environment reaches only it.
+      _ <- Proc.readCreateProcessWithExitCode (Proc.proc "cabal" ["run", "-v0", "exe:nova-nix", "--", "--version"]) ""
+      (_, listed, _) <- Proc.readCreateProcessWithExitCode (Proc.proc "cabal" ["list-bin", "-v0", "exe:nova-nix"]) ""
+      let exe = fromMaybe "nova-nix" (listToMaybe (reverse (filter (not . null) (lines (filter (/= '\r') listed)))))
+          locations homeDir stateVars extra =
+            [ ("HOME", homeDir),
+              ("USERPROFILE", homeDir),
+              ("ZDOTDIR", homeDir),
+              ("LOCALAPPDATA", root </> "local-app-data"),
+              ("XDG_DATA_HOME", root </> "xdg-data"),
+              ("XDG_CONFIG_HOME", root </> "xdg-config"),
+              ("XDG_CONFIG_DIRS", root </> "xdg-dirs"),
+              ("NIX_CONF_DIR", root </> "system")
+            ]
+              ++ stateVars
+              ++ extra
+          isolated given config =
+            ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n" <> config)
+              : given
+              ++ filter (\(key, _) -> key `notElem` ("NIX_CONFIG" : "NIX_USER_CONF_FILES" : "NIX_PATH" : "NIX_STATE_HOME" : "XDG_STATE_HOME" : map fst given)) ambient
+          home = root </> "home"
+          state = [("NIX_STATE_HOME", root </> "state")]
+          vars = locations home state []
+          onWindows = SI.os == "mingw32"
+          -- Each run is refused, without starting the binary, unless every
+          -- location it is given, and the state directory, profiles and
+          -- links the binary computes from them on this host, are under the
+          -- root.  On Windows a state directory NIX_STATE_HOME does not name
+          -- is the Local AppData folder, which no variable moves.
+          runIn given config args = do
+            inside <- locationsUnder given
+            if inside
+              then Proc.readCreateProcessWithExitCode ((Proc.proc exe args) {Proc.env = Just (isolated given config), Proc.cwd = Just (root </> "work")}) ""
+              else pure (ExitFailure 1, "", "the test refused to run: a location is outside " <> root)
+          locationsUnder given = do
+            rootPath <- OP.encodeFS root
+            stateHome <- case (lookup "NIX_STATE_HOME" given, onWindows) of
+              (Just dir, _) -> Just . Gen.NixStateHome <$> OP.encodeFS dir
+              (Nothing, True) -> pure Nothing
+              (Nothing, False) -> Just . Gen.XdgStateHome <$> traverse OP.encodeFS (lookup "XDG_STATE_HOME" given)
+            homeDir <- traverse OP.encodeFS (lookup (if onWindows then "USERPROFILE" else "HOME") given)
+            let under path = OP.splitDirectories rootPath `isPrefixOf` OP.splitDirectories path
+                computed = case (stateHome, homeDir) of
+                  (Just stateFrom, Just homeFrom) ->
+                    let env = Gen.ProfileEnvironment stateFrom homeFrom
+                     in all under [Gen.stateDirectory env, Gen.profilesDirectory env, Gen.profileLinkPath Gen.HomeProfileLink env, Gen.profileLinkPath Gen.StateProfileLink env]
+                  _ -> False
+            pure (all ((root `isPrefixOf`) . snd) given && computed)
+          nn = runIn vars ""
+          outcome (code, out, err) = "exit " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err
+          succeeded run@(code, _, _) check = if code == ExitSuccess then check else Fail (outcome run)
+          stderrLines (_, _, err) = lines (filter (/= '\r') err)
+          profiles = root </> "state" </> "profiles"
+          helloPath = home </> ".nix-profile" </> "bin" </> "hello"
+          worldPath = home </> ".nix-profile" </> "bin" </> "world"
+          hello = profileFixture 'a' "hello-1.0"
+          world = profileFixture 'b' "world-2.0"
+          other = profileFixture 'c' "other-1.0"
+          script message = "#!/bin/sh\necho " <> message <> "\n"
+          stage name = root </> "stage" </> name
+          writeStaged path bytes = createDirectoryIfMissing True (takeDirectory path) *> BS.writeFile path bytes
+          -- A read that fails is the test's to report, not the suite's.
+          readIfThere path = either (\(_ :: IOException) -> Nothing) Just <$> try (BS.readFile path)
+          linkIfThere path = either (\(_ :: IOException) -> Nothing) Just <$> try (Dir.getSymbolicLinkTarget path)
+          twoOutputs =
+            "derivation { name = \"two-1.0\"; system = builtins.currentSystem; builder = "
+              <> nixQuotedPath (T.unpack shell)
+              <> "; outputs = [ \"out\" \"dev\" ]; args = [ \"-c\" \"echo out > $out; echo dev > $dev\" ]; }"
+      do
+        -- The store is under a linked directory, so the tree names a
+        -- directory it expands at a spelling other than the store's.
+        Dir.createDirectoryLink (root </> "real") (root </> "via")
+        store <- openStore (StoreDir (root </> "via" </> "store"))
+        let storeDir = stDir store
+            storeArg = unStoreDir storeDir
+            inStore = storePathToFilePath storeDir
+            canonical = storePathToText defaultStoreDir
+        writeStaged (stage "hello" </> "bin" </> "hello") (script "hello from the profile")
+        writeStaged (stage "world" </> "bin" </> "world") (script "world")
+        writeStaged (stage "other" </> "bin" </> "hello") (script "the other hello")
+        forM_ [stage "hello" </> "bin" </> "hello", stage "world" </> "bin" </> "world", stage "other" </> "bin" </> "hello"] ExecBit.markExecutable
+        mapM_ (\(name, path) -> addToStore store (stage name) path Nothing []) [("hello", hello), ("world", world), ("other", other)]
+        closeStore store
+        listedEmpty <- nn ["profile", "list", "--store", storeArg]
+        emptyLink <- linkIfThere (home </> ".nix-profile")
+        addHello <- nn ["profile", "add", "--store", storeArg, inStore hello]
+        helloContent <- readIfThere helloPath
+        ran <-
+          if SI.os == "mingw32"
+            then pure Nothing
+            else Just <$> Proc.readProcessWithExitCode (T.unpack shell) [helloPath] ""
+        listedText <- nn ["profile", "list", "--store", storeArg]
+        listedJson <- nn ["profile", "list", "--json", "--store", storeArg]
+        prettyJson <- nn ["profile", "list", "--json", "--pretty", "--store", storeArg]
+        compactJson <- nn ["profile", "list", "--pretty", "--json", "--no-pretty", "--store", storeArg]
+        conflicting <- nn ["profile", "add", "--store", storeArg, inStore other]
+        prioritised <- nn ["profile", "add", "--priority", "4", "--store", storeArg, inStore other]
+        otherContent <- readIfThere helloPath
+        addWorld <- nn ["profile", "add", "--store", storeArg, inStore world]
+        roots <- nn ["store", "gc", "--print-roots", "--store", storeArg]
+        removed <- nn ["profile", "remove", "--store", storeArg, "hello", "other"]
+        helloAfter <- Dir.doesPathExist helloPath
+        worldAfter <- Dir.doesPathExist worldPath
+        collected <- nn ["store", "gc", "--store", storeArg]
+        generationsKept <- traverse (\n -> Dir.doesPathExist (profiles </> ("profile-" <> show (n :: Int) <> "-link") </> "manifest.json")) [1, 2, 3, 4]
+        helloKept <- Dir.doesPathExist (inStore hello)
+        index <- nn ["profile", "remove", "--store", storeArg, "3"]
+        nothingSelected <- nn ["profile", "remove", "--store", storeArg]
+        built <- nn ["profile", "add", "--store", storeArg, "--expr", T.unpack twoOutputs]
+        toInstall <- nn ["profile", "add", "--store", storeArg, "--expr", "(" <> T.unpack twoOutputs <> ") // { meta.outputsToInstall = [ \"dev\" ]; }"]
+        specified <- nn ["profile", "add", "--store", storeArg, "--expr", "(" <> T.unpack twoOutputs <> ").dev // { outputSpecified = true; }"]
+        builtJson <- nn ["profile", "list", "--json", "--store", storeArg]
+        refusedOther <- nn ["profile", "add", "--store", root </> "other-store", "--expr", T.unpack twoOutputs]
+        otherStoreMade <- Dir.doesPathExist (root </> "other-store" </> ".nova-nix")
+        listedOther <- nn ["profile", "list", "--store", root </> "other-store"]
+        createDirectoryIfMissing True (root </> "up" </> "nix" </> "store")
+        writeStaged (root </> "up" </> "nix" </> "var" </> "nix" </> "db" </> "db.sqlite") ""
+        upstream <- nn ["profile", "add", "--store", root </> "up" </> "nix" </> "store", inStore hello]
+        xdgCases <-
+          if onWindows
+            then [] <$ putStrLn "  SKIP  XDG_STATE_HOME: Windows reads the Local AppData folder in its place"
+            else do
+              xdgListed <- runIn (locations (root </> "home-xdg") [("XDG_STATE_HOME", root </> "xdg-state")] []) "" ["profile", "list", "--store", storeArg]
+              xdgLink <- linkIfThere (root </> "home-xdg" </> ".nix-profile")
+              sequence
+                [ runTest "with NIX_STATE_HOME unset, profiles are in XDG_STATE_HOME's nix" $
+                    succeeded xdgListed (assertEqual "link" (Just (root </> "xdg-state" </> "nix" </> "profiles" </> "profile")) xdgLink)
+                ]
+        stateLinked <- runIn (locations (root </> "home-state-link") [("NIX_STATE_HOME", root </> "state-link")] []) "use-xdg-base-directories = true\n" ["profile", "list", "--store", storeArg]
+        stateLink <- linkIfThere (root </> "state-link" </> "profile")
+        homeLinkMade <- Dir.doesPathExist (root </> "home-state-link" </> ".nix-profile")
+        let jsonOf paths = "{\"elements\":{" <> T.intercalate "," paths <> "},\"version\":3}"
+            elementJson name priority paths = "\"" <> name <> "\":{\"active\":true,\"priority\":" <> T.pack (show (priority :: Int)) <> ",\"storePaths\":[" <> T.intercalate "," ["\"" <> path <> "\"" | path <- paths] <> "]}"
+            builtPaths = case builtJson of
+              (ExitSuccess, out, _) -> either (const []) pathsOf (parseJson (T.strip (T.pack out)))
+              _ -> []
+            pathsOf json = case json of
+              JsonObject top | Just (JsonObject elements) <- Map.lookup "elements" top -> [(name, [p | JsonString p <- paths]) | (name, JsonObject element) <- Map.toList elements, Just (JsonArray paths) <- [Map.lookup "storePaths" element]]
+              _ -> []
+            outputOf name = filter (T.isSuffixOf ("-two-1.0" <> name))
+        (++ xdgCases)
+          <$> sequence
+            [ runTest "profile list of a profile that is not there prints nothing and makes ~/.nix-profile" $
+                succeeded listedEmpty (assertEqual "stdout" "" (let (_, out, _) = listedEmpty in out) `andThen` assertEqual "link" (Just (root </> "state" </> "profiles" </> "profile")) emptyLink),
+              runTest "profile add puts the program under ~/.nix-profile/bin" $
+                succeeded addHello (assertEqual "bin/hello" (Just (script "hello from the profile")) helloContent),
+              runTest "the program runs through ~/.nix-profile/bin" $
+                case ran of
+                  Nothing -> Pass
+                  Just (code, out, err) -> assertEqual "run" (ExitSuccess, "hello from the profile\n") (code, out) `andThen` assertEqual "stderr" "" err,
+              runTest "profile list prints upstream's lines, the name in bold"
+                $ succeeded listedText
+                $ assertEqual "lines" ["Name:               \ESC[1mhello\ESC[0m", "Store paths:        " <> inStore hello] (let (_, out, _) = listedText in lines (filter (/= '\r') out)),
+              runTest "profile list --json prints the manifest, paths in the canonical spelling"
+                $ succeeded listedJson
+                $ assertEqual "json" (jsonOf [elementJson "hello" 5 [canonical hello]]) (let (_, out, _) = listedJson in T.strip (T.pack out)),
+              runTest "profile list --json --pretty indents the manifest, and a later --no-pretty puts it on one line"
+                $ succeeded prettyJson . succeeded compactJson
+                $ let (_, compactOut, _) = compactJson
+                      (_, prettyOut, _) = prettyJson
+                   in case parseJson (T.strip (T.pack compactOut)) of
+                        Right json ->
+                          assertEqual "indented" (Ref.renderIndentedJson json) (TE.encodeUtf8 (T.pack (filter (/= '\r') prettyOut)))
+                            `andThen` assertEqual "one line" 1 (length (lines compactOut))
+                        Left err -> Fail err,
+              runTest "a file at one path in two packages of one priority fails the add in upstream's words, with nova-nix's commands" $
+                case conflicting of
+                  (ExitFailure 1, _, _) ->
+                    assertEqual "first line" (Just "error: An existing package already provides the following file:") (listToMaybe (stderrLines conflicting))
+                      `andThen` assertEqual "hint" True (("         nova-nix profile remove hello" :: String) `elem` stderrLines conflicting)
+                  _ -> Fail (outcome conflicting),
+              runTest "each generation is a root, listed by its link"
+                $ succeeded addWorld . succeeded roots
+                $ let (_, out, _) = roots
+                      rootLinks = [takeFileName (takeWhile (/= ' ') line) | line <- lines (filter (/= '\r') out)]
+                   in assertEqual "links" ["profile-1-link", "profile-2-link", "profile-3-link"] (filter ("profile-" `isPrefixOf`) rootLinks),
+              runTest "profile remove takes the program off, in upstream's words, and keeps the rest"
+                $ succeeded removed
+                $ assertEqual "lines" ["removing 'hello'", "removing 'other'", "removed 2 packages, kept 1 packages"] (stderrLines removed)
+                  `andThen` assertEqual "bin/hello, bin/world" (False, True) (helloAfter, worldAfter),
+              runTest "store gc keeps every generation and what only an old one holds" $
+                succeeded collected (assertEqual "generations" [True, True, True, True] generationsKept `andThen` assertEqual "hello" True helloKept),
+              runTest "a lower priority number puts a package's file in place of one already there" $
+                succeeded prioritised (assertEqual "bin/hello" (Just (script "the other hello")) otherContent),
+              runTest "a number is refused as upstream refuses an index" $
+                assertEqual "index" (ExitFailure 1, ["error: 'nova-nix profile' does not support indices ('3')"]) (let (code, _, _) = index in code, stderrLines index),
+              runTest "profile remove with nothing selected is a usage error, before the profile is read" $
+                assertEqual "usage" (ExitFailure 1, ["profile remove: no packages specified"]) (let (code, _, _) = nothingSelected in code, stderrLines nothingSelected),
+              runTest "a derivation is built and added for every output, the one its outputSpecified selects, or those meta.outputsToInstall names" $
+                succeeded built . succeeded toInstall . succeeded specified $
+                  case (lookup "two" builtPaths, lookup "two-1" builtPaths, lookup "two-2" builtPaths) of
+                    (Just every, Just installed, Just selected) ->
+                      assertEqual "every output" 2 (length every)
+                        `andThen` assertEqual "outputsToInstall" (outputOf "-dev" every) installed
+                        `andThen` assertEqual "outputSpecified" (outputOf "-dev" every) selected
+                    _ -> Fail (T.pack (show builtPaths)),
+              runTest "a profile whose generation is in another store is refused before anything is built" $
+                case refusedOther of
+                  (ExitFailure 1, _, _) ->
+                    assertEqual "names the flags" True (any (\line -> "--store" `isInfixOf` line && "--profile" `isInfixOf` line) (stderrLines refusedOther))
+                      `andThen` assertEqual "nothing built" False otherStoreMade
+                  _ -> Fail (outcome refusedOther),
+              runTest "profile list refuses a profile whose generation is in another store, as the commands that change one do" $
+                case listedOther of
+                  (ExitFailure 1, "", _) -> assertEqual "names the flags" True (any (\line -> "--store" `isInfixOf` line && "--profile" `isInfixOf` line) (stderrLines listedOther))
+                  _ -> Fail (outcome listedOther),
+              runTest "a store upstream Nix manages is refused, as build refuses it" $
+                case upstream of
+                  (ExitFailure 1, _, err) | "profile add: " `isPrefixOf` err -> Pass
+                  _ -> Fail (outcome upstream),
+              runTest "use-xdg-base-directories links the default profile from the state directory, not the home" $
+                succeeded stateLinked (assertEqual "link" (Just (root </> "state-link" </> "profiles" </> "profile")) stateLink `andThen` assertEqual "home link" False homeLinkMade)
             ]
 
 -- | Step 2 of the ladder: a dependency-aware build end-to-end.  A root
@@ -28794,6 +29447,7 @@ fakeRealiseStore holds stop = do
                   sqReferences = \_ -> pure (Right Set.empty)
                 },
             soAddEvalObjects = \objects -> Right () <$ (record FakeAdded >> modifyIORef' added (<> objectPaths objects)),
+            soAddSourceTree = \_ _ _ -> pure (Left "a tree no test asked for"),
             soBuild = \requests -> maybe (Right ()) Left stop <$ record (FakeBuilt requests),
             soCheck = \_ -> pure (Right ()),
             soAddOutLinkRoot = \link _ -> pure (Right link)
@@ -28811,6 +29465,7 @@ unexpectedOps =
   StoreOps
     { soQueries = StoreQueries {sqValidPaths = \_ -> pure Set.empty, sqReferences = \_ -> pure (Right Set.empty)},
       soAddEvalObjects = \_ -> pure (Left "an add no test asked for"),
+      soAddSourceTree = \_ _ _ -> pure (Left "a tree no test asked for"),
       soBuild = \requests -> pure (Left (BuildStop ("a build no test asked for: " <> T.pack (show requests)) 1)),
       soCheck = \_ -> pure (Left (BuildStop "a check no test asked for" 1)),
       soAddOutLinkRoot = \_ _ -> pure (Left "a root no test asked for")
@@ -31142,6 +31797,9 @@ cliOperands name flagName = case name of
   Ref.PushCommand -> ["--cache", "https://cache.example.org", "hash-name"]
   Ref.StoreDeleteCommand -> ["hash-name"]
   Ref.StoreGcCommand -> []
+  Ref.ProfileAddCommand -> expression
+  Ref.ProfileRemoveCommand -> ["hello" | flagName /= Ref.AllFlag]
+  Ref.ProfileListCommand -> []
   where
     expression = concat [["--expr", "1"] | flagName /= Ref.ExprFlag]
 
@@ -31154,6 +31812,9 @@ cliSelects name parsed = case (name, parsed) of
   (Ref.PushCommand, Cli.CmdPush _) -> True
   (Ref.StoreDeleteCommand, Cli.CmdStoreDelete _) -> True
   (Ref.StoreGcCommand, Cli.CmdStoreGc _) -> True
+  (Ref.ProfileAddCommand, Cli.CmdProfileAdd {}) -> True
+  (Ref.ProfileRemoveCommand, Cli.CmdProfileRemove {}) -> True
+  (Ref.ProfileListCommand, Cli.CmdProfileList {}) -> True
   _ -> False
 
 -- | One word read back as a POSIX shell reads it, for what
@@ -36535,6 +37196,9 @@ runSuite = do
           testBuildenvDerivations,
           testProfileTree,
           testBuildenvBuildIO,
+          testProfileManifest,
+          testProfileGenerations,
+          testProfileUpdateIO,
           testDependentBuildIO,
           testBuildCheckIO,
           testStoreOpsIO,
@@ -36748,6 +37412,7 @@ runSuite = do
           testBuildUmaskCLI,
           testSandboxSessionsCLI,
           testOutLinkCLI,
+          testProfileCLI,
           testTargetArgs,
           testTargetArgsCLI,
           testUncaughtIOFailureCLI,

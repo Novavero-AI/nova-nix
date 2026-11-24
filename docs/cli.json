@@ -324,7 +324,7 @@
       ]
     },
     {
-      "description": "Deletes every store path no root keeps, directly or through the paths that reference it, and prints how many it deleted and the space it freed, as `nix-store --gc` does. The roots are the links `build` made to its outputs, while they stay, and the links and files under the store's `.nova-nix/gcroots` directory; a path a running program has open is not a root, and a rooted output does not keep the `.drv` that built it. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused. With `--print-roots` it lists the roots and deletes nothing.",
+      "description": "Deletes every store path no root keeps, directly or through the paths that reference it, and prints how many it deleted and the space it freed, as `nix-store --gc` does. The roots are the links `build` made to its outputs and each generation of a profile, while they stay, and the links and files under the store's `.nova-nix/gcroots` directory; a path a running program has open is not a root, and a rooted output does not keep the `.drv` that built it. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused. With `--print-roots` it lists the roots and deletes nothing.",
       "examples": [
         {
           "arguments": [
@@ -351,6 +351,136 @@
         {
           "summary": "Remove every store path not reachable from a root",
           "usage": "nova-nix store gc"
+        }
+      ]
+    },
+    {
+      "description": "Adds a package to a profile and switches the profile to a new generation that holds it, as `nix profile add` does. A `PATH` that is in the store, or a link that leads into it, as the `./result` a build links does, adds the store path it is in, which must be valid. Any other `PATH`, a `<NAME>` or `--expr` is evaluated as `build` evaluates its target, and its derivation built for the outputs it installs: the one the value selects when its `outputSpecified` is true, else those its `meta.outputsToInstall` names, else every output. Before each component of the `-A` path is selected from it, and once the path has selected it, the value is called as `nix-build` calls it, with the arguments from `--arg` and `--argstr` or with none: a set with `__functor` stands for what its functor returns given the set, which is called in turn; a function with a set pattern is called with every argument when it takes `...` and otherwise with those its formals name, its defaults filling the rest, and a formal with neither an argument nor a default fails the command; any other value is left as it is. The package is named after the names of its paths without their versions, with `-1`, `-2` and on appended to a name the profile already holds, and has the priority `--priority` gives, 5 unless it gives another. Where two packages hold a file at one path, the profile links the one with the lower number, and two with one number fail the command, which names both files and the commands that would resolve it. A profile is a link to one of its generations, `PROFILE-1-link`, `PROFILE-2-link` and on beside it, each a store path holding the packages' files linked into one tree and a `manifest.json` that lists the packages, and each a root the garbage collector keeps. The default profile is `profiles/profile` in the state directory, which is `$NIX_STATE_HOME`, else `$XDG_STATE_HOME/nix`, else `~/.local/state/nix`, or on Windows `nix\\state` in the Local AppData folder; `~/.nix-profile`, or with `use-xdg-base-directories` on `profile` in the state directory, links to it, and both are made when they are missing, whichever profile `--profile` names. A profile whose current generation is outside the store, as one upstream Nix keeps in `/nix/store` is while nova-nix uses another store, is refused. A change that finds the profile changed by another command since it began starts again. On Windows each link is a symlink, which needs Developer Mode or an elevated shell. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is evaluated.",
+      "examples": [
+        {
+          "arguments": [
+            "profile",
+            "add",
+            "pkgs/windows/hello.nix"
+          ],
+          "command": "nova-nix profile add pkgs/windows/hello.nix",
+          "description": "Build GNU Hello for Windows from the directory a release unpacks to and add it to the default profile, which puts `hello` under `~/.nix-profile/bin`.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "profile",
+            "add",
+            "./result"
+          ],
+          "command": "nova-nix profile add ./result",
+          "description": "Add what a build linked from `./result` to the default profile.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "profile",
+            "add",
+            "--priority",
+            "4",
+            "./result"
+          ],
+          "command": "nova-nix profile add --priority 4 ./result",
+          "description": "Add a package whose files the profile links in place of those of one at the default priority.",
+          "output": []
+        }
+      ],
+      "name": "nova-nix profile add",
+      "synopsis": [
+        {
+          "summary": "Add a derivation from a .nix file, or the store path a path leads to, to a profile",
+          "usage": "nova-nix profile add PATH"
+        },
+        {
+          "summary": "Add a derivation from the file the search path finds for NAME to a profile",
+          "usage": "nova-nix profile add '<NAME>'"
+        },
+        {
+          "summary": "Add a derivation from an inline expression to a profile",
+          "usage": "nova-nix profile add --expr 'EXPR'"
+        }
+      ]
+    },
+    {
+      "description": "Takes packages off a profile and switches the profile to a new generation without them, as `nix profile remove` does. A `NAME` selects the package of that name, and a store path every package that holds it; `--regex` selects every package whose name, or for a package a flake added its flake reference and attribute, a POSIX extended regular expression matches whole, ignoring case; and `--all`, which takes nothing beside it, every package. Each package taken off is named, and then how many were taken off and kept; a selector that selects nothing is warned of, and when nothing is selected the profile is left as it is. A number is refused, as upstream refuses one in place of a name, and so is a line that selects nothing, or `--all` beside another selector. A profile is a link to one of its generations, `PROFILE-1-link`, `PROFILE-2-link` and on beside it, each a store path holding the packages' files linked into one tree and a `manifest.json` that lists the packages, and each a root the garbage collector keeps. The default profile is `profiles/profile` in the state directory, which is `$NIX_STATE_HOME`, else `$XDG_STATE_HOME/nix`, else `~/.local/state/nix`, or on Windows `nix\\state` in the Local AppData folder; `~/.nix-profile`, or with `use-xdg-base-directories` on `profile` in the state directory, links to it, and both are made when they are missing, whichever profile `--profile` names. A profile whose current generation is outside the store, as one upstream Nix keeps in `/nix/store` is while nova-nix uses another store, is refused. A change that finds the profile changed by another command since it began starts again. On Windows each link is a symlink, which needs Developer Mode or an elevated shell. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused.",
+      "examples": [
+        {
+          "arguments": [
+            "profile",
+            "remove",
+            "hello"
+          ],
+          "command": "nova-nix profile remove hello",
+          "description": "Take GNU Hello off the default profile.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "profile",
+            "remove",
+            "--all",
+            "--profile",
+            "./my-profile"
+          ],
+          "command": "nova-nix profile remove --all --profile ./my-profile",
+          "description": "Take every package off a profile other than the default.",
+          "output": []
+        }
+      ],
+      "name": "nova-nix profile remove",
+      "synopsis": [
+        {
+          "summary": "Take packages off a profile, by name or by a store path they hold",
+          "usage": "nova-nix profile remove NAME..."
+        },
+        {
+          "summary": "Take off a profile the packages whose names a regular expression matches",
+          "usage": "nova-nix profile remove --regex PATTERN"
+        },
+        {
+          "summary": "Take every package off a profile",
+          "usage": "nova-nix profile remove --all"
+        }
+      ]
+    },
+    {
+      "description": "Prints each package in a profile, as `nix profile list` does: its name, in bold, and its store paths, with a blank line between packages, and for a package a flake added its flake attribute and its original and locked flake references. With `--json` it prints the profile's `manifest.json` instead, indented when stdout is a terminal unless `--pretty` or `--no-pretty` says otherwise, the later of them winning. A profile with no manifest holds no packages. The default profile and its link are made when they are missing, and a profile whose current generation is outside the store is refused, as for every profile command.",
+      "examples": [
+        {
+          "arguments": [
+            "profile",
+            "list"
+          ],
+          "command": "nova-nix profile list",
+          "description": "List the packages in the default profile.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "profile",
+            "list",
+            "--json",
+            "--pretty"
+          ],
+          "command": "nova-nix profile list --json --pretty",
+          "description": "Print the default profile's manifest, indented.",
+          "output": []
+        }
+      ],
+      "name": "nova-nix profile list",
+      "synopsis": [
+        {
+          "summary": "Print the packages in a profile",
+          "usage": "nova-nix profile list"
+        },
+        {
+          "summary": "Print a profile's manifest as JSON",
+          "usage": "nova-nix profile list --json"
         }
       ]
     }
@@ -449,6 +579,11 @@
         "name": "require-drop-supplementary-groups"
       },
       {
+        "description": "Link the default profile from `profile` in the state directory in place of `~/.nix-profile` (default `false`)",
+        "flag": null,
+        "name": "use-xdg-base-directories"
+      },
+      {
         "description": "The CA bundle a sandboxed fixed-output build sees (default: `$NIX_SSL_CERT_FILE`, `$SSL_CERT_FILE`, or the first that exists of `/etc/ssl/certs/ca-certificates.crt` and `etc/ssl/certs/ca-bundle.crt` under `/nix/var/nix/profiles/default`)",
         "flag": null,
         "name": "ssl-cert-file"
@@ -461,7 +596,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Evaluate `EXPR` in place of a file; a relative path in it resolves against the working directory",
       "name": "--expr",
@@ -473,7 +609,8 @@
       "argument": "ATTRPATH",
       "commands": [
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Select a dotted attribute path (`a.b.c`)",
       "name": "--attr",
@@ -544,7 +681,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Add search path (repeatable, merged with `NIX_PATH`)",
       "name": "--nix-path",
@@ -557,7 +695,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Pass the value of `EXPR` as the argument `NAME` to a function the target evaluates to",
       "name": "--arg",
@@ -570,7 +709,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Pass `STRING`, as a string, as the argument `NAME` to a function the target evaluates to",
       "name": "--argstr",
@@ -583,7 +723,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Confine reads to the search path roots and what the evaluation itself writes; fetch only `allowed-uris`",
       "name": "--restrict-eval",
@@ -596,7 +737,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Confine reads as `--restrict-eval` does, with no search path but the bundled `<nix/*>`, no `currentTime`, `currentSystem` or `storePath`, and pinned fetches only (`allowed-uris` applies only under `--restrict-eval`)",
       "name": "--pure-eval",
@@ -609,7 +751,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Make `builtins.traceVerbose` behave as `builtins.trace`; without it, the first argument is never forced",
       "name": "--trace-verbose",
@@ -622,7 +765,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Refuse to build or substitute what a path's context names when `import` or another builtin reads the path, even an output already valid",
       "name": "--no-allow-import-from-derivation",
@@ -635,7 +779,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Try this binary cache before building",
       "name": "--substituter",
@@ -648,7 +793,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Trust signatures by this public key (`NAME:BASE64`) from any substituter",
       "name": "--trusted-key",
@@ -661,7 +807,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Build from source if substitution fails",
       "name": "--fallback",
@@ -685,7 +832,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Enable sandboxing",
       "name": "--sandbox",
@@ -698,7 +846,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Disable sandboxing",
       "name": "--no-sandbox",
@@ -711,7 +860,8 @@
       "commands": [
         "nova-nix eval",
         "nova-nix build",
-        "nova-nix trust"
+        "nova-nix trust",
+        "nova-nix profile add"
       ],
       "description": "Enable sandboxing, but allow builds to disable it",
       "name": "--relaxed-sandbox",
@@ -723,7 +873,8 @@
       "argument": "S=PATH",
       "commands": [
         "nova-nix eval",
-        "nova-nix build"
+        "nova-nix build",
+        "nova-nix profile add"
       ],
       "description": "Run system `S`'s derivations through `PATH` (repeatable), e.g. `x86_64-windows=/usr/bin/wine`",
       "name": "--exec-wrapper",
@@ -745,9 +896,10 @@
     {
       "argument": null,
       "commands": [
-        "nova-nix push"
+        "nova-nix push",
+        "nova-nix profile remove"
       ],
-      "description": "Select every valid path except derivations, in place of `PATH...`",
+      "description": "Select every valid path except derivations, in place of `PATH...`; for `profile remove`, every package",
       "name": "--all",
       "spellings": [
         "--all"
@@ -798,6 +950,74 @@
       ]
     },
     {
+      "argument": "PATH",
+      "commands": [
+        "nova-nix profile add",
+        "nova-nix profile remove",
+        "nova-nix profile list"
+      ],
+      "description": "Work on the profile at `PATH` in place of the default profile",
+      "name": "--profile",
+      "spellings": [
+        "--profile"
+      ]
+    },
+    {
+      "argument": "N",
+      "commands": [
+        "nova-nix profile add"
+      ],
+      "description": "Give the package priority `N` (default 5): of two files at one path, the profile links the one with the lower number",
+      "name": "--priority",
+      "spellings": [
+        "--priority"
+      ]
+    },
+    {
+      "argument": "PATTERN",
+      "commands": [
+        "nova-nix profile remove"
+      ],
+      "description": "Select the packages whose names a POSIX extended regular expression matches whole, ignoring case",
+      "name": "--regex",
+      "spellings": [
+        "--regex"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix profile list"
+      ],
+      "description": "Print the profile's `manifest.json` in place of its packages' lines",
+      "name": "--json",
+      "spellings": [
+        "--json"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix profile list"
+      ],
+      "description": "With `--json`, indent the JSON, as when stdout is a terminal",
+      "name": "--pretty",
+      "spellings": [
+        "--pretty"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix profile list"
+      ],
+      "description": "With `--json`, print the JSON on one line, as when stdout is not a terminal",
+      "name": "--no-pretty",
+      "spellings": [
+        "--no-pretty"
+      ]
+    },
+    {
       "argument": "DIR",
       "commands": [
         "nova-nix eval",
@@ -805,7 +1025,10 @@
         "nova-nix trust",
         "nova-nix push",
         "nova-nix store delete",
-        "nova-nix store gc"
+        "nova-nix store gc",
+        "nova-nix profile add",
+        "nova-nix profile remove",
+        "nova-nix profile list"
       ],
       "description": "Use `DIR` as the store (default: the platform store)",
       "name": "--store",
@@ -837,7 +1060,7 @@
     }
   ],
   "global": {
-    "description": "nova-nix evaluates Nix expressions, builds derivations, reports what a derivation's closure relies on, pushes store paths to a binary cache and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` alone has another status, 104, for an output that differs.",
+    "description": "nova-nix evaluates Nix expressions, builds derivations, reports what a derivation's closure relies on, pushes store paths to a binary cache, keeps profiles of packages and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` alone has another status, 104, for an output that differs.",
     "examples": [
       {
         "arguments": [

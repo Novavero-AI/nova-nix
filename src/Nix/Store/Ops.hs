@@ -2,8 +2,8 @@
 {-# LANGUAGE RankNTypes #-}
 
 -- | The store a command works against, as a record of its operations:
--- what it holds, adding what an evaluation wrote, building, checking, and
--- rooting an out-link.  A command runs over the record rather than an open
+-- what it holds, adding what an evaluation wrote, adding a tree by its
+-- content, building, checking, and rooting an out-link.  A command runs over the record rather than an open
 -- t'Nix.Store.Handle.Store', so it runs as well over a store reached some
 -- other way, and over a fake one in tests, in the pattern of
 -- "Nix.Realise"'s 'Nix.Realise.RealiseEffects'.
@@ -48,9 +48,10 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Nix.Builder (BuildConfig (..), BuildStop (..), SubstitutionAccess (..), buildRequests, checkStored, realiseWithoutWriting)
-import Nix.Store (Store (..), StoreDB, UpstreamHazard (..), addOutLinkRoot, canonicalStoreDir, closeStore, closeStoreDB, dbFileName, isValidPath, materializeEvalSources, materializeEvalStoreWrites, metaDirName, openStore, openStoreDBReadOnly, queryReferences, storeTablesExist, upstreamManagedRefusal, writeDrvClosure)
+import Nix.Store (Store (..), StoreDB, UpstreamHazard (..), addOutLinkRoot, addSourceTree, canonicalStoreDir, closeStore, closeStoreDB, dbFileName, isValidPath, materializeEvalSources, materializeEvalStoreWrites, metaDirName, openStore, openStoreDBReadOnly, queryReferences, storeTablesExist, upstreamManagedRefusal, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode, parseStorePath, storePathToFilePath)
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
+import qualified NovaCache.NAR as NAR
 import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 import System.IO.Error (illegalOperationErrorType, ioeSetErrorString, mkIOError)
@@ -82,6 +83,10 @@ data StoreOps m = StoreOps
     -- is written; an add of nothing asks nothing of the store and so
     -- refuses nothing.
     soAddEvalObjects :: !(EvalObjects -> m (Either Text ())),
+    -- | Add a tree, given as its NAR, as the path the NAR's SHA-256, a
+    -- name and the store paths it references make, answering the path,
+    -- or why it was refused ('Nix.Store.addSourceTree').
+    soAddSourceTree :: !(Text -> Set StorePath -> NAR.NarEntry -> m (Either Text StorePath)),
     -- | Realise each derivation for the outputs a request names, with the
     -- message and status of a build that stops.
     soBuild :: !([(StorePath, Set Text)] -> m (Either BuildStop ())),
@@ -142,6 +147,7 @@ withLocalStore config action = withOpenedOnFirstUse (openStore dir) closeStore (
             if nothingToAdd objects
               then pure (Right ())
               else refusing >>= maybe (Right <$> (useStore >>= (`addEvalObjects` objects))) (pure . Left),
+          soAddSourceTree = \name refs entry -> useStore >>= \store -> addSourceTree store name refs entry,
           soBuild = \requests ->
             refusing >>= \case
               Nothing -> useStore >>= \store -> buildRequests config store requests

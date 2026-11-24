@@ -18,9 +18,11 @@ import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BC
+import Data.Char (isDigit)
 import Data.Functor.Identity (Identity (..))
 import Data.IORef (readIORef)
-import Data.List (find, partition)
+import Data.Int (Int32)
+import Data.List (find, intercalate, partition, sort)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe, mapMaybe)
 import qualified Data.Set as Set
@@ -28,23 +30,24 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Foreign.C.Error (Errno (..), ePIPE)
 import GHC.IO.Exception (IOException (..))
 import GHC.Profiling (requestHeapCensus)
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuildStop (..), SubstitutionAccess (..), buildWithDeps, defaultBuildConfig, execWrapperConfig, substituteFromCaches)
+import Nix.Builder.Buildenv (Activity (..))
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Sandbox (DropGroups (..), SandboxConfig (..), SandboxFallback (..), SandboxMode (..), parseSandboxPaths)
 import Nix.Builder.Sandbox.Spawn (filePathBytes, processIsRoot)
 import Nix.Builtins (isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
-import Nix.Cli.Args (AutoArg (..), CliOpts (..), Command (..), OutLink, PushArgs (..), Target (..), outLinkFor, parseArgs)
-import Nix.Cli.Reference (Host (..), SystemConfDirSource (..), currentHost, helpLines, systemConfDirSource)
+import Nix.Cli.Args (AutoArg (..), CliOpts (..), Command (..), JsonLayout (..), ListFormat (..), OutLink, ProfileSelection (..), PushArgs (..), RemoveMatcher (..), RemoveSelection (..), Target (..), outLinkFor, parseArgs)
+import Nix.Cli.Reference (Host (..), SystemConfDirSource (..), currentHost, helpLines, renderIndentedJson, systemConfDirSource)
 import Nix.Config (DefaultUse (..), NixConfig (..), PathSetValue (..))
 import qualified Nix.Config as Config
 import Nix.DependencyGraph (DepNode (..), buildDepGraph)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fromATerm)
 import Nix.Environment (EnvLookup (..), argumentBytes, lookupEnvBytes)
-import Nix.Eval (AttrSet, Env, EvalPolicy (..), MonadEval, NixValue (..), Thunk (..), attrSetLookup, compileSource, deepForce, evalBytecode, evalParsed, evaluated, findInSearchPath, force, readThunkValue)
+import Nix.Eval (AttrSet, Env, EvalPolicy (..), MonadEval (..), NixValue (..), Thunk (..), attrSetElems, attrSetLookup, compileSource, deepForce, evalBytecode, evalParsed, evaluated, findInSearchPath, force, readThunkValue, typeName)
 import Nix.Eval.AttrPath (selectAttrPath)
 import Nix.Eval.AutoCall (AutoArgs, autoCallFunction)
 import Nix.Eval.CRegion (Regions (..), regionFigures, renderRegionFigures)
@@ -52,21 +55,25 @@ import Nix.Eval.CRoots (crootsAddThunk)
 import Nix.Eval.CStats (CRoot (..), countSites, renderCensus, takeCensus, valueRoots)
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
-import Nix.Eval.IO (EvalIO, EvalState (..), SessionSettings (..), SessionStore (..), allowEvalPath, evalBaseEnv, evalSearchPath, nixPathValue, readImportTarget, renderEvalFailure, resolveImportTarget, runEvalIOTraced, sourceCopies, withEvalSession)
+import Nix.Eval.IO (EvalFailure (..), EvalIO, EvalState (..), SessionSettings (..), SessionStore (..), allowEvalPath, evalBaseEnv, evalSearchPath, nixPathValue, readImportTarget, renderEvalFailure, resolveImportTarget, runEvalIOTraced, sourceCopies, withEvalSession)
 import Nix.Eval.Policy (ImportFromDerivation (..))
 import Nix.Eval.Print (printAmbiguous)
 import Nix.Eval.Symbol (symbolIntern)
-import Nix.Eval.Types (mkStrBytes, mkThunkBc)
+import Nix.Eval.Types (clistThunks, mkStrBytes, mkThunkBc)
 import Nix.Expr.Resolve (undefinedVariableMessage)
-import Nix.HostPath (hostPathFromBytes)
+import Nix.HostPath (hostPathFromBytes, hostPathText)
 import Nix.Http (defaultFetchRetryPolicy)
+import Nix.Json (renderJson)
 import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
+import Nix.Profile.Generation (Change (..), ProfileFailure (..), ProfileLinkPlace (..), absolutePath, checkProfileStore, readManifest, readProfileEnvironment, resolveDefaultProfile, updateProfile)
+import Nix.Profile.Manifest (Conflict (..), ConflictSide (..), Element (..), FlakeSource (..), Manifest (..), Matcher (..), Selection (..), Selector (..), addElement, defaultPriority, elementIdentifier, flakeAttribute, manifestErrorText, manifestJson, regexMatcher, selectElements)
+import Nix.Profile.Tree (buildEnvFailureText)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), defaultPartSize, isDerivationPath, loadKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
 import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), loadSecretKeyFile, pushTarget, pushToDirectory)
 import Nix.Realise (BuildMode (..), ClosureOutcome (..), Fallback (..), SubstitutesSetting (..))
 import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (..), canonicalStoreDir, closeStore, collectGarbage, deleteStorePaths, findRoots, gcSummaryLine, isValid, openStore, queryAllValidPaths, resolveDeleteTarget, storeEntryNameText, upstreamManagedRefusal, useStoreFileMask)
-import Nix.Store.Ops (EvalObjects (..), StoreOps (..), localQueries, withLocalStore)
-import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
+import Nix.Store.Ops (EvalObjects (..), StoreOps (..), StoreQueries (..), localQueries, withLocalStore)
+import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
 import Nix.Trust (ContentFacts, fetchedByBuiltin, fixedOutputInputs, renderTrustReport, trustReport)
 import Nix.Trust.Scan (scanFetched)
@@ -78,12 +85,13 @@ import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
 import qualified System.File.OsPath as OsFile
 import System.FilePath (takeDirectory, takeFileName, (</>))
-import System.IO (BufferMode (..), hPutStrLn, hSetBinaryMode, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
+import System.IO (BufferMode (..), hIsTerminalDevice, hPutStrLn, hSetBinaryMode, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError, isUserError)
 import qualified System.Info
 import System.Mem (performMajorGC)
 import System.OsPath (OsPath)
 import qualified System.OsPath as OP
+import Text.Read (readMaybe)
 
 -- ---------------------------------------------------------------------------
 -- Where the data and the configuration are
@@ -200,6 +208,9 @@ main = do
     CmdPush pushArgs -> pushCommand storeDir pushArgs
     CmdStoreDelete paths -> storeDeleteCommand storeDir paths
     CmdStoreGc printRoots -> storeGcCommand storeDir printRoots
+    CmdProfileAdd target attrPath selection priority -> profileAddCommand config opts storeDir dataDir target attrPath selection priority
+    CmdProfileRemove selection removals -> profileRemoveCommand config storeDir selection removals
+    CmdProfileList selection format -> profileListCommand config storeDir selection format
     CmdUsage -> mapM_ (TIO.hPutStrLn stderr) helpLines >> exitFailure
     CmdHelp -> toStdout (mapM_ TIO.putStrLn helpLines)
     CmdVersion -> toStdout (putStrLn versionLine)
@@ -712,17 +723,22 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
       traverse (\link -> ExceptT (first LinkRefused <$> soAddOutLinkRoot ops link outputPath)) (outLinkFor outLink outputName)
     pure (outcome, outputPath)
   case outcome of
-    -- Reported as a refusal an add throws is ('reportIOFailure').
-    Left (AddRefused reason) -> do
-      TIO.hPutStrLn stderr ("error: " <> reason)
-      exitWith (ExitFailure 1)
-    -- The status printed is the status exited with: 1, or upstream's
-    -- 104 for a check that found an output different.
-    Left (BuildStopped (BuildStop msg code)) -> do
-      TIO.hPutStrLn stderr ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
-      exitWith (ExitFailure code)
-    Left (LinkRefused err) -> failWith ("build: " <> err)
+    Left stop -> reportStop stop
     Right _ -> toStdout (TIO.putStrLn (T.pack (storePathToFilePath storeDir outputPath)))
+
+-- | Report why a build command stopped once evaluation was done, and exit.
+reportStop :: BuildCommandStop -> IO a
+reportStop stop = case stop of
+  -- Reported as a refusal an add throws is ('reportIOFailure').
+  AddRefused reason -> do
+    TIO.hPutStrLn stderr ("error: " <> reason)
+    exitWith (ExitFailure 1)
+  -- The status printed is the status exited with: 1, or upstream's 104
+  -- for a check that found an output different.
+  BuildStopped (BuildStop msg code) -> do
+    TIO.hPutStrLn stderr ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+    exitWith (ExitFailure code)
+  LinkRefused err -> failWith ("build: " <> err)
 
 -- | The configuration a command's builds run under: the caches, fallback,
 -- substitution setting, cores, launchers and sandbox its options and
@@ -1298,6 +1314,367 @@ storeGcCommand storeDir printRoots = do
       results <- collectGarbage store
       closeStore store
       either (failWith . ("store gc: " <>)) (toStdout . TIO.putStrLn . gcSummaryLine) results
+
+-- ---------------------------------------------------------------------------
+-- Profile commands
+-- ---------------------------------------------------------------------------
+
+-- | Where the link to the default profile is, as nix.conf's
+-- @use-xdg-base-directories@ says.
+profileLinkPlace :: NixConfig -> ProfileLinkPlace
+profileLinkPlace config
+  | ncUseXdgBaseDirectories config = StateProfileLink
+  | otherwise = HomeProfileLink
+
+-- | The profile a profile command works on.  The default profile is
+-- resolved first, its directory and its link made when they are missing,
+-- whether or not @--profile@ names another, as upstream's
+-- @MixDefaultProfile@ resolves it (command.cc:326-329 at 2.35.4); a
+-- profile @--profile@ names is made absolute without reading a link
+-- (command.cc:295).
+chosenProfile :: NixConfig -> ProfileSelection -> IO OsPath
+chosenProfile config selection = do
+  env <- readProfileEnvironment >>= either failError pure
+  defaulted <- resolveDefaultProfile (profileLinkPlace config) env >>= either failError pure
+  case selection of
+    DefaultProfile -> pure defaulted
+    ProfileAt raw -> do
+      bytes <- commandLineBytes "--profile" raw
+      path <- maybe (failError "--profile is not valid UTF-8, so it names no Windows path") pure (hostPathFromBytes bytes)
+      cwd <- OsDir.getCurrentDirectory
+      pure (absolutePath cwd path)
+
+-- | Add a package to a profile: the store path a file argument leads to,
+-- or the target's derivation, built for the outputs it installs, named
+-- after its paths and at the priority @--priority@ gives.  A store
+-- directory upstream Nix's database also manages is refused before
+-- anything is evaluated, as a build refuses one.
+profileAddCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> ProfileSelection -> Maybe String -> IO ()
+profileAddCommand config opts storeDir dataDir target attrPath selection priorityArg = do
+  upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("profile add: " <>))
+  priority <- maybe (pure defaultPriority) priorityValue priorityArg
+  profile <- chosenProfile config selection
+  -- The profile's store and its manifest are checked before anything is
+  -- evaluated, as upstream reads the manifest before it builds
+  -- (profile.cc:365-368), so another store's profile, nix-env's, or a
+  -- manifest that cannot be read is refused before a build.  Each
+  -- attempt at the change checks them again.
+  checkProfileStore storeDir profile >>= either (failError . profileFailureText storeDir) pure
+  readManifest profile >>= either (failError . profileFailureText storeDir) (const (pure ()))
+  buildConfig <- buildConfigFor config opts storeDir
+  outcome <- withLocalStore buildConfig $ \ops -> do
+    paths <- addedPaths config opts storeDir dataDir ops target attrPath
+    let element = Element paths Active priority Nothing
+    updateProfile ops storeDir profile (pure . Changed . addElement (elementIdentifier element) element)
+  either (failError . profileFailureText storeDir) (const (pure ())) outcome
+
+-- | A @--priority@ value: an int, with an optional sign, as upstream reads
+-- one (@string2IntWithUnitPrefix@, util.hh:104-127 at 2.35.4), refused in
+-- its words otherwise.  Upstream also takes a binary unit suffix and
+-- narrows a 64-bit value into an int; neither is taken here.
+priorityValue :: String -> IO Int
+priorityValue raw = maybe (failError ("'" <> T.pack raw <> "' is not an integer")) pure parsed
+  where
+    parsed = do
+      value <- case raw of
+        '-' : digits -> negate <$> decimal digits
+        '+' : digits -> decimal digits
+        digits -> decimal digits
+      if value >= toInteger (minBound :: Int32) && value <= toInteger (maxBound :: Int32) then Just (fromInteger value) else Nothing
+    decimal digits
+      | not (null digits), all isDigit digits = readMaybe digits
+      | otherwise = Nothing
+
+-- | The store paths @profile add@ adds: the store path a file argument
+-- leads to, in itself or through its links, when no attribute is selected
+-- (upstream's @followLinksToStorePath@, store-api.cc:145-173 at 2.35.4),
+-- which must be valid; otherwise the outputs the target's derivation
+-- installs ('installedOutputs'), built.
+addedPaths :: NixConfig -> CliOpts -> StoreDir -> FilePath -> StoreOps IO -> Target -> Maybe T.Text -> IO (Set.Set StorePath)
+addedPaths config opts storeDir dataDir ops target attrPath = do
+  inStore <- case (target, attrPath) of
+    (TargetFile raw, Nothing) -> storePathLedTo storeDir raw
+    _ -> pure Nothing
+  case inStore of
+    Just path -> do
+      held <- sqValidPaths (soQueries ops) (Set.singleton path)
+      if Set.member path held
+        then pure (Set.singleton path)
+        else failError ("path '" <> T.pack (storePathToFilePath storeDir path) <> "' is not valid")
+    Nothing -> builtOutputs config opts storeDir dataDir ops target attrPath
+
+-- | How many links 'storePathLedTo' follows before it gives up, as
+-- upstream's @followLinksToStore@ does (store-api.cc:149-158 at 2.35.4).
+maxLinkFollows :: Int
+maxLinkFollows = 1024
+
+-- | The store path a path argument is in, made absolute against the
+-- working directory without reading a link and then followed through
+-- links until it is in the store, by the store's own spelling; 'Nothing'
+-- when it reaches something in no store.
+storePathLedTo :: StoreDir -> FilePath -> IO (Maybe StorePath)
+storePathLedTo storeDir raw = do
+  bytes <- commandLineBytes "PATH" raw
+  start <- maybe (failError "PATH is not valid UTF-8, so it names no Windows path") pure (hostPathFromBytes bytes)
+  cwd <- OsDir.getCurrentDirectory
+  follow maxLinkFollows (absolutePath cwd start)
+  where
+    follow remaining path = do
+      spelled <- OP.decodeFS path
+      case parseStorePathPrefix storeDir (T.pack spelled) of
+        Just sp -> pure (Just sp)
+        Nothing -> do
+          probed <- try (OsDir.pathIsSymbolicLink path)
+          case probed of
+            Right True
+              | remaining <= 0 -> failError ("too many symbolic links encountered while resolving '" <> T.pack raw <> "'")
+              | otherwise -> OsDir.getSymbolicLinkTarget path >>= follow (remaining - 1) . absolutePath (OP.takeDirectory path)
+            Right False -> pure Nothing
+            Left (_ :: IOException) -> pure Nothing
+
+-- | Evaluate the target to a derivation and build it for the outputs it
+-- installs, as @build@ evaluates and builds one, and give their paths.
+builtOutputs :: NixConfig -> CliOpts -> StoreDir -> FilePath -> StoreOps IO -> Target -> Maybe T.Text -> IO (Set.Set StorePath)
+builtOutputs config opts storeDir dataDir ops target attrPath = do
+  (drvSP, outputs, evalObjects) <-
+    evalTarget config opts storeDir (ReadWriteSession ops) dataDir target attrPath $ \st val -> do
+      drvSP <- derivationPath val
+      outputs <- evalOrExit st (installedOutputs val)
+      (,,) drvSP outputs <$> sessionObjects st
+  drv <- recordedDerivation (eoDerivations evalObjects) drvSP
+  paths <- traverse (namedOutputPath drv) (Set.toList outputs)
+  outcome <- runExceptT $ do
+    ExceptT (first AddRefused <$> soAddEvalObjects ops evalObjects)
+    ExceptT (first BuildStopped <$> soBuild ops [(drvSP, outputs)])
+  either reportStop (const (pure (Set.fromList paths))) outcome
+
+-- | The outputs @profile add@ installs of a derivation, as upstream's
+-- @queryOutputs(false, true)@ chooses them (get-drvs.cc:107-177 at
+-- 2.35.4), and @out@ when that chooses none
+-- (installable-attr-path.cc:62-68): the output @outputName@ names when
+-- @outputSpecified@ is true; else those @meta.outputsToInstall@ names,
+-- when it passes upstream's @checkMeta@ (get-drvs.cc:213-242); else every
+-- output @outputs@ lists, or @out@ when there is no @outputs@.
+installedOutputs :: NixValue -> EvalIO (Set.Set T.Text)
+installedOutputs val = case val of
+  VAttrs attrs -> do
+    outputs <- attrSetLookup "outputs" attrs >>= maybe (pure (Set.singleton outName)) (force >=> outputNames)
+    specified <- attrSetLookup "outputSpecified" attrs >>= maybe (pure False) (force >=> boolean "the 'outputSpecified' attribute of a derivation")
+    chosen <-
+      if specified
+        then do
+          selected <- attrSetLookup "outputName" attrs >>= maybe (pure "") (force >=> text "the output name of a derivation")
+          if Set.member selected outputs
+            then pure (Set.singleton selected)
+            else throwEvalError ("derivation does not have output '" <> selected <> "'")
+        else toInstall attrs outputs
+    pure (if Set.null chosen then Set.singleton outName else chosen)
+  _ -> pure (Set.singleton outName)
+  where
+    outName = "out"
+    outputNames value = case value of
+      VList items -> clistThunks items >>= fmap Set.fromList . traverse (force . Thunk >=> text "the name of an output of a derivation")
+      other -> throwEvalError ("expected a list but found " <> typeName other <> " while evaluating the 'outputs' attribute of a derivation")
+    toInstall attrs outputs =
+      attrSetLookup "meta" attrs >>= \case
+        Nothing -> pure outputs
+        Just metaThunk ->
+          force metaThunk >>= \case
+            VAttrs meta ->
+              attrSetLookup "outputsToInstall" meta >>= \case
+                Nothing -> pure outputs
+                Just listed -> do
+                  value <- force listed
+                  usable <- checkMeta value
+                  if not usable then pure outputs else namedIn outputs value
+            other -> throwEvalError ("expected a set but found " <> typeName other <> " while evaluating the 'meta' attribute of a derivation")
+    namedIn outputs value = case value of
+      VList items -> clistThunks items >>= fmap Set.fromList . traverse (force . Thunk >=> installed outputs)
+      _ -> badOutputsToInstall
+    installed outputs value = case value of
+      VStr bytes _
+        | Right name <- TE.decodeUtf8' bytes, Set.member name outputs -> pure name
+      _ -> badOutputsToInstall
+    badOutputsToInstall = throwEvalError "this derivation has bad 'meta.outputsToInstall'"
+    boolean what value = case value of
+      VBool b -> pure b
+      other -> throwEvalError ("expected a Boolean but found " <> typeName other <> " while evaluating " <> what)
+    text what value = case value of
+      VStr bytes _ | Right decoded <- TE.decodeUtf8' bytes -> pure decoded
+      other -> throwEvalError ("expected a string but found " <> typeName other <> " while evaluating " <> what)
+
+-- | Whether a @meta@ value is one upstream reads (@checkMeta@,
+-- get-drvs.cc:213-232 at 2.35.4): an int, a Boolean, a string or a float,
+-- or a list of such values, or a set of them that is not a derivation,
+-- which has an @outPath@.
+checkMeta :: NixValue -> EvalIO Bool
+checkMeta value = case value of
+  VList items -> clistThunks items >>= allChecked . map Thunk
+  VAttrs attrs ->
+    attrSetLookup "outPath" attrs >>= \case
+      Just _ -> pure False
+      Nothing -> attrSetElems attrs >>= allChecked
+  VInt _ -> pure True
+  VBool _ -> pure True
+  VStr _ _ -> pure True
+  VFloat _ -> pure True
+  _ -> pure False
+  where
+    allChecked thunks = case thunks of
+      [] -> pure True
+      thunk : rest -> force thunk >>= checkMeta >>= \ok -> if ok then allChecked rest else pure False
+
+-- | Take packages off a profile, as the matchers select them.  A store
+-- directory upstream Nix's database also manages is refused first.
+profileRemoveCommand :: NixConfig -> StoreDir -> ProfileSelection -> RemoveSelection -> IO ()
+profileRemoveCommand config storeDir selection removals = do
+  upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("profile remove: " <>))
+  selector <- case removals of
+    RemoveAll -> pure SelectAll
+    RemoveSome matchers -> SelectSome <$> traverse (removalMatcher storeDir) matchers
+  profile <- chosenProfile config selection
+  outcome <- withLocalStore (defaultBuildConfig storeDir) $ \ops -> updateProfile ops storeDir profile (removing selector)
+  either (failError . profileFailureText storeDir) (const (pure ())) outcome
+  where
+    warn = TIO.hPutStrLn stderr . ("warning: " <>)
+    -- Upstream's lines (profile.cc:680-687): each element taken off, then
+    -- the counts.
+    removing selector manifest@(Manifest elements) = do
+      let Selection names warnings = selectElements selector manifest
+      mapM_ warn warnings
+      if Set.null names
+        then Unchanged <$ warn "No packages to remove. Use 'nova-nix profile list' to see the current profile."
+        else do
+          let kept = Map.withoutKeys elements names
+          mapM_ (\element -> TIO.hPutStrLn stderr ("removing '" <> elementIdentifier element <> "'")) (Map.restrictKeys elements names)
+          TIO.hPutStrLn stderr ("removed " <> T.pack (show (Map.size elements - Map.size kept)) <> " packages, kept " <> T.pack (show (Map.size kept)) <> " packages")
+          pure (Changed (Manifest kept))
+
+-- | What a @profile remove@ selector matches (profile.cc:597-614 at
+-- 2.35.4): a number is refused, as upstream refuses an index, in words of
+-- nova-nix's own, since upstream's say it no longer takes one, which
+-- describes upstream's history and not nova-nix's; a store path,
+-- in the canonical spelling or the store's own, selects the elements
+-- holding it; any other word, the element of that name.  A pattern that
+-- does not compile is refused before the profile is read.
+removalMatcher :: StoreDir -> RemoveMatcher -> IO Matcher
+removalMatcher storeDir removal = case removal of
+  RemoveRegex raw -> do
+    regex <- argumentText "--regex" raw
+    maybe (failError ("invalid regular expression '" <> regex <> "'")) pure (regexMatcher regex)
+  RemoveNamed raw -> do
+    named <- argumentText "NAME" raw
+    case indexNumber raw of
+      Just index -> failError ("'nova-nix profile' does not support indices ('" <> T.pack (show index) <> "')")
+      Nothing -> pure (maybe (MatchName named) MatchStorePath (parseStorePath storeDir named <|> parseStorePath defaultStoreDir named))
+  where
+    -- Upstream's string2Int<size_t>: digits after an optional '+', within
+    -- 64 bits (util.cc:104-114).
+    indexNumber arg = do
+      value <- case arg of
+        '+' : digits -> decimal digits
+        digits -> decimal digits
+      if value <= toInteger (maxBound :: Word64) then Just value else Nothing
+    decimal :: String -> Maybe Integer
+    decimal digits
+      | not (null digits), all isDigit digits = readMaybe digits
+      | otherwise = Nothing
+
+-- | A command-line argument's text, refused when it is not UTF-8.
+argumentText :: T.Text -> String -> IO T.Text
+argumentText what arg = commandLineBytes what arg >>= either (const (failError (what <> " is not valid UTF-8"))) pure . TE.decodeUtf8'
+
+-- | Print what a profile holds: upstream's lines, or with @--json@ its
+-- manifest, indented when stdout is a terminal, as upstream's
+-- @printJSON@ chooses (common-args.hh:46).
+profileListCommand :: NixConfig -> StoreDir -> ProfileSelection -> ListFormat -> IO ()
+profileListCommand config storeDir selection format = do
+  profile <- chosenProfile config selection
+  -- Upstream lists a profile of any store; here its paths would be
+  -- printed under this store's spelling, naming paths it does not hold.
+  checkProfileStore storeDir profile >>= either (failError . profileFailureText storeDir) pure
+  manifest <- readManifest profile >>= either (failError . profileFailureText storeDir) pure
+  case format of
+    ListJson layout -> do
+      indented <- case layout of
+        IndentedOnTerminal -> hIsTerminalDevice stdout
+        Indented -> pure True
+        Compact -> pure False
+      let json = manifestJson manifest
+      toStdout (BS.putStr (if indented then renderIndentedJson json else renderJson json <> "\n"))
+    ListText -> toStdout (mapM_ TIO.putStrLn (listLines storeDir manifest))
+
+-- | The escapes upstream sets a name in bold, then red, and back with.
+ansiBold, ansiRed, ansiNormal :: T.Text
+ansiBold = "\ESC[1m"
+ansiRed = "\ESC[31;1m"
+ansiNormal = "\ESC[0m"
+
+-- | What @profile list@ prints (profile.cc:818-843 at 2.35.4): for each
+-- element its name in bold, with @(inactive)@ in red after an inactive
+-- one's, its flake's lines for one a flake made, and its paths as the
+-- store spells them, with a blank line between elements.  Upstream's
+-- logger writes the escapes to stdout whatever stdout is
+-- (@Logger::writeToStdout@, logging.cc:48-53).
+listLines :: StoreDir -> Manifest -> [T.Text]
+listLines storeDir (Manifest elements) = intercalate [""] (map elementLines (Map.toAscList elements))
+  where
+    elementLines (name, element) =
+      ("Name:               " <> ansiBold <> name <> ansiNormal <> activity (elementActivity element))
+        : maybe [] sourceLines (elementSource element)
+        ++ ["Store paths:        " <> T.unwords (sort [T.pack (storePathToFilePath storeDir path) | path <- Set.toList (elementPaths element)])]
+    activity Active = ""
+    activity Inactive = " " <> ansiRed <> "(inactive)" <> ansiNormal
+    sourceLines source =
+      [ "Flake attribute:    " <> flakeAttribute source,
+        "Original flake URL: " <> sourceOriginalUrl source,
+        "Locked flake URL:   " <> sourceUrl source
+      ]
+
+-- | A profile's failure in words.  A conflict is upstream's, with
+-- nova-nix's commands in its hints (profile.cc:443-468 at 2.35.4).
+profileFailureText :: StoreDir -> ProfileFailure -> T.Text
+profileFailureText storeDir failure = case failure of
+  ProfileIOFailed reason -> reason
+  ManifestFailed path manifestError -> manifestErrorText path manifestError
+  NixEnvProfile profile -> "profile " <> quotedPath profile <> " was made by nix-env, whose manifest.nix nova-nix does not read"
+  ForeignGeneration profile current ->
+    "profile "
+      <> quotedPath profile
+      <> " is in another store: its current generation, "
+      <> quotedPath current
+      <> ", is not in the store \""
+      <> T.pack (unStoreDir storeDir)
+      <> "\"; name that store with --store, or another profile with --profile"
+  TreeFailed treeFailure -> buildEnvFailureText treeFailure
+  TreeConflict (Conflict (ConflictSide existingFile existingName _) (ConflictSide newFile _ newPaths) priority) ->
+    T.concat
+      [ "An existing package already provides the following file:\n\n  ",
+        quotedPath existingFile,
+        "\n\nThis is the conflicting file from the new package:\n\n  ",
+        quotedPath newFile,
+        "\n\nTo remove the existing package:\n\n  nova-nix profile remove ",
+        existingName,
+        "\n\nThe new package can also be added next to the existing one by assigning a different priority.\nThe conflicting packages have a priority of ",
+        T.pack (show priority),
+        ".\nTo prioritise the new package:\n\n  nova-nix profile add ",
+        T.unwords (Set.toAscList newPaths),
+        " --priority ",
+        T.pack (show (priority - 1)),
+        "\n\nTo prioritise the existing package:\n\n  nova-nix profile add ",
+        T.unwords (Set.toAscList newPaths),
+        " --priority ",
+        T.pack (show (priority + 1)),
+        "\n"
+      ]
+  StoreRefused reason -> reason
+  where
+    quotedPath path = "\"" <> hostPathText path <> "\""
+
+-- | Fail with an error as upstream prints one: @error: @ and the message,
+-- its later lines indented under the first.
+failError :: T.Text -> IO a
+failError = failWith . renderEvalFailure . EvalFailure []
 
 -- | Resolve push roots: every valid non-derivation path with @--all@, otherwise
 -- each named path.  Named paths may be full store paths in either store-dir
