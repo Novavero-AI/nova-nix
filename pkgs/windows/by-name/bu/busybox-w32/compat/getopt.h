@@ -1,6 +1,6 @@
 /*
- * MinGW-w64's getopt.h (mingw-w64-headers/crt/getopt.h), for getopt.c from
- * mingw-w64-crt/misc, which the package compiles: TinyCC has neither.
+ * MinGW-w64's getopt declarations, for its getopt, which the package
+ * compiles from MinGW-w64's runtime: TinyCC has neither.
  */
 #ifndef __GETOPT_H__
 #define __GETOPT_H__

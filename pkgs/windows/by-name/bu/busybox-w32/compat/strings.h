@@ -1,6 +1,6 @@
 /*
- * MinGW-w64's strings.h (mingw-w64-headers/crt/strings.h), which TinyCC
- * lacks: string.h, where both declare strcasecmp and strncasecmp.
+ * strings.h as MinGW-w64's headers have it, which TinyCC's lack: string.h,
+ * where both declare strcasecmp and strncasecmp.
  */
 #ifndef _STRINGS_H_
 #define _STRINGS_H_ 1

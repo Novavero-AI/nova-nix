@@ -1,7 +1,7 @@
 /*
- * TinyCC's stdlib.h, and getenv_s, which MinGW-w64's declares
- * (mingw-w64-headers/crt/sec_api/stdlib_s.h:25) and TinyCC's secure API
- * header lacks.  msvcrt.dll exports it; mingw-w64-crt's getopt.c calls it.
+ * TinyCC's stdlib.h, and getenv_s, which MinGW-w64's headers declare and
+ * TinyCC's secure API header lacks.  msvcrt.dll exports it; MinGW-w64's
+ * getopt, which the package compiles, calls it.
  */
 #include_next <stdlib.h>
 

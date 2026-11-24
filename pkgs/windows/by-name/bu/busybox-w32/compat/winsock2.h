@@ -1,13 +1,10 @@
 /*
- * TinyCC's winsock2.h, read as MinGW-w64's reads to a program that
- * targets Windows XP, as busybox-w32 does (_WIN32_WINNT 0x502,
- * include/platform.h): without struct pollfd and the POLL flags, which
- * MinGW-w64's declares only from Vista on
- * (mingw-w64-headers/include/winsock2.h:1122, 1179-1196), TinyCC's
- * whatever the target, and busybox-w32's win32/poll.h for itself.  The
- * flags as they stood are kept across TinyCC's header, and its struct
- * takes another name.  And WSAMSG (include/winsock2.h:866-873), which
- * mswsock.h's WSARecvMsg takes.
+ * TinyCC's winsock2.h, read as MinGW-w64's reads to a program that targets
+ * Windows XP, as busybox-w32 does: without struct pollfd and the POLL
+ * flags, which MinGW-w64's declares only from Vista on, TinyCC's whatever
+ * the target, and busybox-w32 for itself.  The flags as they stood are kept
+ * across TinyCC's header, and its struct takes another name.  And WSAMSG,
+ * as MinGW-w64's headers declare it, which mswsock.h's WSARecvMsg takes.
  */
 #ifndef BUSYBOX_W32_COMPAT_WINSOCK2_H
 #define BUSYBOX_W32_COMPAT_WINSOCK2_H

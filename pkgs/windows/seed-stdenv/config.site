@@ -5,16 +5,14 @@
 
 # libtool takes a Windows compiler that is not GCC for Microsoft's, and then
 # archives with lib, names a static library .lib and passes each source
-# through cygpath; with GCC it does the same unless the linker is GNU ld
-# (_LT_LINKER_SHLIBS in libtool.m4, the cygwin* | mingw* cases).  TinyCC
-# defines no __GNUC__ and prints no "GNU" for -v, so configure finds it
-# neither.  Either of the first two settings alone leaves libtool with
-# Microsoft's tools.  gettext's lib-ld.m4 asks the linker the same question
-# under a name of its own and stores the answer in the variables libtool
-# reads, with_gnu_ld and, through config.rpath, libext, so a configure
-# script that runs both needs all three.  A compiler configure takes for
-# GCC also gets the package's GCC warning options, and tcc passes over one
-# it does not know.
+# through cygpath; with GCC it does the same unless the linker is GNU ld.
+# TinyCC defines no __GNUC__ and prints no "GNU" for -v, so configure finds
+# it neither.  Either of the first two settings alone leaves libtool with
+# Microsoft's tools.  gettext's configure macros ask the linker the same
+# question under a name of their own and store the answer in variables
+# libtool reads, so a configure script that runs both needs all three.  A
+# compiler configure takes for GCC also gets the package's GCC warning
+# options, and tcc passes over one it does not know.
 ac_cv_c_compiler_gnu=yes
 lt_cv_prog_gnu_ld=yes
 acl_cv_prog_gnu_ld=yes
@@ -32,6 +30,6 @@ test "${CFLAGS+set}" = set || CFLAGS=
 # TinyCC's stdlib.h defines atoll inline, on msvcrt.dll's _atoi64, and
 # msvcrt.dll exports no atoll, so configure's link test, which declares
 # the function itself and links a call, finds none.  A package that
-# reads the answer then defines its own beside the header's, as GCC
-# 4.6.4's read-rtl.c does without HAVE_ATOLL (gcc/configure.ac:1009).
+# reads the answer then defines its own beside the header's, as gcc-core's
+# GCC does when configure finds none.
 ac_cv_func_atoll=yes

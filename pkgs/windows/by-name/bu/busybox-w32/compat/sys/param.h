@@ -1,4 +1,4 @@
-/* MinGW-w64's sys/param.h (mingw-w64-headers/crt/sys/param.h): TinyCC has none. */
+/* sys/param.h as MinGW-w64's headers have it: TinyCC has none. */
 #ifndef _SYS_PARAM_H
 #define _SYS_PARAM_H
 

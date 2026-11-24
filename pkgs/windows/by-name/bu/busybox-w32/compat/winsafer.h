@@ -1,7 +1,6 @@
 /*
- * What busybox-w32's miscutils/drop.c takes from MinGW-w64's winsafer.h
- * (mingw-w64-headers/include/winsafer.h:16-27, 127, 130): TinyCC has no
- * winsafer.h.  advapi32.dll exports the calls.
+ * The Safer API busybox-w32 calls, as MinGW-w64's headers declare it:
+ * TinyCC has no winsafer.h.  advapi32.dll exports the calls.
  */
 #ifndef BUSYBOX_W32_COMPAT_WINSAFER_H
 #define BUSYBOX_W32_COMPAT_WINSAFER_H

@@ -1,14 +1,16 @@
 /*
- * gen_build_files.c - scripts/gen_build_files.sh, for a tree with no shell.
+ * gen_build_files.c - busybox's build-file generator script, in C, for a
+ * tree with no shell.
  *
  * Run from the top of a busybox-w32 tree, it writes what the script writes
  * there, byte for byte: include/applets.h, from include/applets.src.h and
  * the "//applet:" lines of the .c files one and two directories down;
  * include/usage.h, from include/usage.src.h and their "//usage:" lines;
  * and each directory's Config.in, from its Config.src and the "//config:"
- * lines of the .c files beside it.  The script's Kbuild files are not
+ * lines of the .c files beside it.  The script's lists of objects are not
  * written, since the package lists the sources it compiles.  The tree has
- * no embed/ directory, so no scripted applet joins applets.h.
+ * no directory of scripts to embed, so no scripted applet joins
+ * applets.h.
  *
  * The script lists files with shell globs under LC_ALL=C, which skip names
  * that begin with a dot and sort each pattern's matches bytewise; the

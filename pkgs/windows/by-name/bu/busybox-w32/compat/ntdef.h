@@ -1,8 +1,6 @@
 /*
- * REPARSE_DATA_BUFFER from MinGW-w64's ntdef.h
- * (mingw-w64-headers/include/ntdef.h:988-1019), which busybox-w32's
- * win32/mingw.c reads symbolic links and junctions with: TinyCC has no
- * ntdef.h.
+ * REPARSE_DATA_BUFFER, as MinGW-w64's headers declare it, which busybox-w32
+ * reads symbolic links and junctions with: TinyCC has no ntdef.h.
  */
 #ifndef BUSYBOX_W32_COMPAT_NTDEF_H
 #define BUSYBOX_W32_COMPAT_NTDEF_H

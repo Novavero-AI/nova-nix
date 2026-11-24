@@ -1,7 +1,6 @@
 /*
- * The types busybox-w32's win32/mingw.c passes the psapi.dll calls it
- * loads at run time, from MinGW-w64's psapi.h
- * (mingw-w64-headers/include/psapi.h:139-167): TinyCC has no psapi.h.
+ * The types busybox-w32 passes the psapi.dll calls it loads at run time, as
+ * MinGW-w64's headers declare them: TinyCC has no psapi.h.
  */
 #ifndef BUSYBOX_W32_COMPAT_PSAPI_H
 #define BUSYBOX_W32_COMPAT_PSAPI_H

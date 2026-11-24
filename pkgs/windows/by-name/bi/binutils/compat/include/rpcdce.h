@@ -1,12 +1,11 @@
 /*
- * MinGW-w64's rpcdce.h, which TinyCC's headers lack, for ld's ldbuildid.c:
- * --build-id=uuid calls rpcrt4.dll's UuidCreate through a pointer whose type
- * ldbuildid.c writes from these names.  It includes this header after
- * windows.h, which in MinGW-w64 has already included rpc.h
- * (mingw-w64-headers/include/windows.h:88), so what it reads of both is
- * here: UUID (rpcdce.h:40-44, declared by TinyCC's guiddef.h), RPC_STATUS,
- * whose __LONG32 is long (rpc.h:49 and crt/_mingw.h.in:24), RPC_ENTRY for a
- * target that is not ARM (rpc.h:53-60), and RPC_S_OK (rpcnterr.h:9).
+ * What MinGW-w64's rpcdce.h declares for ld's build IDs, which TinyCC's
+ * headers lack: --build-id=uuid calls rpcrt4.dll's UuidCreate through a
+ * pointer whose type ld writes from these names.  ld includes this header
+ * after windows.h, which in MinGW-w64's headers has already included rpc.h,
+ * so what it reads of both is here: UUID, which TinyCC's guiddef.h
+ * declares, RPC_STATUS as a long, RPC_ENTRY for a target that is not ARM,
+ * and RPC_S_OK, each as MinGW-w64's headers define it.
  */
 #ifndef __RPCDCE_H__
 #define __RPCDCE_H__

@@ -1,6 +1,6 @@
 /*
- * MinGW-w64's libgen.h (mingw-w64-headers/crt/libgen.h): TinyCC has none.
- * busybox-w32's win32/dirname.c defines both.
+ * basename and dirname as MinGW-w64's headers declare them: TinyCC has no
+ * libgen.h.  busybox-w32 defines both itself.
  */
 #ifndef _LIBGEN_H_
 #define _LIBGEN_H_
