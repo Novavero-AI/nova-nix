@@ -29,9 +29,9 @@
 # it the missing script fails the build.  make runs $NIX_BUILD_CORES jobs,
 # as in nixpkgs, in one run.  minimal-bootstrap/binutils builds ld on its
 # own, for a race between jobs over ld/.deps/ldwrite.Po; that file is
-# dependency tracking's (ld/Makefile.in:1581), and with
-# --disable-dependency-tracking the compile rule writes none.  nixpkgs' two
-# settings for libtool have nothing to do either: the command length
+# dependency tracking's (its @AMDEP_TRUE@ include in ld/Makefile.in), and
+# with --disable-dependency-tracking the compile rule writes none.  nixpkgs'
+# two settings for libtool have nothing to do either: the command length
 # libtool would measure is 8192 on a MinGW build host, unmeasured and many
 # times the longest archive command here, and the edit of ltmain.sh sorts
 # the members libtool unpacks from an archive, where this configuration
@@ -57,7 +57,7 @@
 # temp-file-binary.patch opens in binary mode the temporary file that ar
 # and ranlib, and objcopy and strip rewriting a file in place, write their
 # output to.  Without mkstemp, which msvcrt.dll lacks, make_tempname opens
-# it with no O_BINARY (binutils/bucomm.c:553), and msvcrt treats the
+# it with no O_BINARY (binutils/bucomm.c), and msvcrt treats the
 # descriptor as text: bfd's writes through it put a CR before each LF, and
 # the copy into place (binutils/rename.c: smart_rename) reads it back
 # through it, which takes those CRs out again but ends at the first 0x1A
@@ -89,7 +89,7 @@
 #   flag goes once the archiver is this package's own ar.
 #
 #   compat/include: alloca as a macro and rpcdce.h, each file naming the
-#   MinGW-w64 lines it follows.
+#   MinGW-w64 declarations it follows.
 #
 # The build is static, bfd's default.  --with-lib-path=: leaves ld no
 # built-in search path, as in nixpkgs, and for a second reason here: ld's
@@ -99,8 +99,8 @@
 #
 # The programs import from msvcrt.dll and kernel32.dll alone, and need the
 # msvcrt.dll of Windows Vista or later, as busybox.exe does: here for
-# mbrtowc, strnlen and utime (mingw-w64-crt/lib-common/msvcrt.def.in:
-# 1285-1833).
+# mbrtowc, strnlen and utime (the symbols added in Windows Vista's
+# msvcrt.dll, in mingw-w64-crt/lib-common/msvcrt.def.in).
 {
   seedStdenv,
   fetchurl,

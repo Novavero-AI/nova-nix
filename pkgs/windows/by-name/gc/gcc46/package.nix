@@ -10,24 +10,26 @@
 # mingw-w64-howto-build-adv.txt, "Build the mingw-w64 CRT"), and GCC's top
 # level hands its own target libraries the same directories,
 # -L ${prefix}/${target}/lib and -isystem ${prefix}/${target}/include
-# (configure.ac:3110-3115).  A derivation's prefix is its output, so this
-# copies gcc-core's output and then the runtime's into its
-# i686-w64-mingw32 directory.
+# (FLAGS_FOR_TARGET's *-w64-mingw* case in configure.ac).  A derivation's
+# prefix is its output, so this copies gcc-core's output and then the
+# runtime's into its i686-w64-mingw32 directory.
 #
 # The driver finds the runtime there because it relocates: when the
 # directory it runs from is not the bin it was configured with, it takes
 # every prefix relative to the one it runs from, and none of the
-# configured ones (gcc/gcc.c:3580-3592, 3622-3642 and 3870-3881,
-# libiberty/make-relative-prefix.c:333-343).  It then searches
-# lib/gcc/i686-w64-mingw32/4.6.4 beside it for libgcc and crtbegin.o, and
-# the target's lib for the rest (gcc.c:3884-3900): crt2.o and the
-# -lmingw32, -lmoldname, -lmingwex, -lmsvcrt, -ladvapi32, -lshell32,
-# -luser32 and -lkernel32 every link names (gcc/config/i386/mingw32.h:
-# 78-80 and 113-123).  A cross driver has no other place for them: it
-# reads no LIBRARY_PATH (gcc.c:3681-3682) and searches no system directory
-# (6395-6436).  cc1 takes the header directories from the same prefix
-# (gcc/incpath.c:136-199).  The programs still name gcc-core's output,
-# which stays in this one's closure.
+# configured ones (gcc_exec_prefix in gcc/gcc.c's process_command,
+# make_relative_prefix_1 in libiberty/make-relative-prefix.c).  It then
+# searches lib/gcc/i686-w64-mingw32/4.6.4 beside it for libgcc and
+# crtbegin.o, and the target's lib for the rest (tooldir_prefix in
+# process_command): crt2.o and the -lmingw32, -lmoldname, -lmingwex,
+# -lmsvcrt, -ladvapi32, -lshell32, -luser32 and -lkernel32 every link
+# names (LIB_SPEC, REAL_LIBGCC_SPEC and STARTFILE_SPEC in
+# gcc/config/i386/mingw32.h).  A cross driver has no other place for
+# them: it reads no LIBRARY_PATH (LIBRARY_PATH_ENV in process_command) and
+# searches no system directory (main's startfile prefixes for a native
+# compiler or a sysroot).  cc1 takes the header directories from the same
+# prefix (add_standard_paths in gcc/incpath.c).  The programs still name
+# gcc-core's output, which stays in this one's closure.
 #
 # busybox's cp copies a file's data (libbb/copy_file.c) and not the
 # nova.exec stream nova-nix reads the executable bit from.  None of

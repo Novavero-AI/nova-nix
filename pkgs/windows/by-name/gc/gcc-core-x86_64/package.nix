@@ -7,9 +7,10 @@
 # writing assembly for x86_64-w64-mingw32, configured, compiled and
 # installed in the seed stdenv by gcc-latest and binutils, and libgcc by
 # the compiler the same make links.  It is MinGW-w64's build guide's GCC
-# core (mingw-w64-doc/howto-build/mingw-w64-howto-build.txt:282-306), which
-# compiles the runtime, mingw-w64-crt-x86_64, the next rung; GCC with its
-# libraries comes after the runtime.
+# core (mingw-w64-doc/howto-build/mingw-w64-howto-build.txt, "Building the
+# GCC core cross-compiler(s)"), which compiles the runtime,
+# mingw-w64-crt-x86_64, the next rung; GCC with its libraries comes after
+# the runtime.
 #
 # The sources are gcc-latest's, GCC 16.2.0 with GMP, MPFR and MPC built in
 # its tree, unpacked as gcc-latest unpacks them, into the directories named
@@ -25,12 +26,13 @@
 # binutils', each by the name of their target, i686-w64-mingw32.
 # --with-headers names mingw-w64-headers-latest's include directory, whose
 # headers are the same files for either target (their configure reads the
-# host only to look for widl, mingw-w64-headers/configure.ac:16-30).
+# host only to look for widl, AC_ARG_WITH([widl]) in
+# mingw-w64-headers/configure.ac).
 #
 # make builds all-gcc and all-target-libgcc and installs them, as gcc-core
 # does for 4.6.4: the guide's GCC core, which compiles the runtime, and
-# libgcc, which, static, links nothing (libgcc/configure.ac:219,
-# GCC_NO_EXECUTABLES) and needs MinGW-w64's headers alone.  With libgcc the
+# libgcc, which, static, links nothing (GCC_NO_EXECUTABLES in
+# libgcc/configure.ac) and needs MinGW-w64's headers alone.  With libgcc the
 # driver links a program against the runtime, which is how
 # test/data/mingw-w64-x86_64.nix checks it; nixpkgs' make builds its
 # target libraries whole.
@@ -59,15 +61,16 @@
 # configure gives the compiler and libgcc, without the -g whose debugging
 # information nixpkgs' strip hook removes after its install
 # (pkgs/development/compilers/gcc/common/strip-attributes.nix).  libgcc's
-# own Makefile adds -g all the same (libgcc/Makefile.in:246-249), so the
-# install phase strips that, with the target's strip, as gcc-latest does
-# with its own.  The build phase deletes TOPLEVEL_CONFIGURE_ARGUMENTS from
-# the top-level Makefile, as gcc-latest's does, and install-strip-gcc
-# strips each program with a STRIP that keeps the zero time stamp ld
-# writes.  The install removes the install-tools directories, which hold
-# fixincludes and what it needs to run again, the manual and info pages,
-# and the share directory that leaves empty, with rmdir, which fails the
-# build if anything else is in it, as gcc-latest's does.
+# own Makefile adds -g all the same (LIBGCC2_DEBUG_CFLAGS and LIBGCC2_CFLAGS
+# in libgcc/Makefile.in), so the install phase strips that, with the
+# target's strip, as gcc-latest does with its own.  The build phase deletes
+# TOPLEVEL_CONFIGURE_ARGUMENTS from the top-level Makefile, as gcc-latest's
+# does, and install-strip-gcc strips each program with a STRIP that keeps
+# the zero time stamp ld writes.  The install removes the install-tools
+# directories, which hold fixincludes and what it needs to run again, the
+# manual and info pages, and the share directory that leaves empty, with
+# rmdir, which fails the build if anything else is in it, as gcc-latest's
+# does.
 {
   seedStdenv,
   binutils,

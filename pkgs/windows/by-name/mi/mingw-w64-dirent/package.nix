@@ -10,12 +10,13 @@
 #
 # TinyCC's own dirent.h is not the header for this file.  It declares the
 # struct dirent of an older MinGW-w64, whose d_name is a pointer into the
-# DIR (win32/include/dirent.h:25-33), and this file fills an array of 260
-# characters (dirent.c:121 and 197).  Against TinyCC's header it compiles
-# without a warning and readdir copies each name through a pointer nothing
-# sets.  So the output carries include/dirent.h, MinGW-w64's declarations
-# at v8.0.3, and a package that links the library reads that header in
-# place of TinyCC's by naming this output in buildInputs.
+# DIR (struct dirent in win32/include/dirent.h), and this file fills an
+# array of 260 characters (_topendir and _treaddir in dirent.c).  Against
+# TinyCC's header it compiles without a warning and readdir copies each name
+# through a pointer nothing sets.  So the output carries include/dirent.h,
+# MinGW-w64's declarations at v8.0.3, and a package that links the library
+# reads that header in place of TinyCC's by naming this output in
+# buildInputs.
 #
 # The source is fetched alone, as busybox-w32 fetches the mingw-w64-crt
 # sources it links, from the GitHub mirror of MinGW-w64's repository at the

@@ -8,8 +8,8 @@
 # stdenv by gcc-latest and binutils, and the target libraries by the
 # compiler the same make links, against MinGW-w64 v14.0.0's headers and
 # the runtime gcc-core-x86_64 compiled.  It finishes the cross toolchain
-# MinGW-w64's build guide builds (mingw-w64-doc/howto-build/
-# mingw-w64-howto-build.txt:353-362).
+# MinGW-w64's build guide builds
+# (mingw-w64-doc/howto-build/mingw-w64-howto-build.txt, "Finishing GCC").
 #
 # The build is gcc-latest's, which says why of each part, for the other
 # target: one cross compiler build given its target's headers and runtime
@@ -30,20 +30,22 @@
 # The flags are those of nixpkgs' cross compiler, the one its
 # pkgsCross.mingwW64 builds, where gcc-latest's are minimal-bootstrap's,
 # which builds the bootstrap compilers alone.  --enable-__cxa_atexit and
-# --enable-long-long are the defaults for this target (gcc/config.gcc:2358
-# with gcc/configure.ac:2132-2154, libstdc++-v3/configure.ac:188), and
-# --disable-libstdcxx-pch and --disable-bootstrap mean here what they
-# mean there.  nixpkgs gives libstdc++ the mcf thread model, from
-# mcfgthreads, a library the ladder does not build; --enable-threads=win32
-# names the model GCC takes for this target on the Windows API alone
-# (gcc/config.gcc:2360-2366), nixpkgs' own for a MinGW target with no
-# thread library, as gcc-latest's is, under which libstdc++ has
-# std::thread since mingw-w64-headers-latest names Windows 10.  Exceptions
-# are SEH, the x86_64 target's (gcc/config/i386/cygming.h:358-369,
-# libgcc/config.host:927-936).  nixpkgs points the compiler at its C
-# library with --with-native-system-header-dir, --with-build-sysroot=/
-# and --with-gxx-include-dir, none of which a compiler given its headers
-# with --with-headers takes.
+# --enable-long-long are the defaults for this target
+# (default_use_cxa_atexit in the mingw case of gcc/config.gcc with
+# use_cxa_atexit in gcc/configure.ac, GLIBCXX_ENABLE_LONG_LONG in
+# libstdc++-v3/configure.ac), and --disable-libstdcxx-pch and
+# --disable-bootstrap mean here what they mean there.  nixpkgs gives
+# libstdc++ the mcf thread model, from mcfgthreads, a library the ladder
+# does not build; --enable-threads=win32 names the model GCC takes for this
+# target on the Windows API alone (thread_file in the mingw case of
+# gcc/config.gcc), nixpkgs' own for a MinGW target with no thread library,
+# as gcc-latest's is, under which libstdc++ has std::thread since
+# mingw-w64-headers-latest names Windows 10.  Exceptions are SEH, the x86_64
+# target's (DWARF2_UNWIND_INFO in gcc/config/i386/cygming.h, tmake_eh_file
+# in the x86_64-*-mingw* case of libgcc/config.host).  nixpkgs points the
+# compiler at its C library with --with-native-system-header-dir,
+# --with-build-sysroot=/ and --with-gxx-include-dir, none of which a
+# compiler given its headers with --with-headers takes.
 #
 # Where nixpkgs' choices need what the ladder does not have, gcc-latest's
 # are kept: GMP, MPFR and MPC in the tree, where nixpkgs links its own and
@@ -62,11 +64,12 @@
 # GCC's configure gives each, without the -g whose debugging information
 # nixpkgs' strip hook removes after its install
 # (pkgs/development/compilers/gcc/common/strip-attributes.nix).  libgcc's
-# own Makefile adds -g all the same (libgcc/Makefile.in:246-249), so the
-# install phase strips it with the target's strip, as gcc-core-x86_64's
-# does.  The install removes the install-tools directories, the manual and
-# info pages, libstdc++'s Python pretty-printers and gdb script and the
-# share directories that leaves empty, as gcc-latest's does.
+# own Makefile adds -g all the same (LIBGCC2_DEBUG_CFLAGS and LIBGCC2_CFLAGS
+# in libgcc/Makefile.in), so the install phase strips it with the target's
+# strip, as gcc-core-x86_64's does.  The install removes the install-tools
+# directories, the manual and info pages, libstdc++'s Python pretty-printers
+# and gdb script and the share directories that leaves empty, as
+# gcc-latest's does.
 #
 # nixpkgs' patch for a Windows target, libstdc-fix-compilation-in-
 # freestanding-win32.patch, declares malloc and free where libstdc++ is
@@ -75,11 +78,13 @@
 # atexit_thread.cc already reaches, as gcc-latest's build of the same file
 # shows.  Of its patches for every GCC 16, gcc-12-no-sys-dirs.patch takes
 # /usr/local/include, /lib and /usr/lib out of the searches of a native
-# compiler or one with a sysroot, and this is neither (gcc/cppdefault.cc:
-# 30-32, gcc/gcc.cc:8618-8659); mangle-NIX_STORE-in-__FILE__.patch hides
-# store hashes in __FILE__ from nixpkgs' scan for references; and the rest
-# change RISC-V, PowerPC, AArch64 and LoongArch code and libgomp, which
-# this build turns off.
+# compiler or one with a sysroot, and this is neither (the
+# CROSS_DIRECTORY_STRUCTURE test above cpp_include_defaults in
+# gcc/cppdefault.cc, the startfile prefixes of driver::set_up_specs in
+# gcc/gcc.cc); mangle-NIX_STORE-in-__FILE__.patch hides store hashes in
+# __FILE__ from nixpkgs' scan for references; and the rest change RISC-V,
+# PowerPC, AArch64 and LoongArch code and libgomp, which this build turns
+# off.
 {
   seedStdenv,
   binutils,

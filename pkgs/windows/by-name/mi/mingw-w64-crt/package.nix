@@ -18,32 +18,35 @@
 #
 # --host names the target: the stdenv's i686-pc-mingw32 stays the build,
 # and configure looks up the compiler, ar, ranlib, dlltool and as under the
-# host's name (configure.ac:37-46), on PATH through buildInputs.  It takes
-# a compiler and an archiver as the environment names them first, and the
+# host's name (AC_PROG_CC, AC_PROG_RANLIB, AC_CHECK_TOOL, AM_PROG_AR and
+# AM_PROG_AS in configure.ac), on PATH through buildInputs.  It takes a
+# compiler and an archiver as the environment names them first, and the
 # stdenv's CC and AR are tcc's, so preConfigure unsets them; with tcc,
-# configure stops at its check for MinGW-w64's _mingw_mac.h (configure.ac:
-# 384).  It unsets C_INCLUDE_PATH too, which holds TinyCC's headers for
-# tcc: GCC reads the variable as well, searches it before its own headers
-# and MinGW-w64's (gcc/incpath.c:455-462 in 4.6.4), and rejects TinyCC's
+# configure stops at its check for MinGW-w64's _mingw_mac.h
+# (AC_CHECK_HEADER([_mingw_mac.h]) in configure.ac).  It unsets
+# C_INCLUDE_PATH too, which holds TinyCC's headers for tcc: GCC reads the
+# variable as well, searches it before its own headers and MinGW-w64's
+# (register_include_chains in gcc/incpath.c in 4.6.4), and rejects TinyCC's
 # stdio.h, so configure stops at the same check.  The runtime reads no LD.
 #
 # --with-sysroot names mingw-w64-headers' output, whose include directory
-# the runtime is compiled against (Makefile.am:14-22).  Its default is the
-# prefix, which here holds no headers.
+# the runtime is compiled against (sysincludes and AM_CPPFLAGS in
+# Makefile.am).  Its default is the prefix, which here holds no headers.
 #
 # --with-default-msvcrt=msvcrt is nixpkgs' flag, as mingw-w64-headers
 # passes it: libmsvcrt.a is the import library for msvcrt.dll
-# (configure.ac:236-247), and the runtime is compiled for its
-# __MSVCRT_VERSION__ 0x700 (Makefile.am:23).
+# (AC_ARG_WITH([default-msvcrt]) in configure.ac), and the runtime is
+# compiled for its __MSVCRT_VERSION__ 0x700 (AM_CFLAGS in Makefile.am).
 #
 # --enable-lib32 and --disable-lib64 are nixpkgs' for an i686 host.  Left
 # to itself, configure decides each by compiling a test with -m32 and -m64
-# (configure.ac:64-100): a compiler that runs but fails the -m32 test would
-# leave a runtime with no libraries and a build that passes, where with the
-# flags the build compiles the runtime or fails.  GCC 4.6.4 for
-# i686-w64-mingw32 has a 64-bit mode only with --enable-targets=all
-# (gcc/config.gcc:1503-1508), and says so for -m64.  The ARM runtimes are
-# off for an i686 host (configure.ac:102-136).
+# (AC_ARG_ENABLE([lib32]) and AC_ARG_ENABLE([lib64]) in configure.ac): a
+# compiler that runs but fails the -m32 test would leave a runtime with no
+# libraries and a build that passes, where with the flags the build compiles
+# the runtime or fails.  GCC 4.6.4 for i686-w64-mingw32 has a 64-bit mode
+# only with --enable-targets=all (TARGET_BI_ARCH in gcc/config.gcc's *-w64-*
+# case), and says so for -m64.  The ARM runtimes are off for an i686 host
+# (AC_ARG_ENABLE([libarm32]) and AC_ARG_ENABLE([libarm64]) in configure.ac).
 #
 # --disable-dependency-tracking is what nixpkgs' configure phase adds to
 # every configure that has it, and make builds with $NIX_BUILD_CORES jobs,
@@ -55,14 +58,15 @@
 # compiler read, in crt2.o and in every object of the libraries.
 #
 # configure links one test program, with -nostdlib, to ask whether ld
-# defines __CTOR_LIST__ (configure.ac:304-361), and binutils' does.  If the
-# link failed, crt2.o would define the symbol itself, and nothing would
-# fail; test/data/gcc46.nix pins crt2.o's symbols for that reason.
+# defines __CTOR_LIST__ (HAVE_CTOR_LIST in configure.ac), and binutils'
+# does.  If the link failed, crt2.o would define the symbol itself, and
+# nothing would fail; test/data/gcc46.nix pins crt2.o's symbols for that
+# reason.
 #
 # The libraries install in lib, the directory configure names for an i686
-# host's 32-bit runtime (configure.ac:142-152, Makefile.am:601), and twelve
-# of libsrc's C files, which the runtime installs uncompiled, in include
-# (Makefile.am:2131-2135).
+# host's 32-bit runtime (libx8632suffx in configure.ac, lib32dir in
+# Makefile.am), and twelve of libsrc's C files, which the runtime installs
+# uncompiled, in include (dist_libsrc_DATA in Makefile.am).
 {
   seedStdenv,
   binutils,
@@ -103,8 +107,9 @@ seedStdenv.mkDerivation {
 
   enableParallelBuilding = true;
   # Two rules install lib32/libntoskrnl.a, lib32_LIBRARIES and lib32_DATA
-  # (Makefile.am:773, and lib32/Makefile.am:208, which Makefile.am:820
-  # includes), and make -j runs them at once on the one file.
+  # (the lib32/libntoskrnl.a entries of lib32_LIBRARIES in Makefile.am and
+  # of lib32_DATA in lib32/Makefile.am, which Makefile.am includes), and
+  # make -j runs them at once on the one file.
   enableParallelInstalling = false;
 }
 // {

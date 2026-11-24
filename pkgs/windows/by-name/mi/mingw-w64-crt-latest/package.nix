@@ -8,39 +8,42 @@
 # what the release changes is said here.
 #
 # gcc10 compiles it, since the runtime calls three builtins GCC 4.6.4
-# lacks: __atomic_load_n (misc/gettimeofday.c:48-49),
-# __builtin_mul_overflow (misc/_recalloc.c:15) and __builtin_bswap16
-# (misc/winbs_ushort.c:5).  gcc10 keeps v8.0.3's runtime in its own
-# prefix, which the runtime does not take in: its compiles read
-# mingw-w64-headers-latest's include directory, which --with-sysroot
-# names, with -I, before any directory of the compiler's
-# (Makefile.am:14-22), and it links no program.  configure links two:
-# one against gcc10's runtime, to learn the suffix of executables, which
-# no file the runtime builds takes (AC_NO_EXECUTABLES links it,
-# configure.ac:34), and one with -nostdlib, which asks whether ld
-# defines __ImageBase (configure.ac:354-405), as binutils' does.  If that
-# link failed, every object would be compiled to name __image_base__ in
-# its place, and nothing would fail; test/data/mingw-w64-latest.nix pins
-# crt2.o's symbols for that reason.  configure looks a C++ compiler up
-# under the host's name too (configure.ac:38) and finds gcc10's g++; the
-# runtime compiles no C++.
+# lacks: __atomic_load_n (getntptimeofday in misc/gettimeofday.c),
+# __builtin_mul_overflow (_recalloc in misc/_recalloc.c) and
+# __builtin_bswap16 (_byteswap_ushort in misc/winbs_ushort.c).  gcc10
+# keeps v8.0.3's runtime in its own prefix, which the runtime does not
+# take in: its compiles read mingw-w64-headers-latest's include directory,
+# which --with-sysroot names, with -I, before any directory of the
+# compiler's (sysincludes and AM_CPPFLAGS in Makefile.am), and it links no
+# program.  configure links two: one against gcc10's runtime, to learn the
+# suffix of executables, which no file the runtime builds takes
+# (AC_NO_EXECUTABLES in configure.ac links it), and one with -nostdlib,
+# which asks whether ld defines __ImageBase (ld_provides_imagebase in
+# configure.ac), as binutils' does.  If that link failed, every object
+# would be compiled to name __image_base__ in its place, and nothing would
+# fail; test/data/mingw-w64-latest.nix pins crt2.o's symbols for that
+# reason.  configure looks a C++ compiler up under the host's name too
+# (AC_PROG_CXX in configure.ac) and finds gcc10's g++; the runtime
+# compiles no C++.
 #
 # --with-default-msvcrt=msvcrt has the build make libmsvcrt-os.a, the
 # import library for msvcrt.dll with the functions it lacks compiled in,
-# and install libmsvcrt.a as a copy of it (configure.ac:256-267,
-# Makefile.am:1468-1477).  The runtime is compiled for __MSVCRT_VERSION__
-# 0x600 (Makefile.am:23), the version mingw-w64-headers-latest writes
+# and install libmsvcrt.a as a copy of it (AC_ARG_WITH([default-msvcrt])
+# in configure.ac, the lib32/libmsvcrt.a and lib32/libmsvcrt-os.a rules in
+# Makefile.am).  The runtime is compiled for __MSVCRT_VERSION__ 0x600
+# (AM_CFLAGS in Makefile.am), the version mingw-w64-headers-latest writes
 # for msvcrt.dll.  nixpkgs' --enable-secure-api is read by no configure
 # at this release, and its --enable-idl by the headers' alone
-# (mingw-w64-headers/configure.ac:115-125), which this does not
-# configure.  nixpkgs regenerates the build files with autoreconfHook,
-# where this uses the release's own, as mingw-w64-crt does, and turns
-# off hardening flags its compiler wrapper adds, where the seed stdenv
-# has no wrapper.
+# (AC_ARG_ENABLE([idl]) in mingw-w64-headers/configure.ac), which this
+# does not configure.  nixpkgs regenerates the build files with
+# autoreconfHook, where this uses the release's own, as mingw-w64-crt does,
+# and turns off hardening flags its compiler wrapper adds, where the seed
+# stdenv has no wrapper.
 #
-# One rule installs each file (lib32/Makefile.am:228 leaves libntoskrnl.a
-# to the rule of Makefile.am:1604-1607), so make installs with
-# $NIX_BUILD_CORES jobs too, as nixpkgs' enableParallelBuilding has it.
+# One rule installs each file (lib32/Makefile.am comments its lib32_DATA
+# entry for libntoskrnl.a out, leaving the file to lib32_LIBRARIES in
+# Makefile.am), so make installs with $NIX_BUILD_CORES jobs too, as
+# nixpkgs' enableParallelBuilding has it.
 {
   seedStdenv,
   binutils,

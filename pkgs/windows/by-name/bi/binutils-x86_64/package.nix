@@ -7,9 +7,10 @@
 # seed stdenv by gcc-latest and binutils.
 #
 # The ladder reaches x86_64 through a cross toolchain, as MinGW-w64's build
-# guide builds one (mingw-w64-doc/howto-build/mingw-w64-howto-build.txt:
-# 208-362) and nixpkgs builds pkgsCross.mingwW64's: these tools, a GCC
-# core that compiles the runtime, the runtime, and GCC with its libraries.
+# guide builds one (mingw-w64-doc/howto-build/mingw-w64-howto-build.txt,
+# "Building binutils cross toolchain" through "Finishing GCC") and nixpkgs
+# builds pkgsCross.mingwW64's: these tools, a GCC core that compiles the
+# runtime, the runtime, and GCC with its libraries.
 # Everything before it is i686, and an i686 compiler cannot write x86_64
 # code without a 64-bit assembler and linker for it to run.
 #
@@ -20,15 +21,16 @@
 # --enable-targets, and that binutils is tcc's, with patches and flags for
 # tcc and msvcrt.dll; nixpkgs builds one binutils for each target.  The
 # x86_64 target's own formats include i386 PE and its linker the i386pe
-# emulation (bfd/config.bfd:715-720, ld/configure.tgt:1009-1012), so these
-# tools read and write both.
+# emulation (the x86_64-*-mingw* cases of bfd/config.bfd and
+# ld/configure.tgt), so these tools read and write both.
 #
 # The release is nixpkgs', 2.46, from the archive it fetches, which also
-# holds gold; configure builds gold only when asked (configure.ac:343-347),
-# and gold writes ELF alone.  GCC 16.2.0 needs nothing newer than 2.41
-# for this target: its configure tests the assembler for each feature it
-# would use and does without one 2.41 lacks, such as the .base64 directive
-# it writes long strings with (gcc/configure.ac:3218-3221).
+# holds gold; configure builds gold only when asked (AC_ARG_ENABLE(gold)
+# in configure.ac), and gold writes ELF alone.  GCC 16.2.0 needs nothing
+# newer than 2.41 for this target: its configure tests the assembler for
+# each feature it would use and does without one 2.41 lacks, such as the
+# .base64 directive it writes long strings with (gcc_cv_as_base64 in
+# gcc/configure.ac).
 #
 # The stdenv's i686-pc-mingw32 is the build and the host, so configure
 # names the programs for the target, bin/x86_64-w64-mingw32-<name>.exe,
@@ -44,18 +46,18 @@
 #
 # --enable-64-bit-bfd, --enable-deterministic-archives, --disable-werror,
 # --with-lib-path=: and MAKEINFO=true are nixpkgs', and mean here what they
-# mean there; the x86_64 target asks for the 64-bit BFD itself
-# (bfd/config.bfd:718), and binutils' rung says why of the last two.  Of
-# nixpkgs' other flags, --enable-new-dtags chooses between two ELF tags,
-# --enable-fix-loongson2f-nop is an option of the MIPS assembler,
-# --disable-gprofng names what configure builds for a Linux target alone
-# (configure.ac:412-424), and --with-system-zlib a zlib the ladder does
-# not have, so the tools link the zlib of binutils' tree.  nixpkgs makes
-# the libraries shared for a host that has them; here they are static,
-# bfd's default, so the programs import no DLL of binutils'.  Plugin
-# support is on, bfd's default where windows.h is found
-# (config/plugins.m4:1-17), as in nixpkgs, and ld installs its libdep
-# plugin, a DLL ar, nm and ld load from lib/bfd-plugins.
+# mean there; the x86_64 target asks for the 64-bit BFD itself (want64 in
+# bfd/config.bfd's x86_64-*-mingw* case), and binutils' rung says why of
+# the last two.  Of nixpkgs' other flags, --enable-new-dtags chooses between
+# two ELF tags, --enable-fix-loongson2f-nop is an option of the MIPS
+# assembler, --disable-gprofng names what configure builds for a Linux
+# target alone (AC_ARG_ENABLE(gprofng) in configure.ac), and
+# --with-system-zlib a zlib the ladder does not have, so the tools link the
+# zlib of binutils' tree.  nixpkgs makes the libraries shared for a host
+# that has them; here they are static, bfd's default, so the programs import
+# no DLL of binutils'.  Plugin support is on, bfd's default where windows.h
+# is found (AC_PLUGINS in config/plugins.m4), as in nixpkgs, and ld installs
+# its libdep plugin, a DLL ar, nm and ld load from lib/bfd-plugins.
 # --disable-nls is new: nixpkgs gives its build gettext, which the ladder
 # does not have, and the tools print their messages untranslated.
 # --disable-dependency-tracking is what nixpkgs' configure phase adds to
@@ -66,7 +68,8 @@
 # strip hook removes after its install, as mingw-w64-crt-latest's is.
 # LDFLAGS gives every link --no-insert-timestamp, for gcc46-cxx's reason:
 # ld writes the time of the link into a PE image unless it is given that
-# (ld/emultempl/pep.em:188 and 1549-1552, bfd/peXXigen.c:850-858).
+# (insert_timestamp and gld${EMULATION_NAME}_after_open in
+# ld/emultempl/pep.em, _bfd_XXi_only_swap_filehdr_out in bfd/peXXigen.c).
 #
 # None of nixpkgs' patches is applied.  deterministic.patch sets a flag the
 # PE writer does not read, for the reason binutils' rung gives.
@@ -77,7 +80,7 @@
 # alone, and avr-size.patch gives size an AVR format.  windres-locate-gcc.patch
 # has windres, run by a path, look for the gcc of its own prefix on PATH;
 # run by its prefixed name, as GCC's build runs it, windres looks there
-# first already (binutils/resrc.c:520-527).
+# first already (look_for_default in read_rc_file in binutils/resrc.c).
 {
   seedStdenv,
   fetchurl,

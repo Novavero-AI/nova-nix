@@ -23,24 +23,25 @@
 # directory from the environment (cc-wrapper.sh, link.specs and
 # ld-wrapper.sh say how).  They have no extension: busybox takes a file
 # that begins with #! for a program, and its sh and GNU make each run one
-# through the sh that line names (win32/mingw.c:559-562 and 822-827,
-# shell/ash.c:7161-7188 and win32/process.c:300-350 in busybox-w32 5f09fb446,
-# src/w32/subproc/sub_proc.c:652-683 and 753-757 in make 4.4.1).  GNU make
-# looks for a command with .exe in every directory of PATH before it
-# looks for it with no extension in any (sub_proc.c:479-527), so it runs a
-# wrapper only while PATH holds no program of the same name: neither
-# toolchain's bin directory is on it.  CC, CXX and LD name the wrappers, as
-# nixpkgs' cc and bintools wrappers' setup hooks name theirs
-# (pkgs/build-support/cc-wrapper/setup-hook.sh:119-120 and
-# bintools-wrapper/setup-hook.sh:57-66 in nixpkgs
+# through the sh that line names (has_exec_format and do_lstat in
+# win32/mingw.c, tryexec in shell/ash.c and mingw_spawn_interpreter in
+# win32/process.c in busybox-w32 5f09fb446, process_begin in
+# src/w32/subproc/sub_proc.c in make 4.4.1).  GNU make looks for a command
+# with .exe in every directory of PATH before it looks for it with no
+# extension in any (find_file in sub_proc.c), so it runs a wrapper only
+# while PATH holds no program of the same name: neither toolchain's bin
+# directory is on it.  CC, CXX and LD name the wrappers, as nixpkgs' cc and
+# bintools wrappers' setup hooks name theirs (the CC and CXX exports in
+# pkgs/build-support/cc-wrapper/setup-hook.sh and the loop over ar, as, ld
+# and the rest in bintools-wrapper/setup-hook.sh in nixpkgs
 # 5eb598da22ce76bc18ec85ecc1de66ca838b3514), and AR binutils' archiver by
 # its path: busybox's sh runs its own ar applet for a command named ar,
 # sparing make alone (setup.sh's BB_OVERRIDE_APPLETS), and the applets'
 # ar.exe comes first on PATH.  GNU ar writes an archive's symbol index
-# unless told not to (binutils/ar.c:1274 in binutils 2.46), so it does not
-# matter that configure finds no ranlib.  OBJDUMP and STRIP name binutils'
-# programs of those names by their paths, as nixpkgs' bintools wrapper
-# names them for a build, WINDRES names cc's windres, a wrapper of
+# unless told not to (write_archive in binutils/ar.c in binutils 2.46), so
+# it does not matter that configure finds no ranlib.  OBJDUMP and STRIP name
+# binutils' programs of those names by their paths, as nixpkgs' bintools
+# wrapper names them for a build, WINDRES names cc's windres, a wrapper of
 # binutils' that preprocesses with gcc-native-x86_64's gcc
 # (windres-wrapper.sh says why), and a build runs binutils' others by
 # their paths.

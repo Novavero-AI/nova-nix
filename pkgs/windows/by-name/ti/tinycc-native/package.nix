@@ -70,8 +70,9 @@ let
   # -B directory.  -lm is how Unix builds ask for the math functions, which
   # msvcrt.dll holds, and TinyCC finds a library only by a file
   # (libtcc.c's tcc_add_library), so the name needs one that adds nothing,
-  # as MinGW-w64's runtime has (mingw-w64-crt/Makefile.am:72-77).  GCC
-  # links its genautomata with -lm (gcc/Makefile.in:3948 at 4.6.4).  tcc
+  # as MinGW-w64's runtime has (_libm_dummy.c and src_libm in
+  # mingw-w64-crt/Makefile.am).  GCC links its genautomata with -lm (the
+  # build/genautomata BUILD_LIBS line in gcc/Makefile.in at 4.6.4).  tcc
   # -ar given no object writes an archive with no member.
   buildRuntime =
     pname: round:

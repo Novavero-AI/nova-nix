@@ -20,94 +20,102 @@
 #
 # GCC's installation guide has a cross compiler given its target's headers
 # and libraries before it is configured, with --with-headers and
-# --with-libs (gcc/doc/install.texi:2346-2350; gcc-core says why not
-# --with-sysroot, the guide's other choice).  The top-level configure
-# copies each into this output, MinGW-w64's headers as
-# i686-w64-mingw32/sys-include and mingw-w64-crt's libraries and start
-# files as i686-w64-mingw32/lib (configure.ac:2244-2273 and 2318-2347),
-# where gcc46 has them, and where the build points the compiler it links
-# with -B, -L and -isystem when it compiles and links the target libraries
-# (configure.ac:3110-3115 and 3134-3137).  libstdc++'s configure links its
-# tests for a MinGW target (libstdc++-v3/crossconfig.m4:153-157), so the
-# runtime has to be there before it runs; gcc-core builds libgcc alone,
-# which links nothing.  The runtime's include directory, which holds the
-# twelve uncompiled sources it installs, is not a library directory and is
-# not copied.  libstdc++ installs its library beside the runtime's and its
+# --with-libs ("Building a cross compiler" in gcc/doc/install.texi;
+# gcc-core says why not --with-sysroot, the guide's other choice).  The
+# top-level configure copies each into this output, MinGW-w64's headers
+# as i686-w64-mingw32/sys-include and mingw-w64-crt's libraries and start
+# files as i686-w64-mingw32/lib (the --with-headers and --with-libs cases
+# and copy_dirs in configure.ac), where gcc46 has them, and where the
+# build points the compiler it links with -B, -L and -isystem when it
+# compiles and links the target libraries (FLAGS_FOR_TARGET's
+# *-w64-mingw* case and build_tooldir directories in configure.ac).
+# libstdc++'s configure links its tests for a MinGW target (the
+# *-mingw32* case of libstdc++-v3/crossconfig.m4), so the runtime has to
+# be there before it runs; gcc-core builds libgcc alone, which links
+# nothing.  The runtime's include directory, which holds the twelve
+# uncompiled sources it installs, is not a library directory and is not
+# copied.  libstdc++ installs its library beside the runtime's and its
 # headers in i686-w64-mingw32/include/c++/4.6.4, a cross compiler's places
-# for them (libstdc++-v3/acinclude.m4:758-788, with the --with-cross-host
-# the top level gives a cross compiler's target libraries,
-# configure.ac:3016-3018), so the driver links a C++ program with no flag
-# naming a directory, as gcc46's links a C one.  nixpkgs points its native
-# compiler at musl's headers and libraries instead, with
-# --with-native-system-header-dir, --with-build-sysroot and the
-# C_INCLUDE_PATH, LIBRARY_PATH and -dynamic-linker its build script
+# for them (gxx_include_dir and glibcxx_toolexeclibdir in
+# GLIBCXX_EXPORT_INSTALL_INFO in libstdc++-v3/acinclude.m4, with the
+# --with-cross-host the top level gives a cross compiler's target
+# libraries in configure.ac's target_configargs), so the driver links a
+# C++ program with no flag naming a directory, as gcc46's links a C one.
+# nixpkgs points its native compiler at musl's headers and libraries
+# instead, with --with-native-system-header-dir, --with-build-sysroot and
+# the C_INCLUDE_PATH, LIBRARY_PATH and -dynamic-linker its build script
 # exports; its no-system-headers.patch and its edit of
 # libstdc++-v3/configure.host are for that compiler and musl too.
 #
 # The build's compiler is gcc46's driver, and its archiver and linker are
 # binutils', each named by the target's name, the only name either puts on
 # PATH: configure, the build being its own host, looks the host's tools up
-# under their bare names (configure.ac:1292 and 3273-3284), and the seed
-# stdenv's CC, AR and LD are tcc's.  preConfigure unsets C_INCLUDE_PATH,
-# which holds TinyCC's headers for tcc, as mingw-w64-crt's does: GCC
-# searches it before its own headers and MinGW-w64's
-# (gcc/incpath.c:455-462).
+# under their bare names (AC_PROG_CC and the host tools'
+# NCN_STRICT_CHECK_TOOLS in configure.ac), and the seed stdenv's CC, AR
+# and LD are tcc's.  preConfigure unsets C_INCLUDE_PATH, which holds
+# TinyCC's headers for tcc, as mingw-w64-crt's does: GCC searches it
+# before its own headers and MinGW-w64's (register_include_chains in
+# gcc/incpath.c).
 #
 # No program carries the time it was built.  binutils' ld writes the time
 # of the link into a PE image's header unless it is given
-# --no-insert-timestamp (ld/emultempl/pe.em:162 and 1616-1619,
-# bfd/peXXigen.c:838-843), which GCC's link spec for MinGW never passes
-# (gcc/config/i386/mingw32.h:99-105), and the seed stdenv has no compiler
-# wrapper to add it, as the stage-2 stdenv's wrappers do
-# (pkgs/windows/stage2-stdenv/link.specs).  LDFLAGS
-# passes it to every link gcc46 makes here: the host's programs take
-# LDFLAGS, and so do the build machine's, the build being the host
-# (configure.ac:3124-3128, gcc/configure.ac:1798-1801).  It replaces the
+# --no-insert-timestamp (insert_timestamp and
+# gld${EMULATION_NAME}_after_open in ld/emultempl/pe.em,
+# _bfd_XXi_only_swap_filehdr_out in bfd/peXXigen.c), which GCC's link spec
+# for MinGW never passes (LINK_SPEC in gcc/config/i386/mingw32.h), and the
+# seed stdenv has no compiler wrapper to add it, as the stage-2 stdenv's
+# wrappers do (pkgs/windows/stage2-stdenv/link.specs).  LDFLAGS passes it
+# to every link gcc46 makes here: the host's programs take LDFLAGS, and so
+# do the build machine's, the build being the host (LDFLAGS_FOR_BUILD in
+# configure.ac, BUILD_LDFLAGS in gcc/configure.ac).  It replaces the
 # stdenv's LDFLAGS, whose -L flags name gcc46's and binutils' lib
 # directories, from which the build links nothing.  strip writes the time
-# again, over the zero ld wrote, unless it is run with -p
-# (binutils/objcopy.c:2836-2839), as nixpkgs' strip hook runs it
+# again, over the zero ld wrote, unless it is run with -p (preserve_dates in
+# binutils/objcopy.c's copy_object), as nixpkgs' strip hook runs it
 # (pkgs/build-support/setup-hooks/strip.sh).  The install phase therefore
 # gives make STRIP, binutils' strip by the target's name with -p, which
 # install-strip, nixpkgs' install target, runs on each program it installs
-# (gcc/Makefile.in:4500-4505, fixincludes/Makefile.in:191-193).  It is a
-# make variable on the command line, since the stdenv splits
-# configureFlags and makeFlags at spaces, and it has to be given:
-# configure, looking for strip under its bare name, finds none and
-# records true (configure.ac:3280).
+# (the install-strip rules in gcc/Makefile.in and fixincludes/Makefile.in).
+# It is a make variable on the command line, since the stdenv splits
+# configureFlags and makeFlags at spaces, and it has to be given: configure,
+# looking for strip under its bare name, finds none and records true
+# (NCN_STRICT_CHECK_TOOLS(STRIP, strip, true) in configure.ac).
 #
 # Two builds at the output's own path are then the same bytes, but
 # nova-nix build --check, which builds at a scratch path and rewrites its
 # hash in what the builder wrote, finds the five drivers, cc1 and cc1plus
 # differ.  Each names the output, and each carries a sum of its bytes that
 # no rewrite of the hash reaches: the PE checksum ld and strip write
-# (bfd/coffcode.h:3394-3427), and in cc1 and cc1plus the MD5 of the
-# objects they link (gcc/genchecksum.c:97-119), two of which compile the
-# prefix in (gcc/Makefile.in:2200-2204 and 3978-3990).
+# (coff_apply_checksum in bfd/coffcode.h), and in cc1 and cc1plus the MD5
+# of the objects they link (executable_checksum in gcc/genchecksum.c), two
+# of which compile the prefix in (the prefix.o rule and
+# PREPROCESSOR_DEFINES in gcc/Makefile.in).
 #
 # CFLAGS and CXXFLAGS are nixpkgs' -O1, and the target libraries' its -O0
 # without the -dynamic-linker it adds for musl.  The target libraries'
 # flags, given, replace the ones with -g configure gives them otherwise
-# (configure.ac:2212-2241), whose debugging information would name the
-# build directory and the store paths the compiler read, and
-# LIBGCC2_DEBUG_CFLAGS=-g0 removes the -g gcc's Makefile adds to libgcc's
-# compiles, as in gcc-core.
+# (CFLAGS_FOR_TARGET and CXXFLAGS_FOR_TARGET in configure.ac), whose
+# debugging information would name the build directory and the store
+# paths the compiler read, and LIBGCC2_DEBUG_CFLAGS=-g0 removes the -g
+# gcc's Makefile adds to libgcc's compiles, as in gcc-core.
 #
 # --disable-win32-registry is not nixpkgs': a GCC for Windows looks its
 # directories up under HKEY_LOCAL_MACHINE\SOFTWARE\Free Software
-# Foundation\4.6.4 (gcc/prefix.c:44-49 and 88-177) wherever its configure
-# links RegOpenKeyExA (gcc/configure.ac:1582-1590), and here it links
-# MinGW-w64's libadvapi32.a.  nixpkgs' --disable-lib* flags mean here what
-# they mean there, but for --disable-libsanitizer, left out, which names a
-# library later than 4.6.4.  gcc-core's --disable-decimal-float and
-# --disable-plugin, which nixpkgs' 4.6.nix, the GCC tinycc builds, passes,
-# are left out as 4.6.cxx.nix leaves them out: decimal float is on for a
-# MinGW target (config/dfp.m4:21-27), and configure finds neither the
-# objdump nor the dlopen its plugin checks look for and builds no plugin
-# support (gcc/configure.ac:4819-4897).  The thread model is win32 and
-# exceptions are SJLJ, as in gcc-core.  --disable-shared, as in nixpkgs,
-# makes libgcc and libstdc++ static, so a program carries what it uses of
-# them and imports no DLL of GCC's.
+# Foundation\4.6.4 (gcc/prefix.c's opening comment, get_key_value and
+# lookup_key) wherever its configure links RegOpenKeyExA
+# (AC_SEARCH_LIBS(RegOpenKeyExA, advapi32) in gcc/configure.ac), and here
+# it links MinGW-w64's libadvapi32.a.  nixpkgs' --disable-lib* flags mean
+# here what they mean there, but for --disable-libsanitizer, left out,
+# which names a library later than 4.6.4.  gcc-core's
+# --disable-decimal-float and --disable-plugin, which nixpkgs' 4.6.nix,
+# the GCC tinycc builds, passes, are left out as 4.6.cxx.nix leaves them
+# out: decimal float is on for a MinGW target (GCC_AC_ENABLE_DECIMAL_FLOAT
+# in config/dfp.m4), and configure finds neither the objdump nor the
+# dlopen its plugin checks look for and builds no plugin support (the
+# checks under AC_ARG_ENABLE(plugin) in gcc/configure.ac).  The thread
+# model is win32 and exceptions are SJLJ, as in gcc-core.
+# --disable-shared, as in nixpkgs, makes libgcc and libstdc++ static, so a
+# program carries what it uses of them and imports no DLL of GCC's.
 {
   seedStdenv,
   fetchurl,
