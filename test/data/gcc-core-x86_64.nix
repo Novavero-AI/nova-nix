@@ -21,14 +21,15 @@
 # and not binutils, and the program's exit status.  The answer,
 # test/data/gcc-core-x86_64-link-answer.txt, is derived: the lines are the
 # configuration's, x86_64 PE names a C symbol with no underscore
-# (gcc/config/i386/cygming.h:60-61), GCC calls __udivti3 for an unsigned
-# 128-bit division (gcc/optabs.def:146), it calls a function declared
-# dllimport, as windows.h declares ExitProcess
-# (mingw-w64-headers/include/processthreadsapi.h:28, apisetcconv.h:43,
-# winnt.h:161), through the pointer named __imp_ and the function's name
-# (gcc/config/mingw/winnt-dll.cc:118-120), which the import library
-# defines (binutils/dlltool.c:2420), and 0x8664 and 0x20b are the PE
-# format's IMAGE_FILE_MACHINE_AMD64 and PE32+.
+# (USER_LABEL_PREFIX in gcc/config/i386/cygming.h), GCC calls __udivti3
+# for an unsigned 128-bit division (udiv_optab in gcc/optabs.def), it
+# calls a function declared dllimport, as windows.h declares ExitProcess
+# (its declaration in mingw-w64-headers/include/processthreadsapi.h,
+# WINBASEAPI in apisetcconv.h, DECLSPEC_IMPORT in winnt.h), through the
+# pointer named __imp_ and the function's name (get_dllimport_decl in
+# gcc/config/mingw/winnt-dll.cc), which the import library defines
+# (make_one_lib_file in binutils/dlltool.c), and 0x8664 and 0x20b are the
+# PE format's IMAGE_FILE_MACHINE_AMD64 and PE32+.
 # nm sorts by the collation of Windows' own locale (see
 # test/data/gcc46.nix), so it lists the symbols unsorted and busybox's
 # sort, which compares bytes, sorts them.

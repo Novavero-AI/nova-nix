@@ -809,11 +809,12 @@ testUncaughtIOFailureCLI = do
 -- | Runs whose stdout is a pipe nothing reads, as after @| head -1@ has
 -- read its line.  Upstream's writes through @std::cout@ then fail with
 -- the stream's error state alone, SIGPIPE being blocked
--- (libutil/unix/signals.cc:136-144 at 2.24.9), so nothing is reported and
--- the command ends with its own status (nix-instantiate.cc:54-62): an eval
--- or @--help@ exits 0, and @store delete@, which prints each path as it
--- deletes it, deletes every path it names.  The read end is closed before
--- the process starts, so its first write meets it.
+-- (@unix::startSignalHandlerThread@ in libutil\/unix\/signals.cc), so
+-- nothing is reported and the command ends with its own status
+-- (@processExpr@ in nix-instantiate.cc): an eval or @--help@ exits 0, and
+-- @store delete@, which prints each path as it deletes it, deletes every
+-- path it names.  The read end is closed before the process starts, so
+-- its first write meets it.
 testClosedStdoutCLI :: IO [Bool]
 testClosedStdoutCLI = do
   putStrLn "cli/closed-stdout"
@@ -1019,16 +1020,17 @@ testImportFromDerivationCLI = do
           [ runTest "build imports and reads an output it builds, and a value forced before the build reads the same after it" $
               if made == Just "keptbuiltdata" then Pass else Fail (outcome madeRun),
             -- realiseContext refuses before it builds, once the paths are
-            -- valid (primops.cc:79-83 at 2.24.9), naming the first Built
-            -- element as upstream renders it (derived-path.cc:108-113).
+            -- valid (primops.cc), naming the first Built element as
+            -- upstream renders it (DerivedPath::Built::to_string in
+            -- derived-path.cc).
             runTest "--no-allow-import-from-derivation refuses an import from a derivation whose output is valid, in upstream's words" $
               if flagOffCode == ExitFailure 1 && maybe False refusesImport (lastLineOf flagOffErr) then Pass else Fail (outcome flagOffRun),
             runTest "allow-import-from-derivation = false in NIX_CONFIG refuses an import from a derivation before anything is built" $
               if configOffCode == ExitFailure 1 && maybe False refusesImport (lastLineOf configOffErr) && not ("[build]" `isInfixOf` configOffErr)
                 then Pass
                 else Fail (outcome configOffRun),
-            -- The warning comes before the build (primops.cc:115-116 at
-            -- 2.34.9), so it precedes the build's own lines.
+            -- The warning comes before the build (realiseContext in
+            -- primops.cc at 2.34.9), so it precedes the build's own lines.
             runTest "trace-import-from-derivation in NIX_CONFIG warns of the import, naming its output, before the build" $
               case break ("[build]  ifd-made" `isInfixOf`) (lines tracedErr) of
                 (before, _ : _)
@@ -1046,7 +1048,9 @@ testImportFromDerivationCLI = do
               if atermCode == ExitSuccess && "keptbuiltdata" `T.isInfixOf` T.pack atermOut then Pass else Fail (outcome atermRun),
             -- Upstream's read-only evaluation refuses a substitution and
             -- builds an output that may not be substituted
-            -- (substitution-goal.cc:53-54, derivation-goal.cc:249 at 2.24.9).
+            -- (PathSubstitutionGoal::init in substitution-goal.cc at
+            -- 2.24.9, PathSubstitutionGoal::substitute at 2.36.0, and
+            -- DerivationGoal::haveDerivation in derivation-goal.cc).
             runTest "eval builds an output of a derivation the store holds that may not be substituted, and reads it" $
               if holderCode == ExitSuccess && printed unsubstitutableOut == Just "\"built-read-only\"" then Pass else Fail (outcome holderRun <> "; " <> outcome unsubstitutableRun),
             runTest "eval refuses to substitute an output of a derivation the store holds, in upstream's words" $
@@ -1058,7 +1062,8 @@ testImportFromDerivationCLI = do
                       Pass
                 _ -> Fail (outcome substitutableRun),
             -- Upstream's substitution goal refuses before anything is built
-            -- or written (substitution-goal.cc:53-54 at 2.24.9), so the
+            -- or written (PathSubstitutionGoal::init in substitution-goal.cc
+            -- at 2.24.9, PathSubstitutionGoal::substitute at 2.36.0), so the
             -- store's own refusal is never reached.
             runTest "eval refuses to substitute an output in a store upstream Nix manages in upstream's words, before refusing the store" $
               case lastLineOf upstreamErr of
@@ -1069,7 +1074,7 @@ testImportFromDerivationCLI = do
                       Pass
                 _ -> Fail (outcome upstreamRun),
             -- nix-instantiate --eval computes these paths without writing
-            -- them (primops.cc:2310 and :2473 at 2.24.9).
+            -- them (prim_toFile and addPath in primops.cc).
             runTest "eval prints a toFile result's path and makes no store" $
               if computedCode == ExitSuccess && printed computedOut == printed writtenOut && not computedStoreMade then Pass else Fail (outcome computedRun <> "; " <> outcome writtenRun),
             runTest "eval prints a builtins.path copy's path in a store upstream Nix manages, writing nothing there" $
@@ -1086,15 +1091,15 @@ testImportFromDerivationCLI = do
             runTest "eval --read-write-mode that must write in a store upstream Nix manages is refused" $
               if neededWriteCode == ExitFailure 1 then Pass else Fail (outcome neededWriteRun),
             -- Upstream's local store adds a fetch as it lands, in any mode
-            -- (tarball.cc:86 at 2.24.9), so its next evaluation takes the
-            -- pinned fetch's early exit (fetchTree.cc:484-497).
+            -- (downloadFile in tarball.cc), so its next evaluation takes the
+            -- pinned fetch's early exit (fetch in fetchTree.cc).
             runTest "eval registers what a pinned fetch writes, so a second eval of it needs no source" $
               if secondFetchCode == ExitSuccess && isJust (printed firstFetchOut) && printed secondFetchOut == printed firstFetchOut
                 then Pass
                 else Fail (outcome firstFetchRun <> "; " <> outcome secondFetchRun),
             -- Upstream's read-write evaluation adds what it makes as it goes
-            -- (primops.cc:2310-2320 at 2.24.9), so a later evaluation
-            -- finds it valid.
+            -- (prim_toFile in primops.cc), so a later evaluation finds it
+            -- valid.
             runTest "eval --read-write-mode writes and registers a toFile result, which a read-only eval then reads" $
               if writtenCode == ExitSuccess && printed readBackOut == Just "\"written\"" then Pass else Fail (outcome writtenRun <> "; " <> outcome readBackRun),
             runTest "eval --read-write-mode imports and reads an output it builds" $

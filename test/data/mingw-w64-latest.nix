@@ -25,8 +25,8 @@
 #
 # hello has gcc10's driver compile hello.c and link it against this
 # runtime, given its directories as GCC's build gives a compiler it links
-# the target libraries' runtime with (configure.ac:3320-3325 in GCC
-# 10.4.0): -B before the runtime's library directory, where the driver
+# the target libraries' runtime with (FLAGS_FOR_TARGET in configure.ac,
+# GCC 10.4.0): -B before the runtime's library directory, where the driver
 # finds crt2.o and the libraries first, and -isystem before the headers'.
 # gcc10 holds v8.0.3's in its own prefix, which the driver reads after
 # these.  The program prints the release and the msvcrt.dll version the

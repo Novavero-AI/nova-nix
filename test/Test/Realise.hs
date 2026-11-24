@@ -752,7 +752,8 @@ testRealise = do
               (result, [sp | EvQueriedNext sp <- events], realiseWork events),
       -- Upstream's goal for each output runs its own course: dev's ends for
       -- want of a substitute and out's arrives from the next cache, so no
-      -- goal failed and the derivation builds (derivation-goal.cc:281).
+      -- goal failed and the derivation builds (outputsSubstitutionTried in
+      -- derivation-goal.cc at 2.24.9, haveDerivation at 2.36.0).
       runTest "an output whose cache failed and that the next cache delivers fails nothing, though its sibling has no cache left" $
         let (result, events, _) =
               runRealiseIn
@@ -891,7 +892,7 @@ testRealise = do
               (Right (), [EvFetched [fakePath "lib-dev"], EvBuilt "lib-out", EvBuilt "mid-out", EvBuilt "app-out"])
               (result, realiseWork events),
       -- checkPathValidity refuses an output name the derivation does not
-      -- have (derivation-goal.cc:1500-1503 at 2.24.9), before anything is
+      -- have (derivation-goal.cc at 2.24.9), before anything is
       -- substituted for it.
       runTest "an output a derivation does not have fails the request, naming each in order" $
         let (result, events, _) =
@@ -906,7 +907,9 @@ testRealise = do
               (Left ("derivation '/nix/store/" <> T.replicate 32 "l" <> "-lib.drv' does not have wanted outputs 'lib-bin', 'lib-man'"), [])
               (messageOf result, realiseWork events),
       -- Upstream starts no goal for an input that names no output
-      -- (derivation-goal.cc:352).
+      -- (DerivationGoal::gaveUpOnSubstitution in derivation-goal.cc at
+      -- 2.24.9, DerivationResolutionGoal::realiseInputs in
+      -- derivation-resolution-goal.cc at 2.36.0).
       runTest "an input asked for no output is not realised" $
         let (result, events, _) =
               runRealise Set.empty [fakeNode "app" ["app-out"] [("lib", [])], fakeNode "lib" ["lib-out"] []] [] [] "app"
@@ -1177,9 +1180,9 @@ testRealise = do
                 Realise.MissingOutputs helloDrv ("dev" :| [])
               ]
           ),
-      -- realiseContext asks for one output of a derivation
-      -- (primops.cc:54-58 at 2.24.9), and the goal it gets substitutes the
-      -- outputs it wants alone (DerivationGoal::haveDerivation).
+      -- realiseContext asks for one output of a derivation (primops.cc),
+      -- and the goal it gets substitutes the outputs it wants alone
+      -- (DerivationGoal::haveDerivation).
       runTest "a request for one output of three substitutes it alone, asks about no other, and builds nothing" $
         let (result, events, final) =
               runRequests (fakeWorld [("lib-out", []), ("lib-dev", []), ("lib-doc", [])] []) Set.empty [threeOutputLib] [("lib", ["lib-dev"])]
@@ -1188,7 +1191,8 @@ testRealise = do
               (Right (), [EvFetched [fakePath "lib-dev"]], [fakePath "lib-dev"], Set.singleton (fakePath "lib-dev"))
               (result, realiseWork events, [path | EvQueried path <- events], fwValid final),
       -- One worker keeps one goal for a derivation, whichever request
-      -- reaches it (Worker::makeDerivationGoalCommon, worker.cc:46-61).
+      -- reaches it (Worker::makeDerivationGoalCommon in worker.cc at
+      -- 2.24.9, Worker::initGoalIfNeeded at 2.36.0).
       runTest "an input two requests share is realised once" $
         let (result, events, _) =
               runRequests
@@ -1215,9 +1219,8 @@ testRealise = do
               (Right (), [EvFetched [fakePath "pkg-bin", fakePath "pkg-lib"]], [Realise.Substituted])
               (result, realiseWork events, [status | EvReported status _ <- events]),
       -- A failed goal ends every other unless keep-going is set
-      -- (Worker::removeGoal, worker.cc:162-168 at 2.24.9), and buildPaths
-      -- then names every request its worker did not finish
-      -- (entry-points.cc:41-47).
+      -- (Worker::removeGoal in worker.cc), and buildPaths then names every
+      -- request its worker did not finish (entry-points.cc).
       runTest "a request that fails leaves the ones after it unrealised, and the call names each" $
         let (result, events, _) =
               runRequests
@@ -1237,7 +1240,7 @@ testRealise = do
               runRequests (fakeWorld [] []) (Set.singleton "b-out") [fakeNode "a" ["a-out"] [], fakeNode "b" ["b-out"] []] [("a", ["a-out"]), ("b", ["b-out"])]
          in assertEqual "requests" (Left (Realise.FailedWith (Realise.BuildFailed "building b-out failed")), [EvBuilt "a-out"]) (result, realiseWork events),
       -- The worker's first pass finishes a goal whose outputs are valid
-      -- (worker.cc:319-333), before any build can fail.
+      -- (Worker::run in worker.cc), before any build can fail.
       runTest "a request whose outputs are valid is realised before the others, and a failure does not name it" $
         let (result, events, _) =
               runRequests (fakeWorld [] ["z-out"]) (Set.singleton "a-out") [fakeNode "a" ["a-out"] [], fakeNode "z" ["z-out"] []] [("a", ["a-out"]), ("z", ["z-out"])]
@@ -1255,7 +1258,9 @@ testRealise = do
                 [("b", ["b-out"]), ("c", ["c-out"])]
          in assertEqual "requests" (Left (Realise.FailedWith (Realise.BuildFailed "building d-out failed")), [EvBuilt "c-out"]) (result, realiseWork events),
       -- A failed query is rethrown out of the worker
-      -- (substitution-goal.cc:90-94), so buildPaths does not catch it.
+      -- (PathSubstitutionGoal::init in substitution-goal.cc at 2.24.9,
+      -- PathSubstitutionGoal::substitute at 2.36.0), so buildPaths does
+      -- not catch it.
       runTest "a cache that cannot be asked stops the call and is reported as it is, though requests are left" $
         let (result, events, _) =
               runRequests
@@ -1268,7 +1273,7 @@ testRealise = do
               (Left (Realise.FailedWith (Realise.CacheQueryFailed (fakeQueryFailure (fakePath "a-out")))), [])
               (result, realiseWork events),
       -- checkPathValidity throws in the worker's first pass
-      -- (derivation-goal.cc:1500-1503), before any goal has built.
+      -- (derivation-goal.cc), before any goal has built.
       runTest "a request for an output its derivation lacks stops the call before any request is realised" $
         let (result, events, _) =
               runRequests (fakeWorld [] []) Set.empty [fakeNode "a" ["a-out"] [], fakeNode "b" ["b-out"] []] [("a", ["a-out"]), ("b", ["b-man"])]
@@ -1278,8 +1283,8 @@ testRealise = do
                 (Left ("derivation '/nix/store/" <> T.replicate 32 "b" <> "-b.drv' does not have wanted outputs 'b-man'"))
                 (either (Left . Realise.requestsFailureMessage defaultStoreDir) Right result),
       -- Upstream's worker takes its goals by key, the derivation's name
-      -- and then its path (DerivationGoal::key, derivation-goal.cc:97-104
-      -- at 2.24.9): here the name and the path disagree.
+      -- and then its path (DerivationGoal::key in derivation-goal.cc):
+      -- here the name and the path disagree.
       runTest "of two requests for outputs their derivations lack, the call reports the one named first, not the one whose path sorts first" $
         let first = StorePath (T.replicate 32 "z") "a.drv"
             second = StorePath (T.replicate 32 "b") "b.drv"
@@ -1290,9 +1295,9 @@ testRealise = do
          in assertEqual "requests" (Left (Realise.FailedWith (Realise.MissingOutputs first ("a-man" :| ["a-zed"])))) result,
       -- A derivation's outputs are kept by output name, dev before out,
       -- where upstream's worker runs their substitution goals by key, the
-      -- path's name and then the path (substitution-goal.hh:59-62 at
-      -- 2.24.9).  An out path's name is the derivation's own, so it comes
-      -- first, though its path sorts after dev's here.
+      -- path's name and then the path (PathSubstitutionGoal::key in
+      -- substitution-goal.hh).  An out path's name is the derivation's own,
+      -- so it comes first, though its path sorts after dev's here.
       runTest "a derivation's missing outputs are asked of the caches in the order upstream's worker asks, by path name and then path" $
         let out = StorePath (T.replicate 32 "z") "two"
             dev = StorePath (T.replicate 32 "a") "two-dev"

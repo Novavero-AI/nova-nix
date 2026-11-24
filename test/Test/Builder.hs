@@ -212,8 +212,9 @@ testBuildOrchestrator = do
               then assertEqual "pinned" (Map.fromList [("PATHEXT", ".COM;.EXE;.BAT;.CMD")]) scrubbed
               else assertEqual "empty" Map.empty scrubbed,
       -- Build-time placeholder substitution.  Upstream rewrites the whole
-      -- @name=value@ string (local-derivation-goal.cc:2004), so a sentinel in
-      -- a dynamic attribute name is substituted along with the values.
+      -- @name=value@ string (@runChild@ in local-derivation-goal.cc at
+      -- 2.24.9, unix-derivation-builder.cc at 2.36.0), so a sentinel in a
+      -- dynamic attribute name is substituted along with the values.
       runTest "rewritePlaceholders substitutes an output sentinel" $
         assertEqual
           "substituted"
@@ -3205,7 +3206,7 @@ genDerivationsCase = do
       [if activity == Active then "true" else "false", BS8.pack (show priority), BS8.pack (show (length paths))] ++ paths
 
 -- | Reading the @derivations@ attribute of a @builtin:buildenv@
--- derivation (buildenv.cc:185-201 at 2.35.4).
+-- derivation (@builtinBuildenv@ in buildenv.cc).
 testBuildenvDerivations :: IO [Bool]
 testBuildenvDerivations = do
   putStrLn "builder/buildenv-derivations"
@@ -4014,10 +4015,11 @@ testBuildCheckIO = do
               `andThen` assertEqual "root" rootBefore rootAfter,
       -- Upstream compares the outputs in the order its topological sort
       -- of their references gives, an output after the ones it references
-      -- (registerOutputs, local-derivation-goal.cc:2381-2415 at 2.24.9),
-      -- and throws at the first that differs.  Output a records b's path,
-      -- so b is compared first though a sorts first by name and comes
-      -- first in the derivation, and both differ.
+      -- (registerOutputs in local-derivation-goal.cc at 2.24.9,
+      -- derivation-builder-impl.cc at 2.36.0), and throws at the first
+      -- that differs.  Output a records b's path, so b is compared first
+      -- though a sorts first by name and comes first in the derivation,
+      -- and both differ.
       runTestM "of two outputs that differ the one the other references is named, though the other sorts first" $
         inStore "order" $ \store config -> do
           let aSP = fixture "k" "f" "check-order-a"
@@ -4302,9 +4304,10 @@ testOutputOrderIO = do
     ]
 
 -- | Outputs that reference each other in a cycle fail the build with
--- upstream's message (local-derivation-goal.cc:2406-2408 at 2.24.9) and
--- leave nothing registered, while a one-way reference between outputs and
--- a self-reference build and are recorded.  A rebuilt output referencing a
+-- upstream's message (@registerOutputs@ in local-derivation-goal.cc at
+-- 2.24.9, derivation-builder-impl.cc at 2.36.0) and leave nothing
+-- registered, while a one-way reference between outputs and a
+-- self-reference build and are recorded.  A rebuilt output referencing a
 -- sibling registered before the build is no cycle even when the sibling's
 -- discarded copy references it back, since upstream treats a registered
 -- output as a leaf.
@@ -4739,8 +4742,8 @@ testFetchMirrors = do
 
 -- | @builtin:fetchurl@ with @unpack@ and @executable@, against a loopback
 -- server: the output each makes, its modes once registered, and the
--- recursive hash upstream's builtin gives it (fetchurl.cc:31-59 at
--- 2.24.9).  Each expected NAR is encoded here from the format
+-- recursive hash upstream's builtin gives it (@builtinFetchurl@ in
+-- fetchurl.cc).  Each expected NAR is encoded here from the format
 -- ('narSpecStr'), the bytes upstream's restore and dump reproduce, so the
 -- restore and the hash are held to bytes nova-cache did not write.
 testFetchurlUnpack :: IO [Bool]
@@ -5088,8 +5091,10 @@ testSubstituteFromCaches = do
           -- out's, and the next holds out alone.  Upstream's goal for out
           -- arrives from the next cache and dev's ends for want of a
           -- substitute, so no goal failed and the derivation builds
-          -- (derivation-goal.cc:281).  Out is fetched from the next cache to
-          -- learn that, and not registered, since dev cannot arrive.
+          -- (DerivationGoal::outputsSubstitutionTried in derivation-goal.cc
+          -- at 2.24.9, DerivationGoal::haveDerivation at 2.36.0).  Out is
+          -- fetched from the next cache to learn that, and not registered,
+          -- since dev cannot arrive.
           runTestM "an output that fails at one cache and arrives from the next builds its derivation when a sibling has no cache left" $ do
             let first target _
                   | target == narRequest multiDev = notFound
@@ -5542,8 +5547,9 @@ testBuilder = do
         forceRemoveIfExists tmpStore
         pure ret,
       -- Upstream records the .drv as every output's deriver
-      -- (local-derivation-goal.cc:2738 at 2.24.9), and a push names it in
-      -- the narinfo's Deriver field, a basename as on the wire.
+      -- (registerOutputs in local-derivation-goal.cc at 2.24.9,
+      -- derivation-builder-impl.cc at 2.36.0), and a push names it in the
+      -- narinfo's Deriver field, a basename as on the wire.
       runTestM "every built output names its .drv as its deriver, and a push's narinfo carries it" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-deriver"
@@ -6227,9 +6233,9 @@ testBuilder = do
     ]
 
 -- | The tail of upstream's refusal of an output under a flat hash that is
--- not a regular file its owner may not execute (@registerOutputs@,
--- local-derivation-goal.cc:2505-2507 at 2.24.9); the message opens with
--- the output's path.
+-- not a regular file its owner may not execute (@registerOutputs@ in
+-- local-derivation-goal.cc at 2.24.9, derivation-builder-impl.cc at
+-- 2.36.0); the message opens with the output's path.
 flatOutputRefusal :: Text
 flatOutputRefusal = "should be a non-executable regular file since recursive hashing is not enabled (one of outputHashMode={flat,text} is true)"
 

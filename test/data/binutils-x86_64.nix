@@ -11,8 +11,8 @@
 # ld, given the i386pe emulation, link a function that returns 42 as an
 # i386 program's entry point, as test/data/binutils.nix does for i686,
 # and that program run.  dlltool assembles parts of the library with the
-# as of its own directory and prefix (binutils/dlltool.c:4189-4260).  The
-# x86_64 program exits through ExitProcess because under the x86_64
+# as of its own directory and prefix (deduce_name in binutils/dlltool.c).
+# The x86_64 program exits through ExitProcess because under the x86_64
 # emulation of Windows ARM64 the value its entry point returns is not its
 # exit status, as it is on x64 and for an i386 program on either.  The
 # function takes 40 bytes of stack before the call, as the x64 calling
@@ -28,17 +28,18 @@
 # Windows is the PE format's little-endian.  The answer,
 # test/data/binutils-x86_64-link-answer.txt, is derived: nm prints a
 # 64-bit address in 16 digits, or 16 blanks for an undefined symbol
-# (binutils/nm.c:1855-1860), and an x86_64 PE symbol with no underscore
-# (bfd/config.bfd:719); the import library defines __imp_ExitProcess as
-# the slot of the import address table the loader fills with
-# ExitProcess's address (binutils/dlltool.c:2420); nm sorts by the
+# (print_symbol_info_bsd in binutils/nm.c), and an x86_64 PE symbol with
+# no underscore (targ_underscore in the x86_64-*-mingw* case of
+# bfd/config.bfd); the import library defines __imp_ExitProcess as the
+# slot of the import address table the loader fills with ExitProcess's
+# address (make_one_lib_file in binutils/dlltool.c); nm sorts by the
 # collation of Windows' own locale (see test/data/gcc46.nix), so it
 # lists answer.o's symbols unsorted, in the order COFF writes them, the
-# undefined after the defined (bfd/coffgen.c:810-853); objdump names the
-# formats pei-x86-64 and pei-i386 (bfd/pei-x86_64.c:28, bfd/pei-i386.c);
-# and the x86_64 program's exit status is the value it passes
-# ExitProcess, the i386 program's the value its one thread's entry point
-# returns.
+# undefined after the defined (coff_renumber_symbols in bfd/coffgen.c);
+# objdump names the formats pei-x86-64 and pei-i386 (TARGET_NAME in
+# bfd/pei-x86_64.c and bfd/pei-i386.c); and the x86_64 program's exit
+# status is the value it passes ExitProcess, the i386 program's the
+# value its one thread's entry point returns.
 #
 # stamps lists every program and DLL binutils-x86_64 installs with the
 # TimeDateStamp of its COFF file header, as test/data/gcc-latest.nix's

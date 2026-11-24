@@ -10,11 +10,11 @@
 # decides by linking a test whether crt2.o defines __CTOR_LIST__ itself,
 # and a test that fails on Windows for another reason changes the symbols,
 # not the build's exit status.  nm sorts with the collation of Windows'
-# own locale (setlocale (LC_COLLATE, "") and strcoll, binutils/nm.c:1959
-# and 888), which msvcrt takes from the system whatever the environment
-# says, so the symbols are listed unsorted and sorted by name with
-# busybox's sort, which compares bytes.  Compared with
-# test/data/gcc46-crt-answer.txt.
+# own locale (setlocale (LC_COLLATE, "") in main and strcoll in
+# non_numeric_forward, binutils/nm.c), which msvcrt takes from the
+# system whatever the environment says, so the symbols are listed
+# unsorted and sorted by name with busybox's sort, which compares bytes.
+# Compared with test/data/gcc46-crt-answer.txt.
 #
 # hello has gcc46's driver compile hello.c and link it, with no flag naming
 # a directory, into a program that runs: a line through msvcrt.dll's puts,

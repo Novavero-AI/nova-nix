@@ -479,12 +479,12 @@ testEvalComparison = do
       -- Upstream's eqValues compares two derivations by their outPaths,
       -- takes sets of different sizes as unequal, and walks two sets of
       -- one size pair by pair in symbol order, each pair's names and then
-      -- its values, stopping at the first difference (eval.cc:2763-2782
-      -- at 2.24.9).  A symbol's order is the order the table interned the
-      -- name in, so the walk's order is pinned in a child process, whose
-      -- table is new: there, as under upstream, the names below are
-      -- interned in the order the expression gives them, since neither
-      -- evaluator interns them at startup.
+      -- its values, stopping at the first difference (eval.cc).  A
+      -- symbol's order is the order the table interned the name in, so
+      -- the walk's order is pinned in a child process, whose table is
+      -- new: there, as under upstream, the names below are interned in
+      -- the order the expression gives them, since neither evaluator
+      -- interns them at startup.
       emits
         "== compares a pair's values before a later pair's names"
         "builtins.trace ({ zq1 = throw \"x\"; zq2 = 1; } == { zq1 = 1; zq3 = 1; }) null"
@@ -659,9 +659,8 @@ testEvalAttrs = do
       runTest "update with a string right operand" $
         assertEvalError "update-string-right" "{} // \"x\"" "expected a set but found a string: \"x\"",
       -- The update queue of 2.34 and later evaluates and checks the right
-      -- operand before it evaluates the left (evalForUpdate,
-      -- eval.cc:2014-2019 at 2.34.9, the same at 2.35.4); 2.24.9 does the
-      -- left first.
+      -- operand before it evaluates the left (ExprOpUpdate::evalForUpdate
+      -- in eval.cc); 2.24.9 does the left first.
       runTest "update with two non-set operands reports the right" $
         assertEvalError "update-both" "1 // \"x\"" "expected a set but found a string: \"x\"",
       runTest "update evaluates a throwing right before checking the left" $
@@ -711,9 +710,8 @@ testSharedEmptySet :: IO [Bool]
 testSharedEmptySet = do
   putStrLn "eval/shared-empty-set"
   sequence
-    [ -- ExprOpUpdate::eval (eval.cc:1908-1911 at 2.24.9): the left
-      -- operand's emptiness is checked first, so two empty operands give
-      -- the right one.
+    [ -- ExprOpUpdate::eval (eval.cc): the left operand's emptiness is
+      -- checked first, so two empty operands give the right one.
       runTestM "an update with an empty operand is the other operand's set, the left checked first, and otherwise a new right-biased set" $
         quickCheckPasses $
           QC.forAll ((,) <$> genUpdateOperand <*> genUpdateOperand) $ \(leftShape, rightShape) -> QC.ioProperty $ do
@@ -909,8 +907,8 @@ testValuePrinter = do
           ("expected a list but found a set: { a = " <> marker "potential infinite recursion" <> "; }"),
       -- A set or list the print reaches again prints as upstream's
       -- repeated marker: a set by its bindings, any empty one among them,
-      -- and a list with elements by the cell holding it (print.cc:330-335
-      -- and :408-413 at 2.24.9).  The first two expect nix-instantiate
+      -- and a list with elements by the cell holding it (printAttrs and
+      -- printList in print.cc).  The first two expect nix-instantiate
       -- 2.24.9's final error lines for the same expressions.
       runTestM "a set reached twice prints as repeated the second time" $
         assertEvalErrorIO
@@ -932,9 +930,10 @@ testValuePrinter = do
           (setFound ("{ p = { }; q = " <> marker "repeated" <> "; }")),
       -- Upstream gives bindings of their own to removeAttrs of every
       -- attribute, intersectAttrs of sets with no name in common, and a
-      -- literal whose every name is a null dynamic one (primops.cc:2852,
-      -- :2945, eval.cc:1193 at 2.24.9), and shares the rest, a removal
-      -- from an empty set among them.
+      -- literal whose every name is a null dynamic one (prim_removeAttrs
+      -- and prim_intersectAttrs in primops.cc, ExprAttrs::eval in
+      -- eval.cc), and shares the rest, a removal from an empty set among
+      -- them.
       runTestM "an empty set upstream gives bindings of its own prints in full after the shared one" $
         assertEvalErrorIO
           tmpBase
@@ -945,7 +944,7 @@ testValuePrinter = do
           )
           (setFound ("{ e = { }; f = " <> marker "repeated" <> "; i = { }; n = { }; r = { }; }")),
       -- ExprOpUpdate::eval copies the other operand's Value when one is
-      -- empty (eval.cc:1908-1909 at 2.24.9), bindings and all.
+      -- empty (eval.cc), bindings and all.
       runTestM "an update with an empty operand prints as repeated after the other operand" $
         assertEvalErrorIO
           tmpBase
@@ -1227,12 +1226,13 @@ genAttrName =
 -- ---------------------------------------------------------------------------
 
 -- | A value reached twice is entered once: upstream's deep force skips a
--- value it has forced (@forceValueDeep@, eval.cc:2099-2131 at 2.24.9),
--- and its printers print a set or list they have printed as repeated
--- (print-ambiguous.cc:38-66, print.cc:330-446).  A derivation holds
--- itself through its @all@ and output attributes, so neither ends on one
--- without that.  Each case runs under 'repeatedWatchdogMicros', and a
--- print is read only one byte past what is expected.
+-- value it has forced (@forceValueDeep@ in eval.cc), and its printers
+-- print a set or list they have printed as repeated (@printAmbiguous@ in
+-- print-ambiguous.cc, @printAttrs@ and @printList@ in print.cc).  A
+-- derivation holds itself through its @all@ and output attributes, so
+-- neither ends on one without that.  Each case runs under
+-- 'repeatedWatchdogMicros', and a print is read only one byte past what
+-- is expected.
 testRepeatedValues :: IO [Bool]
 testRepeatedValues = do
   putStrLn "eval/repeated"
@@ -1259,16 +1259,16 @@ testRepeatedValues = do
           result <- evaluate (evalNix "let x = { a = x; }; in builtins.deepSeq x 1")
           pure (assertRight "deepSeq-self-pure" result (assertEqual "deepSeq-self-pure" (VInt 1))),
       -- Identity, not equality, and an empty set or list is never
-      -- repeated (print-ambiguous.cc:39, :53).
+      -- repeated (printAmbiguous in print-ambiguous.cc).
       printsStrict "a set reached twice prints as repeated the second time" "let a = { x = 1; }; in [ a a ]" ("[ { x = 1; } " <> repeatedMarker <> " ]"),
       -- An update with an empty operand is the other operand's Value,
-      -- bindings and all (eval.cc:1908-1909 at 2.24.9).
+      -- bindings and all (ExprOpUpdate::eval in eval.cc).
       printsStrict
         "an update with an empty operand prints as repeated after the other operand"
         "let a = { x = 1; }; in [ a (a // { }) ({ } // a) (a // { y = 2; }) ]"
         ("[ { x = 1; } " <> repeatedMarker <> " " <> repeatedMarker <> " { x = 1; y = 2; } ]"),
       -- Upstream's prim_tryEval builds the result's bindings afresh on
-      -- each call (primops.cc:895-923 at 2.24.9), a failed one included.
+      -- each call (primops.cc), a failed one included.
       printsStrict
         "two failed tryEvals are two sets"
         "[ (builtins.tryEval (throw \"a\")) (builtins.tryEval (throw \"b\")) ]"
@@ -1277,8 +1277,8 @@ testRepeatedValues = do
       printsStrict "an empty set or list reached twice prints in full both times" "let e = { }; l = [ ]; in [ e e l l ]" "[ { } { } [ ] [ ] ]",
       -- Upstream keeps the elements of a list of one or two in the Value
       -- that holds it, and a longer list's in an array its copies share
-      -- (value.hh:407-410), so a function's two results are two short
-      -- lists but one long one.
+      -- (listElems in value.hh at 2.24.9), so a function's two results
+      -- are two short lists but one long one.
       printsStrict
         "a short list is one per cell and a long one is one however many cells hold it"
         "let f = y: y; s = [ 1 2 ]; l = [ 1 2 3 ]; in [ (f s) (f s) s s (f l) (f l) ]"
@@ -2225,7 +2225,7 @@ testRegionCensus = do
 
 -- | A chain of @//@: its operands evaluated last to first and merged from
 -- the first, as upstream 2.34's update queue gathers and folds them
--- (eval.cc:1991-2029 at 2.34.9, the same at 2.35.4).
+-- (@ExprOpUpdate::evalForUpdate@ and @ExprOpUpdate::eval@ in eval.cc).
 testUpdateChains :: IO [Bool]
 testUpdateChains = do
   putStrLn "eval/update-chains"
@@ -2297,7 +2297,7 @@ testAllocSites = do
             added <- sitesAdded (mapM_ allocateSet allocations)
             pure (fmap sitesSets added QC.=== Right (setsExpected allocations)),
       -- Upstream's allocBindings answers a size of 0 with its one
-      -- emptyBindings (attr-set.cc:16-17 at 2.24.9).
+      -- emptyBindings (attr-set.cc).
       runTestM "every set built with no attributes is the shared empty set, at every site" $
         quickCheckPasses $
           QC.forAll ((,) <$> QC.arbitraryBoundedEnum <*> QC.listOf (QC.elements ["a", "b", "c"])) $ \(site, removed) -> QC.ioProperty $ do
@@ -2311,9 +2311,9 @@ testAllocSites = do
                 keep (attrSetRemoveKeys site removed emptyAttrSet)
             sets <- readIORef built
             pure ((sets, fmap sitesSets added) QC.=== (replicate 4 (unAttrSet emptyAttrSet), Right Map.empty)),
-      -- Upstream sizes a literal and intersectAttrs' result before it
-      -- knows what they hold (eval.cc:1193, primops.cc:2945 at 2.24.9),
-      -- and gives bindings of their own to a size above 0.
+      -- Upstream sizes a literal and intersectAttrs' result before it knows
+      -- what they hold (ExprAttrs::eval in eval.cc, prim_intersectAttrs in
+      -- primops.cc), and gives bindings of their own to a size above 0.
       runTestM "a set sized for attributes that holds none is an empty set of its own, counted and not shareable" $
         quickCheckPasses $
           QC.forAll ((,) <$> QC.arbitraryBoundedEnum <*> QC.chooseInt (1, 4)) $ \(site, size) -> QC.ioProperty $ do
@@ -2337,10 +2337,10 @@ testAllocSites = do
       -- Upstream layers a right operand of at most 16 attributes on a left
       -- whose chain is not full, adding the right's size to
       -- nrOpUpdateValuesCopied, and else merges, adding the result's
-      -- (eval.cc:1932-1988 at 2.34.9).  A set built here is flat, so its
-      -- chain is not full.  An empty operand, which the evaluator never
-      -- passes, makes a union, which counts as shareable, and two make one
-      -- with the default room.
+      -- (ExprOpUpdate::eval in eval.cc at 2.34.9).  A set built here is
+      -- flat, so its chain is not full.  An empty operand, which the
+      -- evaluator never passes, makes a union, which counts as shareable,
+      -- and two make one with the default room.
       runTestM "an update layers a right operand of at most 16 entries and counts its entries as copied, else merges and counts the result's, and a union counts none" $ do
         pool <- mapM (\i -> symbolIntern ("copied_" <> T.pack (show (i :: Int)))) [1 .. 30]
         let build keys = do
@@ -2456,8 +2456,8 @@ testAllocSites = do
         (updateSource "{ a = 1; }" (singleRights setMaxLayers))
         (fromIntegral setMaxLayers - 1 + 9),
       -- A chain folds from its first operand, as upstream 2.34's update
-      -- queue does (eval.cc:1991-2005 at 2.34.9): { c } layers on { a, b },
-      -- and { d } on that, one entry each, as 2.34.9's
+      -- queue does (ExprOpUpdate::eval in eval.cc): { c } layers on
+      -- { a, b }, and { d } on that, one entry each, as 2.34.9's
       -- nrOpUpdateValuesCopied counts them.
       copiesTest
         "a chain of updates copies what each update layers"
@@ -2475,8 +2475,8 @@ testAllocSites = do
         []
         [(SetLiteral, SetSiteFigures 9 0 (9 * setBytes 1)), (SetUpdate, SetSiteFigures 8 0 (7 * setBytes 1 + setBytes 9))],
       -- 2.34's update queue evaluates every operand before it merges any
-      -- (eval.cc:1991-2005 at 2.34.9), so a chain one of whose operands
-      -- fails merges nothing, whichever operand it is.
+      -- (ExprOpUpdate::eval in eval.cc), so a chain one of whose
+      -- operands fails merges nothing, whichever operand it is.
       copiesTest
         "a chain of updates one of whose operands fails copies nothing"
         "builtins.deepSeq [ (builtins.tryEval ({ a = 1; } // { b = 2; } // throw \"x\")) (builtins.tryEval ({ a = 1; } // throw \"x\" // { b = 2; })) ] null"
@@ -2864,7 +2864,7 @@ testFrameKnots = do
       -- use, in a new frame.
       -- One thunk of an inherit's from-expression serves every name it
       -- gives, as upstream's ExprAttrs::buildInheritFromEnv makes one
-      -- (eval.cc:1179-1189 at 2.24.9), so the expression runs once.
+      -- (eval.cc), so the expression runs once.
       emits
         "an inherit's from-expression is evaluated once for all the names it gives"
         "builtins.deepSeq { inherit (builtins.trace \"e\" { a = 1; b = 2; }) a b; } null"
@@ -3449,9 +3449,9 @@ testEvalHigherOrder = do
       -- listToAttrs
       runTest "listToAttrs" $
         assertEval "listToAttrs" "(builtins.listToAttrs [ { name = \"x\"; value = 1; } { name = \"y\"; value = 2; } ]).x" (VInt 1),
-      -- prim_listToAttrs (primops.cc:2881-2904 at 2.24.9) looks value up
-      -- only for a name it has not seen, and getAttr (primops.cc:641-651)
-      -- words a missing attribute.
+      -- prim_listToAttrs (primops.cc) looks value up only for a name it
+      -- has not seen, and getAttr (primops.cc at 2.24.9, EvalState::getAttr
+      -- in eval.cc at 2.36.0) words a missing attribute.
       runTest "listToAttrs reads no value for a name already seen" $
         assertEval "listToAttrs-repeat" "builtins.listToAttrs [ { name = \"a\"; value = 1; } { name = \"a\"; } ] == { a = 1; }" (VBool True),
       runTest "listToAttrs reads every element's name" $
@@ -3839,7 +3839,7 @@ testBatch3 = do
           "builtins.length (builtins.zipAttrsWith (name: vals: vals) [ { a = 1; } { a = 2; } ]).a"
           (VInt 2),
       -- Upstream fills each name's list from the list's sets first to
-      -- last (primops.cc:3158-3163 at 2.24.9).
+      -- last (prim_zipAttrsWith in primops.cc).
       runTest "zipAttrsWith gathers each name's values in list order" $
         assertEval
           "zipAttrs-order"
@@ -4231,13 +4231,13 @@ testDerivationPathFieldsIO = do
   pure results
 
 -- | A derivation whose pass reads an @outputHash@ is fixed-output, an
--- empty one and one coerced from another type included (primops.cc:1347-1351,
--- 1425-1437 at 2.24.9): its outputs must be @out@ alone, and the hash is
--- read with newHashAllowEmpty (hash.cc:271-281), so an empty one is the
--- all-zero digest of the algorithm @outputHashAlgo@ names.  A fixed
--- output's path depends on its name, mode and hash alone, so an empty
--- hash's path is the all-zero hash's.  Each expected message is upstream's
--- at 2.24.9, read from its source.
+-- empty one and one coerced from another type included
+-- (@derivationStrictInternal@ in primops.cc): its outputs must be @out@
+-- alone, and the hash is read with newHashAllowEmpty (hash.cc), so an
+-- empty one is the all-zero digest of the algorithm @outputHashAlgo@
+-- names.  A fixed output's path depends on its name, mode and hash alone,
+-- so an empty hash's path is the all-zero hash's.  Each expected message
+-- is upstream's at 2.24.9, read from its source.
 testFixedOutputHash :: IO [Bool]
 testFixedOutputHash = do
   putStrLn "eval/fixed-output-hash"
@@ -4274,11 +4274,11 @@ testFixedOutputHash = do
     ]
 
 -- | An @outputHashMode@ is read as upstream's @handleHashMode@ reads it
--- (primops.cc:1230-1245 at 2.24.9), in the pass over the attributes, for
--- every derivation: @nar@ and @recursive@ hash a NAR, @flat@ the bytes,
--- @text@ and @git@ need experimental features nova-nix does not
--- implement, and anything else is refused.  Each expected message is
--- upstream's at 2.24.9, read from its source.
+-- (primops.cc), in the pass over the attributes, for every derivation:
+-- @nar@ and @recursive@ hash a NAR, @flat@ the bytes, @text@ and @git@
+-- need experimental features nova-nix does not implement, and anything
+-- else is refused.  Each expected message is upstream's at 2.24.9, read
+-- from its source.
 testOutputHashMode :: IO [Bool]
 testOutputHashMode = do
   putStrLn "eval/output-hash-mode"
@@ -4387,12 +4387,12 @@ testPathArgumentsIO = do
   pure results
 
 -- | @builtins.path@ reads its arguments as upstream's @prim_path@ does
--- (primops.cc:2558-2597 at 2.24.9).  @recursive = false@ copies the one
--- file at the path by its bytes, to the flat fixed-output path of those
--- bytes, with the pin read as their SHA-256 and the filter never called,
--- and refuses a directory as upstream's flat read does; an argument it
--- does not take is refused at its turn.  Each expected message is
--- upstream's at 2.24.9, read from its source.
+-- (primops.cc).  @recursive = false@ copies the one file at the path by
+-- its bytes, to the flat fixed-output path of those bytes, with the pin
+-- read as their SHA-256 and the filter never called, and refuses a
+-- directory as upstream's flat read does; an argument it does not take
+-- is refused at its turn.  Each expected message is upstream's at
+-- 2.24.9, read from its source.
 testPathMethodIO :: IO [Bool]
 testPathMethodIO = do
   putStrLn "eval/path-method-io"
@@ -4446,8 +4446,9 @@ testPathMethodIO = do
         fails "an argument it does not take is refused before anything is copied" ("builtins.path { path = " <> quoted "missing" <> "; foo = 1; }") (unsupported "foo"),
         -- The arguments are read in the set's own order, by interned
         -- symbol, and both evaluators intern path before any name a
-        -- program brings (eval.cc:265 at 2.24.9), so path is read first
-        -- wherever the program writes it.
+        -- program brings (sPath in the EvalState constructor in eval.cc
+        -- at 2.24.9, StaticEvalSymbols in eval.hh at 2.36.0), so path is
+        -- read first wherever the program writes it.
         fails "an argument read before the one it does not take fails first" "builtins.path { foo = 1; path = throw \"p\"; }" "p"
       ]
         ++ [gives "a symlink is copied flat as the file it names, under its own name" ("path = " <> quoted "link" <> "; recursive = false;") linkPath | canLink]
@@ -4548,7 +4549,7 @@ testDerivationTraceIO = do
           (renderEvalFailure (EvalFailure ["while evaluating attribute 'foo' of derivation 'x'"] "a\nb")),
       runTest "a failure with no trace renders on the error line" $
         assertEqual "render-untraced" "error: a\n       b" (renderEvalFailure (EvalFailure [] "a\nb")),
-      -- showErrorInfo passes over a trace whose text is empty (error.cc:386).
+      -- showErrorInfo passes over a trace whose text is empty (error.cc).
       runTest "an empty line of context is left out" $
         assertEqual
           "render-empty-line"
@@ -4558,10 +4559,10 @@ testDerivationTraceIO = do
 
 -- | @builtins.addErrorContext@ forces its value and coerces its message
 -- only when that fails, in the catch around the force, and the value's
--- failure escapes whatever the message does (@prim_addErrorContext@,
--- primops.cc:1027-1055 at 2.36.0).  The pure evaluator reports a
--- failure's message alone, so these see which failure escapes, not the
--- line it carries.
+-- failure escapes whatever the message does (@prim_addErrorContext@ in
+-- primops.cc at 2.36.0).  The pure evaluator reports a failure's
+-- message alone, so these see which failure escapes, not the line it
+-- carries.
 testErrorContext :: IO [Bool]
 testErrorContext = do
   putStrLn "eval/error-context"
@@ -4582,9 +4583,8 @@ testErrorContext = do
 
 -- | The line @builtins.addErrorContext@ adds to a failure's trace under
 -- the IO evaluator, and how the CLI reports it: upstream's @addTrace@ in
--- @prim_addErrorContext@ (primops.cc:831-844 at 2.24.9), printed by
--- @showErrorInfo@ (error.cc at 2.24.9) with its positioned lines left
--- out.
+-- @prim_addErrorContext@ (primops.cc), printed by @showErrorInfo@
+-- (error.cc at 2.24.9) with its positioned lines left out.
 testErrorContextIO :: IO [Bool]
 testErrorContextIO = do
   putStrLn "eval/error-context-io"
@@ -4638,10 +4638,9 @@ testErrorContextIO = do
     ]
 
 -- | The lines of context a failure gathers in listToAttrs, upstream's from
--- prim_listToAttrs (primops.cc:2881-2904 at 2.24.9): forceList's and
--- forceAttrs's on their type errors alone, forceStringNoCtx's on any
--- failure reading the name, and getAttr's on a missing attribute.  Only the
--- IO evaluator keeps them.
+-- prim_listToAttrs (primops.cc): forceList's and forceAttrs's on their type
+-- errors alone, forceStringNoCtx's on any failure reading the name, and
+-- getAttr's on a missing attribute.  Only the IO evaluator keeps them.
 testListToAttrsTraceIO :: IO [Bool]
 testListToAttrsTraceIO = do
   putStrLn "eval/listToAttrs-trace"
@@ -4756,8 +4755,8 @@ testPathFilterBody = do
 -- | Interpolating a path that is a symlink copies the link, and one below
 -- a symlinked directory the file it names: upstream's copyPathToStore
 -- stores path.resolveSymlinks(SymlinkResolution::Ancestors) under
--- path.baseName() (eval.cc:2574 at 2.34.9, :2602 at 2.35.4), where 2.24.9
--- resolved the path in full and copied what a link points to.
+-- path.baseName() (eval.cc at 2.34.9), where 2.24.9 resolved the path in
+-- full and copied what a link points to.
 testInterpolatedSymlinkIO :: IO [Bool]
 testInterpolatedSymlinkIO = do
   putStrLn "eval/interpolated-symlink-io"
@@ -4877,11 +4876,11 @@ testSourceReadErrorsBody = do
 -- every entry's lstat is refused.  Upstream's readDirectory gives such an
 -- entry no type and prim_readDir binds it to a deferred readFileType of
 -- its path under the directory with its symlinks resolved
--- (posix-source-accessor.cc:138-149, primops.cc:2027-2051 at 2.24.9):
--- the listing names every entry, and only forcing one fails, as
--- readFileType on it fails.  The owner keeps read permission and loses
--- search; where that does not refuse the lstat (Windows, where the mode
--- does not govern a lookup, or root) the group is skipped.
+-- (posix-source-accessor.cc and primops.cc at 2.24.9): the listing names
+-- every entry, and only forcing one fails, as readFileType on it fails.
+-- The owner keeps read permission and loses search; where that does not
+-- refuse the lstat (Windows, where the mode does not govern a lookup, or
+-- root) the group is skipped.
 testReadDirUntypedEntriesIO :: IO [Bool]
 testReadDirUntypedEntriesIO = do
   putStrLn "eval/readdir-untyped-entries-io"
@@ -5195,11 +5194,11 @@ plainStringRefusal text =
   "the string '" <> text <> "' is not allowed to refer to a store path (such as '00000000000000000000000000000000-a')"
 
 -- | Every builtin that reads a plain string reads it as upstream's
--- @forceStringNoCtx@ does (eval.cc:2253-2258 and primops.cc at 2.24.9):
--- a string with context is refused, naming the context's first element,
--- and the same string with its context discarded is read as before.
--- @split@ gives back a string its pattern does not match, context and
--- all, as upstream's returns its argument (primops.cc:4309-4312).
+-- @forceStringNoCtx@ does (eval.cc and primops.cc): a string with
+-- context is refused, naming the context's first element, and the same
+-- string with its context discarded is read as before.  @split@ gives
+-- back a string its pattern does not match, context and all, as
+-- upstream's returns its argument (@prim_split@ in primops.cc).
 testPlainStringContext :: IO [Bool]
 testPlainStringContext = do
   putStrLn "eval/plain-string-context"
@@ -5338,7 +5337,8 @@ testUnsafeGetAttrPos = do
       inFile "removeAttrs keeps the positions it keeps" "builtins.unsafeGetAttrPos \"b\" (builtins.removeAttrs {\n  a = 1;\n  b = 2;\n} [ \"a\" ])" (3, 3),
       inFile "intersectAttrs keeps the right set's position" "builtins.unsafeGetAttrPos \"a\" (builtins.intersectAttrs { a = null; } {\n  a = 1;\n})" (2, 3),
       -- Upstream walks the left set when it is the smaller, and keeps the
-      -- attribute it finds in the right (primops.cc:2985-2990 at 2.24.9).
+      -- attribute it finds in the right (prim_intersectAttrs in
+      -- primops.cc).
       inFile "intersectAttrs keeps the right set's position when the left is smaller" "builtins.unsafeGetAttrPos \"a\" (builtins.intersectAttrs { a = null; } {\n  a = 1;\n  b = 2;\n})" (2, 3),
       inFile "listToAttrs is at the element's value" "builtins.unsafeGetAttrPos \"k\" (builtins.listToAttrs [ {\n  name = \"k\";\n  value = 1;\n} ])" (3, 3),
       noPosition "mapAttrs makes attributes with none" "builtins.unsafeGetAttrPos \"a\" (builtins.mapAttrs (n: v: v) {\n  a = 1;\n})",
@@ -6282,8 +6282,8 @@ testUpstreamConformance = do
           "hash-truncated"
           "builtins.convertHash { hash = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85\"; hashAlgo = \"sha256\"; toHashFormat = \"base16\"; }",
       -- An algorithm name upstream does not know is refused with
-      -- parseHashAlgo's message (hash.cc:435-442 at 2.24.9), and
-      -- convertHash parses hashAlgo before the hash (primops.cc:4100-4108).
+      -- parseHashAlgo's message (hash.cc at 2.24.9), and convertHash parses
+      -- hashAlgo before the hash (prim_convertHash in primops.cc).
       runTest "unknown hash algorithm is rejected" $
         assertEvalError
           "hash-bad-algo"
@@ -6292,7 +6292,7 @@ testUpstreamConformance = do
       runTest "hashString refuses an unknown algorithm with upstream's message" $
         assertEvalError "hashString-bad-algo" "builtins.hashString \"sha3\" \"\"" unknownSha3,
       -- A base16 or nix32 digest that does not decode is refused as the
-      -- Hash constructor refuses it (hash.cc:214, :232, :242 at 2.24.9).
+      -- Hash constructor refuses it (hash.cc at 2.24.9).
       runTest "a base16 digest with a character outside its alphabet is refused" $
         assertEvalError "base16-invalid" (toBase16 ("sha256:" <> badBase16)) ("invalid base-16 hash '" <> badBase16 <> "'"),
       runTest "a nix32 digest with a character outside its alphabet is refused" $
@@ -6300,8 +6300,8 @@ testUpstreamConformance = do
       runTest "a nix32 digest with bits past the end of the digest is refused" $
         assertEvalError "base32-overflow" (toBase16 ("sha256:" <> overflowingNix32)) ("invalid base-32 hash '" <> overflowingNix32 <> "'"),
       -- convertHash hands a given hashAlgo to Hash::parseAny
-      -- (primops.cc:4108 at 2.24.9), which refuses a tag that names
-      -- another algorithm and needs one or the other (hash.cc:184-198).
+      -- (prim_convertHash in primops.cc), which refuses a tag that names
+      -- another algorithm and needs one or the other (hash.cc).
       runTest "convertHash refuses a tag that names another algorithm than hashAlgo" $
         assertEvalError
           "convertHash-tag-mismatch"
@@ -6361,9 +6361,10 @@ testUpstreamConformance = do
         case evalNix "(derivation { name = \"t\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputHash = \"sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"; outputHashAlgo = \"sha256\"; }).drvPath" of
           Right _ -> Pass
           Left err -> Fail ("expected success, got: " <> err),
-      -- outputHashAlgo is read with parseHashAlgoOpt (primops.cc:1352 at
-      -- 2.24.9), which gives no algorithm for a name it does not know, so
-      -- the hash's own tag decides, and an untagged hash has no type.
+      -- outputHashAlgo is read in derivationStrictInternal (primops.cc)
+      -- with parseHashAlgoOpt, which gives no algorithm for a name it does
+      -- not know, so the hash's own tag decides, and an untagged hash has
+      -- no type.
       runTest "fixed-output unknown outputHashAlgo gives way to the SRI tag" $
         assertEval
           "fixed-output-unknown-algo"
@@ -6410,8 +6411,8 @@ testUpstreamConformance = do
       runTest "a newline in a base64 hash is skipped" $
         assertEval "base64-newline" (toBase16 "sha256-47DEQpj8HBSa+/TImW+5JCeu\\nQeRkm5NMpJWZG3hSuFU=") (mkStr "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
       -- A refused character and a wrong decoded length are one error
-      -- upstream (hash.cc:247-258 at 2.24.9), which drops the decoder's
-      -- own exception.
+      -- upstream (the Hash constructor in hash.cc at 2.24.9, parseLowLevel
+      -- there at 2.36.0), which drops the decoder's own exception.
       runTest "a carriage return in an SRI hash is refused" $
         assertEvalError "sri-carriage-return" (toBase16 "sha256-47DEQpj8HBSa+/TImW+5JCeu\\rQeRkm5NMpJWZG3hSuFU=") "invalid SRI hash '47DEQpj8HBSa+/TImW+5JCeu\rQeRkm5NMpJWZG3hSuFU='",
       runTest "a character outside the base64 alphabet in an SRI hash is refused" $
@@ -6419,9 +6420,9 @@ testUpstreamConformance = do
       runTest "a character outside the base64 alphabet in a prefixed hash is refused" $
         assertEvalError "base64-url-safe" (toBase16 "sha256:47DEQpj8HBSa+_TImW+5JCeuQeRkm5NMpJWZG3hSuFU=") "invalid base-64 hash '47DEQpj8HBSa+_TImW+5JCeuQeRkm5NMpJWZG3hSuFU='",
       -- The algorithm tag ends at the first ':', else at the first '-'
-      -- (getParsedTypeAndSRI, hash.cc:150-169 at 2.24.9), so a separator
-      -- after the padding, which the decoder never reads, still decides
-      -- the tag.
+      -- (getParsedTypeAndSRI in hash.cc at 2.24.9, parseAnyHelper at
+      -- 2.36.0), so a separator after the padding, which the decoder
+      -- never reads, still decides the tag.
       runTest "a '-' after the padding of a prefixed hash is ignored" $
         assertEval "prefixed-dash" (toBase16 "md5:AAAAAAAAAAAAAAAAAAAAAA=-") (mkStr "00000000000000000000000000000000"),
       runTest "a ':' after the padding of an SRI hash makes its tag an unknown algorithm" $
@@ -6612,9 +6613,10 @@ genBase64Text =
 base64Alphabet :: BS.ByteString
 base64Alphabet = BS8.pack (['A' .. 'Z'] ++ ['a' .. 'z'] ++ ['0' .. '9'] ++ "+/")
 
--- | Upstream's @base64Decode@ loop (util.cc:240-275 at 2.24.9), one byte
--- of the string at a time, its accumulator an unsigned 32-bit integer as
--- there.  'Nothing' where upstream throws.
+-- | Upstream's @base64Decode@ loop (util.cc at 2.24.9, @base64::decode@
+-- in base-n.cc at 2.36.0), one byte of the string at a time, its
+-- accumulator an unsigned 32-bit integer as there.  'Nothing' where
+-- upstream throws.
 base64DecodeModel :: [Word8] -> Maybe [Word8]
 base64DecodeModel = go 0 0 []
   where
@@ -6745,11 +6747,11 @@ testEvalFidelity = do
       -- each dynamic name in source order: it evaluates the name, skips a
       -- null, interns it, and raises an error naming where a name bound
       -- so far was defined, before it evaluates the next name
-      -- (eval.cc:1247-1275 at 2.24.9).  A name is defined at its
-      -- attribute path's first token (parser.y:367-380), and a position
-      -- in text with no file is in upstream's string origin
-      -- (position.cc:69-83).  A key of a plain string is a name, so each
-      -- key here concatenates to stay dynamic.
+      -- (eval.cc).  A name is defined at its attribute path's first token
+      -- (binds in parser.y at 2.24.9, binds1 at 2.36.0), and a position
+      -- in text with no file is in upstream's string origin (Pos::print
+      -- in position.cc).  A key of a plain string is a name, so each key
+      -- here concatenates to stay dynamic.
       runTest "dynamic key colliding with static errors" $
         assertEvalError "dyn-collide" "{ b = 1; ${\"b\" + \"\"} = 2; }" (alreadyDefined "b" "1:3"),
       -- The name is written as upstream's printIdentifier writes an
@@ -6851,7 +6853,7 @@ testEvalFidelity = do
     ]
   where
     -- Upstream's message for a dynamic name bound before
-    -- (eval.cc:1269 at 2.24.9), the earlier definition at a line and
+    -- (ExprAttrs::eval in eval.cc), the earlier definition at a line and
     -- column of a test's text, in guillemets (U+00AB, U+00BB) escaped to
     -- keep the source ASCII.
     alreadyDefined name lineColumn = "dynamic attribute '" <> name <> "' already defined at \x00ABstring\x00BB:" <> lineColumn
@@ -7389,9 +7391,9 @@ testFetchGitPins = do
                   other -> pure (Fail (T.pack (show other)))
           [] -> pure (Fail "fixture returned no commits"),
         -- A declared narHash is read as Input::getNarHash reads it and
-        -- the hashes compared (fetchers.cc:214-222, :324-333 at 2.24.9),
-        -- so text after its padding, which base64 decoding never reads,
-        -- still matches.
+        -- the hashes compared (InputScheme::checkLocks in fetchers.cc
+        -- at 2.24.9, Input::checkLocks at 2.36.0), so text after its
+        -- padding, which base64 decoding never reads, still matches.
         runTestM "a narHash pin with text after its padding matches" $ case shas of
           (sha : _) -> do
             let pinned = "rev = \"" <> sha <> "\"; "
@@ -7785,8 +7787,8 @@ testRealiseContext = do
                 Right _ -> QC.property (either (const False) (const True) (planRealisation AllowImportFromDerivation ReadWrite pending (Set.fromList valid) outputPaths request))
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
       -- realiseContext refuses once every path is valid and before it
-      -- builds (primops.cc:79-83 at 2.24.9, :108-118 at 2.34.9), naming the
-      -- first Built element of its set, so a valid output is refused too.
+      -- builds (primops.cc), naming the first Built element of its set,
+      -- so a valid output is refused too.
       runTest "with import from derivation off, a context naming an output is refused, though the output is valid" $
         assertEqual "plan" (Left (ImportFromDerivationOff drv "dev")) (planRealisation RefuseImportFromDerivation ReadWrite Map.empty (Set.fromList [drv, src, out, dev]) outputPaths request),
       runTest "with import from derivation off, a path that is not valid is refused first" $
@@ -7825,8 +7827,8 @@ testRealiseContext = do
           ],
       runTest "a read-only substitution is refused in upstream's words" $
         assertEqual "message" ("cannot substitute path '" <> logical dev <> "' - no write access to the Nix store") (Realise.noWriteAccessMessage dev),
-      -- isInDir (file-system.cc:151-157 at 2.24.9) needs a character
-      -- after the separator.
+      -- isInDir (file-system.cc at 2.24.9) needs a character after the
+      -- separator.
       runTest "a path is in the store only below the store directory, as upstream's isInStore asks" $
         assertEqual
           "in store"
@@ -7997,7 +7999,7 @@ testRealiseContextIO = do
               (Right (VBool False), [FakeQueried _, FakeQueried _, FakeBuilt [(_, wanted)]]) | wanted == Set.singleton "out" -> Pass
               other -> Fail ("expected the output built and nothing added, got: " <> T.pack (show other)),
           -- realiseContext refuses once every path is valid and before it
-          -- builds (primops.cc:79-83 at 2.24.9), whatever the session.
+          -- builds (primops.cc), whatever the session.
           runTestM "with import from derivation off, a read-write session refuses before it adds or builds, though the outputs are valid" $ do
             (ops, calls) <- fakeRealiseStore (const True) Nothing
             answer <- evalUnder refusingImports (ReadWriteSession ops) ("builtins.pathExists " <> outOfTwo)
@@ -8006,26 +8008,25 @@ testRealiseContextIO = do
             (ops, calls) <- fakeRealiseStore ((== "two.drv") . spName) Nothing
             answer <- evalUnder refusingImports (readOnlyOver ops) ("builtins.readFile " <> outOfTwo)
             refusedBeforeRealising answer <$> calls,
-          -- addPath realises with isIFD at its default, true
-          -- (primops.cc:2443 at 2.24.9).
+          -- addPath realises with isIFD at its default, true (primops.cc).
           runTestM "with import from derivation off, builtins.path refuses a path whose context names an output" $ do
             (ops, calls) <- fakeRealiseStore (const True) Nothing
             answer <- evalUnder refusingImports (ReadWriteSession ops) ("builtins.path { path = " <> outOfTwo <> "; }")
             refusedBeforeRealising answer <$> calls,
-          -- tryEval catches only an AssertionError (primops.cc:914 at
-          -- 2.24.9), and the refusal is an EvalBaseError, an IFDError at
-          -- 2.34.9 (eval-error.hh:72).
+          -- tryEval catches only an AssertionError (prim_tryEval in
+          -- primops.cc), and the refusal is an EvalBaseError, an
+          -- IFDError at 2.34.9 (eval-error.hh).
           runTestM "builtins.tryEval does not catch the refusal of an import from derivation" $ do
             (ops, _) <- fakeRealiseStore (const True) Nothing
             answer <- evalUnder refusingImports (ReadWriteSession ops) ("builtins.tryEval (import " <> outOfTwo <> ")")
             pure $ case answer of
               Left failure | refusedImport failure -> Pass
               other -> Fail ("expected the refusal to escape tryEval, got: " <> T.pack (show other)),
-          -- tryEval catches only an assertion (primops.cc:914 at 2.24.9).
+          -- tryEval catches only an assertion (prim_tryEval in primops.cc).
           runTestM "builtins.tryEval does not catch a refusal" $
             refusedRead ("builtins.tryEval (import " <> twoOutputs <> ")"),
           -- prim_pathExists catches only a RestrictedPathError
-          -- (primops.cc:1663-1665 at 2.24.9).
+          -- (primops.cc).
           runTestM "builtins.pathExists answers a failed build with the failure, not false" $ do
             (ops, _) <- fakeRealiseStore (const False) (Just (BuildStop "building two failed: exit 3: builder failed" 1))
             answer <- evalWith (ReadWriteSession ops) ("builtins.pathExists " <> outOfTwo)
@@ -8042,16 +8043,16 @@ testRealiseContextIO = do
               )
               ("let d = " <> twoOutputs <> "; in builtins.findFile [ { prefix = \"x\"; path = \"${d}\"; } ] \"x\""),
           -- Upstream's checks that come before realisePath or addPath
-          -- (primops.cc:1977-1982, 2497-2498 and 2569-2592 at 2.24.9).
+          -- (prim_hashFile, prim_filterSource and prim_path in primops.cc).
           runTestM "builtins.hashFile refuses an unknown algorithm before it realises its path" $
             failsWith ("unknown hash algorithm 'bogus'" `T.isPrefixOf`) ("builtins.hashFile \"bogus\" " <> outOfTwo),
           runTestM "builtins.filterSource forces its filter before it realises its path" $
             failsWith ("expected a function" `T.isPrefixOf`) ("builtins.filterSource 1 " <> outOfTwo),
           runTestM "builtins.path reads every argument before it realises its path" $
             failsWith (== "unsupported argument 'zzz' to 'addPath'") ("builtins.path { path = " <> outOfTwo <> "; zzz = 1; }"),
-          -- prim_path forces the filter as a function and the name as a
-          -- string with no context at their turns (primops.cc:2573-2576 at
-          -- 2.24.9), and an empty name is the base name (:2593-2594).
+          -- prim_path in primops.cc forces the filter as a function and
+          -- the name as a string with no context at their turns, and an
+          -- empty name is the base name.
           runTestM "builtins.path refuses a filter that is not a function at its turn, before it realises its path" $
             failsWith ("expected a function" `T.isPrefixOf`) ("builtins.path { path = " <> outOfTwo <> "; filter = 1; }"),
           runTestM "builtins.path refuses a filter that is not a function for a flat copy too, under upstream's line of context" $
@@ -8064,7 +8065,7 @@ testRealiseContextIO = do
             readOnlyAnswer "builtins.path { path = ./filtered/child; name = \"\"; }" <&> \case
               Right (VStr bytes _) | "-child" `BS.isSuffixOf` bytes -> Pass
               other -> Fail ("expected a copy named child, got: " <> T.pack (show other)),
-          -- addPath's try block (primops.cc:2487 at 2.24.9).
+          -- addPath's try block (primops.cc).
           runTestM "builtins.path gives a refusal of its path's context upstream's line of context" $
             tracedWith addingTwo ("builtins.path { path = " <> outOfTwo <> "; }"),
           runTestM "builtins.filterSource gives a refusal of its path's context upstream's line of context" $
@@ -8074,8 +8075,9 @@ testRealiseContextIO = do
           runTestM "builtins.filterSource gives a failure in its filter upstream's line of context" $
             tracedWith (== ("while adding path '" <> canonPathValue (T.pack (root </> "filtered")) <> "'")) "builtins.filterSource (p: t: throw \"no\") ./filtered",
           -- Upstream's fetchers add what they fetch in any mode
-          -- (fetchTree.cc:504-509, tarball.cc:86, fetchers.cc:195 at
-          -- 2.24.9), so a read-only evaluation reads it through its context.
+          -- (fetch in fetchTree.cc, downloadFile in tarball.cc and
+          -- Input::fetchToStore in fetchers.cc at 2.24.9), so a read-only
+          -- evaluation reads it through its context.
           if SI.os == "mingw32"
             then runTest "a read-only session imports a fetchTarball result through its context (skipped: fetchTarball extracts through sh, which nova-nix does not assume on Windows)" Pass
             else runTestM "a read-only session imports a fetchTarball result through its context" $ do
@@ -8084,7 +8086,7 @@ testRealiseContextIO = do
                 ExitFailure n -> pure (Fail ("tar exited " <> T.pack (show n) <> ": " <> T.pack tarErr))
                 ExitSuccess -> readsAs "from a tarball" ("(import \"${builtins.fetchTarball " <> nixString (fileUrl tarball) <> "}/default.nix\").v"),
           -- nix-instantiate --eval computes these paths without writing
-          -- them (primops.cc:2310 and :2473 at 2.24.9).
+          -- them (prim_toFile and addPath in primops.cc).
           runTestM "a read-only session computes the path of a toFile result and writes nothing" $
             computedWithoutWriting "builtins.toFile \"named\" \"text\"",
           runTestM "a read-only session computes the path of a builtins.path copy by its NAR and writes nothing" $
@@ -8093,8 +8095,8 @@ testRealiseContextIO = do
             computedWithoutWriting "builtins.path { path = ./filtered/child; recursive = false; }",
           runTestM "a read-only session computes the path of a filtered copy and writes nothing" $
             computedWithoutWriting "builtins.filterSource (p: t: true) ./filtered",
-          -- Upstream's fetchers add what they fetch in any mode
-          -- (fetchTree.cc:504-509 at 2.24.9).
+          -- Upstream's fetchers add what they fetch in any mode (fetch in
+          -- fetchTree.cc at 2.24.9).
           runTestM "a read-only session writes what a fetcher fetches" $ do
             let dir = root </> "fetching-store"
             (ops, _) <- fakeRealiseStore (const False) Nothing
@@ -8104,8 +8106,8 @@ testRealiseContextIO = do
                 there <- Dir.doesPathExist (storePathToFilePath (StoreDir dir) sp)
                 pure (if there then Pass else Fail ("the fetch was not written to " <> storePathToText defaultStoreDir sp))
               other -> pure (Fail ("expected the fetched path, got: " <> T.pack (show other))),
-          -- fetchTree.cc:484-497 at 2.24.9: the URLs name no file, so only
-          -- the early exit answers.
+          -- fetchTree.cc's fetch: the URLs name no file, so only the early
+          -- exit answers.
           runTestM "a pinned fetchurl the store holds returns its path without downloading" $ do
             let pin = sha256Digest "pinned\n"
             held <- either (fail . show) pure (makeFixedOutputPath "held-file" "sha256" FlatIngestion pin)
@@ -8223,8 +8225,8 @@ testRealiseContextIO = do
   forceRemoveIfExists root
   pure (readerResults <> results)
 
--- | Upstream's @autoCallFunction@ (eval.cc:1767-1814 at 2.24.9) over the
--- pure evaluator, each case a set of @fun@, the value called, and @args@,
+-- | Upstream's @autoCallFunction@ (eval.cc at 2.24.9) over the pure
+-- evaluator, each case a set of @fun@, the value called, and @args@,
 -- whose attributes are the arguments, unforced; and the targets and
 -- arguments the command line names, as the parser reads them.
 testTargetArgs :: IO [Bool]
@@ -8658,16 +8660,16 @@ testStringsOffSymbolsIO = do
             ]
         )
         -- The names the source writes, and allOutputs, which appendContext
-        -- interns as it runs, as upstream's does (context.cc:270-271 at
-        -- 2.24.9).
+        -- interns as it runs, as upstream's does (prim_appendContext in
+        -- context.cc).
         ( ["zs", "zi", "zj", "zu", "zp", "zq", "zn", "_", "zl", "zc", "builtins", "split", "appendContext", "deepSeq", "null", "true", "path", "outputs", "/nix/store/" <> censusStoreHash <> "-zctxname.drv"]
             ++ ["allOutputs"]
         )
         ["zs", "zi", "zj", "zu", "zp", "zq", "zn", "zl", "zc"],
       -- Upstream's listToAttrs interns each element's name as it reads it
-      -- (prim_listToAttrs, primops.cc:2896 at 2.24.9), so the first in
-      -- symbol order is the first in the list, here the last by name.  The
-      -- strings evaluated before, in name order, take no symbol.
+      -- (prim_listToAttrs in primops.cc), so the first in symbol order is
+      -- the first in the list, here the last by name.  The strings
+      -- evaluated before, in name order, take no symbol.
       emits
         "string values equal to a set's names do not decide its order"
         "let early = builtins.concatStringsSep \",\" [ (\"z\" + \"a\") (\"z\" + \"b\") ]; in builtins.seq early (({ }: null) (builtins.listToAttrs [ { name = \"z\" + \"b\"; value = 1; } { name = \"z\" + \"a\"; value = 2; } ]))"
@@ -8680,10 +8682,10 @@ testStringsOffSymbolsIO = do
 
 -- | @listToAttrs@, @groupBy@ and @fromJSON@ intern each name of the set
 -- they build where upstream's do, as they meet it: @listToAttrs@ an
--- element's name before it reads the next element (primops.cc:2896 at
--- 2.24.9), @groupBy@ the name its function returns before it calls the
--- function again (:3713), and @fromJSON@ a member's name before its value
--- (json-to-value.cc:50-52).
+-- element's name before it reads the next element (@prim_listToAttrs@ in
+-- primops.cc), @groupBy@ the name its function returns before it calls the
+-- function again (@prim_groupBy@ there), and @fromJSON@ a member's name
+-- before its value (@JSONObjectState::key@ in json-to-value.cc).
 -- The first name in symbol order is the unexpected argument a call names
 -- and the pair @==@ decides at first, so each case runs in a child
 -- process, whose symbol table holds the startup names alone, none of
@@ -8740,11 +8742,11 @@ testBuilderInterningIO = do
 -- selects from, and a has-attribute test after it forces the value it
 -- tests, as upstream's @ExprSelect::eval@ and @ExprOpHasAttr::eval@ call
 -- @getName@, which interns a computed name, on either side of the force
--- (eval.cc:203-213, :1386-1396 and :1452-1454 at 2.24.9).  The value
--- forced is a set @listToAttrs@ builds, interning its name as it runs, so
--- the order of the two names shows which came first.  It is the second
--- in the path, since the first is forced before any name is read.  Each
--- case runs in a child, whose symbol table holds neither name.
+-- (eval.cc).  The value forced is a set @listToAttrs@ builds, interning
+-- its name as it runs, so the order of the two names shows which came
+-- first.  It is the second in the path, since the first is forced before
+-- any name is read.  Each case runs in a child, whose symbol table holds
+-- neither name.
 testSelectInterningIO :: IO [Bool]
 testSelectInterningIO = do
   putStrLn "eval/select-interning-io"
@@ -8768,11 +8770,11 @@ testSelectInterningIO = do
     names = ["s", "builtins", "listToAttrs", "name", "value", "za", "zb"]
 
 -- | A set interns each dynamic name once it has evaluated it, before it
--- evaluates the next, as upstream's @ExprAttrs::eval@ does
--- (eval.cc:1257-1264 at 2.24.9), so dynamic names new to the symbol
--- table take their places in source order.  The first name in symbol
--- order is the unexpected argument a call names, so each case runs in a
--- child process, whose symbol table holds neither name.
+-- evaluates the next, as upstream's @ExprAttrs::eval@ in eval.cc does,
+-- so dynamic names new to the symbol table take their places in source
+-- order.  The first name in symbol order is the unexpected argument a
+-- call names, so each case runs in a child process, whose symbol table
+-- holds neither name.
 testDynamicAttrInterningIO :: IO [Bool]
 testDynamicAttrInterningIO = do
   putStrLn "eval/dynamic-attr-interning-io"
@@ -8797,13 +8799,14 @@ testDynamicAttrInterningIO = do
 
 -- | @deepSeq@ and @--strict@ force a set's values in the order the set
 -- holds them, as upstream's @forceValueDeep@ walks a set's @Bindings@
--- (eval.cc:2110-2111 at 2.24.9), which are sorted by @Symbol@
--- (attr-set.hh:30-33), whose order is the order the symbol table
--- interned the name in (symbol-table.hh:71).  Upstream's parser interns
--- a set's names in source order (parser.y:367, :433, :443), so of two
--- values that fail, the one written first fails first here, where name
--- order would force the other.  The case runs in a child process, whose
--- symbol table holds neither name.
+-- (eval.cc), which are sorted by @Symbol@ (the @Attr@ comparison in
+-- attr-set.hh), whose order is the order the symbol table interned the
+-- name in (the @Symbol@ comparison in symbol-table.hh).  Upstream's
+-- parser interns a set's names in source order (@binds@ and @attrpath@
+-- in parser.y at 2.24.9, @binds1@ at 2.36.0), so of two values that
+-- fail, the one written first fails first here, where name order would
+-- force the other.  The case runs in a child process, whose symbol
+-- table holds neither name.
 testDeepForceOrderIO :: IO [Bool]
 testDeepForceOrderIO = do
   putStrLn "eval/deep-force-order-io"
@@ -8816,21 +8819,21 @@ testDeepForceOrderIO = do
 
 -- | A binding, a list element, a call's argument or a default whose
 -- value is a variable holds the variable's own cell where upstream's
--- @maybeThunk@ does (eval.cc:1006-1046 at 2.24.9), which @==@ shows of a
--- function, equal only to itself (eval.cc:2727).  A global and a
--- variable of an enclosing scope are bound by then, and so is a
--- recursive set's static name by the time its dynamic ones are bound
--- (eval.cc:1273).  A variable only a with supplies never is
--- (eval.cc:869-872).  A recursive set, a @let@ and a set pattern fill
--- their slots in symbol order, so a variable naming a sibling shares its
--- cell only when the sibling's name was interned first, and a recursive
--- set that binds @__overrides@ shares none but an inherited name's
--- (eval.cc:1214-1218).  Symbol order is the order the symbol table
--- interned the names in, so each case runs in a child process, whose
--- table holds none of the names but the globals and interns them in the
--- order the source gives them, as upstream's parser does; a @let@ that
--- binds nothing the case uses puts a set pattern's names in the order
--- the case needs.
+-- @maybeThunk@ does (eval.cc), which @==@ shows of a function, equal
+-- only to itself (@eqValues@ in eval.cc).  A global and a variable of
+-- an enclosing scope are bound by then, and so is a recursive set's
+-- static name by the time its dynamic ones are bound (@ExprAttrs::eval@
+-- in eval.cc).  A variable only a with supplies never is
+-- (@EvalState::lookupVar@ in eval.cc).  A recursive set, a @let@ and a
+-- set pattern fill their slots in symbol order, so a variable naming a
+-- sibling shares its cell only when the sibling's name was interned
+-- first, and a recursive set that binds @__overrides@ shares none but
+-- an inherited name's (@ExprAttrs::eval@ in eval.cc).  Symbol order is
+-- the order the symbol table interned the names in, so each case runs
+-- in a child process, whose table holds none of the names but the
+-- globals and interns them in the order the source gives them, as
+-- upstream's parser does; a @let@ that binds nothing the case uses puts
+-- a set pattern's names in the order the case needs.
 testSharedVariableCellsIO :: IO [Bool]
 testSharedVariableCellsIO = do
   putStrLn "eval/shared-variable-cells-io"
@@ -8860,8 +8863,8 @@ testSharedVariableCellsIO = do
       evaluatesTo "a default shares the cell of a formal bound before it" "let za = 0; zb = 0; in ({ za, zb ? za }: [ za ] == [ zb ]) { za = x: x; }" "true",
       evaluatesTo "a default does not share the cell of a formal bound after it" "let zb = 0; za = 0; in ({ za, zb ? za }: [ za ] == [ zb ]) { za = x: x; }" "false",
       -- Upstream's parser interns a default's variable before the formal
-      -- it defaults (parser.y:280 and :483), so a formal written after
-      -- the default that names it is bound before.
+      -- it defaults (expr_simple and formal in parser.y), so a formal
+      -- written after the default that names it is bound before.
       evaluatesTo "a default shares the cell of a formal written after it" "({ zb ? za, za }: [ za ] == [ zb ]) { za = x: x; }" "true",
       evaluatesTo "a let binding shares the cell at the end of a chain declared out of symbol order" "let zl = 0; zm = 0; zn = 0; in let zn = zm; zm = zl; zl = x: x; in [ zl ] == [ zn ]" "true",
       evaluatesTo "a default shares the cell at the end of a chain declared out of symbol order" "let zr = 0; zt = 0; zx = 0; in ({ zx ? zt, zt ? zr, zr }: [ zr ] == [ zx ]) { zr = x: x; }" "true",
@@ -8950,7 +8953,7 @@ testSharedVariableCellsIO = do
 -- (value.hh at 2.24.9), where a copy per cell would grow the string arena
 -- each time a string passes from one cell to another.  A string literal's
 -- value is its bytes in the code, as upstream's @ExprString@ hands out
--- the value it holds (eval.cc:1024-1028).
+-- the value it holds (@ExprString::maybeThunk@ in eval.cc).
 testStringSharing :: IO [Bool]
 testStringSharing = do
   putStrLn "eval/string-sharing"
@@ -9029,24 +9032,24 @@ testParseOrderInterningIO :: IO [Bool]
 testParseOrderInterningIO = do
   putStrLn "eval/parse-order-interning-io"
   sequence
-    [ internsInOrder "a let's bindings before its body (parser.y:206, :367)" "let za = 1; zb = za; in { zc = zb; }" ["za", "zb", "zc"],
-      internsInOrder "a variable where it is read, before the binding that defines it (:280)" "let zq = zt; zs = 1; zt = 2; in zq" ["zq", "zt", "zs"],
-      internsInOrder "an argument after its body, an inner one first (:179)" "with { }; [ (zx: zw: { zy = 1; }) zv ]" ["zy", "zw", "zx", "zv"],
-      internsInOrder "formals before the body, each after its default (:482-483)" "{ za ? { zb = 1; }, zc }: { zd = za; }" ["zb", "za", "zc", "zd"],
-      internsInOrder "a variable a default reads before the formal it defaults (:280, :483)" "{ zx ? zy, zy }: zx" ["zy", "zx"],
-      internsInOrder "an @-name written first after the formals and the body (:197)" "with { }; [ (zn@{ za }: { zb = za; }) zv ]" ["za", "zb", "zn", "zv"],
-      internsInOrder "an @-name written last after the formals and the body (:190)" "with { }; [ ({ za }@zn: { zb = za; }) zv ]" ["za", "zb", "zn", "zv"],
-      internsInOrder "an attribute path before its or default (:265, :433, :443)" "{ }.za.zb or { zc = 1; }" ["za", "zb", "zc"],
-      internsInOrder "a has-attribute path after its operand (:247)" "{ zc = 1; } ? za.zb" ["zc", "za", "zb"],
-      internsInOrder "an attribute path written in several places in source order (:367, :433, :443)" "{ za.zb = 1; zc = 2; za.zd = 3; }" ["za", "zb", "zc", "zd"],
-      internsInOrder "inherited names in order, after an inherit's source (:394, :416)" "with { }; { inherit ({ zc = 1; }) zb za; inherit zd; ze = 1; }" ["zc", "zb", "za", "zd", "ze"],
-      internsInOrder "a with's scope before its body (:204)" "with { zb = 1; }; { za = zb; }" ["zb", "za"],
-      internsInOrder "a dynamic key's expression in place, and a key of a plain string as a name (:444-452)" "with { }; { ${zk} = 1; ${\"zm\"} = 2; \"zn\" = 3; zl = 4; }" ["zk", "zm", "zn", "zl"],
-      internsInOrder "a key of a URI as a name where it is written (:301-309, :444-452)" "{ ${zu:v} = 1; zl = 2; }" ["zu:v", "zl"],
-      internsInOrder "__curPos is no name (:276-278)" "{ za = __curPos; zb = 1; }" ["za", "zb"],
+    [ internsInOrder "a let's bindings before its body (parser.y's binds and expr_function)" "let za = 1; zb = za; in { zc = zb; }" ["za", "zb", "zc"],
+      internsInOrder "a variable where it is read, before the binding that defines it (parser.y's expr_simple)" "let zq = zt; zs = 1; zt = 2; in zq" ["zq", "zt", "zs"],
+      internsInOrder "an argument after its body, an inner one first (parser.y's expr_function)" "with { }; [ (zx: zw: { zy = 1; }) zv ]" ["zy", "zw", "zx", "zv"],
+      internsInOrder "formals before the body, each after its default (parser.y's formal)" "{ za ? { zb = 1; }, zc }: { zd = za; }" ["zb", "za", "zc", "zd"],
+      internsInOrder "a variable a default reads before the formal it defaults (parser.y's expr_simple and formal)" "{ zx ? zy, zy }: zx" ["zy", "zx"],
+      internsInOrder "an @-name written first after the formals and the body (parser.y's expr_function)" "with { }; [ (zn@{ za }: { zb = za; }) zv ]" ["za", "zb", "zn", "zv"],
+      internsInOrder "an @-name written last after the formals and the body (parser.y's expr_function)" "with { }; [ ({ za }@zn: { zb = za; }) zv ]" ["za", "zb", "zn", "zv"],
+      internsInOrder "an attribute path before its or default (parser.y's expr_select and attrpath)" "{ }.za.zb or { zc = 1; }" ["za", "zb", "zc"],
+      internsInOrder "a has-attribute path after its operand (parser.y's expr_op)" "{ zc = 1; } ? za.zb" ["zc", "za", "zb"],
+      internsInOrder "an attribute path written in several places in source order (parser.y's binds and attrpath)" "{ za.zb = 1; zc = 2; za.zd = 3; }" ["za", "zb", "zc", "zd"],
+      internsInOrder "inherited names in order, after an inherit's source (parser.y's binds and attrs)" "with { }; { inherit ({ zc = 1; }) zb za; inherit zd; ze = 1; }" ["zc", "zb", "za", "zd", "ze"],
+      internsInOrder "a with's scope before its body (parser.y's expr_function)" "with { zb = 1; }; { za = zb; }" ["zb", "za"],
+      internsInOrder "a dynamic key's expression in place, and a key of a plain string as a name (string_attr in parser.y's attrpath)" "with { }; { ${zk} = 1; ${\"zm\"} = 2; \"zn\" = 3; zl = 4; }" ["zk", "zm", "zn", "zl"],
+      internsInOrder "a key of a URI as a name where it is written (parser.y's expr_simple and attrpath)" "{ ${zu:v} = 1; zl = 2; }" ["zu:v", "zl"],
+      internsInOrder "__curPos is no name (parser.y's expr_simple)" "{ za = __curPos; zb = 1; }" ["za", "zb"],
       -- An evaluation shows the order: the argument an unexpected-argument
       -- error names is the first in symbol order, here as under upstream
-      -- (eval.cc:1566-1576).
+      -- (callFunction in eval.cc).
       emits "a let's bindings are interned before its body" "let za = 1; in ({ }: za) { zb = 1; za = 2; }" ["error: function 'anonymous lambda' called with unexpected argument 'za'"],
       emits "a function's formals are interned before its body" "({ za ? 1 }: ({ }: null) { zb = 1; za = 2; }) { }" ["error: function 'anonymous lambda' called with unexpected argument 'za'"],
       emits "an attribute path is interned before its or default" "{ }.za or (({ }: null) { zb = 1; za = 2; })" ["error: function 'anonymous lambda' called with unexpected argument 'za'"]
@@ -9085,25 +9088,24 @@ failsInChild label source expected = runTestM label $ do
   pure (assertEqual label [show expected] (lines out))
 
 -- | The failure of a call to a set pattern, with the line of context
--- upstream adds for the call (eval.cc:1550-1556 and :1576-1583 at
--- 2.24.9).
+-- upstream adds for the call (@callFunction@ in eval.cc).
 callFailure :: Text -> Text -> EvalFailure
 callFailure function what = EvalFailure ["from call site"] ("function '" <> function <> "' called " <> what)
 
 -- | The symbol table once a session has started: the names upstream 2.24.9
 -- interns as it starts with its default settings, each once, in the
--- order it first interns them.  @EvalState@'s constructor interns its
--- static symbols in the order eval.hh declares them (eval.hh:173-187,
--- eval.cc:225-277), the empty name among them.  @createBaseEnv@
--- (primops.cc:4598-4873) then installs @builtins@, @true@, @false@,
+-- order it first interns them.  @EvalState@'s constructor in eval.cc
+-- interns its static symbols in the order eval.hh declares them (@sWith@
+-- to @exprSymbols@), the empty name among them.  @createBaseEnv@
+-- (primops.cc) then installs @builtins@, @true@, @false@,
 -- @null@ and the constants @__currentTime@ to @__nixPath@, every
 -- registered primop not gated on an experimental feature in the order it
--- registers (primops.cc from :249, then primops/context.cc,
--- fetchMercurial.cc, fetchTree.cc and fromTOML.cc), and @derivation@,
--- interning each name and then that name less a @__@ prefix
--- (eval.cc:466-485, :523-549).  Last come the names the @derivation@
--- wrapper's parser interns that nothing before it did
--- (primops/derivation.nix, parser.y:179-483).
+-- registers (primops.cc from @primop_scopedImport@, then
+-- primops/context.cc, fetchMercurial.cc, fetchTree.cc and fromTOML.cc),
+-- and @derivation@, interning each name and then that name less a @__@
+-- prefix (@addConstant@ and @addPrimOp@ in eval.cc).  Last come the names
+-- the @derivation@ wrapper's parser interns that nothing before it did
+-- (primops/derivation.nix, the grammar actions of parser.y).
 upstreamStartupTable :: [Text]
 upstreamStartupTable =
   [ "<with>",
@@ -9420,13 +9422,14 @@ testStartupSymbolsIO = do
 -- | The errors of a call to a set pattern, of a select and of @abort@, as
 -- upstream words them at 2.24.9, with the lines of context it adds less
 -- their positions.  A set pattern checks every formal it lacks before
--- anything unexpected (eval.cc:1546-1586) and names the function after
--- the attribute it is bound to (parser-state.hh:176-177,
--- nixexpr.cc:573-577); a select names the name its set lacks
--- (eval.cc:1396-1404); @abort@ words its message (primops.cc:808).
--- Upstream also adds @while calling the 'abort' builtin@ to @abort@'s
--- failure and @while calling a functor ...@ to a functor's (eval.cc:1641,
--- :1708), which this evaluator does not add, so the expectations leave
+-- anything unexpected (@callFunction@ in eval.cc) and names the function
+-- after the attribute it is bound to (@ParserState::addAttr@ in
+-- parser-state.hh, @ExprLambda::setName@ in nixexpr.cc); a select names
+-- the name its set lacks (@ExprSelect::eval@ in eval.cc); @abort@ words
+-- its message (@primop_abort@ in primops.cc).  Upstream also adds
+-- @while calling the 'abort' builtin@ to @abort@'s failure and
+-- @while calling a functor ...@ to a functor's (@callFunction@ in
+-- eval.cc), which this evaluator does not add, so the expectations leave
 -- them out.
 testCallErrorsIO :: IO [Bool]
 testCallErrorsIO = do
@@ -9538,11 +9541,11 @@ testFirstArgumentOrderIO = do
 
 -- | An empty hash is the all-zero digest of the algorithm its context
 -- gives, which upstream warns of on stderr as it reads the hash
--- (newHashAllowEmpty, hash.cc:271-281 at 2.24.9): a fixed-output
--- derivation's, and the sha256 pin of fetchurl, fetchTarball and
--- builtins.path, whose copy then fails as upstream's does on a pin it
--- does not match (fetchTree.cc:515-522, primops.cc:2478-2482).  Each
--- expected stream is read from upstream's source at 2.24.9.
+-- (newHashAllowEmpty in hash.cc): a fixed-output derivation's, and
+-- the sha256 pin of fetchurl, fetchTarball and builtins.path, whose
+-- copy then fails as upstream's does on a pin it does not match
+-- (@fetch@ in fetchTree.cc, @addPath@ in primops.cc).  Each expected
+-- stream is read from upstream's source at 2.24.9.
 testEmptyHashIO :: IO [Bool]
 testEmptyHashIO = do
   putStrLn "eval/empty-hash-io"
@@ -9610,7 +9613,7 @@ testEmptyHashIO = do
           ("builtins.path { path = " <> pathText tree <> "; filter = p: t: true; sha256 = \"\"; }")
           [sha256Warning, pathMismatch],
         -- The other warning derivationStrict gives, through the same
-        -- logger (primops.cc:1332-1343 at 2.24.9).
+        -- logger (derivationStrictInternal in primops.cc at 2.24.9).
         emits
           "a structured derivation warns of a check it disables"
           (drvPath "__structuredAttrs = true; allowedReferences = [ ];")
@@ -9921,13 +9924,12 @@ testClassIFollowupsIO = do
       ]
 
 -- | A path value inside a store path is copied under its base name, as
--- every path value is (upstream's copyPathToStore, eval.cc:2381-2406 at
--- 2.24.9), never coerced to itself.  The tree sits in a temporary store
--- the way a fetch or a channel leaves one, so the copy is read through
--- the store this evaluation was given: store text names the canonical
--- directory, where nothing is.  Each expected path is derived from the
--- NAR the copy must hash, so the base name and the bytes read are both
--- pinned.
+-- every path value is (upstream's copyPathToStore in eval.cc), never
+-- coerced to itself.  The tree sits in a temporary store the way a
+-- fetch or a channel leaves one, so the copy is read through the store
+-- this evaluation was given: store text names the canonical directory,
+-- where nothing is.  Each expected path is derived from the NAR the
+-- copy must hash, so the base name and the bytes read are both pinned.
 testInStoreCopyIO :: IO [Bool]
 testInStoreCopyIO = do
   putStrLn "eval/in-store-copy-io"
@@ -10647,7 +10649,8 @@ testEvalPolicyRules = do
         assertEqual "extra-bool" (Right False) (cfgPure ["extra-pure-eval = true"]),
       runTest "the default config has both modes off" $
         assertEqual "defaults" (Right (False, False, [])) ((\c -> (ncRestrictEval c, ncPureEval c, ncAllowedUris c)) <$> config []),
-      -- eval-settings.hh:145-154 at 2.24.9 and :196-218 at 2.34.9.
+      -- enableImportFromDerivation and, from 2.34.9,
+      -- traceImportFromDerivation in eval-settings.hh.
       runTest "import from derivation is allowed and not traced by default, and nix.conf sets each" $
         let imports = fmap (\c -> (ncAllowImportFromDerivation c, ncTraceImportFromDerivation c)) . config
          in assertEqual "defaults" (Right (True, False)) (imports [])

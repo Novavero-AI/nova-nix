@@ -8,12 +8,12 @@
 # naming a directory, into a program that runs.  The program prints the
 # compiler's version and its default C standard, a 64-bit division and
 # remainder of values read at run time, which GCC 10 has libgcc's
-# __divmoddi4 compute in one call (gcc/config/i386/i386.c:22610 and 23411),
-# and the results of the three builtins GCC 4.6.4 lacks
-# that MinGW-w64's runtimes after v8.0.3 call: __atomic_load_n,
-# __builtin_mul_overflow and __builtin_bswap16 (see
-# pkgs/windows/by-name/mi/mingw-w64-headers).  _Generic, which 4.6.4's C
-# front end lacks as well, compiles it.
+# __divmoddi4 compute in one call (ix86_init_libfuncs and
+# TARGET_EXPAND_DIVMOD_LIBFUNC in gcc/config/i386/i386.c), and the
+# results of the three builtins GCC 4.6.4 lacks that MinGW-w64's
+# runtimes after v8.0.3 call: __atomic_load_n, __builtin_mul_overflow
+# and __builtin_bswap16 (see pkgs/windows/by-name/mi/mingw-w64-headers).
+# _Generic, which 4.6.4's C front end lacks as well, compiles it.
 #
 # hello-cxx has the C++ driver compile hello.cc and link it the same way.
 # The program has the compiler, libstdc++, libsupc++ and libgcc's unwinder
