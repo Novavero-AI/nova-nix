@@ -1202,7 +1202,7 @@ withDevelopFixture fixture check = do
   document <- BS.readFile (developData (fixture <> ".json"))
   either (pure . Fail . ("fixture: " <>)) check (parseBuildEnvironment document)
 
--- | Upstream's ignoreVars (develop.cc:315-332 at 2.35.4).
+-- | Upstream's @ignoreVars@ (develop.cc).
 upstreamIgnoreVars :: [Text]
 upstreamIgnoreVars = ["BASHOPTS", "HOME", "NIX_BUILD_TOP", "NIX_ENFORCE_PURITY", "NIX_LOG_FD", "NIX_REMOTE", "PPID", "SHELLOPTS", "SSL_CERT_FILE", "TEMP", "TEMPDIR", "TERM", "TMP", "TMPDIR", "TZ", "UID"]
 

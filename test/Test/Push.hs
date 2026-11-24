@@ -470,8 +470,9 @@ testPushDirectory = do
     narOf sp = NAR.serialise (NAR.NarDirectory [("data", NAR.NarRegular False (contentsOf sp))])
     narInfoFile cache sp = cache </> T.unpack (spHash sp) <> ".narinfo"
     -- The directories upstream's file:// store makes in a cache it opens
-    -- (local-binary-cache-store.cc:109-113 at 2.24.9), sorted, with the
-    -- realisations directory under its name through 2.34.9 and from 2.35.4.
+    -- (LocalBinaryCacheStore::init in local-binary-cache-store.cc), sorted,
+    -- with the realisations directory under its name through 2.34.9 and
+    -- from 2.35.4.
     upstreamCacheDirectories = ["build-trace-v2", "log", "nar", "realisations"]
     readMaybeFile path = either (const Nothing) Just <$> (try (BS.readFile path) :: IO (Either IOException BS.ByteString))
     -- A store holding top and leaf under the root, and the cache

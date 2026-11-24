@@ -1174,9 +1174,9 @@ testBytecodeTags = do
           lambda <- (\stored -> VLambda emptyEnv stored 0) . namedBy name <$> compileFormalsToEval formals
           cell <- evaluated lambda
           (QC.=== lambda) <$> readComputed (unThunk cell),
-      -- Upstream's addAttr names the function an attribute path's last
-      -- name binds, and ExprLambda::setName the function that is its body
-      -- (parser-state.hh:176-177, nixexpr.cc:573-577 at 2.24.9).
+      -- Upstream's addAttr in parser-state.hh names the function an
+      -- attribute path's last name binds, and ExprLambda::setName in
+      -- nixexpr.cc the function that is its body.
       runTestM "a set pattern bound to a static name reads back named, as does the one its body is" $ do
         let inner = ELambda (FormalSet [Formal "a" Nothing] False) (ELit NixNull) NoCaptureInfo
             outer = ELambda (FormalNamedSet "args" [] True) inner NoCaptureInfo
@@ -1853,11 +1853,12 @@ testBytecodeCompile = do
                 QC.ioProperty (recordPos recorder pos >>= lookupPos <&> (QC.=== expected pos))
         result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
-      -- Upstream's Pos::print with its origin (position.cc:69-83 at
-      -- 2.24.9) writes a file by its path and text with no file as
-      -- string in guillemets, then the line and the column; noPos is its
-      -- empty Pos (nixexpr.cc:608-612), line 0 and column 0, in none in
-      -- guillemets, and a column of 0 is left out.
+      -- Upstream's Pos::print with its origin (position.cc) writes a file
+      -- by its path and text with no file as string in guillemets, then
+      -- the line and the column; noPos is its empty Pos (nixexpr.cc's
+      -- PosTable::operator[] at 2.24.9, pos-table.cc at 2.36.0), line 0
+      -- and column 0, in none in guillemets, and a column of 0 is left
+      -- out.
       runTestM "a position prints as upstream's messages write it" $ do
         recorder <- newPosRecorder
         inFile <- recordPos recorder (SrcPos (SourceFile "/positions/set.nix") 2 3)

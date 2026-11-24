@@ -765,9 +765,9 @@ testParserErrors = do
       runTest "truncated lambda reports end of input" $
         assertRight "truncated lambda" (syntaxErrorOf "{ a, b }:") $ \err ->
           assertEqual "end of input" True ("end of input" `T.isInfixOf` peMessage err),
-      -- Upstream's attribute name is an identifier or or (the attr rule,
-      -- parser.y:455-458 at 2.24.9), so its grammar refuses any other
-      -- keyword as one, at the keyword.
+      -- Upstream's attribute name is an identifier or or (the attr rule of
+      -- parser.y), so its grammar refuses any other keyword as one, at the
+      -- keyword.
       runTest "a keyword other than or is no attribute name, refused where it stands" $
         let refusedAt source = (\err -> (peLine err, peCol err)) <$> syntaxErrorOf source
             cases keyword =
@@ -788,8 +788,9 @@ testParserErrors = do
         assertEval "quoted" "let s = { \"if\" = 1; inherit ({ \"rec\" = 2; }) \"rec\"; }; in s.\"if\" + s.\"rec\"" (VInt 3)
     ]
 
--- | The keywords upstream's lexer makes tokens of their own (lexer.l:109-117
--- at 2.24.9), none of which its grammar takes as an attribute name.
+-- | The keywords upstream's lexer makes tokens of their own (its rules
+-- from @if@ to @inherit@ in lexer.l), none of which its grammar takes as
+-- an attribute name.
 refusedAttrKeywords :: [Text]
 refusedAttrKeywords = ["if", "then", "else", "assert", "with", "let", "in", "rec", "inherit"]
 
@@ -894,7 +895,7 @@ literalEscape _ = Nothing
 
 -- | A key written as a string or as @${ expr }@ is a name when upstream's
 -- parser builds its expression as a plain string, and dynamic otherwise
--- (the @attrpath@ and @attrs@ rules, parser.y:416-452 at 2.24.9).
+-- (the @attrpath@ and @attrs@ rules of parser.y).
 testStringAttrKeys :: IO [Bool]
 testStringAttrKeys = do
   putStrLn "parser/string-attr-keys"

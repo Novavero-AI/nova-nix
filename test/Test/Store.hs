@@ -219,10 +219,11 @@ testStorePaths = do
             QC.forAll genCompressCase $ \(len, bytes) ->
               BS.unpack (compressHash len (BS.pack bytes)) QC.=== compressHashModel len bytes
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
-      -- Upstream's own fixture (libstore-tests/nar-info.cc:44-62 and
-      -- data/nar-info/json-1/impure.json at 2.35.4): foo, the NAR SHA-256
-      -- of "(...)", referencing bar and itself, is n5wkd9...-foo, so the
-      -- type upstream hashes is source, then each reference after a colon.
+      -- Upstream's own fixture (makeNarInfo in libstore-tests/nar-info.cc
+      -- and data/nar-info/json-1/impure.json at 2.35.4): foo, the NAR
+      -- SHA-256 of "(...)", referencing bar and itself, is n5wkd9...-foo,
+      -- so the type upstream hashes is source, then each reference after
+      -- a colon.
       runTest "a source path's type is upstream's: source, then each reference after a colon" $
         assertEqual
           "upstream's fixture"
