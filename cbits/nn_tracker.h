@@ -11,6 +11,12 @@
  * frees the objects a close finds unreached through a sweep, which keeps
  * the rest in the order they were added.
  *
+ * A tracker takes objects only while an evaluation session holds the
+ * arena (nn_arena.h).  An object made outside every session would sit
+ * below every region and be freed by the next session's teardown under
+ * whoever held it, so each kind's allocator reports failure there, as
+ * the sub-arenas' allocators do.
+ *
  * Not thread-safe - single-threaded evaluation only.
  */
 
@@ -28,8 +34,8 @@ typedef struct {
     uint32_t capacity;   /* objects the array has room for */
 } nn_tracker_t;
 
-/* Add an object.  Returns 0, or -1 with the tracker unchanged when its
- * array cannot grow. */
+/* Add an object.  Returns 0, or -1 with the tracker unchanged outside an
+ * evaluation session (nn_arena_live is 0) or when its array cannot grow. */
 int nn_tracker_add(nn_tracker_t *tracker, void *object);
 
 /* Free every object with `free_object`, and then the array: the tracker

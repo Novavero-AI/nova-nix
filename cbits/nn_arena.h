@@ -5,7 +5,9 @@
  * destroy window, which an evaluation session opens.  Outside it, each
  * sub-arena's allocators report failure through their ordinary sentinel
  * (NULL, UINT32_MAX, NN_SYMBOL_INVALID) instead of touching freed or
- * never-allocated state.
+ * never-allocated state, and so do the allocators of the objects the
+ * arena's teardown frees one by one (nn_tracker.h), which ask it as they
+ * add each object to its tracker.
  *
  * The Haskell boundary asks it in three places: after an allocator's
  * failure, to tell a call outside an evaluation session from
