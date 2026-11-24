@@ -61,8 +61,8 @@ jobs:
             nix: "2.34.9"
             rev: 6f06d204d8f2d8761d9da78778745974a3216381
           - channel: unstable
-            nix: "2.35.4"
-            rev: 1c89083e451e891152365b799595cf7790a43325
+            nix: "2.36.0"
+            rev: 619c39f6eac5d1ed6b8f073a9414baf7034b2356
     # An evaluator that loops on one case would otherwise hold the runner
     # for GitHub's six-hour default.
     timeout-minutes: 30
