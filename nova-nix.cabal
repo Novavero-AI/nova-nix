@@ -349,7 +349,26 @@ test-suite nova-nix-test
   type:             exitcode-stdio-1.0
   main-is:          Main.hs
   hs-source-dirs:   test
-  other-modules:    CacheFixture, DirDacl, HttpFixture, NodeStatus
+  other-modules:
+    CacheFixture
+    DirDacl
+    HttpFixture
+    NodeStatus
+    Test.Builder
+    Test.CData
+    Test.Cli
+    Test.Daemon
+    Test.Derivation
+    Test.Eval
+    Test.Exceptions
+    Test.Harness
+    Test.Parser
+    Test.Pkgs
+    Test.Push
+    Test.Realise
+    Test.Store
+    Test.Substituter
+    Test.Trust
   default-language: Haskell2010
   default-extensions:
     OverloadedStrings
