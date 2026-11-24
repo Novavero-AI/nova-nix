@@ -342,14 +342,14 @@ assertEval label source expected =
   assertRight label (evalNix source) $ \actual ->
     assertEqual label expected actual
 
--- | Assert that a Nix expression parses but fails to EVALUATE.  A parse
--- failure fails the assertion: a test documenting a runtime error must
--- not keep passing after a regression stops the construct from parsing.
 -- | The bytes of a string value, and nothing for any other value.
 stringBytes :: NixValue -> BS.ByteString
 stringBytes (VStr bytes _) = bytes
 stringBytes _ = BS.empty
 
+-- | Assert that a Nix expression parses but fails to EVALUATE.  A parse
+-- failure fails the assertion: a test documenting a runtime error must
+-- not keep passing after a regression stops the construct from parsing.
 assertEvalFail :: Text -> Text -> TestResult
 assertEvalFail label source = case evalNix source of
   Left err
@@ -1764,12 +1764,6 @@ data FrameBinding = FrameBinding
 data FrameValue = FrameConstant !Int | FrameAlias !Int | FrameOffset !Int !Int
   deriving (Show)
 
--- | A pending thunk holds the C pointer of the env its code runs in, and a
--- recursive frame (a @let@, a @rec@ set, a formals set) is built before
--- the thunks that point at it and filled after.  A generated binding may
--- name one declared after it, whose slot is still empty while the
--- earlier binding's thunk is made, so a frame that read its own slots
--- while being built would read that hole.
 -- | A graph of C integers and lists for the census to count: a list's
 -- child either appears once or fills two slots with one cell.
 data CensusTree = CensusLeaf !Int64 | CensusNode ![CensusChild]
@@ -3254,6 +3248,12 @@ testEnvLayout = do
       result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} property
       pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
 
+-- | A pending thunk holds the C pointer of the env its code runs in, and a
+-- recursive frame (a @let@, a @rec@ set, a formals set) is built before
+-- the thunks that point at it and filled after.  A generated binding may
+-- name one declared after it, whose slot is still empty while the
+-- earlier binding's thunk is made, so a frame that read its own slots
+-- while being built would read that hole.
 testFrameKnots :: IO [Bool]
 testFrameKnots = do
   putStrLn "eval/frame-knots"
@@ -5499,7 +5499,6 @@ testImportPure = do
 -- Tests: import and IO builtins (IO)
 -- ---------------------------------------------------------------------------
 
--- | Parse and evaluate Nix source using the IO evaluator.
 -- | The per-suite temp store 'evalNixIO' evaluates against, exposed so
 -- a test inspecting materialized trees resolves the same directory.
 evalNixIOStoreDir :: IO StoreDir
@@ -16100,12 +16099,16 @@ zstdArchive = ZstdL.compress testZstdCompressionLevel . Tar.write
 gzipArchive :: [TarEntry.Entry] -> BL.ByteString
 gzipArchive = GZip.compress . Tar.write
 
--- | Test-setup helpers: the paths and link targets below are short literals,
--- so encoding them cannot fail; 'error' marks setup bugs, not test failures.
+-- | A test archive's entry path.  The paths the tests pass are short
+-- literals, so encoding one cannot fail; 'error' marks a setup bug, not a
+-- test failure.
 tarPathOrDie :: Bool -> FilePath -> TarEntry.TarPath
 tarPathOrDie isDir p =
   either (error . ("test tar path: " ++)) id (TarEntry.toTarPath isDir p)
 
+-- | A test archive's link target.  The targets the tests pass are short
+-- literals, so encoding one cannot fail; 'error' marks a setup bug, not a
+-- test failure.
 linkOrDie :: FilePath -> TarEntry.LinkTarget
 linkOrDie t =
   fromMaybe (error ("test link target: " ++ t)) (TarEntry.toLinkTarget t)
@@ -35047,12 +35050,6 @@ testWalkPathRules = do
           ]
     ]
 
--- | Bytecode short_arg spill: op-level payload counts at or above the
--- 0xFFFF sentinel move to the first data word, so literals are not
--- capped at 65535 elements.  The two exact-boundary list cases pin the
--- inline maximum (65534) and the first spilled count (65535); the rest
--- drive each counted-op kind (list, attrs, let, string parts, attr path)
--- well past the inline maximum.
 -- ---------------------------------------------------------------------------
 -- Bytecode shared across elements
 -- ---------------------------------------------------------------------------
@@ -35118,6 +35115,12 @@ testBytecodePerElement = do
         assertNoPerElementBytecode (summed ("builtins.genList (i: let inherit ({ v = i; }) v; in v) " <>))
     ]
 
+-- | Bytecode short_arg spill: op-level payload counts at or above the
+-- 0xFFFF sentinel move to the first data word, so literals are not
+-- capped at 65535 elements.  The two exact-boundary list cases pin the
+-- inline maximum (65534) and the first spilled count (65535); the rest
+-- drive each counted-op kind (list, attrs, let, string parts, attr path)
+-- well past the inline maximum.
 testBytecodeCountSpill :: IO [Bool]
 testBytecodeCountSpill = do
   putStrLn "bytecode/count-spill"
