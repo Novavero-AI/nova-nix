@@ -7,7 +7,10 @@
 # derivation a change leaves alone has the store path an earlier push to
 # main published, so it is downloaded.  One the change alters has a store
 # path the cache lacks, so it builds.  A stage's handoff holds every rung
-# of that stage, so a rung it lacks fails.  A cache that answers and cannot
+# of that stage, so a rung it lacks fails.  A job that builds with a
+# stage's rungs but not the stage itself, such as Hello's on the native
+# toolchain, cannot build a rung that takes hours, so a rung it lacks
+# leaves that job's work to the ladder.  A cache that answers and cannot
 # be used looks like a rung it lacks: nova-nix passes over a narinfo no
 # trusted key signs, or one whose archive is gone, and builds, as upstream
 # does.  The job would stay green while every run built the ladder from the
@@ -30,26 +33,31 @@
 #   STAGE      the stage whose rungs to realise, an attribute of rungs.nix
 #   LACKING    what a rung the cache lacks is: build, one the change alters,
 #              built after the held ones; fail, a rung missing from a cache
-#              that holds the stage whole
+#              that holds the stage whole; defer, one the change alters,
+#              which the ladder builds: then no rung is realised and
+#              held=false goes to GITHUB_OUTPUT, and with none lacking,
+#              held=true goes there and every rung is realised as with fail
 #   ARGUMENT   passed to each `nova-nix eval` and `nova-nix build`, as
 #              --store DIR is
 # Required environment:
 #   CACHE_URL    the cache's address, for the narinfo queries
 #   NIX_CONFIG   nix.conf settings naming the cache as a substituter and the
 #                key it signs with
+#   GITHUB_OUTPUT  with defer, the file a step's outputs are appended to
 #
 # Portable to bash 3.2, which is what macOS ships.
 set -euo pipefail
 
 nova_nix=${1:?the nova-nix executable}
 stage=${2:?the stage whose rungs to realise}
-lacking=${3:?what a rung the cache lacks is, build or fail}
+lacking=${3:?what a rung the cache lacks is, build, fail or defer}
 shift 3
 : "${CACHE_URL:?}" "${NIX_CONFIG:?}"
 case $lacking in
   build | fail) ;;
+  defer) : "${GITHUB_OUTPUT:?}" ;;
   *)
-    echo "::error::LACKING is build or fail, not $lacking" >&2
+    echo "::error::LACKING is build, fail or defer, not $lacking" >&2
     exit 1
     ;;
 esac
@@ -103,9 +111,10 @@ realise() {
 count=$(evaluate "builtins.length ($RUNGS)" "$@")
 # An empty list would pass having checked nothing.
 [ "$count" -gt 0 ] || fail "rungs.nix lists no rung for the $stage stage"
-held=0
-# The rungs the cache lacks, each preceded by a space: an attribute path
-# has none.
+# The rungs the cache holds, each as ATTR=HASH, and those it lacks, each
+# preceded by a space: an attribute path has neither a space nor an =.
+held=
+held_count=0
 lacked=
 
 for ((index = 0; index < count; index++)); do
@@ -125,19 +134,33 @@ for ((index = 0; index < count; index++)); do
   case $status in
     200)
       echo "== $attr: held by the cache"
-      realise "$attr" "$@"
-      [ "$realised" != built ] || fail "$attr was built, and the cache holds it: $narinfo"
-      held=$((held + 1))
+      held="$held $attr=$hash"
+      held_count=$((held_count + 1))
       ;;
     404)
-      [ "$lacking" = build ] || fail "$attr: $narinfo is not there, and the cache holds the $stage stage whole"
+      [ "$lacking" != fail ] || fail "$attr: $narinfo is not there, and the cache holds the $stage stage whole"
       echo "== $attr: not held by the cache"
       lacked="$lacked $attr"
       ;;
     *) fail "$attr: $narinfo answered $status" ;;
   esac
 done
-echo "the cache held $held of the $stage stage's $count rungs"
+echo "the cache holds $held_count of the $stage stage's $count rungs"
+
+if [ "$lacking" = defer ]; then
+  if [ -n "$lacked" ]; then
+    echo "::notice::the cache lacks the $stage stage's${lacked}, which this change alters; the ladder builds them, and this job leaves what needs them to it"
+    echo "held=false" >> "$GITHUB_OUTPUT"
+    exit 0
+  fi
+  echo "held=true" >> "$GITHUB_OUTPUT"
+fi
+
+for entry in $held; do
+  attr=${entry%%=*}
+  realise "$attr" "$@"
+  [ "$realised" != built ] || fail "$attr was built, and the cache holds it: $CACHE_URL/${entry#*=}.narinfo"
+done
 
 for attr in $lacked; do
   realise "$attr" "$@"

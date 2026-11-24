@@ -21892,9 +21892,9 @@ testSeedStdenvWindows = do
     seedHello :: Text
     seedHello = "checks.hello"
     stage1Hello :: Text
-    stage1Hello = "pkgs.hello"
+    stage1Hello = "(pkgs.lib.callPackageWith pkgs ./pkgs/windows/by-name/he/hello/package.nix { stdenv = pkgs.stage1Stdenv; })"
     stage1Seeds :: [Text]
-    stage1Seeds = ["pkgs.stdenv.mingwSeed", "pkgs.stdenv.msysSeed"]
+    stage1Seeds = ["pkgs.stage1Stdenv.mingwSeed", "pkgs.stage1Stdenv.msysSeed"]
     roots :: [Text]
     roots = toolRoots ++ [seedHello, stage1Hello] ++ stage1Seeds
     helloArchive :: Text
@@ -24248,9 +24248,9 @@ testStage2StdenvWindows = do
     seedHelloRoot :: Text
     seedHelloRoot = "seedChecks.hello"
     stage1Hello :: Text
-    stage1Hello = "pkgs.hello"
+    stage1Hello = "(pkgs.lib.callPackageWith pkgs ./pkgs/windows/by-name/he/hello/package.nix { stdenv = pkgs.stage1Stdenv; })"
     stage1Seeds :: [Text]
-    stage1Seeds = ["pkgs.stdenv.mingwSeed", "pkgs.stdenv.msysSeed"]
+    stage1Seeds = ["pkgs.stage1Stdenv.mingwSeed", "pkgs.stage1Stdenv.msysSeed"]
     roots :: [Text]
     roots = toolRoots ++ [wrappersRoot, helloRoot, flagsRoot, seedHelloRoot, stage1Hello] ++ packageRoots ++ stage1Seeds
     -- The stage-1 stdenv's other five packages, built with the stage-2
@@ -31927,16 +31927,11 @@ testTrustWindowsGraphs = do
                     assertEqual "seed" (Trust.FetchedBy "builtin:fetchurl", [Trust.inputOutput hex0Input]) (Trust.inputProvenance seedInput, Trust.inputSameHash seedInput)
                       `andThen` assertEqual "hex0" (Trust.BuiltBy (trustText (Trust.inputOutput seedInput)), [Trust.inputOutput seedInput]) (Trust.inputProvenance hex0Input, Trust.inputSameHash hex0Input)
                   other -> Fail ("inputs: " <> T.pack (show other)),
-              runTest "hello's closure runs the MSYS2 packages of bash's tree as builders, through builtin:unpack, and no MinGW-w64 package" $
-                let ran = ranNames helloReport
-                 in assertEqual "bash and its runtime" True (all (`elem` ran) ["bash-5.3.015-1-x86_64.pkg.tar.zst", "msys2-runtime-3.6.9-2-x86_64.pkg.tar.zst", "coreutils-8.32-5-x86_64.pkg.tar.zst"])
-                      `andThen` assertEqual "MinGW-w64" [] (filter ("mingw-w64-" `T.isPrefixOf`) ran)
-                      `andThen` assertEqual "directly" [] (ranDirectly helloReport)
-                      `andThen` assertEqual "fetched" [] [Trust.inputProvenance input | input <- Trust.trInputs helloReport, Trust.inputProvenance input /= Trust.FetchedBy "builtin:fetchurl"]
-                      `andThen` ( case Set.toList (treeBuilders helloReport) of
-                                    [builder] | "-msys-seed/usr/bin/bash.exe" `BS.isSuffixOf` builder -> Pass
-                                    other -> Fail ("builders: " <> T.pack (show other))
-                                )
+              runTest "hello's closure, through the stdenv, runs only the seed and hex0 as builders, as kaem's does" $
+                assertEqual "run as builders" ["hex0-seed.exe", "hex0.exe"] (ranNames helloReport)
+                  `andThen` assertEqual "directly" ["hex0-seed.exe", "hex0.exe"] (ranDirectly helloReport)
+                  `andThen` assertEqual "tree builders" Set.empty (treeBuilders helloReport)
+                  `andThen` assertEqual "outside" Map.empty (Trust.trOutsideBuilders helloReport)
             ]
     Right other -> sequence [runTest "trust over pkgs/windows evaluates" (Fail ("unexpected roots: " <> T.pack (show (fst other))))]
     Left err -> sequence [runTest "trust over pkgs/windows evaluates" (Fail err)]

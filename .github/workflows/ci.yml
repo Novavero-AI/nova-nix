@@ -764,10 +764,11 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # End-to-end (Windows-only): the executable this repo ships, driving a real
-  # build through the real stdenv - fetch the MinGW-w64 seed, build GNU hello
-  # with it via genericBuild, and run the produced hello.exe.  Deliberately no
-  # store cache: a warm store would let the builder skip the exact work this
-  # job exists to exercise.
+  # build through the package set's stdenv - its tools taken from the public
+  # cache, GNU hello built with them here, and the produced hello.exe run,
+  # or, for a change to the toolchain, left to the seed ladder.
+  # Deliberately no store cache: a warm store would let the builder skip the
+  # exact work this job exists to exercise.
   # ---------------------------------------------------------------------------
 
   e2e-windows:
@@ -847,11 +848,30 @@ jobs:
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
       # Every source pkgs/windows fetches, from the public cache where it
-      # holds it, so the builds below fetch none.  They name no substituter
-      # and substitute nothing.
+      # holds it, so the builds below fetch none.
       - name: Take the sources from the public cache
         shell: bash
         run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+      # The stdenv's toolchain from the public cache, which the seed ladder's
+      # runs on main publish; built from the seed it takes hours.  The
+      # ladder builds the native x86_64 toolchain from every stage before
+      # it, so a change to any rung under it alters the toolchain's rungs,
+      # and the cache lacks them until main publishes them.  The ladder's
+      # Stage-2 stdenv job then builds that toolchain and Hello on it, and
+      # this job builds neither.  The stdenv's wrappers (stage2Stdenv.cc)
+      # take moments, so ones the change alters build here.
+      - name: Name the public cache as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+      - name: Take the native toolchain from the public cache
+        id: toolchain
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" native-x86_64 defer
+      - name: Take the stdenv's wrappers from the public cache, or build them
+        if: steps.toolchain.outputs.held == 'true'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" stage2-stdenv build
 
       # pkgs/windows/hello.nix points at the by-name hello package, which
       # builds through the real stdenv (genericBuild, setup.sh) rather than
@@ -859,23 +879,38 @@ jobs:
       # mkDerivation package.  The workspace lives on D: while the store is
       # anchored on C: - building from here is deliberate: it exercises
       # canonical /nix/store text rendered through the store dir.
+      # With no substituter, so that Hello itself is built here, and its
+      # [build] line is required: from the public cache, which serves it
+      # once main publishes it, Hello would arrive with no build at all.
       - name: Build hello.nix through the real stdenv
-        shell: pwsh
+        if: steps.toolchain.outputs.held == 'true'
+        shell: bash
+        env:
+          NIX_CONFIG: ""
         run: |
-          $exe = "$env:RUNNER_TEMP\bin\nova-nix.exe"
-          $out = (& $exe build pkgs\windows\hello.nix) | Select-Object -Last 1
-          if ($LASTEXITCODE -ne 0) { Write-Error "nova-nix build failed"; exit 1 }
-          Write-Host "out path: $out"
-          # setup.sh installs with `make install prefix=`, so autotools lands
-          # the binary under bin/, not at the output root.
-          $hello = Join-Path $out "bin\hello.exe"
-          if (-not (Test-Path $hello)) { Write-Error "no bin\hello.exe in $out"; exit 1 }
-          $got = (& $hello) -join "`n"
-          Write-Host "output: $got"
-          if ($got -ne "Hello, world!") {
-            Write-Error "unexpected hello output: $got"
+          set -euo pipefail
+          log="$RUNNER_TEMP/hello-build.log"
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/hello.nix 2> "$log" | tail -n 1); then
+            cat "$log"
+            echo "::error::nova-nix build failed"
+            exit 1
+          fi
+          cat "$log"
+          # A line may end in the carriage return of Windows' text mode.
+          grep -q -E '^[[:space:]]*\[build\][[:space:]]+hello[[:space:]]*$' "$log" || {
+            echo "::error::hello was not built here"
             exit 1
           }
+          echo "out path: $out"
+          # setup.sh installs with `make install prefix=`, so autotools lands
+          # the binary under bin/, not at the output root.
+          hello="$(cygpath -u "$out")/bin/hello.exe"
+          [ -f "$hello" ] || { echo "::error::no bin/hello.exe in $out"; exit 1; }
+          # hello.exe ends its line with a carriage return, as a native
+          # Windows program does.
+          got=$("$hello" | tr -d '\r')
+          echo "output: $got"
+          [ "$got" = "Hello, world!" ] || { echo "::error::unexpected hello output: $got"; exit 1; }
 
       - name: Diagnose store layout on failure
         if: failure()

@@ -45,7 +45,10 @@ jobs:
   # The closure is built again here, with the public cache as a substituter:
   # after the first publish, everything a push left alone substitutes and
   # only the delta builds, and --all then finds the rest already cached.  A
-  # toolchain bump is the cold case, a second full build.  The bytes pushed
+  # push that alters the toolchain leaves Hello to the seed ladder's run on
+  # it, whose Stage-2 stdenv job builds that toolchain and Hello on it and
+  # publishes both: until it does, the cache lacks the toolchain, which
+  # takes hours to build here.  The bytes pushed
   # are this job's, so this job runs its own Hello first and one that does
   # not print is never published.  That check is what holds a closure back:
   # a job cannot need one of another workflow, so this one does not wait
@@ -57,6 +60,8 @@ jobs:
     name: Publish (public cache)
     runs-on: windows-latest
     timeout-minutes: 45
+    outputs:
+      held: ${{ steps.toolchain.outputs.held }}
     environment:
       name: cache
       url: ${{ env.CACHE_URL }}
@@ -96,23 +101,29 @@ jobs:
         shell: bash
         run: bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
+      - name: Name the public cache as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+      - name: Take the native toolchain from the public cache
+        id: toolchain
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" native-x86_64 defer
+
       # build prints the out path as its last stdout line; the [subst] and
       # [build] lines go to stderr and stay in the job log.  LC_ALL pinned
-      # as E2E (public cache) pins it: the greeting is compared literally,
-      # and hello configures NLS in when it finds libintl, which the seed
-      # ships.  The build never sees it: the builder scrubs the ambient
+      # as E2E (public cache) pins it, since the greeting is compared
+      # literally.  The build never sees it: the builder scrubs the ambient
       # environment down to SystemRoot, SystemDrive and windir.
       - name: Build hello.nix, substituting what the cache already has, and run it
+        if: steps.toolchain.outputs.held == 'true'
         shell: bash
         env:
           LC_ALL: C
         run: |
           set -euo pipefail
-          out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/hello.nix \
-            --substituter "$CACHE_URL" \
-            --trusted-key "$CACHE_PUBLIC_KEY" | tail -n 1)
+          out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/hello.nix | tail -n 1)
           echo "out path: $out"
-          got=$("$(cygpath -u "$out")/bin/hello.exe")
+          got=$("$(cygpath -u "$out")/bin/hello.exe" | tr -d '\r')
           echo "output: $got"
           [ "$got" = "Hello, world!" ] || { echo "unexpected hello output: $got" >&2; exit 1; }
 
@@ -142,7 +153,9 @@ jobs:
   # must come entirely from it: a single [build] line means the cache is
   # missing part of the current closure and the job turns red, instead of
   # a silent local rebuild hiding the gap.  Once the publish job above has
-  # refreshed the cache from this same tree.
+  # refreshed the cache from this same tree, and only when it built Hello:
+  # on a push that alters the toolchain, the cache holds this tree's Hello
+  # once the seed ladder's run publishes it.
   # ---------------------------------------------------------------------------
   e2e-public-cache:
     name: E2E (public cache)
@@ -178,6 +191,7 @@ jobs:
       # found; cygpath keeps the separators Windows-native so the store dir
       # the binary renders paths through has one spelling.
       - name: Substitute the whole closure from the public cache
+        if: needs.publish.outputs.held == 'true'
         shell: bash
         env:
           LC_ALL: C
@@ -197,7 +211,7 @@ jobs:
             echo "the public cache is missing part of the current closure: the lines above were built locally" >&2
             exit 1
           fi
-          got=$("$(cygpath -u "$out")/bin/hello.exe")
+          got=$("$(cygpath -u "$out")/bin/hello.exe" | tr -d '\r')
           echo "output: $got"
           [ "$got" = "Hello, world!" ] || { echo "unexpected hello output: $got" >&2; exit 1; }
 
