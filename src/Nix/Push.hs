@@ -472,8 +472,10 @@ pushPaths :: PushConfig -> Store -> [StorePath] -> IO (Either Text PushSummary)
 pushPaths cfg store roots =
   -- Every synchronous exception: the push raises sqlite-simple's from the
   -- database, walk failures and IO errors from the serialiser, and IO
-  -- errors from the log, and each is a failed push to report.
-  runExceptT run `catchSync` \e -> pure (Left ("push failed: " <> T.pack (displayException e)))
+  -- errors from the log, and each is a failed push, reported as its
+  -- exception says, as every other failure here is, for the command to
+  -- word.
+  runExceptT run `catchSync` \e -> pure (Left (T.pack (displayException e)))
   where
     run :: ExceptT Text IO PushSummary
     run = do
