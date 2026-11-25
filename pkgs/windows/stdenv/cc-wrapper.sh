@@ -1,5 +1,5 @@
 #!/bin/sh
-# nova-nix stage-2 stdenv: one of gcc-native-x86_64's compiler drivers, as
+# nova-nix stdenv: one of gcc-native-x86_64's compiler drivers, as
 # the stdenv's builds run it.  wrap.sh writes gcc, cc, g++ and c++ from
 # this template, each with its driver as @driver@, -std=gnu17 as @std@ for
 # the C drivers and nothing for the C++ ones, and link.specs as @specs@.

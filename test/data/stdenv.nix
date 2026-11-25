@@ -10,8 +10,8 @@
 let
   pkgs = import ../../pkgs/windows;
 
-  building = pkgs.stage2Stdenv // {
-    mkDerivation = attrs: pkgs.stage2Stdenv.mkDerivation (attrs // { allowSubstitutes = false; });
+  building = pkgs.stdenv // {
+    mkDerivation = attrs: pkgs.stdenv.mkDerivation (attrs // { allowSubstitutes = false; });
   };
 
   # A package of pkgs/windows/by-name called with the stage-2 stdenv, and
@@ -29,8 +29,8 @@ in
   greeter = withStage2 "/gr/greeter/package.nix" { inherit libgreet; };
 
   flags = building.mkDerivation {
-    name = "stage2-stdenv-flags";
-    src = ./stage2-stdenv-flags;
+    name = "stdenv-flags";
+    src = ./stdenv-flags;
     dontConfigure = true;
     # The drivers the stdenv's wrap, which flags.sh runs by their paths to
     # see what the wrappers keep from them.

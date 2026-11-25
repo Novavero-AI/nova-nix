@@ -1,5 +1,5 @@
 #!/bin/sh
-# nova-nix stage-2 stdenv: binutils-native-x86_64's resource compiler, as
+# nova-nix stdenv: binutils-native-x86_64's resource compiler, as
 # the stdenv's builds run it under the name windres.  wrap.sh writes it
 # from this template, with windres.exe as @windres@ and
 # gcc-native-x86_64's gcc.exe as @driver@.

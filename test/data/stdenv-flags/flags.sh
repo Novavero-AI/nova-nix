@@ -1,9 +1,9 @@
-# What the stage-2 stdenv gives a build's compilers and linker, as a build
-# sees it.  test/data/stage2-stdenv.nix's flags runs this in its build
+# What pkgs/windows' stdenv gives a build's compilers and linker, as a
+# build sees it.  test/data/stdenv.nix's flags runs this in its build
 # phase, in the source directory with the stdenv's PATH, and installs the
 # lines it writes to flags.txt, which CI compares with
-# test/data/stage2-stdenv-flags-answer.txt.  A step that fails leaves its
-# line out.
+# test/data/stdenv-flags-answer.txt.  A step that fails leaves its line
+# out.
 #
 # gcc, cc, g++ and c++, run by name as a package's build runs them, each
 # compile and link std.c, which prints the standard it was compiled as,
@@ -11,7 +11,7 @@
 # recipe; ld links answer.c's object; and the line of each program has the
 # time stamp in its PE header.  gcc -v, which links nothing, exits 0.
 # Then, for each variable of the environment that names directories GCC
-# searches (pkgs/windows/stage2-stdenv/cc-wrapper.sh), it writes whether
+# searches (pkgs/windows/stdenv/cc-wrapper.sh), it writes whether
 # gcc and g++, with the variable naming a directory, print that directory
 # with -v -E or -print-search-dirs, and whether gcc-native-x86_64's own
 # drivers do, which $compilers names, so that the check is known to find

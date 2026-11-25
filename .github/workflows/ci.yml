@@ -872,9 +872,9 @@ jobs:
       # ladder builds the native x86_64 toolchain from every stage before
       # it, so a change to any rung under it alters the toolchain's rungs,
       # and the cache lacks them until main publishes them.  The ladder's
-      # Stage-2 stdenv job then builds that toolchain and Hello on it, and
-      # this job builds neither.  The stdenv's wrappers (stage2Stdenv.cc)
-      # take moments, so ones the change alters build here.
+      # Stdenv job then builds that toolchain and Hello on it, and this job
+      # builds neither.  The stdenv's wrappers (stdenv.cc) take moments, so
+      # ones the change alters build here.
       - name: Name the public cache as a substituter
         shell: bash
         run: bash .github/cache/name-substituters.sh "$CACHE_URL" "$CACHE_PUBLIC_KEY"
@@ -885,7 +885,7 @@ jobs:
       - name: Take the stdenv's wrappers from the public cache, or build them
         if: steps.toolchain.outputs.held == 'true'
         shell: bash
-        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" stage2-stdenv build
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" stdenv build
 
       # pkgs/windows/hello.nix points at the by-name hello package, which
       # builds through the real stdenv (genericBuild, setup.sh) rather than

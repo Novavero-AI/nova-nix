@@ -63,8 +63,8 @@
 # gld${EMULATION_NAME}_after_open in ld/emultempl/pe.em,
 # _bfd_XXi_only_swap_filehdr_out in bfd/peXXigen.c), which GCC's link spec
 # for MinGW never passes (LINK_SPEC in gcc/config/i386/mingw32.h), and the
-# seed stdenv has no compiler wrapper to add it, as the stage-2 stdenv's
-# wrappers do (pkgs/windows/stage2-stdenv/link.specs).  LDFLAGS passes it
+# seed stdenv has no compiler wrapper to add it, as the package set's
+# stdenv has (pkgs/windows/stdenv/link.specs).  LDFLAGS passes it
 # to every link gcc46 makes here: the host's programs take LDFLAGS, and so
 # do the build machine's, the build being the host (LDFLAGS_FOR_BUILD in
 # configure.ac, BUILD_LDFLAGS in gcc/configure.ac).  It replaces the

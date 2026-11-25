@@ -1,4 +1,4 @@
-# nova-nix stage-2 stdenv: the specs the compiler drivers' wrappers give
+# nova-nix stdenv: the specs the compiler drivers' wrappers give
 # gcc-native-x86_64 with -specs, which it reads after its own
 # (OPT_specs_ in driver_handle_option and the user specs in
 # driver::set_up_specs, gcc/gcc.cc in GCC 16.2.0), skipping a line that
@@ -9,11 +9,11 @@
 # the driver runs only when it links (%l in LINK_COMMAND_SPEC, and the
 # link entry of static_specs, in gcc/gcc.cc), so every link it makes gets
 # --no-insert-timestamp (ld-wrapper.sh says why), and a command that links
-# nothing gets no linker option.  -Wl, which the stage-1 stdenv's wrapper
-# adds to each command it finds no compile-only option in, is an input file
-# to the driver, so with it gcc -v, which prints the configuration and
-# stops, goes on to link a program from no object (OPT_Wl_ in
-# driver_handle_option, driver::maybe_print_and_exit and
-# driver::prepare_infiles in gcc/gcc.cc).
+# nothing gets no linker option.  The flag is not given on the command line
+# as -Wl,--no-insert-timestamp: a -Wl, option is an input file to the
+# driver, so with it gcc -v, which prints the configuration and stops, goes
+# on to link a program from no object (OPT_Wl_ in driver_handle_option,
+# driver::maybe_print_and_exit and driver::prepare_infiles in
+# gcc/gcc.cc).
 *link:
 + --no-insert-timestamp

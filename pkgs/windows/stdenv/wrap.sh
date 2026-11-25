@@ -1,4 +1,4 @@
-# nova-nix stage-2 stdenv: writes the stdenv's compiler, linker and
+# nova-nix stdenv: writes the stdenv's compiler, linker and
 # resource compiler wrappers into $out/bin, from the templates
 # cc-wrapper.sh, ld-wrapper.sh and windres-wrapper.sh.
 #

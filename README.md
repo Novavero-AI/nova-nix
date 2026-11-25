@@ -293,7 +293,7 @@ Set-Location "$env:LOCALAPPDATA\Programs\nova-nix-windows-x64"
 ```console
 > nova-nix build pkgs\windows\hello.nix --substituter https://cache.novavero.ai --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
   [subst]  hello
-C:\nix\store\sk4x5j4ca20xsfw1f4px96l1sap3z8kh-hello
+C:\nix\store\2558zw5m0x3z4i78vmvnrdw93rh2pqdr-hello
 > .\result\bin\hello.exe
 Hello, world!
 ```

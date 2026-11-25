@@ -156,13 +156,12 @@ package, each called with its dependencies from the set itself. It has
 two stdenvs with one `mkDerivation` interface, both made only of tools
 built from the seed:
 
-- `stdenv`, the stage-2 stdenv ([`pkgs/windows/stage2-stdenv`]), also
-  named `stage2Stdenv`: the seed stdenv's shell and tools with the
-  ladder's native x86_64 GCC and binutils behind compiler and linker
-  wrappers, building for `x86_64-windows`. Its fixup phase copies each
-  DLL an output's programs and libraries import, and Windows does not
-  provide, beside them. [`hello.nix`](../../pkgs/windows/hello.nix) and
-  the set's other packages build with it.
+- `stdenv` ([`pkgs/windows/stdenv`]): the seed stdenv's shell and tools
+  with the ladder's native x86_64 GCC and binutils behind compiler and
+  linker wrappers, building for `x86_64-windows`. Its fixup phase copies
+  each DLL an output's programs and libraries import, and Windows does
+  not provide, beside them. [`hello.nix`](../../pkgs/windows/hello.nix)
+  and the set's other packages build with it.
 - `seedStdenv`, the seed stdenv ([`pkgs/windows/seed-stdenv`]):
   busybox-w32's `sh` and applets, GNU make and TinyCC. The ladder's rungs
   from binutils on build with it, as `i686-windows` derivations.
@@ -210,8 +209,8 @@ stages, grouped here from the ten lists
    2.46, GCC 16.2.0 and the MinGW-w64 runtime for `x86_64-w64-mingw32`
    follow as a cross toolchain running on i686, and then, built by it,
    binutils and GCC 16.2.0 that run on x86_64 and write x86_64.
-7. **The stage-2 stdenv's** compiler and linker wrappers over that native
-   toolchain.
+7. **Stdenv.** The compiler and linker wrappers of the set's `stdenv`
+   over that native toolchain.
 
 Every rung is an ordinary derivation.
 
@@ -281,7 +280,7 @@ Neither is built. Each is designed in its issue, and this is the design.
 [tinycc]: ../../pkgs/windows/by-name/ti/tinycc/package.nix
 [`cbits/nn_winfs.c`]: ../../cbits/nn_winfs.c
 [`pkgs/windows/seed-stdenv`]: ../../pkgs/windows/seed-stdenv
-[`pkgs/windows/stage2-stdenv`]: ../../pkgs/windows/stage2-stdenv
+[`pkgs/windows/stdenv`]: ../../pkgs/windows/stdenv
 [`src/Nix/Builder/Unpack.hs`]: ../../src/Nix/Builder/Unpack.hs
 [`src/Nix/Environment.hs`]: ../../src/Nix/Environment.hs
 [`src/Nix/Profile/Generation.hs`]: ../../src/Nix/Profile/Generation.hs

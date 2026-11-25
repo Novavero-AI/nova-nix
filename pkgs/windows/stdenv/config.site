@@ -1,4 +1,4 @@
-# The defaults the stage-2 stdenv's builds take in place of configure's,
+# The defaults this stdenv's builds take in place of configure's,
 # read through CONFIG_SITE by each autoconf configure script the stdenv
 # runs, unless the package points CONFIG_SITE elsewhere.  What configure
 # cannot detect about PATH, ../seed-stdenv/setup.sh exports.  configure
