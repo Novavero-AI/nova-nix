@@ -11,12 +11,10 @@
 # on i686 and is named for its target.  This is a Canadian cross, as
 # gcc-native-x86_64 is: the stdenv's i686-pc-mingw32 is the build, and
 # x86_64-w64-mingw32 the host and the target.  With the host and the target
-# the same, the top level gives the programs no prefix (the reset of
-# program_transform_name before AC_CANONICAL_TARGET in configure.ac), so
-# they install as bin/<name>.exe, and ar, as, dlltool, ld, ld.bfd, nm,
-# objcopy, objdump, ranlib, readelf, strip and windres again in
-# x86_64-w64-mingw32/bin, as binutils-x86_64's do under their prefixed
-# names.
+# the same, the top level gives the programs no prefix, so they install as
+# bin/<name>.exe, and ar, as, dlltool, ld, ld.bfd, nm, objcopy, objdump,
+# ranlib, readelf, strip and windres again in x86_64-w64-mingw32/bin, as
+# binutils-x86_64's do under their prefixed names.
 #
 # The archive, the flags and what the build leaves out are
 # binutils-x86_64's, which says why of each, with --host added.  The

@@ -14,10 +14,9 @@
 # The fixup copies each DLL an output's programs and libraries import,
 # and that Windows does not provide, beside them: Windows has no RPATH,
 # and a program finds a DLL in its own directory before the system's and
-# PATH's.  The imports are read from
-# each PE file with objdump, and a bundled DLL's own imports in turn, to a
-# fixpoint.  A DLL found in no input is an undeclared dependency, and
-# fails the build.
+# PATH's.  The imports are read from each PE file with objdump, and a
+# bundled DLL's own imports in turn, to a fixpoint.  A DLL found in no
+# input is an undeclared dependency, and fails the build.
 set -e
 
 # These paths reach the package's phases, which the seed stdenv's setup.sh

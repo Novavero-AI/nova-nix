@@ -1,16 +1,13 @@
 # GCC 16.2.0 with C and C++ that runs on x86_64 Windows and writes
 # x86_64-w64-mingw32, as nixpkgs builds a GCC whose host is its target with
-# a cross compiler of its own version (nixpkgs
-# 5eb598da22ce76bc18ec85ecc1de66ca838b3514, gccForMajorMinorVersion in
-# pkgs/development/compilers/gcc/all.nix, with gcc/default.nix and
-# common/configure-flags.nix): the C and C++ drivers, cc1, cc1plus, cpp,
-# collect2, gcov, libgcc and libstdc++, configured, compiled and installed
-# in the seed stdenv by gcc-x86_64 and binutils-x86_64, with the programs
-# the build runs itself compiled by gcc-latest, against MinGW-w64 v14.0.0's
-# headers and the runtime gcc-core-x86_64 compiled.  It runs as gcc and g++,
-# the drivers the package set's stdenv wraps
-# (pkgs/windows/stdenv/wrap.sh), and its assembler and linker are
-# binutils-native-x86_64's.
+# a cross compiler of its own version: the C and C++ drivers, cc1,
+# cc1plus, cpp, collect2, gcov, libgcc and libstdc++, configured, compiled
+# and installed in the seed stdenv by gcc-x86_64 and binutils-x86_64, with
+# the programs the build runs itself compiled by gcc-latest, against the
+# headers mingw-w64-headers-latest installs and the runtime
+# gcc-core-x86_64 compiled.  It runs as gcc and g++, the drivers the
+# package set's stdenv wraps (pkgs/windows/stdenv/wrap.sh), and its
+# assembler and linker are binutils-native-x86_64's.
 #
 # The build is a Canadian cross, as binutils-native-x86_64's is: the
 # stdenv's i686-pc-mingw32 is the build, and x86_64-w64-mingw32 the host

@@ -1,19 +1,14 @@
 # nova-nix stdenv: the specs the compiler drivers' wrappers give
-# gcc-native-x86_64 with -specs, which it reads after its own
-# (OPT_specs_ in driver_handle_option and the user specs in
-# driver::set_up_specs, gcc/gcc.cc in GCC 16.2.0), skipping a line that
-# begins with # (skip_whitespace in gcc/gcc.cc).
+# gcc-native-x86_64 with -specs, which it reads after its own, skipping a
+# line that begins with #.
 #
 # A spec whose text begins with + and a space is added to the end of the
-# spec of that name (set_spec in gcc/gcc.cc).  The link spec is in what
-# the driver runs only when it links (%l in LINK_COMMAND_SPEC, and the
-# link entry of static_specs, in gcc/gcc.cc), so every link it makes gets
-# --no-insert-timestamp (ld-wrapper.sh says why), and a command that links
-# nothing gets no linker option.  The flag is not given on the command line
-# as -Wl,--no-insert-timestamp: a -Wl, option is an input file to the
-# driver, so with it gcc -v, which prints the configuration and stops, goes
-# on to link a program from no object (OPT_Wl_ in driver_handle_option,
-# driver::maybe_print_and_exit and driver::prepare_infiles in
-# gcc/gcc.cc).
+# spec of that name.  The link spec is in what the driver runs only when it
+# links, so every link it makes gets --no-insert-timestamp (ld-wrapper.sh
+# says why), and a command that links nothing gets no linker option.  The
+# flag is not given on the command line as -Wl,--no-insert-timestamp: a
+# -Wl, option is an input file to the driver, so with it gcc -v, which
+# prints the configuration and stops, goes on to link a program from no
+# object.
 *link:
 + --no-insert-timestamp

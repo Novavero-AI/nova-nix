@@ -23,28 +23,21 @@
 # directory from the environment (cc-wrapper.sh, link.specs and
 # ld-wrapper.sh say how).  They have no extension: busybox takes a file
 # that begins with #! for a program, and its sh and GNU make each run one
-# through the sh that line names (has_exec_format and do_lstat in
-# win32/mingw.c, tryexec in shell/ash.c and mingw_spawn_interpreter in
-# win32/process.c in busybox-w32 5f09fb446, process_begin in
-# src/w32/subproc/sub_proc.c in make 4.4.1).  GNU make looks for a command
-# with .exe in every directory of PATH before it looks for it with no
-# extension in any (find_file in sub_proc.c), so it runs a wrapper only
-# while PATH holds no program of the same name: neither toolchain's bin
-# directory is on it.  CC, CXX and LD name the wrappers, as nixpkgs' cc and
-# bintools wrappers' setup hooks name theirs (the CC and CXX exports in
-# pkgs/build-support/cc-wrapper/setup-hook.sh and the loop over ar, as, ld
-# and the rest in bintools-wrapper/setup-hook.sh in nixpkgs
-# 5eb598da22ce76bc18ec85ecc1de66ca838b3514), and AR binutils' archiver by
-# its path: busybox's sh runs its own ar applet for a command named ar,
-# sparing make alone (setup.sh's BB_OVERRIDE_APPLETS), and the applets'
-# ar.exe comes first on PATH.  GNU ar writes an archive's symbol index
-# unless told not to (write_archive in binutils/ar.c in binutils 2.46), so
-# it does not matter that configure finds no ranlib.  OBJDUMP and STRIP name
-# binutils' programs of those names by their paths, as nixpkgs' bintools
-# wrapper names them for a build, WINDRES names cc's windres, a wrapper of
-# binutils' that preprocesses with gcc-native-x86_64's gcc
-# (windres-wrapper.sh says why), and a build runs binutils' others by
-# their paths.
+# through the sh that line names.  GNU make looks for a command with .exe
+# in every directory of PATH before it looks for it with no extension in
+# any, so it runs a wrapper only while PATH holds no program of the same
+# name: neither toolchain's bin directory is on it.  CC, CXX and LD name
+# the wrappers, as the setup hooks of nixpkgs' cc and bintools wrappers
+# name theirs, and AR binutils' archiver by its path: busybox's sh runs its
+# own ar applet for a command named ar, sparing make alone, which the seed
+# stdenv's setup.sh names in BB_OVERRIDE_APPLETS, and the applets' ar.exe
+# comes first on PATH.  GNU ar writes an archive's symbol index unless told
+# not to, so it does not matter that configure finds no ranlib.  OBJDUMP
+# and STRIP name binutils' programs of those names by their paths, as
+# nixpkgs' bintools wrapper names them for a build, WINDRES names cc's
+# windres, a wrapper of binutils' that preprocesses with
+# gcc-native-x86_64's gcc (windres-wrapper.sh says why), and a build runs
+# binutils' others by their paths.
 {
   busybox-w32,
   gnumake,
@@ -111,7 +104,7 @@ in
         buildTriple = "x86_64-w64-mingw32";
       }
       # Parallel installing follows parallel building unless the package
-      # says otherwise, as nixpkgs' make-derivation.nix sets it.
+      # says otherwise, as nixpkgs' mkDerivation sets it.
       // (
         if attrs.enableParallelBuilding or false then
           { enableParallelInstalling = attrs.enableParallelInstalling or true; }
