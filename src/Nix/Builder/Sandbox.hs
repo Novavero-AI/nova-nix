@@ -36,8 +36,10 @@
 -- rest, then tokens, each its length, a colon, its bytes and a NUL.  The
 -- pipe stays open after the plan, and its end kills the build.  On its standard
 -- output the helper writes at most one record, @STAGE ERRNO INDEX@, for a
--- step that failed ('parseStatus'); the builder's start closes that
--- output, so nothing there means the builder ran.  The stage names here
+-- step that failed ('parseStatus'), so nothing there means the builder
+-- ran.  On Linux the builder's start closes that output; on macOS the
+-- helper keeps it open to report a failure to watch the build log, which
+-- can come after the builder ran.  The stage names here
 -- and in the helper are one list.
 module Nix.Builder.Sandbox
   ( -- * Settings
@@ -259,18 +261,21 @@ data SandboxConfig = SandboxConfig
     -- macOS.
     scAllowedImpureHostDeps :: !(Set ByteString),
     scViolationLog :: !ViolationLog,
-    -- | Upstream's @ssl-cert-file@: the CA bundle a fixed-output build sees
-    -- at @\/etc\/ssl\/certs\/ca-certificates.crt@, when there is one.
+    -- | Upstream's @ssl-cert-file@: the CA bundle a fixed-output build in
+    -- the Linux sandbox sees at @\/etc\/ssl\/certs\/ca-certificates.crt@,
+    -- when there is one.
     scCaFile :: !(Maybe ByteString),
     -- | Where the @nova-nix-sandbox@ helper is, when it was found.
     scHelper :: !(Maybe FilePath)
   }
   deriving (Eq, Show)
 
--- | No build sandboxed, and otherwise upstream's defaults where they are
--- the same on every OS: fallback on, no paths, @\/build@, half of memory
--- for @\/dev\/shm@, kept groups tolerated, no impure host paths allowed,
--- refusals unlogged, and no CA bundle or helper, which only IO can find.
+-- | No build sandboxed, upstream's defaults where they are the same on
+-- every OS (fallback on, @\/build@, half of memory for @\/dev\/shm@,
+-- refusals unlogged), and the plainest value of each default that depends
+-- on the OS, on whether the process is root, or on what only IO can find:
+-- no paths, kept groups tolerated, no impure host paths allowed, and no CA
+-- bundle or helper.
 defaultSandboxConfig :: SandboxConfig
 defaultSandboxConfig =
   SandboxConfig
@@ -349,17 +354,17 @@ data SandboxUse = Sandboxed !Network | Unsandboxed
 
 -- | The network a sandboxed build gets.
 data Network
-  = -- | A namespace of its own, holding only a loopback interface.
+  = -- | On Linux a namespace of its own, holding only a loopback
+    -- interface; on macOS no network, but the loopback one a derivation
+    -- asks for ('LocalNetworking').
     PrivateNetwork
   | -- | The host's.
     HostNetwork
   deriving (Eq, Show)
 
--- | A fixed-output derivation reaches the host's network, as upstream's
--- derivation type leaves it unsandboxed (@DerivationType::isSandboxed@ and
--- @BasicDerivation::type@ in derivations.cc at 2.24.9,
--- @derivation::Type::isSandboxed@ and @derivation::type@ there at 2.36.0);
--- every other build gets a network of its own (@startBuilder@ in LDG).
+-- | A fixed-output derivation reaches the host's network, as upstream Nix
+-- leaves it unsandboxed; every other build gets a private one
+-- ('PrivateNetwork').
 -- 'fixedOutput' is the rule the @impureEnvVars@ carve-out follows too.
 buildNetwork :: Derivation -> Network
 buildNetwork drv = case fixedOutput drv of
@@ -418,7 +423,8 @@ data LocalNetworking = LocalNetworkingDenied | LocalNetworkingAllowed
 -- (@derivationOptionsFromStructuredAttrs@ in derivation-options.cc at
 -- 2.36.0).
 data DarwinOptions = DarwinOptions
-  { -- | @__sandboxProfile@: profile text the build's profile ends with.
+  { -- | @__sandboxProfile@: profile text the build's profile holds after
+    -- its own rules, with only the build's mark after it.
     doExtraProfile :: !ByteString,
     -- | @__impureHostDeps@: host paths the build may read, each beneath
     -- an @allowed-impure-host-deps@ entry.
@@ -562,16 +568,15 @@ devDir = "/dev"
 -- build the host's network files and the CA bundle, each optional.
 --
 -- Every host path is bound read-only, the build directory alone writable,
--- where upstream binds them plainly (@doBind@ in LDG): the builder runs as the
+-- where upstream binds them plainly: the builder runs as the
 -- invoking user, so a writable bind would let a build change a valid store
 -- path, the bundled shell later builds run, an @--exec-wrapper@ launcher,
 -- or any file of the user's a @sandbox-paths@ entry names.  A bind is
 -- read-only through every mount beneath its source, which a recursive bind
--- brings along.  A device node stays usable on a read-only mount.  The
--- one host path the helper binds writable is outside the plan: where the
--- kernel will not mount a devpts of the sandbox's own, it binds the
--- host's @\/dev\/pts@ and @\/dev\/ptmx@ instead, as upstream does
--- (@runChild@ in LDG).
+-- brings along.  A device node stays usable on a read-only mount.  Outside
+-- the plan the helper binds two host paths writable: where the kernel will
+-- not mount a devpts of the sandbox's own, it binds the host's
+-- @\/dev\/pts@ and @\/dev\/ptmx@ instead, as upstream does.
 --
 -- A build directory that holds the store directory is upstream's error
 -- (@startBuilder@ in LDG).  A target that is not absolute, or has a @..@
@@ -790,9 +795,8 @@ data DarwinPathInputs = DarwinPathInputs
   }
   deriving (Eq, Show)
 
--- | A macOS build's paths: each it may read and run, in the order the
--- profile names them, which is the targets' sorted order, and the
--- directories above them it may read.
+-- | A macOS build's paths: each it may read and run, in the targets'
+-- sorted order, and the directories above them it may read.
 data DarwinPaths = DarwinPaths
   { dpPaths :: ![DarwinPath],
     dpAncestry :: ![ByteString]
@@ -951,18 +955,16 @@ data DarwinProfile = DarwinProfile
   }
   deriving (Eq, Show)
 
--- | A macOS build's profile, nova-nix's own text written to upstream's
--- rules (@DarwinDerivationBuilder::setUser@ at 2.36.0, with the rules of
--- upstream's @sandbox-defaults.sb@ and @sandbox-network.sb@): everything
--- is denied unless an allow form here allows it, and what is refused is
--- logged only under 'ViolationsLogged'.  The build may write its
--- outputs and its build directory ('profileBase'); a fixed-output build
--- reaches the network ('profileNetwork'); the inputs and every other path
--- ('darwinPathsInSandbox') may be read and run; and each directory of the
--- ancestry may be read, so a path to them resolves.  The terminals are
--- refused after every rule that could allow one ('profileTerminals'), the
--- derivation's own text follows, and the build's mark ('profileMark')
--- comes last.
+-- | A macOS build's profile, nova-nix's own text written to upstream
+-- Nix's rules: everything is denied unless an allow form here allows it,
+-- and what is refused is logged only under 'ViolationsLogged'.  The build
+-- may write its outputs and its build directory ('profileBase'); a
+-- fixed-output build reaches the network ('profileNetwork'); the inputs
+-- and every other path ('darwinPathsInSandbox') may be read and run; and
+-- each directory of the ancestry may be read, so a path to them resolves.
+-- The terminals are refused after every rule that could allow one
+-- ('profileTerminals'), the derivation's own text follows, and the build's
+-- mark ('profileMark') comes last.
 --
 -- macOS compiles the path filters of one operation into one table of at
 -- most 64 KiB, however many forms hold them, so the paths in the store
@@ -984,8 +986,8 @@ data DarwinProfile = DarwinProfile
 -- this profile lets the build read and run them alone, as the Linux
 -- sandbox binds every host path read-only.  A path is written in a
 -- string escaped for the profile's reader ('profileString'), as upstream
--- escapes it (@sbplQuote@).  An allow form is never written with no
--- filter, which would allow its operations everywhere.
+-- escapes it.  An allow form of paths is never written with no path,
+-- which would allow its operations everywhere.
 darwinProfile :: DarwinProfile -> ByteString
 darwinProfile profile =
   BS.concat
@@ -1286,7 +1288,7 @@ renderDarwinPlan plan =
 -- What the helper reports
 -- ---------------------------------------------------------------------------
 
--- | A step of @nova-nix-sandbox run@ that can fail.
+-- | A step of @nova-nix-sandbox run@ that can fail on Linux.
 data SetupStage
   = StageStdout
   | StageSigchld
@@ -1456,10 +1458,9 @@ data Unavailability
     ProbeUnreadable !Text
   deriving (Eq, Show)
 
--- | The cause, in a line.  Upstream logs its probe's at debug level
--- (@userNamespacesSupported@ and @mountAndPidNamespacesSupported@ in
--- namespaces.cc at 2.24.9, linux-namespaces.cc at 2.36.0); these are its
--- words.
+-- | The cause, in a line, in upstream Nix's words where its probe logs
+-- the same cause (at debug level); a cause that names nova-nix or its
+-- helper is nova-nix's own.
 unavailabilityCause :: Unavailability -> Text
 unavailabilityCause cause = case cause of
   PlatformUnsupported -> "sandboxing builds is not supported on this platform"
@@ -1611,21 +1612,17 @@ darwinStageName stage = case stage of
   DarwinStageExec -> "exec"
 
 -- | A failed macOS setup step, as 'setupFailureMessage' reports a Linux
--- one, in the words of upstream's errors at 2.36.0 (in
--- unix-derivation-builder.cc, darwin-derivation-builder.cc, child.cc,
--- file-descriptor.cc and processes.cc there), given the plan and the
--- program the helper
--- executes.  A profile macOS's sandbox refuses is reported with the words
--- of upstream's line for it, @failed to configure sandbox@
--- (@DarwinDerivationBuilder::setUser@),
--- which the helper writes to the build log with the sandbox's own reason
--- after them.  Upstream reads that line as one of the child's setup
--- messages and reports the end of its pipe instead, while waiting for the
--- build environment to initialize, the line among its previous messages
--- (@UnixDerivationBuilderImpl::processSandboxSetupMessages@).  A failure
--- to watch the build log is not a setup step: the helper reports it once
--- the build has ended, on the status channel, since the log it could not
--- watch cannot carry it.
+-- one, in the words of upstream Nix's errors, given the plan and the
+-- program the helper executes.  A profile macOS's sandbox refuses is
+-- reported with the words of upstream's line for it, @failed to configure
+-- sandbox@, which the helper writes to the build log with the sandbox's
+-- own reason after them.  Upstream reads that line as one of the child's
+-- setup messages and reports the end of its pipe instead, while waiting
+-- for the build environment to initialize, the line among its previous
+-- messages.  A failure to watch the build log goes on the status channel,
+-- since the log it could not watch cannot carry it: before the builder
+-- starts when the log cannot be watched at all, as @\/dev\/null@ cannot,
+-- or once the build has ended when watching it fails during the build.
 darwinSetupFailureMessage :: DarwinPlan -> ByteString -> StatusRecord DarwinStage -> Text
 darwinSetupFailureMessage plan program record = case recordStage record of
   DarwinStageStdout -> setup (sys "cannot dup stderr into stdout")
@@ -1649,7 +1646,8 @@ darwinSetupFailureMessage plan program record = case recordStage record of
 
 -- | What the helper's run of a builder came to.
 data HelperOutcome
-  = -- | The sandbox was made and the builder ran, exiting so.
+  = -- | The sandbox was made and the builder ran, and the helper exited
+    -- so: as the builder did, or with a failure of its own after it.
     BuilderRan !ExitCode
   | -- | The sandbox was not made, for the reason given.
     SetupIncomplete !Text
@@ -1660,8 +1658,9 @@ data HelperOutcome
 -- 'darwinSetupFailureMessage'), whether the plan reached it, how it
 -- exited and what it wrote on its status output.  A record is the step
 -- that failed.  With none, the exit is the builder's, which the helper
--- relays, unless the plan never reached it: then the helper ended before
--- it could report anything.
+-- relays, or the helper's own failure after the builder ran, its reason in
+-- the build log; unless the plan never reached it: then the helper ended
+-- before it could report anything.
 helperOutcome :: (Enum stage, Bounded stage) => (stage -> ByteString) -> (StatusRecord stage -> Text) -> Either Text () -> ExitCode -> ByteString -> HelperOutcome
 helperOutcome stageName failureMessage delivered exitCode status = case parseStatus stageName status of
   Left unreadable -> SetupIncomplete unreadable

@@ -8,16 +8,26 @@
 --
 -- 1. Creates a directory for the build under the store's state directory
 --    ("Nix.Builder.BuildDir")
--- 2. Sets up the environment: only store paths from @inputDrvs@ and
---    @inputSrcs@ are visible.  PATH contains only the builder and
---    specified dependencies.  No internet access (in sandboxed mode).
--- 3. Runs the builder (usually @bash -e \/nix\/store\/...-stdenv\/setup@)
--- 4. The @setup@ script sources the derivation's environment variables,
---    then runs @genericBuild@ which calls @unpackPhase@, @patchPhase@,
---    @configurePhase@, @buildPhase@, @installPhase@, @fixupPhase@, etc.
--- 5. Builder writes output to @$out@ (the output store path)
+-- 2. Sets up the environment: the derivation's variables over the
+--    standard ones, with a PATH of the builder's directory, its sibling
+--    @usr\/bin@ and the system directories ('buildPath').  A sandboxed
+--    build ("Nix.Builder.Sandbox") reaches, of the store, only its input
+--    closure, the closure of its @sandbox-paths@, its outputs and its
+--    build directory, and the host's network only when it is fixed-output
+--    (a macOS one may also ask for local networking); an unsandboxed one
+--    reaches the whole filesystem and the network.
+-- 3. Runs the derivation's builder with its arguments (for a nixpkgs
+--    stdenv, @bash -e@ on scripts that source the stdenv's @setup@)
+-- 4. The build script runs @genericBuild@, which calls @unpackPhase@,
+--    @patchPhase@, @configurePhase@, @buildPhase@, @installPhase@,
+--    @fixupPhase@, etc.
+-- 5. Builder writes output to @$out@ (the output store path, or a scratch
+--    path for an output already valid; a Linux sandboxed build's is that
+--    path beneath its chroot)
 -- 6. Nix scans the output for references to other store paths
--- 7. Output is moved to the store and registered
+-- 7. Output is placed in the store and registered ('Nix.Store.placeInStore':
+--    a Linux sandboxed build's moves out of its chroot, any other build's
+--    is there already)
 --
 -- == Checking
 --
@@ -34,13 +44,13 @@
 -- The key difference is process creation.  Upstream on Linux uses
 -- @fork\/exec@ with namespace isolation.  nova-nix spawns builders through
 -- "System.Process", which reaches @CreateProcess@ on Windows with no POSIX
--- layer, and runs them without filesystem or network isolation.
+-- layer, and runs them as the invoking user, without filesystem or network
+-- isolation.
 --
--- The builder's process tree runs inside a Win32 job object with
--- kill-on-job-close ('Proc.use_process_jobs'), so an interrupt or a
--- builder exit reaps grandchildren instead of orphaning them.  Filesystem
--- and privilege isolation are still future work: a restricted token with a
--- store-granting ACL (the security boundary), then AppContainer for more.
+-- The builder's process tree runs inside a Win32 job object
+-- ('Proc.use_process_jobs'), so the build waits until every process in
+-- the tree has exited, and an interrupt terminates the whole job instead
+-- of orphaning grandchildren.
 module Nix.Builder
   ( -- * Build execution
     BuildResult (..),
@@ -302,7 +312,7 @@ data BuildConfig = BuildConfig
     bcSubstitution :: !SubstitutionAccess,
     -- | What 'buildWithDeps' does with the derivation it is given:
     -- upstream's build mode, which @nix-build --check@ sets.  Nothing
-    -- else reads it, and 'buildDerivation' always builds.
+    -- else reads it, and 'buildDerivation' never checks.
     bcMode :: !BuildMode,
     -- | What a builder's @NIX_BUILD_CORES@ says: upstream's @cores@, 0
     -- meaning every core.  Where a derivation's attributes reach the
@@ -356,8 +366,9 @@ data SubstitutionAccess
   deriving (Eq, Show)
 
 -- | Default build configuration.  A builder is told of one core
--- ('baselineCores'), where upstream's default is the machine's count,
--- which takes IO to find ("Nix.Builder.Cores"), and runs unsandboxed
+-- ('baselineCores'), where upstream's default is the CPU limit of the
+-- process's cgroup on Linux, otherwise the machine's count, which takes
+-- IO to find ("Nix.Builder.Cores"), and runs unsandboxed
 -- ('defaultSandboxConfig'), where upstream sandboxes on Linux, since
 -- finding the sandbox's helper takes IO too.  A build that fails keeps
 -- nothing, as upstream's @keep-failed@ defaults off.
@@ -403,7 +414,9 @@ data BuildResult
 -- 2. Decide how the builder runs, refusing a sandbox that cannot be had
 -- 3. Create the build directory ('withBuildDir')
 -- 4. Set up environment from derivation + standard vars
--- 5. Run the builder process, which writes each output at its store path
+-- 5. Run the builder process, which writes each output at its store path,
+--    or at a scratch path for one already valid; a Linux sandboxed build
+--    writes them beneath its chroot until they are registered
 -- 6. On success: scan the outputs for references and register them,
 --    failing on a reference cycle between them ('registerOutputs')
 -- 7. On failure: clean up and report error, keeping the build directory
@@ -457,10 +470,13 @@ buildOutputs config store drv drvPath =
 -- after it ('checkedOutputPath'), removing what was there, as upstream
 -- does.  The verdict says which ('DifferingRebuild').  'Left' is why
 -- there was no comparison to answer with, naming the derivation as
--- 'buildWithDeps' names one that failed to build: its builder failed; an
--- output is not valid, so there is nothing to compare a rebuild with; or
--- the store is one upstream Nix's database may also manage, refused
--- before anything is touched ("Nix.Store.Upstream").
+-- 'buildWithDeps' names one that failed to build: the rebuild failed (an
+-- input missing, its builder failing, or what it wrote refused: an output
+-- missing or open to other users, a cycle between outputs, a fixed
+-- output's wrong hash); the derivation has no output, or one is not
+-- valid, so there is nothing to compare a rebuild with; or the store is
+-- one upstream Nix's database may also manage, refused before anything
+-- is touched ("Nix.Store.Upstream").
 checkDerivation :: BuildConfig -> Store -> Derivation -> StorePath -> IO (Either Text CheckVerdict)
 checkDerivation config store drv drvPath =
   first (stopReport drv) <$> checkOutputs config store drv drvPath
@@ -593,11 +609,11 @@ type Finish a = Set StorePath -> [OutputPlan] -> Written -> Commit -> IO (Either
 type Commit = IO () -> IO ()
 
 -- | What a build's builder left: where each output is on disk once it has
--- ended, at its scratch path in the store, or for a sandboxed build at
--- that path in the chroot, where it stays until it is registered; and
+-- ended, at its scratch path in the store, or for a Linux sandboxed build
+-- at that path in the chroot, where it stays until it is registered; and
 -- whether the builder left an output writable by its group or anyone else
--- ('writableByOthers'), read for a sandboxed build before the chroot's
--- seal changes the mode ('sealChroot').
+-- ('writableByOthers'), read for a Linux sandboxed build before the
+-- chroot's seal changes the mode ('sealChroot').
 data Written = Written
   { writtenPath :: OutputPlan -> FilePath,
     writtenOpen :: OutputPlan -> IO Bool
@@ -788,7 +804,8 @@ execWrapperConfig = foldl' step (Right Map.empty)
 
 -- | How this machine can spawn a derivation's builder.
 data BuilderSpawn
-  = -- | The derivation targets this machine's platform; spawn it directly.
+  = -- | The derivation targets this machine's platform, or one it executes
+    -- as well ('extraPlatforms'); spawn it directly.
     SpawnNative
   | -- | Spawn through this launcher, named for the derivation's system.
     SpawnThrough !FilePath
@@ -882,8 +899,8 @@ runPlannedBuild config context drv run buildDir plans finish = do
                 -- builder wrote, compared by now and not kept, whatever
                 -- the comparison found, but a rebuild that differs, which
                 -- under 'KeepFailed' is at its @.check@ path by now.  A
-                -- sandboxed build's are still in its chroot, which goes
-                -- with them.
+                -- Linux sandboxed build's are still in its chroot, which
+                -- goes with them.
                 for_ [p | p <- plans, opValid p] (removePathForcibly . scratchDir)
               Left _ -> clearScratch
             pure finished
@@ -1290,8 +1307,8 @@ data BuildLayout = BuildLayout
     layoutBuildDir :: !BuildPlace,
     -- | Each output by name, at the path the builder writes it to.
     layoutOutputs :: ![(Text, BuildPlace)],
-    -- | The @HOME@ the builder is told of: its build directory where it
-    -- runs where its paths are, and upstream's @\/homeless-shelter@ in the
+    -- | The @HOME@ the builder is told of: its build directory when it
+    -- runs unsandboxed, and upstream's @\/homeless-shelter@ in the
     -- sandbox ('Nix.Builder.Sandbox.sandboxHome').
     layoutHome :: !FilePath
   }
@@ -1374,11 +1391,10 @@ builderInvocation config drv layout = case (execWrapperFor config drv, decodeBui
     seenOutputs = [(name, placeSeen place) | (name, place) <- layoutOutputs layout]
 
 -- | Replace each output's @builtins.placeholder@ sentinel with its
--- build-time path (the same value @$out@ carries).  Only the args and the
--- environment are rewritten; the builder path is left alone, matching
--- upstream, which assigns @builder = drv->builder@ unrewritten and rewrites
--- only @drv->args@ (@runChild@ in local-derivation-goal.cc at 2.24.9,
--- unix-derivation-builder.cc at 2.36.0).
+-- build-time path (the same value @$out@ carries).  The args, the
+-- environment and the files attributes reach the builder as
+-- ('attrsDelivery') are rewritten; the builder path is left alone, as
+-- upstream Nix leaves it.
 rewritePlaceholders :: [(Text, FilePath)] -> Text -> Text
 rewritePlaceholders outputDirs value =
   foldr (uncurry T.replace) value (placeholderRewrites outputDirs)
@@ -1521,12 +1537,8 @@ passedFileName name = T.unpack (passedFilePrefix <> Nix32.encode (sha256Digest (
 
 -- | Build the process environment from the derivation's contribution
 -- ('adEnv') + standard vars, naming the build directory as the builder
--- sees it and its home.
--- The builder path is used to derive PATH entries - the builder's own
--- directory and its sibling @usr\/bin@ are included so that coreutils
--- shipped alongside the builder (e.g. Git for Windows' MSYS2 tools)
--- are available.  This mirrors real Nix where PATH contains only
--- store paths from declared build dependencies.
+-- sees it and its home.  Its PATH is the builder's 'buildPath', which a
+-- PATH the derivation sets displaces.
 buildEnvironment ::
   BuildConfig ->
   Map Text Text ->
@@ -1601,9 +1613,8 @@ scrubAmbient ambient
 
 -- | Construct the build PATH from the builder's location.
 -- Includes the builder's directory, its sibling @usr\/bin@ (for MSYS2
--- coreutils bundled with Git for Windows), and system directories.
--- On a bootstrapped store, the builder's dir IS a store path, so this
--- naturally becomes a store-only PATH.
+-- coreutils bundled with Git for Windows), and system directories,
+-- which follow it even when the builder's directory is a store path.
 --
 -- A bare-name or dot-relative builder has no directory to derive: @.@
 -- here would put the BUILD WORKING DIRECTORY first on PATH, so a file
@@ -1790,8 +1801,8 @@ isWindows = System.Info.os == "mingw32"
 -- retry policy, make the output from what each serves, and verify it
 -- against the derivation's @outputHash@.  Nix's bootstrap fetcher is
 -- baked into the binary because nothing can be fetched before a fetcher
--- exists.  Returns the same @Either (exit, msg) ()@ shape as
--- 'runBuilder', so the shared output-registration path is reused
+-- exists.  Returns @Either (exit, msg) ()@, which the build reports as a
+-- refused builder, so the shared output-registration path is reused
 -- unchanged.
 --
 -- The output is made as upstream's builtin makes it (@builtinFetchurl@ in
@@ -1928,7 +1939,7 @@ attrIsTrue :: Text -> Map Text BS.ByteString -> Bool
 attrIsTrue key env = Map.lookup key env == Just envTrue
 
 -- | Nova's mirror extension uses the ASCII-whitespace-separated @urls@ field.
--- An absent field preserves the legacy single @url@ interface. An explicit
+-- An absent field falls back to the single @url@ attribute. An explicit
 -- empty or malformed list is an error, rather than a silent fallback.
 fetchUrlsFromEnv :: Map Text BS.ByteString -> Either Text (NonEmpty Text)
 fetchUrlsFromEnv env = case Map.lookup envUrls env of
@@ -2284,18 +2295,16 @@ scanOutput store scan written (output, plan) = do
   pure (doName output, scanned)
 
 -- | An output the builder wrote, made ready where it is to be placed or
--- compared, in upstream's order (@registerOutputs@ in
--- local-derivation-goal.cc at 2.24.9, derivation-builder-impl.cc at
--- 2.36.0, and @canonicalisePathMetaData_@ in posix-fs-canonicalise.cc): one
--- that lets its group or anyone else write it is refused, since someone other
--- than the build may have changed it, and so is one holding a node another
+-- compared, in upstream Nix's order: one that lets its group or anyone
+-- else write it is refused, since someone other than the build may have
+-- changed it, and so is one holding a node another
 -- user owns; it is made canonical, so nothing in it is setuid or writable by
 -- another user, before it is read or changed; a fixed output is replaced with
 -- a fresh copy of itself, made canonical again, so a descriptor the builder
 -- passed out names an inode that is not registered; and its hashes are
 -- rewritten and its references scanned ('scanBuilt').  Whether others could
--- write the output is read from what the builder left, before a sandboxed
--- build's seal changed its mode.  A sandboxed build's chroot is closed to
+-- write the output is read from what the builder left, before a Linux
+-- sandboxed build's seal changed its mode.  Its chroot is closed to
 -- other users before this ('Nix.Builder.Sandbox.Spawn.sealChroot'); a process
 -- of the same user can still change an output while it is read.
 preparedOutput :: OutputScan -> DerivationOutput -> FilePath -> Bool -> ExceptT Text IO BuiltOutput
@@ -2389,9 +2398,9 @@ placeOutput :: Store -> StorePath -> Maybe Text -> ScannedOutput -> IO (Either T
 placeOutput store drvPath deriver scanned = case scanned of
   AlreadyRegistered -> pure (Right Nothing)
   NeedsRegistering (BuiltOutput output outDir refs) -> do
-    -- An unsandboxed builder wrote straight into the store path, so there
-    -- outDir IS the target and placing it moves nothing; a sandboxed one's
-    -- moves out of the chroot here.
+    -- An unsandboxed or macOS sandboxed builder wrote straight into the
+    -- store path, so there outDir IS the target and placing it moves
+    -- nothing; a Linux sandboxed one's moves out of the chroot here.
     let targetPath = storePathToFilePath (stDir store) (doPath output)
     reg <- placeInStore store outDir (doPath output) deriver refs
     fixedCheck <- verifyFixedOutput (volumeCaseHack (stCaseSensitivity store)) drvPath output refs targetPath
@@ -2598,9 +2607,11 @@ dedupStorePaths = Map.elems . Map.fromList . map (\sp -> (spHash sp, sp))
 -- Returns 'BuildSuccess' with the root output path on success, or
 -- 'BuildFailure' with the status the build exits with
 -- ('realiseFailureStatus'): 104 if a check found an output different, and
--- 1 if a derivation fails to build, a substitute fails under 'NoFallback',
--- a cache cannot be asked, a derivation's @allowSubstitutes@ cannot be
--- read, or a check has no valid output to compare with.
+-- 1 for any other failure: a derivation fails to build, a substitute fails
+-- under 'NoFallback', a cache cannot be asked, a derivation's attributes
+-- cannot be read, a check has no valid output to compare with, a
+-- dependent asks for an output a derivation does not have, or the graph
+-- cannot be read or holds a cycle.
 --
 -- A store upstream Nix's database may also manage is refused, with
 -- status 1, before anything is read or any cache asked
@@ -2647,7 +2658,8 @@ buildRequests config store requests = do
 -- substitution is refused before a cache is asked, as upstream's
 -- read-only evaluation refuses it ('Nix.Realise.noWriteAccessMessage'),
 -- and an output that has to be built is refused for the reason given.
--- Nothing is opened or written, so a refusal of a substitution comes
+-- Nothing is written, and nothing is opened but the @.drv@ files it reads
+-- and what the validity answer reads, so a refusal of a substitution comes
 -- before the refusal of the store.
 realiseWithoutWriting :: BuildConfig -> (StorePath -> IO Bool) -> Text -> [(StorePath, Set Text)] -> IO (Either BuildStop ())
 realiseWithoutWriting config valid reason = realiseRequestsWith config effects
@@ -2757,8 +2769,10 @@ substEffects config store =
 
 -- | Substitute paths from 'bcCaches' with everything they reference,
 -- references first ('substituteClosure'), as a build substitutes a
--- derivation's outputs, and build nothing.  A path no cache holds, or
--- one that references a path no cache holds, is left as it is.  A store
+-- derivation's outputs, and build nothing.  The paths are one batch: when
+-- no cache holds one of them, or one references a path no cache holds,
+-- none of them is substituted, though a reference that arrived first
+-- stays.  A store
 -- upstream Nix's database may also manage refuses each path once its
 -- narinfo is read ('fetchSubstituteWith'), and the outcome is a failed one.
 substituteFromCaches :: BuildConfig -> Store -> [StorePath] -> IO ClosureOutcome

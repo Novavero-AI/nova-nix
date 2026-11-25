@@ -100,8 +100,10 @@ unpackOutputName :: Text
 unpackOutputName = "out"
 
 -- | Extraction budget for one @builtin:unpack@ build, across every
--- archive in @srcs@: total bytes materialized and total filesystem
--- entries created.  Archive bytes decompress and expand with no
+-- archive in @srcs@: total bytes materialized and total entries made, one
+-- per file, directory or link an archive lists and per entry a directory
+-- link's copy makes; a parent directory only implied by an entry's path
+-- is not counted.  Archive bytes decompress and expand with no
 -- relation to their compressed size, so extraction without a budget
 -- lets a small input produce an output with no upper bound.
 data UnpackLimits = UnpackLimits
@@ -161,16 +163,17 @@ type DecodeError = Either Tar.FormatError Tar.DecodeLongNamesError
 -- ---------------------------------------------------------------------------
 
 -- | Run a @builtin:unpack@ derivation: extract every archive listed in its
--- @srcs@ env into the @out@ output directory.  Returns the same
--- @Either (exit, msg) ()@ shape as the process runner, so the shared
--- output-validation and registration path in "Nix.Builder" is reused
--- unchanged.
+-- @srcs@ env into the @out@ output directory.  Returns
+-- @Either (exit, msg) ()@, which "Nix.Builder" reports as a refused
+-- builder, so the shared output-validation and registration path there is
+-- reused unchanged.
 --
 -- @srcs@ carries eval's canonical @\/nix\/store@ spelling, and the physical
 -- root may live elsewhere - @C:\\nix\\store@ on Windows, where a bare
 -- \/-rooted path resolves against the current DRIVE - so each entry is
 -- parsed as a store path and rendered through the store dir rather than
--- opened verbatim.  On Unix the rendering is the identity.
+-- opened verbatim.  For a store at @\/nix\/store@ the rendering is the
+-- identity.
 runBuiltinUnpack :: StoreDir -> UnpackLimits -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
 runBuiltinUnpack storeDir limits drv outputDirs =
   case (Map.lookup envSrcs (drvEnv drv), lookup unpackOutputName outputDirs) of

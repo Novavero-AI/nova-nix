@@ -16,7 +16,8 @@
 -- written once here.  What a backend needs around the run is not: on
 -- Linux, a chroot made from its skeleton before the run, sealed after it,
 -- and removed; on macOS, the paths its profile names, each looked at
--- ('profileFilters') and resolved ('resolvedPath').
+-- ('profileFilters'), and the store and build directories resolved
+-- ('resolvedPath').
 --
 -- == Where it runs
 --
@@ -206,7 +207,9 @@ data HelperRun = HelperRun
 -- after every one of the build's it found had ended, finds none of the
 -- build's left; where it cannot get there it fails the build, and a
 -- process of the build may be left.  Neither holds if the helper is
--- killed by a signal no process can handle.
+-- killed by a signal no process can handle, though on Linux the builder
+-- is set to die with the helper and takes its namespace with it, not
+-- necessarily before this returns.
 runHelper :: Handle -> FilePath -> ByteString -> FilePath -> [String] -> IO HelperRun
 runHelper buildLog helper plan workDir command =
   bracket openLogPipe closePipe $ \(fromBuilder, toLog) ->
@@ -361,7 +364,8 @@ sealChroot root storeDir = do
 
 -- | Run a sandboxed build's action in its chroot, made empty and filled
 -- with the skeleton: what an earlier build left at the name is removed
--- first, and the chroot is removed when the action ends, however it ends.
+-- first, or moved aside where it cannot be ('clearLeftover'), and the
+-- chroot is removed when the action ends, however it ends.
 -- The action is given the chroot's root.  'Left' is why the chroot could
 -- not be made.
 --

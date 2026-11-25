@@ -14,11 +14,12 @@
  *
  * The helper stays the builder's parent: it waits for the builder, kills
  * the builder's process group when the lifeline closes or a terminating
- * signal arrives, and ends as the builder ended.  The builder leads a
- * session of its own (commonChildInit in child.cc), and once it has
- * ended, or the build is to end, every process still in its group is
- * killed before the builder is reaped, as upstream kills the group before
- * it waits (Pid::kill in processes.cc).
+ * signal arrives, and ends as the builder ended, unless it cannot learn
+ * how the builder ended, finish the sweep below, see the build's output
+ * end or watch the log, each of which fails the build.  The builder leads
+ * a session of its own, and once it has ended, or the build is to end,
+ * every process still in its group is killed before the builder is
+ * reaped, as upstream kills the group before it waits.
  *
  * macOS has no PID namespace, and a process of the build can leave the
  * group by a session of its own; upstream's builder runs as a build user,

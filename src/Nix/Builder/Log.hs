@@ -282,7 +282,10 @@ noColourVars = ["NO_COLOR", "NOCOLOR"]
 -- ---------------------------------------------------------------------------
 
 -- | A pipe to hand a builder as both its standard output and its
--- standard error, as @(read end, write end)@.
+-- standard error, or the sandbox helper as its standard error, which the
+-- helper makes the builder's output on Linux and copies a pipe of the
+-- builder's to on macOS ('Nix.Builder.Sandbox.Spawn.runHelper'), as
+-- @(read end, write end)@.
 --
 -- One channel keeps the order the builder wrote in.  Upstream's channel
 -- is a pseudoterminal: the builder's standard error is its slave side,

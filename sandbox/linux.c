@@ -569,9 +569,9 @@ static int plan_binds(const struct plan *plan, const char *target)
     return 0;
 }
 
-/* Bind a host device directory or node the devpts fallback needs
- * (runChild in LDG), as doBind binds it: writable, the one host path the
- * sandbox binds so, since a terminal is written through it, and only where
+/* Bind a host device directory or node the devpts fallback needs, as
+ * upstream binds it: writable, as the sandbox binds only these and the
+ * build directory, since a terminal is written through it, and only where
  * the kernel will not mount a devpts of the sandbox's own. */
 static void bind_host(const struct plan *plan, const char *source, const char *stage)
 {
