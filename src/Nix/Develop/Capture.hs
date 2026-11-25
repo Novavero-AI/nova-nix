@@ -37,12 +37,12 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust, listToMaybe)
+import Data.Maybe (listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word64)
-import Nix.Derivation (Derivation (..), DerivationOutput (..), DrvFile, fixedOutput, inputAddressed)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), DrvFile, impureOutputHash, inputAddressed)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAttrs, structuredAttrsKey)
 import Nix.Hash (makeTextPath, sha256Digest)
 import Nix.Json (Json (..), parseJson)
@@ -81,9 +81,7 @@ data CaptureFailure
   = -- | Its builder's base name is not @bash@.
     NotBashBuilder
   | -- | An output is floating content-addressed or impure, which upstream
-    -- keeps in the capture and nova-nix builds for no derivation, or is
-    -- fixed beside other outputs or under a name other than @out@, which
-    -- upstream refuses as it reads the derivation.
+    -- keeps in the capture and nova-nix builds for no derivation.
     UncapturableOutputs
   | -- | Its structured attributes are not a JSON object, with why.
     UnreadableStructuredAttrs !Text
@@ -150,12 +148,14 @@ builderBaseName path = case BS.uncons path of
   Nothing -> BS.empty
   Just (start, rest) -> BC.takeWhileEnd (/= '/') (BS.cons start (BC.dropWhileEnd (== '/') rest))
 
--- | Whether every output is one upstream defers: all input-addressed, or
--- the derivation fixed-output.  Upstream refuses a fixed output beside
--- others as it reads the derivation (@BasicDerivation::type@ in
--- derivations.cc at 2.24.9, @derivation::type@ there at 2.36.0).
+-- | Whether every output is one upstream defers in the capture: an
+-- input-addressed output, or a fixed one, beside others or under another
+-- name than @out@ too, since upstream defers each before anything reads
+-- the derivation's outputs together.
 capturable :: Derivation -> Bool
-capturable drv = all (T.null . doHashAlgo) (drvOutputs drv) || isJust (fixedOutput drv)
+capturable = all deferred . drvOutputs
+  where
+    deferred output = T.null (doHashAlgo output) || not (T.null (doHash output) || doHash output == impureOutputHash)
 
 -- | The environment less the checks on what the outputs refer to
 -- (@getDerivationEnvironment@ in develop.cc).  A derivation is structured
