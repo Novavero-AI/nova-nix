@@ -59,27 +59,20 @@
 #
 # No program carries the time it was built.  binutils' ld writes the time
 # of the link into a PE image's header unless it is given
-# --no-insert-timestamp (insert_timestamp and
-# gld${EMULATION_NAME}_after_open in ld/emultempl/pe.em,
-# _bfd_XXi_only_swap_filehdr_out in bfd/peXXigen.c), which GCC's link spec
-# for MinGW never passes (LINK_SPEC in gcc/config/i386/mingw32.h), and the
-# seed stdenv has no compiler wrapper to add it, as the package set's
-# stdenv has (pkgs/windows/stdenv/link.specs).  LDFLAGS passes it
-# to every link gcc46 makes here: the host's programs take LDFLAGS, and so
-# do the build machine's, the build being the host (LDFLAGS_FOR_BUILD in
-# configure.ac, BUILD_LDFLAGS in gcc/configure.ac).  It replaces the
-# stdenv's LDFLAGS, whose -L flags name gcc46's and binutils' lib
-# directories, from which the build links nothing.  strip writes the time
-# again, over the zero ld wrote, unless it is run with -p (preserve_dates in
-# binutils/objcopy.c's copy_object), as nixpkgs' strip hook runs it
-# (pkgs/build-support/setup-hooks/strip.sh).  The install phase therefore
-# gives make STRIP, binutils' strip by the target's name with -p, which
-# install-strip, nixpkgs' install target, runs on each program it installs
-# (the install-strip rules in gcc/Makefile.in and fixincludes/Makefile.in).
-# It is a make variable on the command line, since the stdenv splits
-# configureFlags and makeFlags at spaces, and it has to be given: configure,
-# looking for strip under its bare name, finds none and records true
-# (NCN_STRICT_CHECK_TOOLS(STRIP, strip, true) in configure.ac).
+# --no-insert-timestamp, which GCC's link spec for MinGW never passes, and
+# the seed stdenv has no compiler wrapper to add it, as the package set's
+# stdenv has (pkgs/windows/stdenv/link.specs).  LDFLAGS passes it to every
+# link gcc46 makes here: the host's programs take LDFLAGS, and so do the
+# build machine's, the build being the host.  It replaces the stdenv's
+# LDFLAGS, whose -L flags name gcc46's and binutils' lib directories, from
+# which the build links nothing.  strip writes the time again, over the
+# zero ld wrote, unless it is run with -p, as nixpkgs' strip hook runs it.
+# The install phase therefore gives make STRIP, binutils' strip by the
+# target's name with -p, which install-strip, nixpkgs' install target,
+# runs on each program it installs.  It is a make variable on the command
+# line, since the stdenv splits configureFlags and makeFlags at spaces, and
+# it has to be given: configure, looking for strip under its bare name,
+# finds none and records true.
 #
 # Two builds at the output's own path are then the same bytes, but
 # nova-nix build --check, which builds at a scratch path and rewrites its

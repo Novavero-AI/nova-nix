@@ -81,21 +81,21 @@ in
         ];
         CC = cc;
         # TinyCC is its own linker.  The iconv and gettext checks look for
-        # an ld on PATH unless LD names one (lib-ld.m4's AC_LIB_PROG_LD),
-        # and fail without; nixpkgs' minimal-bootstrap sets LD to tcc too.
+        # an ld on PATH unless LD names one, and fail without; nixpkgs'
+        # minimal bootstrap sets LD to tcc too.
         LD = cc;
         AR = "${tcc} -ar";
         # TinyCC's headers, then what MinGW-w64's have and TinyCC's lack.
         C_INCLUDE_PATH = "${tinycc-native.env.C_INCLUDE_PATH};${./include}";
         CONFIG_SHELL = "${applets}/bin/sh.exe";
         CONFIG_SITE = ./config.site;
-        # What config.guess answers for an i686 MinGW environment
-        # (*:MINGW*:*), which it cannot work out from busybox's uname, whose
-        # system name is Windows_NT.
+        # What config.guess answers for an i686 MinGW environment, which it
+        # cannot work out from busybox's uname, whose system name is
+        # Windows_NT.
         buildTriple = "i686-pc-mingw32";
       }
       # Parallel installing follows parallel building unless the package
-      # says otherwise, as nixpkgs' make-derivation.nix sets it.
+      # says otherwise, as nixpkgs' mkDerivation sets it.
       // (
         if attrs.enableParallelBuilding or false then
           { enableParallelInstalling = attrs.enableParallelInstalling or true; }
