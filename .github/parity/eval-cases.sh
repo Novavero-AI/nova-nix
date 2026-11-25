@@ -542,6 +542,12 @@ if upstreamAtLeast 2.25.0; then
 fi
 echo
 
+echo "== what builtins.toFile refuses =="
+toFileDrv='(derivation { name = "d"; system = "x86_64-linux"; builder = "/bin/sh"; })'
+refused "toFile refuses an output of a derivation, naming it" "builtins.toFile \"x\" \"\${$toFileDrv}\""
+refused "toFile refuses a derivation's every output, ahead of one output" "builtins.toFile \"x\" \"\${$toFileDrv}\${$toFileDrv.drvPath}\""
+echo
+
 echo "== what fromTOML makes of a date =="
 refused "fromTOML refuses a date" 'builtins.fromTOML "d = 1979-05-27"'
 refused "fromTOML refuses a time" 'builtins.fromTOML "t = 07:32:00"'

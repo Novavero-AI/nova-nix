@@ -5875,7 +5875,20 @@ testBatchD = do
       runTest "toFile type error arg1" $
         assertEvalFail "toFile-err1" "builtins.toFile 42 \"world\"",
       runTest "toFile type error arg2" $
-        assertEvalFail "toFile-err2" "builtins.toFile \"hello\" 42"
+        assertEvalFail "toFile-err2" "builtins.toFile \"hello\" 42",
+      -- Upstream names the first element of the contents' context that is
+      -- no plain path, in its order of a context: a derivation's outputs
+      -- before one output.
+      runTest "toFile refuses a derivation in upstream's words, naming the first such reference" $
+        let drv = "(derivation { name = \"d\"; system = \"s\"; builder = \"b\"; })"
+            refusal what = "files created by builtins.toFile may not reference derivations, but x references " <> what
+         in case evalNix ("builtins.baseNameOf " <> drv <> ".drvPath") of
+              Right (VStr base _) ->
+                let drvBase = TE.decodeUtf8 base
+                 in assertEvalError "an output" ("builtins.toFile \"x\" \"${" <> drv <> "}\"") (refusal ("!out!" <> drvBase))
+                      `andThen` assertEvalError "every output" ("builtins.toFile \"x\" " <> drv <> ".drvPath") (refusal ("=" <> drvBase))
+                      `andThen` assertEvalError "both" ("builtins.toFile \"x\" \"${" <> drv <> "}${" <> drv <> ".drvPath}\"") (refusal ("=" <> drvBase))
+              other -> Fail ("the derivation's path: " <> T.pack (show other))
     ]
 
 -- ---------------------------------------------------------------------------

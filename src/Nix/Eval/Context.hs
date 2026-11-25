@@ -14,6 +14,8 @@ module Nix.Eval.Context
     -- * Queries
     contextIsEmpty,
     firstContextEncoded,
+    inUpstreamOrder,
+    encodedElement,
     contextRequest,
 
     -- * Extraction (for derivation building)
@@ -72,12 +74,22 @@ contextIsEmpty (StringContext s) = Set.null s
 -- is not this type's constructor order, so that order is searched here.
 firstContextEncoded :: StringContext -> Maybe Text
 firstContextEncoded (StringContext elems) =
-  encoded . minimumBy (comparing upstreamOrder) <$> NE.nonEmpty (Set.toList elems)
+  encodedElement . minimumBy (comparing upstreamOrder) <$> NE.nonEmpty (Set.toList elems)
+
+-- | A context's elements in the order upstream keeps them
+-- ('upstreamOrder').
+inUpstreamOrder :: StringContext -> [StringContextElement]
+inUpstreamOrder (StringContext elems) = sortOn upstreamOrder (Set.toList elems)
+
+-- | An element in the encoding upstream prints: a plain path as its base
+-- name, all outputs of a derivation as @=@ and the .drv's, one output as
+-- @!output!@ and the .drv's.
+encodedElement :: StringContextElement -> Text
+encodedElement element = case element of
+  SCPlain sp -> baseName sp
+  SCAllOutputs sp -> "=" <> baseName sp
+  SCDrvOutput sp output -> "!" <> output <> "!" <> baseName sp
   where
-    encoded element = case element of
-      SCPlain sp -> baseName sp
-      SCAllOutputs sp -> "=" <> baseName sp
-      SCDrvOutput sp output -> "!" <> output <> "!" <> baseName sp
     baseName sp = spHash sp <> "-" <> spName sp
 
 -- | What realising a context asks of the store, in upstream's order of
@@ -90,7 +102,7 @@ contextRequest (StringContext elems) =
       crOutputs = [(drv, output) | SCDrvOutput drv output <- ordered]
     }
   where
-    ordered = sortOn upstreamOrder (Set.toList elems)
+    ordered = inUpstreamOrder (StringContext elems)
     elementPath element = case element of
       SCPlain sp -> sp
       SCAllOutputs sp -> sp
