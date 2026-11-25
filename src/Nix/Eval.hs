@@ -689,20 +689,12 @@ callWith takeCell takeValue callAgain = \case
   VBuiltin builtin taken -> applyBuiltin builtin taken $ \case
     ForceOnApply -> ArgForced <$> takeValue
     ForceOnUse -> ArgDeferred <$> takeCell
-  funcVal@(VAttrs attrs) ->
-    attrSetLookup "__functor" attrs >>= \case
-      Just functorThunk -> do
-        functor <- force functorThunk
-        -- Upstream applies the functor to itself and to the argument in
-        -- one nested callFunction, so both bodies run a frame below this
-        -- one: 'applyValue' opens that frame for the self application,
-        -- and the recursion opens it again for the argument.
-        partiallyApplied <- applyValue functor funcVal
-        withCallFrame (callAgain partiallyApplied)
-      Nothing -> notAFunction funcVal
+  funcVal@(VAttrs attrs) -> callFunctor funcVal attrs callAgain
   funcVal -> notAFunction funcVal
-  where
-    notAFunction value = throwEvalError ("attempt to call " <> typeName value <> ", which is not a function")
+
+-- | The refusal of a call to a value that is not a function.
+notAFunction :: (MonadEval m) => NixValue -> m a
+notAFunction value = throwEvalError ("attempt to call " <> typeName value <> ", which is not a function")
 
 -- | @builtins.tryEval e@: @{ success, value }@ with catchable errors
 -- (a throw, a failed assert, and a search path lookup that matches no
@@ -1692,8 +1684,8 @@ applyForced (VLambda closureEnv formals bodyBcIdx) arg = do
   evalBytecode extEnv bodyBcIdx
 applyForced (VBuiltin builtin taken) arg =
   applyBuiltin builtin taken (const (pure (ArgForced arg)))
-applyForced other _ =
-  throwEvalError ("attempt to call " <> typeName other <> ", which is not a function")
+applyForced funcVal@(VAttrs attrs) arg = callFunctor funcVal attrs (`applyForced` arg)
+applyForced other _ = notAFunction other
 
 -- | Apply a function value to an UNFORCED thunk argument.  Upstream's
 -- higher-order list builtins (filter, any, all, groupBy, foldl') pass
@@ -1712,9 +1704,25 @@ applyUnforced (VLambda closureEnv formals bodyBcIdx) argThunk = do
 applyUnforced (VBuiltin builtin taken) argThunk = applyBuiltin builtin taken $ \case
   ForceOnApply -> ArgForced <$> force argThunk
   ForceOnUse -> pure (ArgDeferred argThunk)
+applyUnforced funcVal@(VAttrs attrs) argThunk = callFunctor funcVal attrs (`applyUnforced` argThunk)
 applyUnforced other argThunk = do
   val <- force argThunk
   applyForced other val
+
+-- | Call a set with @__functor@, given how to apply what the functor gives
+-- to the argument.  Upstream applies the functor to the set and to the
+-- argument in one nested call, so both bodies run a frame below the
+-- caller's: 'applyValue' opens that frame for the self application,
+-- and the frame opened here holds the application to the argument.  A set
+-- without @__functor@ is not a function.
+callFunctor :: (MonadEval m) => NixValue -> AttrSet -> (NixValue -> m NixValue) -> m NixValue
+callFunctor funcVal attrs applyPartial =
+  attrSetLookup "__functor" attrs >>= \case
+    Just functorThunk -> do
+      functor <- force functorThunk
+      partiallyApplied <- applyValue functor funcVal
+      withCallFrame (applyPartial partiallyApplied)
+    Nothing -> notAFunction funcVal
 
 -- | Apply a function value to an argument a builtin has taken: forced,
 -- or as the thunk it was held as.

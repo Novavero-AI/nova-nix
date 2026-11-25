@@ -3547,6 +3547,14 @@ testBuiltinArgumentOrder = do
            yields "builtins.all (builtins.elem (throw \"a\")) [ [ ] ]" (VBool False),
            yields "builtins.foldl' builtins.elem 1 [ [ 1 ] [ true ] ]" (VBool True)
          ]
+      -- A set with __functor is a function to every builtin that calls
+      -- one, as upstream Nix calls one.
+      <> [ yields "builtins.any { __functor = self: x: x; } [ true ]" (VBool True),
+           yields "builtins.filter { __functor = self: x: x > 1; } [ 1 2 ] == [ 2 ]" (VBool True),
+           yields "builtins.sort { __functor = self: a: b: a < b; } [ 2 1 ] == [ 1 2 ]" (VBool True),
+           yields "builtins.foldl' { __functor = self: acc: x: acc + x; } 0 [ 1 2 ] == 3" (VBool True),
+           yields "builtins.length (builtins.genericClosure { startSet = [ { key = 1; } ]; operator = { __functor = self: item: [ ]; }; }) == 1" (VBool True)
+         ]
 
 -- ---------------------------------------------------------------------------
 -- Tests: Batch 1 - Trivial pure builtins + constants
