@@ -210,7 +210,7 @@ emptyContext = mempty
 
 -- | Smart constructor for context-free strings from 'Text'.
 -- Encodes to the UTF-8 bytes that ARE the string's value: a Nix string
--- is a byte string, and every Text-producing site goes through here.
+-- is a byte string, and Text-producing sites go through here.
 mkStr :: Text -> NixValue
 mkStr t = VStr (TE.encodeUtf8 t) emptyContext
 
@@ -242,9 +242,12 @@ bytesToTextLossy = TE.decodeUtf8With lenientDecode
 -- the cell does: 'mkThunkBc' takes a built t'Env', and 'tieFrame' builds a
 -- frame whose bindings point back at it before filling its slots.  A
 -- deferred application's cell ('mkApplyThunk') holds the cells it applies
--- and no env.  A cell lives until the evaluation session ends
--- ('Nix.Eval.IO.withEvalSession'), and the static cells
--- ('Nix.Eval.CThunk.cthunkNull' and its kin) for the life of the process.
+-- and no env.  A cell lives until the outermost evaluation session ends
+-- ('Nix.Eval.IO.withEvalSession') unless, under
+-- 'Nix.Eval.CRegion.RegionsCollect', the close of the force that allocated
+-- it finds nothing reaching it and frees its line; the static cells
+-- ('Nix.Eval.CThunk.cthunkNull' and its kin) live for the life of the
+-- process.
 --
 -- Two thunks are equal when they are one cell, and 'show' gives the
 -- cell's address.  Neither reads the cell, whose state changes as it is
@@ -761,7 +764,9 @@ envLookupResolved :: (MonadCData m) => Word32 -> Word32 -> Env -> m Thunk
 envLookupResolved level idx (Env envPtr) = Thunk <$> cenvLookupResolved envPtr level idx
 
 -- | Name-based variable lookup for 'EVar': the name's thunk in the first
--- name table on the parent chain, the env's own included, that binds it.
+-- name table on the parent chain, the env's own included, that binds it
+-- to a filled entry; an entry not filled yet is passed over as if the
+-- table did not bind the name.
 -- Positional slots are not searched.  The resolver makes an 'EVar' only
 -- of a name a frame's name table or the root env binds, and closure
 -- trimming keeps the parent chain of every env an 'EVar' is evaluated in,
@@ -1443,15 +1448,16 @@ class (MonadCData m) => MonadEval m where
   -- ThrownError\/AssertionError there, and every other EvalError escapes.
   throwEvalError :: Text -> m a
 
-  -- | Raise a catchable error - @builtins.throw@ and a failed @assert@.
-  -- These are the only errors 'catchEvalError' (tryEval) recovers from.
+  -- | Raise a catchable error - @builtins.throw@, a failed @assert@, and a
+  -- search path lookup that matches no entry.  These are the only errors
+  -- 'catchEvalError' (tryEval) recovers from.
   throwCatchableError :: Text -> m a
 
   -- | Abort evaluation (uncatchable by tryEval, matching real Nix).
   abortEvaluation :: Text -> m a
 
   -- | tryEval semantics: recover from a 'throwCatchableError'
-  -- (throw\/assert); eval errors and aborts propagate.
+  -- (throw, assert, a search path miss); eval errors and aborts propagate.
   catchEvalError :: m a -> m (Either Text a)
 
   -- | Run the action; when it fails with ANY evaluation failure
@@ -1524,7 +1530,8 @@ class (MonadCData m) => MonadEval m where
 
   -- | Classify a single filesystem path as @"regular"@, @"directory"@,
   -- @"symlink"@, or @"unknown"@: an lstat of the path itself, refused
-  -- when a symlink sits anywhere above it, as upstream's accessor
+  -- when a symlink sits above it beneath the accessor's root (for a path
+  -- in the store, beneath the store directory), as upstream's accessor
   -- refuses one.  Used by @builtins.readFileType@ and, on a resolved
   -- root, by the source tree walk.
   getFileType :: Text -> m Text
@@ -1582,8 +1589,9 @@ class (MonadCData m) => MonadEval m where
   setExecutableFile :: Text -> m ()
 
   -- | Look up a previously recorded fetch by a key naming exactly what was
-  -- fetched. 'Nothing' when nothing was recorded, or the record no longer
-  -- describes anything on disk.
+  -- fetched. 'Nothing' when nothing readable was recorded.  A record is
+  -- answered whether or not what it names is still on disk, which the
+  -- caller asks with 'adoptStorePath'.
   lookupFetchCache :: Text -> m (Maybe Text)
 
   -- | Take over a store path an earlier evaluation wrote: 'True' when it is
@@ -1681,9 +1689,10 @@ class (MonadCData m) => MonadEval m where
   realiseContext :: StringContext -> m (Either ContextRefusal ())
 
   -- | Compute the store path a source file/directory gets when copied into
-  -- the store (recursive NAR sha256 to a @source@ fixed-output path), WITHOUT
-  -- performing the copy.  Used when a path literal is coerced in a derivation
-  -- argument or environment value.  Unavailable in pure evaluation.
+  -- the store (recursive NAR sha256 to a fixed-output path named by the
+  -- path's base name), WITHOUT performing the copy.  Used when a path
+  -- literal is coerced in a derivation argument or environment value.  Pure
+  -- evaluation has no store, so a path there answers itself.
   storeSourcePath :: Text -> m Text
 
   -- | The policy this evaluation runs under.  The builtins whose behaviour

@@ -17,8 +17,7 @@
 -- literal written in the list or set itself, for a function's argument,
 -- and for anything already forced.  It is not where upstream hands over a
 -- value without a thunk and nova-nix makes one (an indented string, a
--- @~\/@ path, a variable bound to a literal by @let@ or @rec@, a global
--- such as @map@).  A function value carries neither the name nor
+-- @~\/@ path).  A function value carries neither the name nor
 -- the source position upstream prints after @lambda@, so its marker holds
 -- the word alone.
 --

@@ -30,8 +30,10 @@
  *
  * Envs, the with-scope arrays, the list items arrays (nn_list.h) and the
  * cells of deferred applications (nn_thunk.h) are allocated from a
- * page-based bump allocator.  Nothing is individually freed -
- * nn_env_destroy() tears down everything at eval end.
+ * page-based bump allocator.  No object is freed on its own: while the
+ * region collector runs, a page's lines that hold nothing reached are
+ * freed and bumped from again (nn_region.h), and nn_env_destroy() frees
+ * every page at eval end.
  *
  * Every allocation for an env names its site, the construct or builtin
  * that makes the env (nn_stats.h), under which the census counts it.

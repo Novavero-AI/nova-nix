@@ -248,8 +248,8 @@ data Census = Census
     censusVisitedObjects :: !Word64,
     -- | The bytes those objects hold.
     censusVisitedBytes :: !Word64,
-    -- | Pointers the mark met that it could not place at the start of an
-    -- object it holds, and so did not follow: none while the mark models
+    -- | Pointers the mark met that it could not place in its index, and so
+    -- did not follow: none while the mark models
     -- every pointer the data layer stores.
     censusUnplaced :: !Word64,
     -- | Wall-clock seconds the count and the index took.
@@ -444,8 +444,8 @@ nameRoot root = case root of
 -- Every root's object exists when the count runs: the C objects a caller
 -- can name are made by actions ("Nix.Eval.CData"), so forcing a root makes
 -- none.
--- 'Left' when the C side cannot allocate the index or the mark's work
--- stack.
+-- 'Left' when the C side cannot allocate the index, the mark's work
+-- stack, or the array it sorts the reached sets' sizes in.
 takeCensus :: [CRoot] -> IO (Either CStatusError Census)
 takeCensus roots = do
   started <- getMonotonicTime

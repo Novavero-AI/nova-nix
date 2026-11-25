@@ -35,8 +35,10 @@
  * removal.
  *
  * Lifecycle: arena-managed.  Every set is tracked at creation and
- * bulk-freed by nn_attrset_free_all at arena teardown, which frees no
- * value: the values are cells the thunk arena owns.
+ * bulk-freed by nn_attrset_free_all at arena teardown, or freed earlier
+ * by the region collector once nothing reaches it (nn_attrset_sweep,
+ * nn_region.h).  Neither frees a value: the values are cells the thunk
+ * arena owns.
  *
  * Every constructor names its site, the construct or builtin that makes
  * the set (nn_stats.h), under which the census counts it.
@@ -180,7 +182,8 @@ void nn_attrset_free_all(void);
  * and `b` (keys in `b` override `a`, positions with them), sized for the
  * entries of both.  Both inputs must be frozen.
  * The result is returned frozen and is arena-tracked (freed by
- * nn_attrset_free_all).  Returns NULL when the union would pass
+ * nn_attrset_free_all, or by nn_attrset_sweep).  Returns NULL when the union
+ * would pass
  * NN_ATTRSET_MAX_ENTRIES or an allocation fails. */
 nn_attrset_t *nn_attrset_union(const nn_attrset_t *a, const nn_attrset_t *b,
                                uint32_t site);
@@ -203,7 +206,8 @@ nn_attrset_t *nn_attrset_update(const nn_attrset_t *a, const nn_attrset_t *b,
 /* Create a new flat set at `site` with the given keys removed, sized for
  * the entries of `set`.  Input must be frozen.
  * The result is returned frozen and is arena-tracked (freed by
- * nn_attrset_free_all).  Returns NULL when an allocation fails. */
+ * nn_attrset_free_all, or by nn_attrset_sweep).  Returns NULL when an
+ * allocation fails. */
 nn_attrset_t *nn_attrset_remove_keys(
     const nn_attrset_t *set,
     const nn_symbol_t *keys,

@@ -15,8 +15,11 @@
  * indexes every object; the caller names roots and calls nn_stats_mark,
  * which follows every pointer from them; nn_stats_end releases the index.
  * The mark frees and writes nothing in the data layer: its marks are bits
- * of its own.  It dereferences only a pointer it places at the start of
- * an object the index holds, and counts any other pointer it meets as
+ * of its own.  It dereferences only a pointer it places: a tracked
+ * object's address, or a unit boundary within what a block or page has
+ * handed out (a thunk cell, NN_ENV_ALIGNMENT bytes of a page,
+ * NN_STR_ALIGNMENT bytes of strings), which it reads as the start of an
+ * object of the pointer's kind.  It counts any other pointer it meets as
  * unplaced, which a graph the mark models in full never holds.  Every
  * value lives in C (nn_thunk.h), so the mark reaches all a root holds
  * without the caller.

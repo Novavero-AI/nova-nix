@@ -186,8 +186,9 @@ errorPrefix = "error: "
 -- ---------------------------------------------------------------------------
 
 -- | A path value's copy: the store path it is copied to, and the
--- path-value text of the tree evaluation read for it, the path with its
--- symlinks resolved, which the build driver restores the copy from.
+-- path-value text of the tree evaluation read for it, the path with the
+-- symlinks among its ancestors resolved and its own last component left
+-- alone, which the build driver restores the copy from.
 data SourceCopy = SourceCopy
   { scStorePath :: !SP.StorePath,
     scSource :: !Text
@@ -230,8 +231,9 @@ data EvalState = EvalState
     -- | Each path value coerced so far, by its text, with its copy, so a
     -- path literal used across many derivations is hashed only once.
     esSourcePathCache :: !(IORef (Map Text SourceCopy)),
-    -- | Every store object evaluation made (store path to its
-    -- references), written or, in a read-only session, only named, for
+    -- | Every store object evaluation made but a path value's copy
+    -- ('esSourcePathCache') and a derivation ('esDrvClosure'), store path
+    -- to its references, written or, in a read-only session, only named, for
     -- the build driver to register before building.  All of them, not
     -- only @builtins.toFile@: an unrecorded write reaches @drvInputSrcs@
     -- as an unregistered path and fails the build that names it.
@@ -264,9 +266,9 @@ data EvalState = EvalState
     -- | The allowed path prefixes under a restricting policy: the search
     -- path roots the caller seeded with 'allowEvalPath', plus every store
     -- object this evaluation copies, fetches or writes (upstream's
-    -- @allowPath@ after each such step), plus the fetchers' scratch
-    -- directories.  Mutable because it grows as evaluation proceeds, like
-    -- the import cache.
+    -- @allowPath@ after each such step), plus the closures of the outputs a
+    -- realised context names, plus the fetchers' scratch directories.  Mutable
+    -- because it grows as evaluation proceeds, like the import cache.
     esAllowedPaths :: !(IORef AllowedPaths),
     -- | The store contexts are realised against.
     esStore :: !SessionStore,
@@ -404,9 +406,10 @@ newEvalStateWith policy searchPaths store storeDir baseDir = do
         esAdded = added
       }
 
--- | Grant access to a path prefix (upstream @EvalState::allowPath@): the
+-- | Grant access to a path prefix, as upstream Nix grants one: the
 -- caller seeds the search path roots before evaluation, and the instance
--- adds every store object the evaluation produces.  Like upstream's, this
+-- adds every store object the evaluation copies, fetches or writes, and
+-- the closures of the outputs it realises.  Like upstream's, this
 -- is a no-op when nothing restricts access, so an unrestricted evaluation
 -- does not accumulate a set it never consults.  The prefix is allowed on
 -- the drive its reads open ('locatedPath'), the form every check uses.

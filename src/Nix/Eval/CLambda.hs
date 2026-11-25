@@ -7,7 +7,9 @@
 -- specification.  A thunk holds one under tag 9, so a closure takes
 -- nothing on GHC's heap.
 --
--- Lambda structs are tracked and freed in bulk at arena teardown.
+-- Lambda structs are tracked and freed in bulk at arena teardown, or one
+-- by one by the region collector ("Nix.Eval.CRegion") once nothing
+-- reaches them.
 module Nix.Eval.CLambda
   ( -- * Opaque handle
     NnLambda,

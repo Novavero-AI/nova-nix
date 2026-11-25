@@ -2,7 +2,9 @@
 --
 -- Wraps @cbits/nn_env.c@ - arena-allocated @nn_env_t@ envs that hold
 -- their slots inline, and a parent, a name table and with-scopes when
--- they have them.  All memory is freed in bulk at arena teardown.
+-- they have them.  All memory is freed in bulk at arena teardown, and the
+-- region collector ("Nix.Eval.CRegion") hands out again the lines of a
+-- page that hold nothing it reached.
 --
 -- An env is a word and its slots (@cbits/nn_env.h@).  One of one to
 -- seven slots and no scopes keeps its parent in that word, as upstream's

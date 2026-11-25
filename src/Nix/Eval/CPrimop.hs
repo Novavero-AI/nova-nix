@@ -4,7 +4,9 @@
 -- under @NN_VALUE_PRIMOP_APP@, so a partial application, like every
 -- other value, lives in C and holds nothing in GHC's heap.
 --
--- Applications are tracked and freed in bulk at arena teardown.
+-- Applications are tracked and freed in bulk at arena teardown, or one by
+-- one by the region collector ("Nix.Eval.CRegion") once nothing reaches
+-- them.
 module Nix.Eval.CPrimop
   ( -- * Opaque handle
     NnPrimopApp,

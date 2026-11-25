@@ -5,7 +5,9 @@
 --
 -- Lists are immutable after construction: 'clistFromThunks' builds one
 -- and 'clistThunks' reads its items.  The headers are freed in bulk at
--- arena teardown, and the items arrays with the env pages that hold them.
+-- arena teardown, and the items arrays with the env pages that hold them;
+-- the region collector ("Nix.Eval.CRegion") frees a header, and the lines
+-- of an items array, once nothing reaches them.
 --
 -- 'nullPtr' is the empty list, so the C constructors report failure
 -- through a status of their own rather than a NULL, and every one is
@@ -138,8 +140,9 @@ clistToThunkList cl
 -- ---------------------------------------------------------------------------
 
 -- | A C list, the payload of @VList@ in t'Nix.Eval.Types.NixValue': an
--- @nn_list_t@ that lives until the evaluation session ends, or null for
--- the empty list.
+-- @nn_list_t@ that lives until the outermost evaluation session ends, or
+-- until the region collector frees it once nothing reaches it
+-- ("Nix.Eval.CRegion"), or null for the empty list.
 --
 -- Two lists are equal when they are one C list, and 'show' gives its
 -- address.  Neither reads the list; 'clistThunks' reads its items.

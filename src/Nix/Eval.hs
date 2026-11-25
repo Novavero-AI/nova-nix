@@ -15,8 +15,11 @@
 --
 -- Thunks, environments and values live in the C data layer, so
 -- everything here that builds or forces one runs in an evaluation
--- session ('Nix.Eval.IO.withEvalSession').  Outside one the first C call
--- raises 'Nix.Eval.CStatus.ArenaNotInitialized' instead of faulting.
+-- session ('Nix.Eval.IO.withEvalSession').  The exceptions are the shared
+-- @null@, @true@ and @false@ cells and each builtin's own cell, which are
+-- C statics outside every arena.  Outside a session the first C call that
+-- needs an arena raises 'Nix.Eval.CStatus.ArenaNotInitialized' instead of
+-- faulting.
 module Nix.Eval
   ( -- * Values (re-exported from Types)
     NixValue (..),
@@ -702,11 +705,11 @@ callWith takeCell takeValue callAgain = \case
     notAFunction value = throwEvalError ("attempt to call " <> typeName value <> ", which is not a function")
 
 -- | @builtins.tryEval e@: @{ success, value }@ with catchable errors
--- (throw, failed assert - the only kinds 'catchEvalError' recovers)
--- mapped to @success = false@.  The catch must wrap the argument's
--- forcing, so the argument is taken unforced.  One that arrives already
--- forced has nothing left to catch and is success-wrapped, as upstream
--- treats a value in WHNF.
+-- (a throw, a failed assert, and a search path lookup that matches no
+-- entry - the kinds 'catchEvalError' recovers) mapped to @success = false@.
+-- The catch must wrap the argument's forcing, so the argument is taken
+-- unforced.  One that arrives already forced has nothing left to catch and is
+-- success-wrapped, as upstream treats a value in WHNF.
 builtinTryEval :: (MonadEval m) => BuiltinArg -> m NixValue
 builtinTryEval arg = do
   result <- catchEvalError (argValue arg)
@@ -1693,9 +1696,9 @@ applyForced other _ =
   throwEvalError ("attempt to call " <> typeName other <> ", which is not a function")
 
 -- | Apply a function value to an UNFORCED thunk argument.  Upstream's
--- higher-order list builtins (filter, any, all, partition, groupBy,
--- foldl') pass elements as unforced values, so an element the function
--- never inspects may contain a throw without failing the call.  A
+-- higher-order list builtins (filter, any, all, groupBy, foldl') pass
+-- elements as unforced values, so an element the function never inspects
+-- may contain a throw without failing the call.  A
 -- builtin callee takes it by its mode for the position, and set-pattern
 -- formals force on destructuring exactly as upstream does.
 applyValueLazy :: (MonadEval m) => NixValue -> Thunk -> m NixValue
@@ -2355,8 +2358,7 @@ coercePathVerbatim p = pure (TE.encodeUtf8 p, emptyContext)
 -- path, carried in the context - upstream's @copyToStore = true@.  Passed
 -- into 'coerceToString' so a path reached through an attrset's @outPath@
 -- (or a @__toString@ result) coerces exactly as the same path written
--- directly would; a fixed path case in the engine dropped both the copy
--- and the context for every such value.
+-- directly would.
 coercePathToStore :: (MonadEval m) => Text -> m (BS.ByteString, StringContext)
 coercePathToStore p = do
   (spText, ctx) <- sourcePathWithContext p
@@ -2617,8 +2619,11 @@ parseContextAttrs attrs = do
         VStr s _ -> decodedText "builtins.appendContext" s
         _ -> throwEvalError "builtins.appendContext: output name must be a string"
 
--- | For a STRING operand, upstream's rule is textual: everything after
--- the final @/@.  For a PATH operand the value may be native-spelled
+-- | For a STRING operand the rule is textual: the last component between
+-- @/@s that is not empty ('lastComponentBytes').  Upstream drops one
+-- trailing @/@ and then takes everything after the final @/@, which agrees
+-- but for a string ending in two or more slashes, where upstream gives the
+-- empty string.  For a PATH operand the value may be native-spelled
 -- (eval's base dir can be a native Windows path), so the split is
 -- separator-aware via 'canonBaseName'.
 builtinBaseNameOf :: (MonadEval m) => NixValue -> m NixValue
@@ -3498,9 +3503,11 @@ builtinPlaceholder val = do
   name <- decodedText "builtins.placeholder" =<< structuredStringValue RefuseContext val
   pure (mkStr (hashPlaceholder name))
 
--- | Refused outright under @pure-eval@, before the argument is looked at,
--- as upstream's @prim_storePath@ is: a dependency on a store path that
--- merely exists is ambient state.
+-- | Refused under @pure-eval@ before the argument is coerced, as upstream
+-- Nix refuses it: a dependency on a store path that merely exists is
+-- ambient state.  The argument is forced as the builtin is applied, before
+-- the policy is read, so one whose evaluation fails reports that failure,
+-- where upstream reports the refusal.
 builtinStorePath :: (MonadEval m) => NixValue -> m NixValue
 builtinStorePath val = do
   policy <- evalPolicy
@@ -3542,9 +3549,10 @@ validateStorePath p = case T.stripPrefix storeDirPrefix p of
 -- Builtin implementations - Nix search path
 -- ---------------------------------------------------------------------------
 
--- | Upstream reads the looked-up name with @forceStringNoCtx@ once it
--- has read every entry (@prim_findFile@ in primops.cc), so an entry's
--- failure comes ahead of a name's.
+-- | Upstream reads the looked-up name once it has read every entry, so an
+-- entry's failure comes ahead of a name's.  Here the name is forced as the
+-- builtin is applied, before the entries, so only its string and context
+-- check comes after their failures.
 builtinFindFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinFindFile (VList cl) nameVal = do
   entries <- listThunks cl >>= mapM forceSearchEntry
@@ -3661,9 +3669,9 @@ builtinToFile nameVal contentsVal = do
     other -> throwEvalError ("builtins.toFile: expected a string, got " <> typeName other)
 
 -- | The store-path references a toFile output may carry: the contents'
--- plain-path context, in sorted order.  A derivation-output reference is
--- an error, exactly as upstream ("files created by builtins.toFile may
--- not reference derivations").
+-- plain-path context, in sorted order.  A derivation or derivation-output
+-- reference is an error, as upstream makes it one, in words of nova-nix's
+-- own: upstream's message also names the file and the reference.
 toFileRefs :: (MonadEval m) => StringContext -> m [StorePath]
 toFileRefs (StringContext elems) = mapM refOf (Set.toAscList elems)
   where
@@ -4280,8 +4288,7 @@ fetchGitResult submodules fields =
 -- rather than a stale-data one.
 --
 -- The leading version tag invalidates every entry written before a change
--- in what the fields mean.  It last moved for the Windows executable bit,
--- which changes the @narHash@ of any tree holding an executable file.
+-- in what the fields mean.
 fetchCacheKey :: Text -> Text -> Text -> Bool -> Bool -> Text
 fetchCacheKey url name rev submodules shallow =
   T.intercalate
@@ -4495,7 +4502,7 @@ decodeSha256Pin s = snd <$> newHashAllowEmpty (Just "sha256") s
 -- | Force a required string attribute from an attrset, using full Nix string
 -- coercion (VStr, VPath, VInt, VBool, VAttrs via __toString/outPath).
 -- A coercion failure (or a throwing attr value) propagates with its own
--- message, as upstream - swallowing it here once masked user throws.
+-- message, as upstream's does.
 -- The Text result decodes strictly: callers use it as a name, URL, or
 -- platform string, none of which may carry invalid UTF-8 here.
 forceAttrStr :: (MonadEval m) => Text -> Text -> AttrSet -> m Text
@@ -4647,9 +4654,10 @@ allOutputsClosure = go Set.empty
           go (Set.insert sp seen) (refs ++ rest)
 
 -- | Eager derivation computation - @builtins.derivationStrict@.  Forces all
--- input attrs into env vars, content-hashes, and returns upstream's result
+-- input attrs into env vars (under @__structuredAttrs@, into the one
+-- @__json@ entry), content-hashes, and returns upstream's result
 -- set: @drvPath@ and one attribute per output holding that output's path,
--- each carrying its store context (primops.cc, @prim_derivationStrict@).
+-- each carrying its store context.
 -- The @derivation@ wrapper ("Nix.Builtins") reaches this only through
 -- @outPath@ and @drvPath@, so forcing a derivation to WHNF never runs it.
 builtinDerivationStrict :: (MonadEval m) => NixValue -> m NixValue
@@ -5268,7 +5276,9 @@ bytesToBase64 = B64.encode
 -- bare/quoted keys, dotted keys, basic/literal strings (multiline),
 -- integers (dec/hex/oct/bin), floats (inc. inf/nan), booleans,
 -- inline tables, arrays, array-of-tables, and standard tables.
--- Datetimes are represented as strings (matching real Nix).
+-- Datetimes are represented as strings, where upstream Nix refuses them
+-- unless its @parse-toml-timestamps@ experimental feature is on, and then
+-- gives a set with @_type = \"timestamp\"@.
 builtinFromTOML :: (MonadEval m) => NixValue -> m NixValue
 builtinFromTOML (VStr s _) = do
   -- TOML is UTF-8 by definition; upstream's parser rejects invalid bytes.

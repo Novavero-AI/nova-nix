@@ -13,16 +13,14 @@
 -- A read-write session, a build's, adds what evaluation has fetched,
 -- written or named and the store does not hold yet before that, so all
 -- of it counts as valid there.  A read-only session, an evaluation as
--- @nix-instantiate --eval@ runs one (@main_nix_instantiate@ in
--- nix-instantiate.cc), adds nothing.  What evaluation computed (a coerced
--- source, a @builtins.toFile@, @builtins.path@ or @builtins.filterSource@
--- result, a derivation) is not valid there unless the store already holds
--- it, since upstream's read-only evaluation computes those paths without
--- writing them (@prim_toFile@ and @addPath@ in primops.cc,
--- @copyPathToStore@ in eval.cc).  What a fetcher fetched is valid there,
--- since upstream's fetchers add their results whatever the mode (@fetch@ in
--- fetchTree.cc, @downloadFile@ in tarball.cc and @Input::fetchToStore@ in
--- fetchers.cc at 2.24.9).  A read-only session realises an output as
+-- @nix-instantiate --eval@ runs one, adds only what a fetcher fetched, as
+-- it is fetched.  What evaluation computed (a coerced source, a
+-- @builtins.toFile@, @builtins.path@ or @builtins.filterSource@ result, a
+-- derivation) is not valid there unless the store already holds it, since
+-- upstream's read-only evaluation computes those paths without writing
+-- them.  What a fetcher fetched is valid there, since upstream's fetchers
+-- add their results whatever the mode.  A read-only session realises an
+-- output as
 -- upstream's read-only evaluation does: every substitution is refused, and
 -- an output that may not be substituted is built.
 module Nix.Eval.RealiseContext
@@ -63,9 +61,9 @@ import Nix.Store.Path (StorePath, defaultStoreDir, storePathBasename, storePathT
 
 -- | What an evaluation session may do to its store.
 data SessionMode
-  = -- | Add nothing, and realise an output as upstream's read-only
-    -- evaluation does, as @nix-instantiate --eval@ does without
-    -- @--read-write-mode@.
+  = -- | Add only what a fetcher fetched, as it is fetched, and realise an
+    -- output as upstream's read-only evaluation does, as
+    -- @nix-instantiate --eval@ does without @--read-write-mode@.
     ReadOnly
   | -- | Add what evaluation made and build what its contexts name, as a
     -- build does.
@@ -129,7 +127,8 @@ data Plan = Plan
 -- asked about that the store holds, and each output's path.  A session
 -- asks the store about every path the request names that it cannot
 -- answer itself: a read-write session about those evaluation did not
--- make, a read-only one about all of them, and about the outputs.
+-- make, a read-only one about all but what a fetcher fetched, and about
+-- the outputs.
 --
 -- A path that is not valid is refused first, in the request's order
 -- ('PathNotValid').  A request that names an output is then refused when
