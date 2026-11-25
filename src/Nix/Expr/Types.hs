@@ -1,7 +1,10 @@
 -- | Core AST types for the Nix expression language.
 --
--- Every Nix source file parses into an 'Expr'. The AST is a direct
--- representation of the language grammar - no desugaring at parse time.
+-- Every Nix source file parses into an 'Expr'. The AST follows the
+-- language grammar, with the desugarings upstream's parser makes: a dotted
+-- binding is nested into sets and the sets of one attribute merged
+-- ('NamedBinding'), and a search path @\<name\>@ becomes a call of
+-- @__findFile@.
 -- The evaluator ("Nix.Eval") reduces expressions to values.
 module Nix.Expr.Types
   ( -- * Expressions
@@ -55,7 +58,8 @@ data NixAtom
 
 -- | A part of an interpolated string (@"hello ${name}"@).
 data StringPart
-  = -- | Literal bytes, the source's with escapes resolved, which are the
+  = -- | Literal bytes, the source's with escapes resolved (and, in a
+    -- double-quoted string, each line ending read as LF), which are the
     -- bytes the value holds whether or not they are UTF-8.
     StrLit !ByteString
   | -- | Resolved escape bytes inside an indented string (@'''@, @''$@,
@@ -152,8 +156,8 @@ data Formals
 
 -- | Closure capture information for lambda trimming.
 --
--- After 'Nix.Expr.ClosureTrim.trimClosures', lambdas that only reference
--- a subset of their outer scope carry a 'Captures' list.  At eval time
+-- After 'Nix.Expr.ClosureTrim.trimClosures', lambdas that hold no 'EVar'
+-- and reference their outer scope carry a 'Captures' list.  At eval time
 -- this drives extraction of exactly those thunks into a flat t'Nix.Eval.Types.Env',
 -- breaking the retention chain to the full parent scope.
 data CaptureInfo
@@ -240,8 +244,8 @@ data Expr
   | -- | Let binding: @let bindings in body@.
     --
     -- The 'CaptureInfo' field is populated by 'Nix.Expr.ClosureTrim.trimClosures'
-    -- after variable resolution.  Positional let blocks that only reference
-    -- a subset of their parent scope carry a 'Captures' list; at eval time
+    -- after variable resolution.  Positional let blocks that hold no 'EVar'
+    -- and reference their parent scope carry a 'Captures' list; at eval time
     -- this drives construction of a trimmed parent env.
     ELet ![Binding] !Expr !CaptureInfo
   | -- | If-then-else: @if cond then t else f@.
@@ -262,7 +266,9 @@ data Expr
     EPos !SrcPos
   | -- | De Bruijn-style resolved variable: @(level, index)@.
     -- Produced by 'Nix.Expr.Resolve.resolveVars' for variables
-    -- bound by lambda formals.  @level@ counts parent-chain hops;
+    -- bound by lambda formals and by let and rec blocks whose keys are all
+    -- static, and renumbered to capture slots by
+    -- 'Nix.Expr.ClosureTrim.trimClosures'.  @level@ counts parent-chain hops;
     -- @index@ is the positional slot within that env's slot array.
     EResolvedVar !Int !Int
   | -- | Variable resolved via with-scopes (not lexical).

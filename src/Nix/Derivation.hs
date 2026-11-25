@@ -18,7 +18,7 @@
 --
 -- @
 -- Derive(
---   [("out", "\/nix\/store\/abc...-hello-2.12.1", "", "sha256")],
+--   [("out", "\/nix\/store\/abc...-hello-2.12.1", "", "")],
 --   [("\/nix\/store\/def...-zlib-1.3.1.drv", ["out"]),
 --    ("\/nix\/store\/ghi...-bash-5.2.drv", ["out"])],
 --   ["\/nix\/store\/jkl...-hello-2.12.1.tar.gz"],
@@ -45,9 +45,12 @@
 -- 6. __Args__: command-line arguments to the builder
 -- 7. __Environment__: environment variables for the build
 --
--- The HASH of this .drv file (after ATerm serialization) determines the
--- output store path.  Change any input yields a different hash and a different output
--- path.  This is how Nix achieves reproducibility.
+-- An input-addressed output's store path comes from a hash of this
+-- derivation's ATerm with every output's path, hash fields and variable
+-- empty and each input derivation replaced by that same hash of its own
+-- ('inputAddressed'); the hash of the .drv file itself names the .drv
+-- ('drvFile').  Change any input and you get a different hash and a
+-- different output path.  This is how Nix achieves reproducibility.
 module Nix.Derivation
   ( -- * Derivation type
     Derivation (..),
@@ -126,9 +129,11 @@ currentPlatform = case (SI.arch, SI.os) of
 -- so upstream adds @i686-linux@ on @x86_64-linux@ (outside WSL1, which
 -- cannot), and 64-bit Windows runs i686 binaries through WoW64, the same
 -- rule for the platform upstream has no entry for.  Upstream also adds
--- @x86_64-darwin@ on @aarch64-darwin@ when Rosetta is installed; that is a
--- filesystem probe, not a property of the platform, and is not modelled
--- here, so such a build needs a launcher named on the command line.
+-- @x86_64-darwin@ on @aarch64-darwin@ when Rosetta is installed.  The WSL1
+-- exception and the Rosetta check probe the running machine, not the
+-- platform, and neither is modelled here: @x86_64-linux@ under WSL1 still
+-- lists @i686-linux@, and a Rosetta build needs a launcher named on the
+-- command line.
 extraPlatforms :: Platform -> [Platform]
 extraPlatforms X86_64_Linux = [I686_Linux]
 extraPlatforms X86_64_Windows = [I686_Windows]

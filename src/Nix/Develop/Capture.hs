@@ -81,7 +81,9 @@ data CaptureFailure
   = -- | Its builder's base name is not @bash@.
     NotBashBuilder
   | -- | An output is floating content-addressed or impure, which upstream
-    -- keeps in the capture and nova-nix builds for no derivation.
+    -- keeps in the capture and nova-nix builds for no derivation, or is
+    -- fixed beside other outputs or under a name other than @out@, which
+    -- upstream refuses as it reads the derivation.
     UncapturableOutputs
   | -- | Its structured attributes are not a JSON object, with why.
     UnreadableStructuredAttrs !Text

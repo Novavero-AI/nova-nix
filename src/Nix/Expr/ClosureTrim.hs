@@ -9,12 +9,13 @@
 -- build a flat env with @envParent = Nothing@, breaking the retention
 -- chain.
 --
--- A scope is trimmable when every reference it makes to an outer scope
--- is an 'EResolvedVar' or an 'EWithVar'.  An outer 'EVar' (a name a
--- frame's name table or the root environment binds) is found by walking
--- the parent chain at runtime, so a scope holding one keeps its chain and
--- is not trimmed.  An 'EWithVar' needs only the with-scopes, which a
--- trimmed scope keeps ('CapturesWithScopes').
+-- A scope is trimmed when it holds no 'EVar' and makes at least one
+-- reference to an outer scope, each an 'EResolvedVar' or an 'EWithVar'.
+-- An 'EVar' (a name a frame's name table or the root environment binds)
+-- is found by walking the parent chain at runtime, so a scope holding one,
+-- even one a frame inside the scope binds, keeps its chain and is not
+-- trimmed; so does a scope with no outer reference.  An 'EWithVar' needs
+-- only the with-scopes, which a trimmed scope keeps ('CapturesWithScopes').
 module Nix.Expr.ClosureTrim
   ( trimClosures,
   )
@@ -170,8 +171,8 @@ trimOneLambda formals body =
 -- Returns @(freeVars, hasOuterEVar, hasOuterWithVar)@ where:
 -- * @freeVars@ is the set of @(level, index)@ pairs for 'EResolvedVar'
 --   references that point outside the lambda (level > current depth)
--- * @hasOuterEVar@ is 'True' if there's any 'EVar' that could reference
---   the outer scope (not shadowed by inner let/rec/lambda scopes)
+-- * @hasOuterEVar@ is 'True' if there's any 'EVar' in the body, whatever
+--   binds it
 -- * @hasOuterWithVar@ is 'True' if there's any 'EWithVar' that needs
 --   with-scope access (doesn't block trimming, but env must preserve
 --   its with-scopes ('Nix.Eval.Types.envWithScopesRaw'))

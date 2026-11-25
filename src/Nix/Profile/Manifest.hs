@@ -132,7 +132,8 @@ writtenVersion = 3
 
 -- | Why a manifest could not be read.
 data ManifestError
-  = -- | The file is not JSON, or not a JSON object.
+  = -- | The file is not UTF-8 JSON or not a JSON object, or its @version@
+    -- is not a number or its @elements@ neither an object nor an array.
     ManifestNotJson !Text
   | -- | A version other than 1, 2 and 3 (the @ProfileManifest@ constructor
     -- in profile.cc).
@@ -273,7 +274,7 @@ manifestJson (Manifest elements) =
 renderManifest :: Manifest -> ByteString
 renderManifest = renderJson . manifestJson
 
--- | A failure in upstream's words, naming the manifest's path.
+-- | A failure as a message naming the manifest's path.
 manifestErrorText :: OsPath -> ManifestError -> Text
 manifestErrorText path failure = case failure of
   ManifestNotJson reason -> "profile manifest " <> quoted <> " cannot be read: " <> reason

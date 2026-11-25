@@ -4,14 +4,16 @@
 --
 -- @
 -- lambda / -> / || / && / == != / < > <= >= / //
--- ! / + - / * \\/ / ++ / ? / negate / application / selection
+-- ! / ++ / + - / * \\/ / negate / ? / application / selection
 -- @
 --
--- Close to the C++ Nix parser (parser.y), with two inert deviations: here
--- @++@ binds looser than multiplication\/addition (parser.y binds it tighter)
--- and unary negate binds looser than @?@ (parser.y makes negate tightest).
--- Both only affect mixed expressions that are type errors regardless, so no
--- program that type-checks parses differently.
+-- Close to upstream Nix's parser, with two deviations: here @++@ binds
+-- looser than multiplication\/addition (upstream binds it tighter) and
+-- unary negate binds looser than @?@ (upstream makes negate tightest).
+-- The first only affects mixed expressions that are type errors
+-- regardless.  The second does not: @-x ? a@ is @(-x) ? a@ upstream,
+-- false for a number @x@, and @-(x ? a)@ here, which negates a Boolean
+-- and fails.
 -- Entirely pure. No IO, no Megaparsec, no Parsec.
 --
 -- The parser notes each name ('recordName') where upstream's parser

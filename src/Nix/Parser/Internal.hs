@@ -152,10 +152,12 @@ tryParserKeepError (Parser p) = Parser $ \st -> case p st of
 -- | Of two competing failures, the one that got further into the
 -- input; upstream's LR parser never backtracks, so its errors sit at
 -- the true site, and reporting the deeper branch is the closest a
--- backtracking parser comes to that.  End-of-input errors carry
--- position (0,0) by construction and rank past every positioned
--- error: end of input is the furthest a branch can get.  Ties keep
--- the second error.
+-- backtracking parser comes to that.  End-of-input errors carry the
+-- position of the lexer's closing 'TokEOF', just past the source's last
+-- byte, so they rank past every error before it: end of input is the
+-- furthest a branch can get.  An error raised with no token left carries
+-- (0,0) and ranks past every positioned error.  Ties keep the second
+-- error.
 deeperError :: ParseError -> ParseError -> ParseError
 deeperError a b
   | rank a > rank b = a

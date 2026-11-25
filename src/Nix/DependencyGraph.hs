@@ -56,7 +56,9 @@ newtype DepGraph = DepGraph {unDepGraph :: Map StorePath DepNode}
 data TopoResult
   = -- | Successfully sorted: build order with leaves (no deps) first.
     TopoSorted ![StorePath]
-  | -- | Cycle detected: the paths involved in the cycle.
+  | -- | Cycle detected: the paths the sort placed before it stalled,
+    -- leaves first, none of them on a cycle.  The paths on a cycle, and
+    -- those depending on one, are the rest of the graph.
     TopoCycle ![StorePath]
   deriving (Eq, Show)
 

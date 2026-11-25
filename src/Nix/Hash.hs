@@ -6,7 +6,7 @@
 --
 -- == How Nix uses hashes
 --
--- Everything in Nix is content-addressed. A store path like:
+-- Every store path is named by a hash. A store path like:
 --
 -- @\/nix\/store\/s66mzxpvicwk07gjbjfw9izjfa797vsw-hello-2.12.1@
 --
@@ -22,7 +22,9 @@
 -- == Hash types in Nix
 --
 -- * __Input hash__ (derivation hash): SHA-256 of all build inputs.
---   Computed BEFORE building.  This is the hash in the store path.
+--   Computed BEFORE building.  This is the hash in an input-addressed
+--   output's store path; a fixed output's path hashes its declared
+--   content instead ('makeFixedOutputPath').
 -- * __Output hash__ (NAR hash): SHA-256 of the built output serialized
 --   as a NAR archive.  Computed AFTER building.  Stored in the narinfo
 --   for integrity verification.
@@ -31,7 +33,7 @@
 --
 -- nova-cache already handles output hashes and file hashes.  This module
 -- provides the shared hashing utilities, the @makeStorePath@ family that
--- constructs content-addressed store paths exactly as C++ Nix does, and
+-- constructs store paths exactly as C++ Nix does, and
 -- the reading of a hash from each spelling upstream accepts.
 module Nix.Hash
   ( -- * Shared hashing utilities
@@ -372,7 +374,7 @@ hashSpelling s
 
 -- | The core store-path construction primitive.  Given a @type@ string, the
 -- inner content digest (raw SHA-256 bytes), and a name, produce the store
--- path.  Mirrors C++ Nix @makeStorePath@:
+-- path, as upstream Nix builds one:
 --
 -- @
 -- s = type ":sha256:" hex(innerDigest) ":" storeDir ":" name
@@ -388,7 +390,9 @@ hashSpelling s
 -- ('checkStorePathName'), carrying the hash part the path would have had:
 -- upstream hashes before it checks the name, and its refusal names both.
 -- Construction validates like the parse boundary does, so every
--- t'StorePath' that exists has a clean name: the write sinks downstream
+-- t'StorePath' that names a path has a clean name (the masking
+-- placeholder of "Nix.Store.Path.Internal" has an empty one and never
+-- reaches a sink): the write sinks downstream
 -- (store copies, the builder's delete-and-move) never see a path that
 -- resolves outside the store root, and no sink needs its own ad hoc name
 -- check.
