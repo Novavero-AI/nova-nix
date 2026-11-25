@@ -213,8 +213,9 @@ derivationsErrorText failure = case failure of
 -- the packages @derivations@ names, printing each warning the tree gives,
 -- and link @manifest.nix@ in it to @manifest@.  Upstream reads
 -- @manifest@ once the tree is made, so a tree that fails is the failure
--- reported when both do.  Returns the process runner's shape, so the
--- shared validation and registration in "Nix.Builder" follow.
+-- reported when both do.  Returns a failure's exit code and message, which
+-- "Nix.Builder" reports as a refused builder, so the shared validation and
+-- registration there follow.
 runBuiltinBuildenv :: StoreDir -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
 runBuiltinBuildenv storeDir drv outputDirs = first failed <$> runExceptT build
   where

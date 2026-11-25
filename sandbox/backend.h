@@ -6,7 +6,8 @@
  * that fails writes on the status channel.  A backend is the sandbox of
  * one OS (linux.c, darwin.c): it starts the builder there as the plan
  * says, waits for it, ends it when the lifeline closes, and has the helper
- * end as the builder ended.  The executable links the core with the one
+ * end as the builder ended, or fail where it cannot see the build out
+ * (backend_run).  The executable links the core with the one
  * backend for the OS it is built for.  The core reads and writes its
  * channels through the backend, since each OS has its own calls for them;
  * the POSIX backends share theirs (posix.h).
@@ -71,9 +72,11 @@ void backend_write_status(const char *bytes, size_t length);
  * lifeline: when it closes, the builder is killed.  A step that fails
  * before the builder starts reports and ends the process.  Otherwise the
  * helper ends as the builder ended: this answers the builder's exit
- * status, or a failure when how it ended cannot be known, or does not
- * return when the backend ends the helper by the signal that ended the
- * builder. */
+ * status, or a failure when how it ended cannot be known or, on macOS,
+ * when the build's processes cannot all be ended or its output does not
+ * end, or does not return when the backend ends the helper by the signal
+ * that ended the builder or, on macOS, reports a failure to watch the
+ * build log. */
 int backend_run(const struct plan *plan, char **argv);
 
 /* Check that this system can make the sandbox.  Answers NULL when it can,
