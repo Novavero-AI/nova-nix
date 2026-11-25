@@ -7,8 +7,8 @@
 -- user and changeable only by the user nova-nix runs as and the
 -- system's administrators ('StoreAccess').  A directory created on the
 -- way to a store, @C:\\nix@ when the installer has not made it, is
--- theirs alone ('ParentAccess'), and a build directory is that user's
--- alone ('OwnerAccess').
+-- theirs alone on Windows, and on POSIX as open as a store's directory
+-- ('ParentAccess'); a build directory is that user's alone ('OwnerAccess').
 --
 -- == POSIX
 --
@@ -107,9 +107,9 @@ data DirAccess
     -- SYSTEM and Administrators: a store's directory and its state
     -- directory.
     StoreAccess
-  | -- | Readable and changeable by the user nova-nix runs as, SYSTEM
-    -- and Administrators alone: a directory created on the way to a
-    -- store.
+  | -- | On Windows readable and changeable by the user nova-nix runs as,
+    -- SYSTEM and Administrators alone, and on POSIX the mode of a store's
+    -- directory: a directory created on the way to a store.
     ParentAccess
   | -- | The user nova-nix runs as alone: a build directory.
     OwnerAccess

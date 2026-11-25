@@ -44,7 +44,7 @@
 -- anyway - needs no separate path.  The cost is one empty
 -- @\<store-path\>.lock@ per substituted or built path left beside it in
 -- the store directory; the files are inert debris, invisible to path
--- queries (only exact store-path basenames resolve).  The one deleter
+-- queries (no registration row names one).  The one deleter
 -- is the collector ("Nix.Store.GC"), which removes a lock file once the
 -- path it guards is no longer live, and may: it runs under the
 -- exclusive store-wide lock, when no process has the store open, and
@@ -81,8 +81,9 @@ import Nix.Store.Path (StoreDir, StorePath, parseStorePathBaseName, storePathToF
 import System.FileLock (FileLock, SharedExclusive (..), lockFile, tryLockFile, unlockFile)
 import System.IO (hPutStrLn, stderr)
 
--- | An exclusive lock held on one store path: the lock file's path and
--- the descriptor whose OS lock is the exclusion.  The descriptor sits
+-- | A lock held on one lock file, exclusive on a store path's, or in its
+-- 'LockMode' on one named directly: the lock file's path and the
+-- descriptor whose OS lock it is.  The descriptor sits
 -- behind an 'MVar' so release is idempotent and thread-safe: a bracket
 -- and an explicit release can both fire on one lock without a
 -- double-close.

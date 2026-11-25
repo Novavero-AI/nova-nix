@@ -10,9 +10,9 @@
 -- 3. If 200: parse the narinfo (NAR hash, size, references, signature)
 -- 4. Validate the narinfo's fields, then verify the signature against a
 --    trusted public key
--- 5. @GET https:\/\/cache.example.com\/nar\/\<narhash\>.nar.xz@ and, in
---    one bounded streaming pass, decompress, hash, parse, and unpack
---    into the store path
+-- 5. @GET https:\/\/cache.example.com\/\<URL\>@, the file the narinfo's
+--    @URL@ field names, and, in one bounded streaming pass, decompress,
+--    hash, parse, and unpack into the store path
 -- 6. Verify the declared NAR hash and size against the streamed bytes,
 --    then re-verify the materialized tree from disk
 -- 7. Register in the store DB with references from narinfo
@@ -20,10 +20,11 @@
 -- A build reads a path's narinfo before anything is downloaded, to realise
 -- the references it declares first ('queryReferencesWith'), and then
 -- fetches the path from the cache that served that narinfo, without asking
--- again ('fetchSubstituteWith').  Each cache is asked about each path once
--- in a run, so a closure costs one narinfo request a path, and a path that
--- cache fails to deliver goes to the caches after it, their references
--- first ('queryNextOfferWith').
+-- again ('fetchSubstituteWith').  Each cache that answers is asked about
+-- each path once in a run, so a closure costs one narinfo request a path
+-- from each cache it asks, and a query that failed is made again.  A path
+-- that cache fails to deliver goes to the caches after it, their
+-- references first ('queryNextOfferWith').
 --
 -- A cache that lacks the path (404, or another status upstream reads as
 -- the file not being there) is passed over, and what no cache holds
@@ -33,9 +34,10 @@
 -- 'Nix.Realise.BuildFromSource' (upstream's @fallback@) says to build
 -- instead ("Nix.Realise").
 --
--- The whole sequence runs under an exclusive per-path lock
--- ("Nix.Store.Lock"), upstream's pathlocks protocol: taken before any
--- deletion or download, validity re-checked under it (another process's
+-- The fetch runs under an exclusive per-path lock
+-- ("Nix.Store.Lock"), upstream's pathlocks protocol: taken once the
+-- narinfo is judged and before any deletion or NAR download, validity
+-- re-checked under it (another process's
 -- finished path is adopted without touching disk), and held until the
 -- caller's registration transaction commits.
 --
@@ -50,8 +52,8 @@
 --
 -- Our nova-cache server implements this protocol.  The narinfo format,
 -- NAR serialization, signature verification - all handled by the
--- @nova-cache@ library.  This module orchestrates the HTTP requests
--- and store registration.
+-- @nova-cache@ library.  This module orchestrates the HTTP requests and
+-- builds each path's registration, which "Nix.Builder" records.
 module Nix.Substituter
   ( -- * Substituting a closure
     SubstResult (..),
@@ -160,7 +162,8 @@ data CacheConfig = CacheConfig
     -- @trusted-public-keys@ set: the keys are not bound to a particular
     -- substituter, and one signed by any trusted key is enough.
     ccPublicKeys :: ![Text],
-    -- | Priority (lower = checked first). cache.nixos.org is 40.
+    -- | Priority (lower = checked first); 'defaultCacheConfig' gives
+    -- cache.nixos.org 40.
     ccPriority :: !Int
   }
   deriving (Eq, Show)
@@ -327,9 +330,10 @@ underPathLock store sp substituteLocked = do
 -- 'BuildFromSource' it is reported and passed over, as upstream logs it
 -- and asks the next cache.
 --
--- A cache asked about the path before in this run answers from the run's
--- t'NarInfoMemo' instead, so a closure requests each narinfo once and a
--- path no cache holds is looked for once.
+-- A cache that answered about the path before in this run answers from
+-- the run's t'NarInfoMemo' instead, so a closure requests each narinfo
+-- once and a path no cache holds is looked for once; a query that failed
+-- is made again.
 queryReferencesWith :: FetchRetryPolicy -> RetryEffects IO -> Fallback -> [CacheConfig] -> StorePath -> StateT NarInfoMemo IO (Offer Substitute)
 queryReferencesWith policy effects fallback caches = offerFrom (Retrying policy effects) fallback (sortCaches caches)
 
@@ -620,8 +624,9 @@ unpackVerifiedNar store sp verified refs deriver =
 
 -- | Verify that the downloaded NAR bytes hash to the narinfo's declared
 -- NarHash, returning the decoded digest on success so registration can
--- record its canonical spelling.  Compares decoded hash bytes, so any
--- valid encoding of the digest validates.
+-- record its canonical spelling.  Compares decoded hash bytes; the
+-- declared NarHash parses only as @sha256:@ and nix-base32
+-- (@parseNixHash@).
 verifyNarHash :: NarInfo.NarInfo -> BS.ByteString -> Either Text Hash.NixHash
 verifyNarHash narInfo rawNar =
   case Hash.parseNixHash (NarInfo.niNarHash narInfo) of
@@ -656,7 +661,8 @@ verifyNarSize narInfo rawNar
 
 -- | Whether a served narinfo describes the requested path: the hash component
 -- of its declared StorePath must equal the requested path's hash.  Only the
--- hash is compared, since the cache may use a different store directory.
+-- hash is compared; 'validateNarInfoFields', which 'judgeNarInfo' runs
+-- first, holds the StorePath to the canonical store directory.
 narInfoMatchesPath :: StorePath -> NarInfo.NarInfo -> Bool
 narInfoMatchesPath sp narInfo =
   storePathHashOf (NarInfo.niStorePath narInfo) == Just (spHash sp)

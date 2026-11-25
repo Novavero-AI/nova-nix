@@ -12,8 +12,10 @@
 -- @C:\\nix\\store\\\<hash\>-\<name\>@
 --
 -- The store is IMMUTABLE.  Once a path is registered, it never changes.
--- This is enforced by making the store directory read-only after builds.
--- This immutability is what enables:
+-- Each path's files and directories are made read-only as the path is
+-- added ("Nix.Store.Metadata"); the store directory itself stays
+-- writable, so paths can be added and removed.  This immutability is
+-- what enables:
 --
 -- * Atomic upgrades (install new version, switch symlink, done)
 -- * Rollbacks (old version still in store, just switch symlink back)
@@ -111,9 +113,11 @@ storePathToFilePath :: StoreDir -> StorePath -> FilePath
 storePathToFilePath (StoreDir dir) sp =
   dir </> T.unpack (storePathBasename sp)
 
--- | Convert a t'StorePath' to canonical 'Text' with forward slashes.
--- Unlike 'storePathToFilePath', this always uses @\/@ as the separator,
--- making it safe for ATerm serialization and cross-platform round-trips.
+-- | Convert a t'StorePath' to 'Text' under a store directory, joined by
+-- @\/@ whatever the platform; the directory keeps its own spelling.
+-- Unlike 'storePathToFilePath', the result under 'defaultStoreDir' is the
+-- canonical text, safe for ATerm serialization and cross-platform
+-- round-trips.
 storePathToText :: StoreDir -> StorePath -> Text
 storePathToText (StoreDir dir) sp =
   T.pack dir <> "/" <> storePathBasename sp
@@ -153,9 +157,8 @@ isInStoreText txt = case T.stripPrefix defaultStoreDirText txt >>= T.uncons of
 -- otherwise resolve against the working drive.
 --
 -- The store dir is a parameter rather than 'platformStoreDir' because a
--- caller may have been given one: resolving reads against the platform
--- default while writes went elsewhere is how @--store@ came to write to
--- one directory and read from another.
+-- caller may have been given one (@--store@): reads resolve against the
+-- directory the writes go to, not the platform default.
 storeTextToFilePath :: StoreDir -> Text -> FilePath
 storeTextToFilePath storeDir txt
   | isCanonicalStoreText txt =

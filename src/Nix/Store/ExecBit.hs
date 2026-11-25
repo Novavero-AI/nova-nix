@@ -143,8 +143,7 @@ withNarSource = NAR.withNarSourceOpts . serialiseOptions
 -- | The NAR hash of a path, read through the same exec-bit source of
 -- truth 'serialiseFromPath' writes.  Streams on every platform: the
 -- archive is pulled in chunks with the ADS resolver answering the
--- flags, and the digest folds over them.  Before the resolver hook,
--- Windows had to materialize the tree in memory to rewrite the flags.
+-- flags, and the digest folds over them.
 narHashOfPath :: NAR.CaseHack -> FilePath -> IO Hash.NixHash
 narHashOfPath mode path =
   withNarSource mode path $ \pull ->

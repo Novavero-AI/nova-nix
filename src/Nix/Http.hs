@@ -1,4 +1,6 @@
--- | The HTTP transfer layer every download nova-nix makes goes through:
+-- | The HTTP transfer layer nova-nix's own HTTP client goes through
+-- (@builtin:fetchurl@, the substituter and push; the evaluator's
+-- @builtins.fetchurl@ and @builtins.fetchTarball@ run @curl@ instead):
 -- the User-Agent each request carries, and upstream's retry policy with
 -- the classification that decides what a retry can outlive.
 --

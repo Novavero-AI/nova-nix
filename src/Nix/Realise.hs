@@ -12,15 +12,16 @@
 -- tells them apart.  What no cache holds builds.  A substitute that a cache
 -- offers and fails to deliver passes the path to the caches after it, and
 -- when none of them delivers it the build stops, unless 'BuildFromSource'
--- (upstream's @fallback@) says to build instead
--- (@DerivationGoal::outputsSubstitutionTried@).  A cache that cannot be asked
--- stops the build at once ('QueryFailed'); under 'BuildFromSource' the caller
--- asks the next cache instead, so that failure never arrives here.
+-- (upstream's @fallback@) says to build instead.  A cache that cannot be
+-- asked stops the build at once ('QueryFailed'); under 'BuildFromSource' the
+-- caller asks the next cache instead, so that failure arrives here only as
+-- a refusal to substitute at all ('noWriteAccessMessage'), which stops the
+-- build too.
 --
 -- A derivation whose @allowSubstitutes@ attribute is false builds here even
--- when a cache holds its outputs ('substitutesAllowed').  Its attributes are
--- read first, as upstream's @ParsedDerivation@ reads them
--- ('derivationAttrs').
+-- when a cache holds its outputs, unless @always-allow-substitutes@ is set
+-- ('substitutesAllowed').  Its attributes are read first, as upstream Nix
+-- reads them ('derivationAttrs').
 --
 -- Under 'BuildCheck' the derivation asked for is not realised but checked:
 -- built again beside its valid outputs, each compared with the one the
