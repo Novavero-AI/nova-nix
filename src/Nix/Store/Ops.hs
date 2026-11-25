@@ -147,7 +147,7 @@ withLocalStore config action = withOpenedOnFirstUse (openStore dir) closeStore (
             if nothingToAdd objects
               then pure (Right ())
               else refusing >>= maybe (Right <$> (useStore >>= (`addEvalObjects` objects))) (pure . Left),
-          soAddSourceTree = \name refs entry -> useStore >>= \store -> addSourceTree store name refs entry,
+          soAddSourceTree = \name refs entry -> refusing >>= maybe (useStore >>= \store -> addSourceTree store name refs entry) (pure . Left),
           soBuild = \requests ->
             refusing >>= \case
               Nothing -> useStore >>= \store -> buildRequests config store requests
