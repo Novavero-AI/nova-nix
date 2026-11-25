@@ -104,7 +104,7 @@ import qualified Data.ByteString as BS
 import Data.Char (isAscii, isSpace, toLower, toUpper)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (sortOn)
+import Data.List (sortOn, uncons)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NE
 import Data.Map.Strict (Map)
@@ -147,7 +147,7 @@ import qualified NovaCache.Xz as Xz
 import System.Directory (createDirectoryIfMissing, removePathForcibly)
 import qualified System.Environment
 import System.Exit (ExitCode (..))
-import System.FilePath (takeDirectory, takeFileName, (</>))
+import System.FilePath (isAbsolute, isPathSeparator, takeDirectory, takeFileName, (</>))
 import qualified System.IO
 import qualified System.Info
 import qualified System.Process as Proc
@@ -1629,9 +1629,10 @@ scrubAmbient ambient
 -- bundled with Git for Windows), and 'windowsSystemDirs', which follow it
 -- even when the builder's directory is a store path.
 --
--- A bare-name or dot-relative builder adds no directory: @.@ there
--- would put the build working directory first on PATH, so a file dropped
--- into the build directory would resolve ahead of every tool.
+-- A builder whose directory depends on the working directory, a bare
+-- name or a relative path such as @./tools/bash@, adds no directory: the
+-- working directory is the build directory, so a file dropped there
+-- would resolve ahead of every tool.
 buildPath :: FilePath -> Text
 buildPath builderPath
   | isWindows = T.intercalate ";" (map T.pack (builderDirs ++ windowsSystemDirs))
@@ -1639,8 +1640,13 @@ buildPath builderPath
   where
     builderDir = takeDirectory builderPath
     builderDirs
-      | builderDir == "." = []
-      | otherwise = [builderDir, takeDirectory builderDir </> "usr" </> "bin"]
+      | independentOfWorkDir builderDir = [builderDir, takeDirectory builderDir </> "usr" </> "bin"]
+      | otherwise = []
+
+-- | Whether a directory names one place whatever the working directory:
+-- absolute, or, on Windows, rooted on the working directory's drive.
+independentOfWorkDir :: FilePath -> Bool
+independentOfWorkDir dir = isAbsolute dir || maybe False (isPathSeparator . fst) (uncons dir)
 
 -- | The home directory environment variable name (platform-dependent).
 homeEnvVar :: Text
