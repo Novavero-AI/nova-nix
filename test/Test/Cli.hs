@@ -1938,7 +1938,21 @@ testOutLinkCLI = do
               if null left && unlinkedCode == ExitSuccess && survived == Just False
                 then Pass
                 else Fail (outcome unlinkedBuilt <> "; left: " <> T.pack (show left) <> "; gc: " <> outcome unlinkedCollected)
-          pure (linked ++ [unlinked])
+          -- nix-build realises only the output outputName names: with
+          -- out valid and dev deleted, building out builds nothing.
+          let marked = T.unpack ("derivation { name = \"one-output\"; system = builtins.currentSystem; builder = " <> nixQuotedPath (T.unpack shell) <> "; outputs = [ \"out\" \"dev\" ]; args = [ \"-c\" \"echo the-builder-ran >&2; echo out > $out; echo dev > $dev\" ]; }")
+              buildMarked flags = runIn unlinkedDir (["build", "--expr", marked, "--store", root </> "one-output-store", "--no-out-link"] ++ flags)
+          devBuilt <- buildMarked ["-A", "dev"]
+          deleted <- traverse (\path -> runIn unlinkedDir ["store", "delete", "--store", root </> "one-output-store", path]) (printed devBuilt)
+          outBuilt@(_, _, outErr) <- buildMarked []
+          devGone <- traverse (fmap not . Dir.doesPathExist) (printed devBuilt)
+          oneOutput <-
+            runTest "build realises only the output its outputName names, as nix-build does" $
+              case (deleted, printed outBuilt, devGone) of
+                (Just (ExitSuccess, _, _), Just _, Just True)
+                  | not ("the-builder-ran" `isInfixOf` outErr) -> Pass
+                _ -> Fail (outcome outBuilt <> "; dev: " <> outcome devBuilt <> "; dev gone: " <> T.pack (show devGone))
+          pure (linked ++ [unlinked, oneOutput])
       )
   pure (parses ++ runs)
 

@@ -720,9 +720,10 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
         -- the root's own recipe among it, since the build reads each one
         -- back.
         -- With --check the derivation is checked, every output of it,
-        -- and otherwise realised for every output.
+        -- and otherwise the output outputName names is realised, the
+        -- only one nix-build realises.
         build = case buildModeFor opts of
-          BuildNormal -> soBuild ops [(drvSP, Set.fromList (map doName (drvOutputs drv)))]
+          BuildNormal -> soBuild ops [(drvSP, Set.singleton outputName)]
           BuildCheck -> soCheck ops drvSP
     outcome <- runExceptT $ do
       ExceptT (first AddRefused <$> soAddEvalObjects ops evalObjects)
@@ -878,10 +879,10 @@ derivationPath (VAttrs attrs) = do
     _ -> failWith "error: derivation result missing drvPath"
 derivationPath _ = failWith "error: result is not a derivation"
 
--- | The output a build prints and links, of the outputs it realises: the
--- value's @outputName@, the first of its @outputs@, which is what
--- upstream's nix-build builds and prints for a derivation, with its
--- message for a set that lacks the attribute.
+-- | The output a build realises, prints and links (@--check@ checks every
+-- output): the value's @outputName@, the first of its @outputs@, which
+-- is what upstream's nix-build builds and prints for a derivation, with
+-- its message for a set that lacks the attribute.
 defaultOutputName :: StorePath -> NixValue -> IO T.Text
 defaultOutputName drvSP val = do
   outputName <- case val of
