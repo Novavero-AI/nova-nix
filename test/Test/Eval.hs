@@ -3313,7 +3313,17 @@ testEvalErrors = do
       runTest "call non-function" $
         assertEvalFail "call-non" "42 1",
       runTest "builtins.throw" $
-        assertEvalFail "throw" "builtins.throw \"boom\""
+        assertEvalFail "throw" "builtins.throw \"boom\"",
+      -- throw and abort coerce their message as interpolation does.
+      runTest "throw coerces a set's __toString and outPath, and the throw stays catchable" $
+        assertEvalError "throw __toString" "throw { __toString = self: \"from toString\"; }" "from toString"
+          `andThen` assertEvalError "throw outPath" "throw { outPath = \"from outPath\"; }" "from outPath"
+          `andThen` assertEval "throw caught" "(builtins.tryEval (throw { __toString = self: \"m\"; })).success" (VBool False),
+      runTest "abort coerces a set's __toString" $
+        assertEvalError "abort __toString" "abort { __toString = self: \"m\"; }" "evaluation aborted with the following error message: 'm'",
+      runTest "throw and abort refuse a message that does not coerce, as interpolation does" $
+        assertEvalError "throw int" "throw 1" "cannot coerce an integer to a string: 1"
+          `andThen` assertEvalError "abort int" "abort 1" "cannot coerce an integer to a string: 1"
     ]
 
 -- ---------------------------------------------------------------------------

@@ -542,6 +542,13 @@ if upstreamAtLeast 2.25.0; then
 fi
 echo
 
+echo "== what throw and abort make of their message =="
+check "throw coerces a set's __toString, and stays catchable" '(builtins.tryEval (throw { __toString = self: "m"; })).success'
+refused "throw coerces a set's outPath" 'throw { outPath = "from outPath"; }'
+refused "abort coerces a set's __toString" 'abort { __toString = self: "m"; }'
+refused "throw refuses a message that does not coerce" 'throw 1'
+echo
+
 echo "== what builtins.toFile refuses =="
 toFileDrv='(derivation { name = "d"; system = "x86_64-linux"; builder = "/bin/sh"; })'
 refused "toFile refuses an output of a derivation, naming it" "builtins.toFile \"x\" \"\${$toFileDrv}\""

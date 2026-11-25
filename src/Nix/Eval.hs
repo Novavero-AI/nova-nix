@@ -1814,17 +1814,22 @@ builtinStringLength value = VInt . fromIntegral . BS.length . fst <$> coerceToSt
 -- Builtin implementations - control
 -- ---------------------------------------------------------------------------
 
--- | The error channel is Text and display-only (tryEval discards the
--- message), so throw/abort messages decode lossily.
+-- | @throw@ and @abort@ coerce their message as string interpolation
+-- does, as upstream's coerce theirs: a path, or a set with @__toString@
+-- or @outPath@, is a message too, and anything else fails to coerce.
+-- The error channel is Text and display-only (tryEval discards the
+-- message), so the messages decode lossily.
 builtinThrow :: (MonadEval m) => NixValue -> m NixValue
-builtinThrow (VStr msg _) = throwCatchableError (bytesToTextLossy msg)
-builtinThrow other = throwEvalError ("builtins.throw: expected a string, got " <> typeName other)
+builtinThrow val = do
+  (msg, _) <- coerceToStringInterp val
+  throwCatchableError (bytesToTextLossy msg)
 
 -- | Upstream's @prim_abort@ in primops.cc words the message it was
 -- given.
 builtinAbort :: (MonadEval m) => NixValue -> m NixValue
-builtinAbort (VStr msg _) = abortEvaluation ("evaluation aborted with the following error message: '" <> bytesToTextLossy msg <> "'")
-builtinAbort other = abortEvaluation ("builtins.abort: expected a string, got " <> typeName other)
+builtinAbort val = do
+  (msg, _) <- coerceToStringInterp val
+  abortEvaluation ("evaluation aborted with the following error message: '" <> bytesToTextLossy msg <> "'")
 
 -- | @builtins.addErrorContext message value@: the value, forced, and when
 -- forcing it fails, the failure with the message as a line of its trace.
