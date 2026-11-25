@@ -736,6 +736,12 @@ testSubstituter = do
         if Subst.narInfoMatchesPath (StorePath (T.replicate 32 "b") "hello") (sampleNarInfo sampleNarHash)
           then Fail "expected identity mismatch"
           else Pass,
+      -- Upstream holds the narinfo's name to the requested path's too, not
+      -- its hash alone.
+      runTest "narInfoMatchesPath rejects a narinfo naming another name under the same hash" $
+        if Subst.narInfoMatchesPath (StorePath sampleHash "goodbye") (sampleNarInfo sampleNarHash)
+          then Fail "a narinfo for another name was taken for the requested path"
+          else Pass,
       -- catchSync, which a fetch and a query wrap each attempt in: a
       -- synchronous exception becomes the handler's value, and so a failed
       -- substitute the realisation passes to the next cache.
