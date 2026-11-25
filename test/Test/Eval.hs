@@ -6626,6 +6626,15 @@ testUpstreamConformance = do
         assertEvalFail "toml-int-overflow" "builtins.fromTOML \"v = 99999999999999999999\"",
       runTest "fromTOML rejects past-64-bit hex integer" $
         assertEvalFail "toml-hex-overflow" "builtins.fromTOML \"v = 0xffffffffffffffff\"",
+      -- Upstream refuses a date or a time unless an experimental feature
+      -- nova-nix does not have is on, once the document has parsed.
+      runTest "fromTOML refuses a date or a time" $
+        foldr
+          andThen
+          Pass
+          [ assertEvalError document ("builtins.fromTOML \"" <> document <> "\"") "while parsing TOML: Dates and times are not supported"
+          | document <- ["d = 1979-05-27", "d = 1979-05-27T07:32:00Z", "d = 1979-05-27 07:32:00", "t = 07:32:00", "a = [ 1979-05-27 ]", "[t]\\nd = 1979-05-27"]
+          ],
       runTest "fromTOML int64 max parses" $
         assertEval "toml-int64-max" "(builtins.fromTOML \"v = 9223372036854775807\").v" (VInt 9223372036854775807),
       runTest "fromTOML int64 min parses" $

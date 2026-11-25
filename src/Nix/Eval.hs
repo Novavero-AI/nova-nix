@@ -5303,9 +5303,9 @@ bytesToBase64 = B64.encode
 -- bare/quoted keys, dotted keys, basic/literal strings (multiline),
 -- integers (dec/hex/oct/bin), floats (inc. inf/nan), booleans,
 -- inline tables, arrays, array-of-tables, and standard tables.
--- Datetimes are represented as strings, where upstream Nix refuses them
--- unless its @parse-toml-timestamps@ experimental feature is on, and then
--- gives a set with @_type = \"timestamp\"@.
+-- A date or a time is refused once the whole document has parsed, as
+-- upstream Nix refuses one unless its @parse-toml-timestamps@ experimental
+-- feature, which nova-nix does not have, is on.
 builtinFromTOML :: (MonadEval m) => NixValue -> m NixValue
 builtinFromTOML (VStr s _) = do
   -- TOML is UTF-8 by definition; upstream's parser rejects invalid bytes.
@@ -5324,6 +5324,8 @@ data TOMLValue
   | TOMLBool !Bool
   | TOMLArray ![TOMLValue]
   | TOMLTable !(Map Text TOMLValue)
+  | -- | A date, a time, or both, which no value holds.
+    TOMLDatetime
   deriving (Show)
 
 -- | Parse a TOML document: its top-level table.
@@ -5331,8 +5333,9 @@ parseTOML :: Text -> Either Text TOMLValue
 parseTOML input = TOMLTable <$> parseTOMLDoc (T.lines input)
 
 -- | Convert a TOMLValue to NixValue.
-tomlToNix :: (MonadCData m) => TOMLValue -> m NixValue
+tomlToNix :: (MonadEval m) => TOMLValue -> m NixValue
 tomlToNix val = case val of
+  TOMLDatetime -> throwEvalError "while parsing TOML: Dates and times are not supported"
   TOMLStr s -> pure (mkStr s)
   TOMLInt n -> pure (VInt n)
   TOMLFloat d -> pure (VFloat d)
@@ -5626,10 +5629,10 @@ parseTOMLNumberOrDatetime s
   | T.isPrefixOf "0x" s || T.isPrefixOf "0X" s = parseHexInt (T.drop 2 s)
   | T.isPrefixOf "0o" s || T.isPrefixOf "0O" s = parseOctInt (T.drop 2 s)
   | T.isPrefixOf "0b" s || T.isPrefixOf "0B" s = parseBinInt (T.drop 2 s)
-  -- Contains date separators, so treat as a datetime string
-  | T.any (== 'T') s && T.any (== '-') s = Right (TOMLStr s)
-  | T.count "-" s >= 2 && T.any isDigit s = Right (TOMLStr s)
-  | T.any (== ':') s && T.any isDigit s = Right (TOMLStr s)
+  -- Contains date or time separators, so a date or a time
+  | T.any (== 'T') s && T.any (== '-') s = Right TOMLDatetime
+  | T.count "-" s >= 2 && T.any isDigit s = Right TOMLDatetime
+  | T.any (== ':') s && T.any isDigit s = Right TOMLDatetime
   -- Float (has dot or exponent)
   | T.any (== '.') s || T.any (\c -> c == 'e' || c == 'E') s = parseFloat s
   -- Plain integer
