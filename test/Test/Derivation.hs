@@ -960,10 +960,18 @@ testDevelopCapture = do
       runTest "a builder of another base name is refused in upstream's words" $
         foldr (andThen . (\builder -> refused plain {drvBuilder = builder} NotBashBuilder)) Pass ["/bin/sh", "/bin/bash5", "", "/", "///", "bash.exe", "/bin/bash/x"]
           `andThen` assertEqual "message" "'nix develop' only works on derivations that use 'bash' as their builder" (captureFailureMessage NotBashBuilder),
-      runTest "a floating content-addressed, impure or mixed output is refused" $
+      runTest "a floating content-addressed or impure output is refused" $
         refused plain {drvOutputs = [DerivationOutput "out" (StorePath "" "") "r:sha256" ""]} UncapturableOutputs
-          `andThen` refused plain {drvOutputs = [DerivationOutput "out" (StorePath "" "") "r:sha256" "impure"]} UncapturableOutputs
-          `andThen` refused fixed {drvOutputs = drvOutputs fixed <> [pendingOutput "dev"]} UncapturableOutputs,
+          `andThen` refused plain {drvOutputs = [DerivationOutput "out" (StorePath "" "") "r:sha256" "impure"]} UncapturableOutputs,
+      -- Upstream defers every input-addressed and fixed output before
+      -- anything reads the outputs together, so a fixed output beside
+      -- others, or under another name than out, is captured.
+      runTest "a fixed output beside another, or named other than out, is captured input-addressed" $
+        let fixedOut = drvOutputs fixed
+            renamed = [output {doName = "bin"} | output <- fixedOut]
+            addressing file = [(doName output, doHashAlgo output, doHash output) | output <- drvOutputs (drvFileDerivation file)]
+         in capture "f" fixed {drvOutputs = fixedOut <> [pendingOutput "dev"]} (\_ file -> assertEqual "beside" [("dev", "", ""), ("out", "", "")] (addressing file))
+              `andThen` capture "f" fixed {drvOutputs = renamed} (\_ file -> assertEqual "renamed" [("bin", "", "")] (addressing file)),
       runTest "structured attributes that are not an object are refused" $
         foldr
           (andThen . (\json -> assertRight "script" scriptPath $ \script -> assertLeft json (drvFilePath <$> captureDerivation script "s" [] structured {drvEnv = Map.insert "__json" (TE.encodeUtf8 json) (drvEnv structured)})))

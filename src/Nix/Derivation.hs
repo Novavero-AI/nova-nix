@@ -56,6 +56,7 @@ module Nix.Derivation
     Derivation (..),
     DerivationOutput (..),
     fixedOutput,
+    impureOutputHash,
 
     -- * ATerm serialization
     toATerm,
