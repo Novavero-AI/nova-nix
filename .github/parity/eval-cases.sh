@@ -542,6 +542,11 @@ if upstreamAtLeast 2.25.0; then
 fi
 echo
 
+echo "== what fromTOML makes of a date =="
+refused "fromTOML refuses a date" 'builtins.fromTOML "d = 1979-05-27"'
+refused "fromTOML refuses a time" 'builtins.fromTOML "t = 07:32:00"'
+echo
+
 echo "== what a builtin reading a plain string makes of string context =="
 withContext='builtins.appendContext "a" { "/nix/store/00000000000000000000000000000000-a" = { path = true; }; }'
 # 2.34.0 names the refused context element by its full store path, where
