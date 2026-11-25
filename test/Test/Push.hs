@@ -272,35 +272,51 @@ testPushMultipart = do
   tmpBase <- getTemporaryDirectory
   let source = tmpBase </> "nova-nix-test-push-multipart-src"
       topSource = tmpBase </> "nova-nix-test-push-multipart-top"
+      goneSource = tmpBase </> "nova-nix-test-push-multipart-gone"
       sp = StorePath (T.replicate 32 "m") "large-output"
       -- A small path that references the large one, for a closure of two.
       spTop = StorePath (T.replicate 32 "n") "small-top"
+      -- A registered path whose tree is gone, which a push cannot read.
+      spGone = StorePath (T.replicate 32 "p") "gone"
   forceRemoveIfExists source
   forceRemoveIfExists topSource
+  forceRemoveIfExists goneSource
   createDirectoryIfMissing True source
   createDirectoryIfMissing True topSource
+  createDirectoryIfMissing True goneSource
+  BS.writeFile (goneSource </> "payload") "gone"
   BS.writeFile (source </> "payload") (BS.pack (take payloadBytes (cycle [0 .. 250])))
   BS.writeFile (topSource </> "payload") "small"
   results <- withTempStore $ \store -> do
     addToStore store source sp Nothing []
     addToStore store topSource spTop Nothing [sp]
+    addToStore store goneSource spGone Nothing []
+    forceRemoveIfExists (storePathToFilePath (stDir store) spGone)
     prepared <- runExceptT (preparePath PushNone store sp)
     case (prepared, mkPartSize testPartBytes) of
-      (Right (artifact, narInfo), Just partSize) -> multipartCases store sp spTop partSize (paBytes artifact) (TE.encodeUtf8 (NarInfo.niUrl narInfo))
+      (Right (artifact, narInfo), Just partSize) -> multipartCases store sp spTop spGone partSize (paBytes artifact) (TE.encodeUtf8 (NarInfo.niUrl narInfo))
       (Left err, _) -> sequence [runTest "push/multipart setup" (Fail err)]
       (Right _, Nothing) -> sequence [runTest "push/multipart setup" (Fail "the test part size is not one")]
   forceRemoveIfExists source
   forceRemoveIfExists topSource
+  forceRemoveIfExists goneSource
   pure results
   where
     -- Large enough for a NAR of at least three parts, so a part has parts
     -- before and after it.
     payloadBytes = 3000
     testPartBytes = 1024
-    multipartCases store sp spTop partSize nar narObject =
+    multipartCases store sp spTop spGone partSize nar narObject =
       sequence
         [ runTest "the test NAR is at least three parts" $
             assertEqual "parts" True (count >= 3),
+          -- The command that pushes words the failure; the push says only
+          -- what went wrong.
+          runTestM "a push that cannot read a path reports why, without the command's prefix" $ do
+            (result, _) <- withModelCache behindProxy (\base -> pushPaths (config base partSize) store [spGone])
+            pure $ case result of
+              Left err | not ("push failed" `T.isInfixOf` err), not (T.null err) -> Pass
+              other -> Fail ("expected the failure without the command's prefix, got " <> T.pack (show other)),
           runTestM "a NAR over the part size goes up in parts under the proxy's limit, each request with the write key, and is completed" $ do
             outcome <- pushTo behindProxy partSize
             pure $
