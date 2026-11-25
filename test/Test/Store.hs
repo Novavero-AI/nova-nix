@@ -2814,6 +2814,18 @@ testStoreWritesUpstreamManaged = do
                     (Right (), Right bytes, BuildSuccess _)
                       | bytes == cacheBytes, builtFile, seen == [narInfoTarget, narTarget] -> Pass
                     other -> Fail ("expected the sibling written, got: " <> T.pack (show (other, builtFile, seen))),
+            -- An add is refused before the store is opened, so this store's
+            -- database is never made where upstream's manages the paths.
+            runTestM "adding a source tree refuses a store upstream's database manages before it opens the store" $ do
+              let fresh = root </> "fresh"
+                  freshDir = StoreDir (fresh </> "nix" </> "store")
+              createDirectoryIfMissing True (fresh </> "nix" </> "var" </> "nix" </> "db")
+              BS.writeFile (fresh </> "nix" </> "var" </> "nix" </> "db" </> "db.sqlite") ""
+              added <- withLocalStore (defaultBuildConfig freshDir) $ \ops -> soAddSourceTree ops "tree" Set.empty (NAR.NarRegular False "x")
+              madeDatabase <- Dir.doesPathExist (unStoreDir freshDir </> metaDirName)
+              pure $ case added of
+                Left reason | "upstream Nix's database" `T.isInfixOf` reason, not madeDatabase -> Pass
+                other -> Fail ("expected the refusal and no database, got: " <> T.pack (show (other, madeDatabase))),
             runTestM "a sibling store under the same directory takes an evaluation's store writes" $
               withPlantedStore "nova-store" $ \store _ -> do
                 written <- mapM (evalIn store) evalWrites
