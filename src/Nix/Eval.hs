@@ -1391,8 +1391,9 @@ data ArgMode
     -- than upstream, which forces nothing before the last argument.
     ForceOnApply
   | -- | Held as a thunk, for a primop that forces it later than that:
-    -- after a later argument, around a catch, or only on some paths.
-    -- The builtin forces it where upstream does.
+    -- after it checks an earlier argument, after a later argument, around
+    -- a catch, or only on some paths.  The builtin forces it where
+    -- upstream does.
     ForceOnUse
   deriving (Eq, Show)
 
@@ -1455,12 +1456,6 @@ forced2 f builtin = BuiltinDef (ForceOnApply :| [ForceOnApply]) $ \case
   [ArgForced a, ArgForced b] -> f a b
   _ -> arityError builtin
 
--- | Three arguments, each forced as it is applied.
-forced3 :: (MonadEval m) => (NixValue -> NixValue -> NixValue -> m NixValue) -> Builtin -> BuiltinDef m
-forced3 f builtin = BuiltinDef (ForceOnApply :| [ForceOnApply, ForceOnApply]) $ \case
-  [ArgForced a, ArgForced b, ArgForced c] -> f a b c
-  _ -> arityError builtin
-
 -- | One argument, held unforced.
 onUse1 :: (MonadEval m) => (BuiltinArg -> m NixValue) -> Builtin -> BuiltinDef m
 onUse1 f builtin = BuiltinDef (ForceOnUse :| []) $ \case
@@ -1487,11 +1482,11 @@ onUseSecond f builtin = BuiltinDef (ForceOnApply :| [ForceOnUse]) $ \case
   [ArgForced a, b] -> f a b
   _ -> arityError builtin
 
--- | Three arguments, the middle one held unforced and the others forced
--- as they are applied.
-onUseMiddle :: (MonadEval m) => (NixValue -> BuiltinArg -> NixValue -> m NixValue) -> Builtin -> BuiltinDef m
-onUseMiddle f builtin = BuiltinDef (ForceOnApply :| [ForceOnUse, ForceOnApply]) $ \case
-  [ArgForced a, b, ArgForced c] -> f a b c
+-- | Three arguments, the first forced as it is applied and the others held
+-- unforced.
+onUseLastTwo :: (MonadEval m) => (NixValue -> BuiltinArg -> BuiltinArg -> m NixValue) -> Builtin -> BuiltinDef m
+onUseLastTwo f builtin = BuiltinDef (ForceOnApply :| [ForceOnUse, ForceOnUse]) $ \case
+  [ArgForced a, b, c] -> f a b c
   _ -> arityError builtin
 
 -- | Every builtin's shape and implementation.  Upstream binds
@@ -1526,28 +1521,28 @@ builtinDef builtin = shape builtin
       Builtin.AttrValues -> forced1 builtinAttrValues
       Builtin.ListToAttrs -> forced1 builtinListToAttrs
       -- Attr set operations (arity 2)
-      Builtin.HasAttr -> forced2 builtinHasAttr
-      Builtin.GetAttr -> forced2 builtinGetAttr
-      Builtin.RemoveAttrs -> forced2 builtinRemoveAttrs
-      Builtin.IntersectAttrs -> forced2 builtinIntersectAttrs
-      Builtin.CatAttrs -> forced2 builtinCatAttrs
+      Builtin.HasAttr -> onUseSecond builtinHasAttr
+      Builtin.GetAttr -> onUseSecond builtinGetAttr
+      Builtin.RemoveAttrs -> onUseSecond builtinRemoveAttrs
+      Builtin.IntersectAttrs -> onUseSecond builtinIntersectAttrs
+      Builtin.CatAttrs -> onUseSecond builtinCatAttrs
       -- List higher-order (arity 2)
       Builtin.Map -> onUseFirst builtinMap
       Builtin.Filter -> onUseFirst builtinFilter
       Builtin.GenList -> onUseFirst builtinGenList
       Builtin.Sort -> onUseFirst builtinSort
-      Builtin.ConcatMap -> forced2 builtinConcatMap
-      Builtin.Any -> forced2 builtinAny
-      Builtin.All -> forced2 builtinAll
+      Builtin.ConcatMap -> onUseSecond builtinConcatMap
+      Builtin.Any -> onUseSecond builtinAny
+      Builtin.All -> onUseSecond builtinAll
       Builtin.Elem -> onUseFirst builtinElem
       Builtin.ElemAt -> onUseFirst builtinElemAt
-      Builtin.Partition -> forced2 builtinPartition
-      Builtin.GroupBy -> forced2 builtinGroupBy
+      Builtin.Partition -> onUseSecond builtinPartition
+      Builtin.GroupBy -> onUseSecond builtinGroupBy
       -- String operations (arity 2)
-      Builtin.ConcatStringsSep -> forced2 builtinConcatStringsSep
+      Builtin.ConcatStringsSep -> onUseSecond builtinConcatStringsSep
       -- Arity 3
-      Builtin.FoldlStrict -> onUseMiddle builtinFoldl
-      Builtin.Substring -> forced3 builtinSubstring
+      Builtin.FoldlStrict -> onUseLastTwo builtinFoldl
+      Builtin.Substring -> onUseLastTwo builtinSubstring
       -- Numeric
       Builtin.IsPath -> forced1 (pure . VBool . isPathVal)
       Builtin.Ceil -> forced1 builtinCeil
@@ -1561,7 +1556,7 @@ builtinDef builtin = shape builtin
       -- String context introspection
       Builtin.HasContext -> forced1 builtinHasContext
       Builtin.GetContext -> forced1 builtinGetContext
-      Builtin.AppendContext -> forced2 builtinAppendContext
+      Builtin.AppendContext -> onUseSecond builtinAppendContext
       Builtin.BaseNameOf -> forced1 builtinBaseNameOf
       Builtin.DirOf -> forced1 builtinDirOf
       Builtin.ConcatLists -> forced1 builtinConcatLists
@@ -1571,24 +1566,24 @@ builtinDef builtin = shape builtin
       Builtin.Sub -> forced2 primSub
       Builtin.Mul -> forced2 primMul
       Builtin.Div -> forced2 primDiv
-      Builtin.BitAnd -> forced2 (bitwise (.&.))
-      Builtin.BitOr -> forced2 (bitwise (.|.))
-      Builtin.BitXor -> forced2 (bitwise xor)
+      Builtin.BitAnd -> onUseSecond (bitwise (.&.))
+      Builtin.BitOr -> onUseSecond (bitwise (.|.))
+      Builtin.BitXor -> onUseSecond (bitwise xor)
       -- Attr set higher-order
       Builtin.MapAttrs -> onUseFirst builtinMapAttrs
       Builtin.FunctionArgs -> forced1 builtinFunctionArgs
       Builtin.ZipAttrsWith -> onUseSecond builtinZipAttrsWith
       -- String manipulation
-      Builtin.Match -> forced2 builtinMatch
-      Builtin.Split -> forced2 builtinSplit
-      Builtin.ReplaceStrings -> forced3 builtinReplaceStrings
-      Builtin.CompareVersions -> forced2 builtinCompareVersions
+      Builtin.Match -> onUseSecond builtinMatch
+      Builtin.Split -> onUseSecond builtinSplit
+      Builtin.ReplaceStrings -> onUseLastTwo builtinReplaceStrings
+      Builtin.CompareVersions -> onUseSecond builtinCompareVersions
       Builtin.SplitVersion -> forced1 builtinSplitVersion
       Builtin.ParseDrvName -> forced1 builtinParseDrvName
       -- Serialization + hashing
       Builtin.ToJSON -> forced1 builtinToJSON
       Builtin.FromJSON -> forced1 builtinFromJSON
-      Builtin.HashString -> forced2 builtinHashString
+      Builtin.HashString -> onUseSecond builtinHashString
       -- Error handling + sequencing
       Builtin.TryEval -> onUse1 builtinTryEval
       Builtin.DeepSeq -> onUseSecond builtinDeepSeq
@@ -1603,9 +1598,9 @@ builtinDef builtin = shape builtin
       Builtin.ToPath -> forced1 builtinToPath
       -- Store path operations
       Builtin.Placeholder -> forced1 builtinPlaceholder
-      Builtin.StorePath -> forced1 builtinStorePath
-      Builtin.FindFile -> forced2 builtinFindFile
-      Builtin.ToFile -> forced2 builtinToFile
+      Builtin.StorePath -> onUse1 builtinStorePath
+      Builtin.FindFile -> onUseSecond builtinFindFile
+      Builtin.ToFile -> onUseSecond builtinToFile
       Builtin.ScopedImport -> onUseFirst builtinScopedImport
       -- Network fetchers
       Builtin.Fetchurl -> forced1 builtinFetchurl
@@ -1623,7 +1618,7 @@ builtinDef builtin = shape builtin
       Builtin.TraceVerbose -> onUse2 builtinTraceVerbose
       Builtin.Break -> forced1 pure
       -- IO: file hashing + type detection
-      Builtin.HashFile -> forced2 builtinHashFile
+      Builtin.HashFile -> onUseSecond builtinHashFile
       Builtin.ReadFileType -> forced1 builtinReadFileType
       -- Serialization
       Builtin.FromTOML -> forced1 builtinFromTOML
@@ -1911,19 +1906,19 @@ missingPairAttr key = addErrorTrace "in a {name=...; value=...;} pair" (throwEva
 
 -- | Upstream's @prim_hasAttr@ (primops.cc): the name, read as an attribute
 -- name, then the set.
-builtinHasAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinHasAttr nameVal setVal = do
+builtinHasAttr :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinHasAttr nameVal setArg = do
   name <- attrNameOf "builtins.hasAttr" nameVal
-  case setVal of
+  argValue setArg >>= \case
     VAttrs attrs -> VBool <$> attrSetMember name attrs
     other -> throwEvalError ("builtins.hasAttr: expected a set, got " <> typeName other)
 
 -- | Upstream's @prim_getAttr@ (primops.cc): the name, read as an attribute
 -- name, then the set.
-builtinGetAttr :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinGetAttr nameVal setVal = do
+builtinGetAttr :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinGetAttr nameVal setArg = do
   name <- attrNameOf "builtins.getAttr" nameVal
-  case setVal of
+  argValue setArg >>= \case
     VAttrs attrs ->
       attrSetLookup name attrs >>= \case
         Just thunk -> force thunk
@@ -1963,24 +1958,33 @@ positionValue idx =
     Just (PosInText _ _) -> pure VNull
     Nothing -> pure VNull
 
--- | Upstream's @prim_removeAttrs@ (primops.cc): each name read as an
--- attribute name, first to last.
-builtinRemoveAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinRemoveAttrs (VAttrs attrs) (VList cl) = do
-  keys <- listThunks cl >>= mapM (force >=> attrNameOf "builtins.removeAttrs")
-  VAttrs <$> attrSetRemoveKeys SetRemoveAttrs keys attrs
-builtinRemoveAttrs (VAttrs _) other =
-  throwEvalError ("builtins.removeAttrs: expected a list, got " <> typeName other)
-builtinRemoveAttrs other _ =
-  throwEvalError ("builtins.removeAttrs: expected a set, got " <> typeName other)
+-- | The set, checked before the list is forced, then each name read as an
+-- attribute name, first to last, as upstream Nix reads them.
+builtinRemoveAttrs :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinRemoveAttrs (VAttrs attrs) namesArg =
+  argValue namesArg >>= \case
+    VList cl -> do
+      keys <- listThunks cl >>= mapM (force >=> attrNameOf "builtins.removeAttrs")
+      VAttrs <$> attrSetRemoveKeys SetRemoveAttrs keys attrs
+    other -> throwEvalError ("builtins.removeAttrs: expected a list, got " <> typeName other)
+builtinRemoveAttrs other _ = expectedFailure "a set" other
 
 -- | Upstream's @prim_intersectAttrs@ (primops.cc): it walks the smaller
 -- set, the second when the two are one size, and finds each name it meets
 -- in the other.  Each attribute it keeps is the second set's, position
 -- included.  The result is sized for the smaller set, so two sets with
--- attributes and no name in common make an empty set of their own.
-builtinIntersectAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinIntersectAttrs (VAttrs left) (VAttrs right) = do
+-- attributes and no name in common make an empty set of their own.  The
+-- first is checked before the second is forced.
+builtinIntersectAttrs :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinIntersectAttrs (VAttrs left) rightArg =
+  argValue rightArg >>= \case
+    VAttrs right -> intersectSets left right
+    other -> throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
+builtinIntersectAttrs other _ = expectedFailure "a set" other
+
+-- | The attributes of the second set whose names the first has.
+intersectSets :: (MonadEval m) => AttrSet -> AttrSet -> m NixValue
+intersectSets left right = do
   sizeLeft <- attrSetSize left
   sizeRight <- attrSetSize right
   let shared
@@ -1990,17 +1994,13 @@ builtinIntersectAttrs (VAttrs left) (VAttrs right) = do
   where
     keepFoundInRight kept name _ = maybe kept (\entry -> Map.insert name entry kept) <$> attrSetLookupSymbolEntry name right
     keepIfInLeft kept name entry = maybe kept (const (Map.insert name entry kept)) <$> attrSetLookupSymbol name left
-builtinIntersectAttrs (VAttrs _) other =
-  throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
-builtinIntersectAttrs other _ =
-  throwEvalError ("builtins.intersectAttrs: expected a set, got " <> typeName other)
 
 -- | Upstream's @prim_catAttrs@ (primops.cc): the name, read as an attribute
 -- name, then the list.
-builtinCatAttrs :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinCatAttrs nameVal listVal = do
+builtinCatAttrs :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinCatAttrs nameVal listArg = do
   name <- attrNameOf "builtins.catAttrs" nameVal
-  case listVal of
+  argValue listArg >>= \case
     VList cl -> listThunks cl >>= catAttrsCollect name >>= thunksList
     other -> throwEvalError ("builtins.catAttrs: expected a list, got " <> typeName other)
 
@@ -2148,24 +2148,32 @@ mergeSorted isLess (x : xs) (y : ys) = do
 -- forces the function before any call and checks each result is a list
 -- as its call returns; this checks the results once every call has
 -- returned.
-builtinConcatMap :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinConcatMap func (VList cl) = do
-  thunks <- listThunks cl
-  results <- mapM (\element -> withCallFrame (callCell element func)) thunks
-  concatted <- mapM extractList results
-  thunksList (concat concatted)
-builtinConcatMap _ other =
-  throwEvalError ("builtins.concatMap: expected a list, got " <> typeName other)
+-- | The function is checked before the list is forced, and applied to
+-- each element unforced, as upstream Nix applies it.
+builtinConcatMap :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinConcatMap funcVal listArg = do
+  func <- expectFunction funcVal
+  argValue listArg >>= \case
+    VList cl -> do
+      thunks <- listThunks cl
+      results <- mapM (\element -> withCallFrame (callCell element func)) thunks
+      concatted <- mapM extractList results
+      thunksList (concat concatted)
+    other -> throwEvalError ("builtins.concatMap: expected a list, got " <> typeName other)
 
 extractList :: (MonadEval m) => NixValue -> m [Thunk]
 extractList (VList cl) = listThunks cl
 extractList other =
   throwEvalError ("builtins.concatMap: function must return a list, got " <> typeName other)
 
-builtinAny :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinAny predFn (VList cl) = VBool <$> (listThunks cl >>= anyThunk predFn)
-builtinAny _ other =
-  throwEvalError ("builtins.any: expected a list, got " <> typeName other)
+-- | @any@ and @all@ check the function, then force the list, and apply
+-- the function to each element unforced.
+builtinAny :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinAny predVal listArg = do
+  predFn <- expectFunction predVal
+  argValue listArg >>= \case
+    VList cl -> VBool <$> (listThunks cl >>= anyThunk predFn)
+    other -> throwEvalError ("builtins.any: expected a list, got " <> typeName other)
 
 anyThunk :: (MonadEval m) => NixValue -> [Thunk] -> m Bool
 anyThunk _ [] = pure False
@@ -2176,10 +2184,12 @@ anyThunk predFn (thunk : rest) = do
     VBool False -> anyThunk predFn rest
     _ -> throwEvalError "builtins.any: predicate must return a bool"
 
-builtinAll :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinAll predFn (VList cl) = VBool <$> (listThunks cl >>= allThunk predFn)
-builtinAll _ other =
-  throwEvalError ("builtins.all: expected a list, got " <> typeName other)
+builtinAll :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinAll predVal listArg = do
+  predFn <- expectFunction predVal
+  argValue listArg >>= \case
+    VList cl -> VBool <$> (listThunks cl >>= allThunk predFn)
+    other -> throwEvalError ("builtins.all: expected a list, got " <> typeName other)
 
 allThunk :: (MonadEval m) => NixValue -> [Thunk] -> m Bool
 allThunk _ [] = pure True
@@ -2223,14 +2233,18 @@ builtinElemAt listArg (VInt idx) = do
 builtinElemAt _ other =
   expectedFailure "an integer" other
 
-builtinPartition :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinPartition predFn (VList cl) = do
-  (rightThunks, wrongThunks) <- listThunks cl >>= partitionThunks predFn
-  right <- thunksList rightThunks
-  wrong <- thunksList wrongThunks
-  valuesSet SetPartition (Map.fromList [("right", right), ("wrong", wrong)])
-builtinPartition _ other =
-  throwEvalError ("builtins.partition: expected a list, got " <> typeName other)
+-- | The function is checked before the list is forced, as upstream Nix
+-- checks it.
+builtinPartition :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinPartition predVal listArg = do
+  predFn <- expectFunction predVal
+  argValue listArg >>= \case
+    VList cl -> do
+      (rightThunks, wrongThunks) <- listThunks cl >>= partitionThunks predFn
+      right <- thunksList rightThunks
+      wrong <- thunksList wrongThunks
+      valuesSet SetPartition (Map.fromList [("right", right), ("wrong", wrong)])
+    other -> throwEvalError ("builtins.partition: expected a list, got " <> typeName other)
 
 -- | Each element, forced before the function is applied to it, as
 -- upstream forces each one, in the side the function puts it on.
@@ -2249,13 +2263,15 @@ partitionThunks predFn = go [] []
 
 -- | Upstream's @prim_groupBy@ (primops.cc): each element joins the group its
 -- function names, and each group holds its elements in list order.
-builtinGroupBy :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinGroupBy func (VList cl) = do
-  thunks <- listThunks cl
-  groups <- groupByCollect func thunks Map.empty
-  traverse (thunksList . reverse >=> evaluated) groups >>= fmap VAttrs . attrSetFromSymbols SetGroupBy
-builtinGroupBy _ other =
-  throwEvalError ("builtins.groupBy: expected a list, got " <> typeName other)
+builtinGroupBy :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinGroupBy funcVal listArg = do
+  func <- expectFunction funcVal
+  argValue listArg >>= \case
+    VList cl -> do
+      thunks <- listThunks cl
+      groups <- groupByCollect func thunks Map.empty
+      traverse (thunksList . reverse >=> evaluated) groups >>= fmap VAttrs . attrSetFromSymbols SetGroupBy
+    other -> throwEvalError ("builtins.groupBy: expected a list, got " <> typeName other)
 
 -- | The groups, each holding its elements last first.  A group's name is
 -- interned before the function is called on the next element, as upstream
@@ -2277,12 +2293,15 @@ groupByCollect func (thunk : rest) !acc = do
 -- Builtin implementations - string (arity 2)
 -- ---------------------------------------------------------------------------
 
-builtinConcatStringsSep :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinConcatStringsSep (VStr sep sepCtx) (VList cl) = do
-  pairs <- listThunks cl >>= mapM forceToStrCtx
-  let texts = map fst pairs
-      mergedCtx = sepCtx <> mconcat (map snd pairs)
-  pure (VStr (BS.intercalate sep texts) mergedCtx)
+builtinConcatStringsSep :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinConcatStringsSep (VStr sep sepCtx) listArg =
+  argValue listArg >>= \case
+    VList cl -> do
+      pairs <- listThunks cl >>= mapM forceToStrCtx
+      let texts = map fst pairs
+          mergedCtx = sepCtx <> mconcat (map snd pairs)
+      pure (VStr (BS.intercalate sep texts) mergedCtx)
+    other -> throwEvalError ("builtins.concatStringsSep: expected a list, got " <> typeName other)
   where
     forceToStrCtx thunk = do
       val <- force thunk
@@ -2291,23 +2310,22 @@ builtinConcatStringsSep (VStr sep sepCtx) (VList cl) = do
       -- the store and the result carries its SCPlain context.  Non-string
       -- scalars still error (coerceMore=False), matching interpolation.
       coerceToStringInterp val
-builtinConcatStringsSep (VStr _ _) other =
-  throwEvalError ("builtins.concatStringsSep: expected a list, got " <> typeName other)
-builtinConcatStringsSep other _ =
-  throwEvalError ("builtins.concatStringsSep: expected a string, got " <> typeName other)
+builtinConcatStringsSep other _ = expectedFailure "a string" other
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - arity 3
 -- ---------------------------------------------------------------------------
 
--- | @prim_foldlStrict@ passes the initial accumulator to the first call
--- of the operator unforced, and forces it itself only when the list is
--- empty (primops.cc at 2.24.9), so it is taken unforced.
-builtinFoldl :: (MonadEval m) => NixValue -> BuiltinArg -> NixValue -> m NixValue
-builtinFoldl op initial (VList cl) =
-  listThunks cl >>= foldlStrict op initial
-builtinFoldl _ _ other =
-  throwEvalError ("builtins.foldl': expected a list, got " <> typeName other)
+-- | The function is checked before the list is forced, and the initial
+-- accumulator reaches the first call of the operator unforced and is
+-- forced here only when the list is empty, as upstream Nix forces it, so
+-- it is taken unforced.
+builtinFoldl :: (MonadEval m) => NixValue -> BuiltinArg -> BuiltinArg -> m NixValue
+builtinFoldl opVal initial listArg = do
+  op <- expectFunction opVal
+  argValue listArg >>= \case
+    VList cl -> listThunks cl >>= foldlStrict op initial
+    other -> throwEvalError ("builtins.foldl': expected a list, got " <> typeName other)
 
 -- | Strict left fold: apply @op acc elem@ for each element.  Each step's
 -- result is forced (upstream foldl' strictness), the initial accumulator
@@ -2322,22 +2340,24 @@ foldlStrict op acc (thunk : rest) = do
 
 -- | Byte-indexed slicing, as upstream: offsets and lengths count bytes,
 -- and a slice may fall mid-codepoint (the resulting bytes are the value).
-builtinSubstring :: (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
-builtinSubstring (VInt start) (VInt len) value
-  | start < 0 = throwEvalError "builtins.substring: negative start position"
-  | otherwise = do
-      (s, ctx) <- coerceToStringInterp value
-      let startPos = fromIntegral start
-          -- Nix clamps len to available length (negative len means rest of string)
-          available = BS.length s - startPos
-          clampedLen =
-            if len < 0
-              then available
-              else min (fromIntegral len) available
-      -- Context is preserved through substring (matching real Nix).
-      pure (VStr (BS.take clampedLen (BS.drop startPos s)) ctx)
-builtinSubstring _ _ _ =
-  throwEvalError "builtins.substring: start and length must be integers"
+--
+-- The start is checked before the length is forced, and the length
+-- before the string, as upstream checks each.
+builtinSubstring :: (MonadEval m) => NixValue -> BuiltinArg -> BuiltinArg -> m NixValue
+builtinSubstring startVal lenArg valueArg = do
+  start <- expectInt startVal
+  when (start < 0) (throwEvalError "negative start position in 'substring'")
+  len <- argValue lenArg >>= expectInt
+  (s, ctx) <- argValue valueArg >>= coerceToStringInterp
+  let startPos = fromIntegral start
+      -- Nix clamps len to available length (negative len means rest of string)
+      available = BS.length s - startPos
+      clampedLen =
+        if len < 0
+          then available
+          else min (fromIntegral len) available
+  -- Context is preserved through substring (matching real Nix).
+  pure (VStr (BS.take clampedLen (BS.drop startPos s)) ctx)
 
 -- ---------------------------------------------------------------------------
 -- Builtin helpers
@@ -2569,14 +2589,14 @@ contextEntryToAttrs entry = do
 --
 -- @builtins.appendContext string contextAttrset@ adds the specified
 -- context elements to the string.
-builtinAppendContext :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinAppendContext (VStr s ctx) (VAttrs contextAttrs) = do
-  newCtx <- attrSetToMap contextAttrs >>= parseContextAttrs
-  pure (VStr s (ctx <> newCtx))
-builtinAppendContext (VStr _ _) other =
-  throwEvalError ("builtins.appendContext: second argument must be a set, got " <> typeName other)
-builtinAppendContext other _ =
-  throwEvalError ("builtins.appendContext: first argument must be a string, got " <> typeName other)
+builtinAppendContext :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinAppendContext (VStr s ctx) contextArg =
+  argValue contextArg >>= \case
+    VAttrs contextAttrs -> do
+      newCtx <- attrSetToMap contextAttrs >>= parseContextAttrs
+      pure (VStr s (ctx <> newCtx))
+    other -> throwEvalError ("builtins.appendContext: second argument must be a set, got " <> typeName other)
+builtinAppendContext other _ = expectedFailure "a string" other
 
 -- | Parse a context attrset into a StringContext.
 -- Each key is a store path; each value is an attrset with optional
@@ -2701,8 +2721,11 @@ builtinLessThan a b = VBool <$> nixCompare force a b
 
 -- | @prim_bitAnd@ and its kin (primops.cc at 2.24.9): both operands go
 -- through @forceInt@, the left first.
-bitwise :: (MonadEval m) => (Int64 -> Int64 -> Int64) -> NixValue -> NixValue -> m NixValue
-bitwise op a b = VInt <$> (op <$> expectInt a <*> expectInt b)
+bitwise :: (MonadEval m) => (Int64 -> Int64 -> Int64) -> NixValue -> BuiltinArg -> m NixValue
+bitwise op a bArg = do
+  x <- expectInt a
+  y <- argValue bArg >>= expectInt
+  pure (VInt (op x y))
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - attr set higher-order
@@ -2773,14 +2796,24 @@ builtinZipAttrsWith func listArg = do
 -- Builtin implementations - string manipulation
 -- ---------------------------------------------------------------------------
 
+-- | The lists are forced and their lengths compared, and every @from@
+-- string forced, before the subject is, as upstream reads them.
 builtinReplaceStrings ::
-  (MonadEval m) => NixValue -> NixValue -> NixValue -> m NixValue
-builtinReplaceStrings (VList fromCl) (VList toCl) (VStr input inputCtx) = do
+  (MonadEval m) => NixValue -> BuiltinArg -> BuiltinArg -> m NixValue
+builtinReplaceStrings (VList fromCl) toArg inputArg = do
+  toCl <-
+    argValue toArg >>= \case
+      VList cl -> pure cl
+      other -> expectedFailure "a list" other
   fromThunks <- listThunks fromCl
   toThunks <- listThunks toCl
   when (length fromThunks /= length toThunks) $
-    throwEvalError "builtins.replaceStrings: 'from' and 'to' must have the same length"
+    throwEvalError "'from' and 'to' arguments passed to builtins.replaceStrings have different lengths"
   froms <- mapM forceStr fromThunks
+  (input, inputCtx) <-
+    argValue inputArg >>= \case
+      VStr bytes ctx -> pure (bytes, ctx)
+      other -> expectedFailure "a string" other
   -- Match-gated replacement forcing, as upstream: a 'to' element is
   -- forced - and its context joins the result - only the first time its
   -- pattern matches, memoized per index.  An unmatched replacement is
@@ -2826,11 +2859,8 @@ builtinReplaceStrings (VList fromCl) (VList toCl) (VStr input inputCtx) = do
       val <- force thunk
       case val of
         VStr s ctx -> pure (s, ctx)
-        _ -> throwEvalError "builtins.replaceStrings: elements must be strings"
-builtinReplaceStrings _ _ (VStr _ _) =
-  throwEvalError "builtins.replaceStrings: first two arguments must be lists"
-builtinReplaceStrings _ _ other =
-  throwEvalError ("builtins.replaceStrings: expected a string, got " <> typeName other)
+        other -> expectedFailure "a string" other
+builtinReplaceStrings other _ _ = expectedFailure "a list" other
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - regex (POSIX ERE via regex-tdfa)
@@ -2889,10 +2919,10 @@ cachedCompileRegex pat =
 -- The regex must match the ENTIRE string (like C++ Nix's regex_match).
 -- Returns @null@ if no match, or a list of capture group strings
 -- (@null@ for non-participating groups).
-builtinMatch :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinMatch patternVal subject = do
+builtinMatch :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinMatch patternVal subjectArg = do
   compiled <- compiledPattern "builtins.match" patternVal
-  case subject of
+  argValue subjectArg >>= \case
     VStr str _ -> matchWithCompiled compiled str
     other -> throwEvalError ("builtins.match: expected a string, got " <> typeName other)
 
@@ -2935,10 +2965,10 @@ captureGroupValue (s, (off, _))
 -- | @builtins.split regex str@: split a string by a POSIX ERE.
 -- Returns an alternating list of non-matched strings and match-group lists.
 -- Example: @split "(x)" "axbxc"@ yields @["a" ["x"] "b" ["x"] "c"]@
-builtinSplit :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinSplit patternVal subject = do
+builtinSplit :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinSplit patternVal subjectArg = do
   compiled <- compiledPattern "builtins.split" patternVal
-  case subject of
+  argValue subjectArg >>= \case
     VStr str ctx -> splitPieces compiled str ctx >>= valuesList
     other -> throwEvalError ("builtins.split: expected a string, got " <> typeName other)
 
@@ -2973,10 +3003,10 @@ buildSplitResult remaining pos (match : rest) = do
 
 -- | Upstream reads both versions with @forceStringNoCtx@, the first
 -- before the second (@prim_compareVersions@ in primops.cc).
-builtinCompareVersions :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinCompareVersions first second = do
+builtinCompareVersions :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinCompareVersions first secondArg = do
   a <- structuredStringValue RefuseContext first
-  b <- structuredStringValue RefuseContext second
+  b <- argValue secondArg >>= structuredStringValue RefuseContext
   pure (VInt (compareVersionParts (splitVersionStr a) (splitVersionStr b)))
 
 -- | Convert 'Ordering' to the Nix compareVersions convention: -1, 0, 1.
@@ -3205,15 +3235,16 @@ fromJSONBuilder =
 -- | Upstream reads the algorithm with @forceStringNoCtx@ before it forces
 -- the string hashed, whose context it discards (@prim_hashString@ in
 -- primops.cc).
-builtinHashString :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinHashString algoVal inputVal = do
-  algo <- structuredStringValue RefuseContext algoVal
-  case inputVal of
+builtinHashString :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinHashString algoVal inputArg = do
+  algoName <- decodedText "builtins.hashString" =<< structuredStringValue RefuseContext algoVal
+  -- The algorithm is checked before the string is forced, as upstream
+  -- checks it.
+  digest <- maybe (throwEvalError (unknownHashAlgo algoName)) pure (hexDigestOf algoName)
+  argValue inputArg >>= \case
     -- The payload IS the hashed bytes - no encode step, so a mid-codepoint
     -- substring hashes to the sha256 of exactly those bytes, as upstream.
-    VStr input _ -> do
-      algoName <- decodedText "builtins.hashString" algo
-      hashBytesWithAlgo algoName input
+    VStr input _ -> pure (mkStr (digest input))
     other -> throwEvalError ("builtins.hashString: expected a string, got " <> typeName other)
 
 digestToHex :: (BA.ByteArrayAccess a) => a -> Text
@@ -3518,17 +3549,15 @@ builtinPlaceholder val = do
   name <- decodedText "builtins.placeholder" =<< structuredStringValue RefuseContext val
   pure (mkStr (hashPlaceholder name))
 
--- | Refused under @pure-eval@ before the argument is coerced, as upstream
+-- | Refused under @pure-eval@ before the argument is forced, as upstream
 -- Nix refuses it: a dependency on a store path that merely exists is
--- ambient state.  The argument is forced as the builtin is applied, before
--- the policy is read, so one whose evaluation fails reports that failure,
--- where upstream reports the refusal.
-builtinStorePath :: (MonadEval m) => NixValue -> m NixValue
-builtinStorePath val = do
+-- ambient state.
+builtinStorePath :: (MonadEval m) => BuiltinArg -> m NixValue
+builtinStorePath arg = do
   policy <- evalPolicy
   if epPureEval policy
     then throwEvalError "'builtins.storePath' is not allowed in pure evaluation mode"
-    else validateStorePath =<< resolvedUnlessStorePath =<< coerceToPath "builtins.storePath" val
+    else validateStorePath =<< resolvedUnlessStorePath =<< coerceToPath "builtins.storePath" =<< argValue arg
   where
     -- prim_storePath in primops.cc resolves the path's symlinks unless the
     -- path is itself a store path, a link directly in the store, so a link
@@ -3564,17 +3593,14 @@ validateStorePath p = case T.stripPrefix storeDirPrefix p of
 -- Builtin implementations - Nix search path
 -- ---------------------------------------------------------------------------
 
--- | Upstream reads the looked-up name once it has read every entry, so an
--- entry's failure comes ahead of a name's.  Here the name is forced as the
--- builtin is applied, before the entries, so only its string and context
--- check comes after their failures.
-builtinFindFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinFindFile (VList cl) nameVal = do
+-- | Every entry is read before the looked-up name is forced, as upstream
+-- Nix reads them, so an entry's failure comes ahead of a name's.
+builtinFindFile :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinFindFile (VList cl) nameArg = do
   entries <- listThunks cl >>= mapM forceSearchEntry
-  name <- structuredStringValue RefuseContext nameVal
+  name <- argValue nameArg >>= structuredStringValue RefuseContext
   VPath <$> findFirst entries name
-builtinFindFile other _ =
-  throwEvalError ("builtins.findFile: expected a list, got " <> typeName other)
+builtinFindFile other _ = expectedFailure "a list" other
 
 -- | The path a name is found at in a search path's entries, failing as a
 -- @\<name\>@ lookup does: upstream's @EvalState::findFile@, which both the
@@ -3584,31 +3610,22 @@ findInSearchPath :: (MonadEval m) => [Thunk] -> BS.ByteString -> m Text
 findInSearchPath entryThunks name = mapM forceSearchEntry entryThunks >>= (`findFirst` name)
 
 -- | Extract {prefix, path} from a search path entry thunk, as the bytes
--- the entry holds.  Upstream keeps both as byte strings, so an entry
--- whose prefix or path has no UTF-8 reading is still an entry, and one
--- that names something else does not stop the lookup.
+-- the entry holds, read as upstream reads one: a set, whose @prefix@ is a
+-- string without context, empty when it is absent, and whose @path@ is
+-- coerced to a string without a copy, its context realised.  Upstream
+-- keeps both as byte strings, so an entry whose prefix or path has no
+-- UTF-8 reading is still an entry, and one that names something else does
+-- not stop the lookup.
 forceSearchEntry :: (MonadEval m) => Thunk -> m (BS.ByteString, BS.ByteString)
-forceSearchEntry thunk = do
-  val <- force thunk
-  case val of
+forceSearchEntry thunk =
+  force thunk >>= \case
     VAttrs attrs -> do
-      prefixThunk <-
-        attrSetLookup "prefix" attrs
-          >>= maybe (throwEvalError "builtins.findFile: entry missing 'prefix'") pure
-      pathThunk <-
-        attrSetLookup "path" attrs
-          >>= maybe (throwEvalError "builtins.findFile: entry missing 'path'") pure
-      prefixVal <- force prefixThunk
-      pathVal <- force pathThunk
-      prefix <- case prefixVal of
-        VStr s _ -> pure s
-        _ -> throwEvalError "builtins.findFile: 'prefix' must be a string"
-      path <- case pathVal of
-        VStr s ctx -> s <$ realiseSearchEntry s ctx
-        VPath s -> pure (TE.encodeUtf8 s)
-        _ -> throwEvalError "builtins.findFile: 'path' must be a string or path"
+      prefix <- attrSetLookup "prefix" attrs >>= maybe (pure BS.empty) (force >=> structuredStringValue RefuseContext)
+      pathThunk <- attrSetLookup "path" attrs >>= maybe (throwEvalError "attribute 'path' missing") pure
+      (path, ctx) <- force pathThunk >>= coerceToString False force applyValue coercePathVerbatim
+      realiseSearchEntry path ctx
       pure (prefix, path)
-    _ -> throwEvalError "builtins.findFile: search path entry must be a set"
+    other -> expectedFailure "a set" other
 
 -- | Realise the context of a search path entry's path before its lookup,
 -- as upstream's @builtins.findFile@ realises it, naming the entry when a
@@ -3668,10 +3685,10 @@ searchPathSuffix prefix name
 
 -- | Upstream reads the name with @forceStringNoCtx@ before it forces the
 -- contents (@prim_toFile@ in primops.cc).
-builtinToFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinToFile nameVal contentsVal = do
+builtinToFile :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinToFile nameVal contentsArg = do
   name <- structuredStringValue RefuseContext nameVal
-  case contentsVal of
+  argValue contentsArg >>= \case
     VStr contents ctx -> do
       fileName <- decodedText "builtins.toFile" name
       refs <- toFileRefs ctx
@@ -3690,11 +3707,10 @@ builtinToFile nameVal contentsVal = do
 toFileRefs :: (MonadEval m) => StringContext -> m [StorePath]
 toFileRefs (StringContext elems) = mapM refOf (Set.toAscList elems)
   where
-    refOf (SCPlain sp) = pure sp
-    refOf (SCDrvOutput _ _) =
-      throwEvalError "builtins.toFile: files created by toFile may not reference derivations"
-    refOf (SCAllOutputs _) =
-      throwEvalError "builtins.toFile: files created by toFile may not reference derivations"
+    isPlain element = case element of
+      SCPlain _ -> True
+      SCDrvOutput _ _ -> False
+      SCAllOutputs _ -> False
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - scoped import
@@ -5172,16 +5188,12 @@ expectBool other = expectedFailure "a Boolean" other
 -- The algorithm is read as upstream's @forceStringNoCtx@ reads it and
 -- refused before the path is realised or read (@prim_hashFile@ in
 -- primops.cc).
-builtinHashFile :: (MonadEval m) => NixValue -> NixValue -> m NixValue
-builtinHashFile algoVal pathVal = do
+builtinHashFile :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
+builtinHashFile algoVal pathArg = do
   algoName <- decodedText "builtins.hashFile" =<< structuredStringValue RefuseContext algoVal
   digest <- maybe (throwEvalError (unknownHashAlgo algoName)) pure (hexDigestOf algoName)
-  bytes <- readFileBytes =<< realisePath "builtins.hashFile" pathVal
+  bytes <- readFileBytes =<< realisePath "builtins.hashFile" =<< argValue pathArg
   pure (mkStr (digest bytes))
-
--- | Shared hash dispatch for raw t'Data.ByteString.ByteString' input.
-hashBytesWithAlgo :: (MonadEval m) => Text -> BS.ByteString -> m NixValue
-hashBytesWithAlgo algo bytes = maybe (throwEvalError (unknownHashAlgo algo)) (\digest -> pure (mkStr (digest bytes))) (hexDigestOf algo)
 
 -- | The base-16 digest an algorithm's name selects, if it names one.
 hexDigestOf :: Text -> Maybe (BS.ByteString -> Text)

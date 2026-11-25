@@ -418,6 +418,23 @@ check "a set comparison decides at the pair whose name was interned first" '{ zb
 refused "a set comparison compares a pair's values before a later pair's names" '{ zq1 = throw "x"; zq2 = 1; } == { zq1 = 1; zq3 = 1; }'
 echo
 
+echo "== which argument a builtin checks first =="
+# The earlier argument is of the wrong type and the later one throws, so
+# the error says which one the builtin checked first.
+for call in 'builtins.hasAttr 1' 'builtins.getAttr 1' 'builtins.catAttrs 1' 'builtins.match 1' \
+  'builtins.split 1' 'builtins.compareVersions 1' 'builtins.toFile 1' 'builtins.concatStringsSep 1' \
+  'builtins.appendContext 1' 'builtins.bitAnd "x"' 'builtins.bitOr "x"' 'builtins.bitXor "x"' \
+  'builtins.removeAttrs 1' 'builtins.intersectAttrs 1' 'builtins.findFile [ 1 ]' 'builtins.substring 0 "x"' \
+  'builtins.replaceStrings [ ] [ "a" ]' 'builtins.concatMap 1' 'builtins.any 1' 'builtins.all 1' \
+  'builtins.partition 1' 'builtins.groupBy 1' "builtins.foldl' 1 0"; do
+  refused "$call, before the argument after it" "$call (throw \"later\")"
+done
+refused "substring checks its start before it forces the length" 'builtins.substring (-1) (throw "later") "s"'
+refused "concatMap checks its function for an empty list" 'builtins.concatMap 1 [ ]'
+refused "foldl' checks its function for an empty list" "builtins.foldl' 1 0 [ ]"
+refused "findFile reads an entry with no prefix" 'builtins.findFile [ { path = throw "path"; } ] "x"'
+echo
+
 echo "== which builtins call a set with __functor =="
 check "a set with __functor is a function to the builtins that call one" 'let f = { __functor = self: x: x > 1; }; v = [ (builtins.filter f [ 1 2 ]) (builtins.any f [ 2 ]) (builtins.partition f [ 1 2 ]) ]; in builtins.deepSeq v v'
 echo
