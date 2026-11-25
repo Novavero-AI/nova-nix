@@ -136,7 +136,8 @@ builder is spawned through the process library, which calls
   ([`scrubAmbient`][builder]). Names compare without regard to case, so
   two spellings of one name never both reach the builder.
 - Unless the derivation sets them, `PATH` is the builder's directory, its
-  sibling `usr\bin`, `C:\Windows\System32` and `C:\Windows`, and
+  sibling `usr\bin`, `C:\Windows\System32` and `C:\Windows`, the first
+  two left out for a builder named relative to the working directory, and
   `USERPROFILE` is the build directory.
 - A `cmd.exe /c` builder gets its command as one string, unquoted, since
   `cmd.exe` does not split arguments as other programs do.

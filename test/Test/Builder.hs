@@ -177,14 +177,15 @@ testBuildOrchestrator = do
               andThen
               Pass
               [assertEqual (T.pack builder) "/path-not-set" (buildPath builder) | builder <- ["bash", "./bash", "./tools/bash", "/store/aaa-bootstrap/bin/bash"]],
-      -- A Windows build's PATH must never open with the build working
-      -- directory: a bare-name or dot-relative builder adds none.
-      runTest "a bare-name or dot-relative builder adds no PATH entry" $
+      -- A Windows build's PATH must never name the build working
+      -- directory: a builder whose directory depends on it, a bare name or
+      -- a relative path, adds none.
+      runTest "a builder named relative to the working directory adds no PATH entry" $
         foldr
           andThen
           Pass
-          [ assertEqual (T.pack builder) False (any (\e -> e == "." || "./" `T.isPrefixOf` e || ".\\" `T.isPrefixOf` e) (T.splitOn ";" (buildPath builder)))
-          | builder <- ["bash", "./bash"]
+          [ assertEqual (T.pack builder) False (any (\e -> e == "." || "./" `T.isPrefixOf` e || ".\\" `T.isPrefixOf` e || "tools" `T.isPrefixOf` e) (T.splitOn ";" (buildPath builder)))
+          | builder <- ["bash", "./bash", "./tools/bash", "tools/bash"]
           ],
       runTest "an absolute builder opens a Windows build's PATH with its own directory" $
         if SI.os == "mingw32"
