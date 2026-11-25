@@ -6,8 +6,8 @@
 # object tools, configured, compiled and installed in the seed stdenv by
 # gcc-x86_64 and binutils-x86_64.
 #
-# The stage-2 stdenv runs these tools on x86_64 Windows under their own
-# names (pkgs/windows/stage2-stdenv/default.nix), and binutils-x86_64 runs
+# The package set's stdenv runs these tools on x86_64 Windows under their
+# own names (pkgs/windows/stdenv/default.nix), and binutils-x86_64 runs
 # on i686 and is named for its target.  This is a Canadian cross, as
 # gcc-native-x86_64 is: the stdenv's i686-pc-mingw32 is the build, and
 # x86_64-w64-mingw32 the host and the target.  With the host and the target

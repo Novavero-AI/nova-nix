@@ -1,7 +1,7 @@
 # GNU hello: a name and a source, with the stdenv's setup.sh doing unpack,
 # configure, build and install.  pkgs/windows builds it with its stdenv,
-# the stage-2 stdenv, as test/data/stage2-stdenv.nix does with substitutes
-# forbidden, and test/data/seed-stdenv.nix with the seed stdenv.
+# as test/data/stdenv.nix does with substitutes forbidden, and
+# test/data/seed-stdenv.nix with the seed stdenv.
 #
 # pkgs/windows/hello.nix points `nova-nix build` at this package: build takes
 # a derivation-valued expression, and this is a function (it takes

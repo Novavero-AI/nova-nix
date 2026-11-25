@@ -7,7 +7,7 @@
 #   seed-stdenv/                          the seed ladder's stdenv, on tools
 #                                         built from the seed: mkDerivation,
 #                                         setup.sh
-#   stage2-stdenv/                        the package set's stdenv: the
+#   stdenv/                               the package set's stdenv: the
 #                                         seed stdenv's tools with the
 #                                         ladder's native x86_64 toolchain,
 #                                         through compiler and linker
@@ -54,9 +54,8 @@ let
   self = byName // {
     inherit lib;
 
-    stdenv = self.stage2Stdenv;
+    stdenv = callPackage ./stdenv { };
     seedStdenv = callPackage ./seed-stdenv { };
-    stage2Stdenv = callPackage ./stage2-stdenv { };
     fetchurl = import ./fetchurl.nix;
   };
 in

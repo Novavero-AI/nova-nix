@@ -1,5 +1,5 @@
 #!/bin/sh
-# nova-nix stage-2 stdenv: binutils-native-x86_64's linker, as the
+# nova-nix stdenv: binutils-native-x86_64's linker, as the
 # stdenv's builds run it under the name ld.  wrap.sh writes it from this
 # template, with the linker as @linker@.
 #

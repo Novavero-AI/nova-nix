@@ -46,7 +46,7 @@ jobs:
   # after the first publish, everything a push left alone substitutes and
   # only the delta builds, and --all then finds the rest already cached.  A
   # push that alters the toolchain leaves Hello to the seed ladder's run on
-  # it, whose Stage-2 stdenv job builds that toolchain and Hello on it and
+  # it, whose Stdenv job builds that toolchain and Hello on it and
   # publishes both: until it does, the cache lacks the toolchain, which
   # takes hours to build here.  The bytes pushed
   # are this job's, so this job runs its own Hello first and one that does

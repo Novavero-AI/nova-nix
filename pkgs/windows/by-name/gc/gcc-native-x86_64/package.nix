@@ -8,8 +8,8 @@
 # in the seed stdenv by gcc-x86_64 and binutils-x86_64, with the programs
 # the build runs itself compiled by gcc-latest, against MinGW-w64 v14.0.0's
 # headers and the runtime gcc-core-x86_64 compiled.  It runs as gcc and g++,
-# the drivers the stage-2 stdenv's compiler wrappers run
-# (pkgs/windows/stage2-stdenv/wrap.sh), and its assembler and linker are
+# the drivers the package set's stdenv wraps
+# (pkgs/windows/stdenv/wrap.sh), and its assembler and linker are
 # binutils-native-x86_64's.
 #
 # The build is a Canadian cross, as binutils-native-x86_64's is: the

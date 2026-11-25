@@ -1,9 +1,10 @@
 # nova-nix seed stdenv: mkDerivation on tools built from the seed, which
-# the seed ladder's rungs build with.  The stage-2 stdenv
-# (../stage2-stdenv), the package set's stdenv, is its builder and tools
-# with the ladder's native x86_64 toolchain.
+# the seed ladder's rungs build with.  The package set's stdenv
+# (../stdenv) is its builder and tools with the ladder's native x86_64
+# toolchain.
 #
-# The stage-2 stdenv's interface, so a package builds with either:
+# The same interface as the package set's stdenv, so a package builds
+# with either:
 #
 #   { stdenv }:
 #   stdenv.mkDerivation { name = "foo"; src = ...; }

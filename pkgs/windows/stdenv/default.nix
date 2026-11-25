@@ -1,4 +1,4 @@
-# nova-nix stage-2 stdenv: mkDerivation for x86_64 Windows on the seed
+# nova-nix stdenv: mkDerivation for x86_64 Windows on the seed
 # ladder's native x86_64 toolchain, the package set's stdenv.
 #
 # The seed stdenv's interface, so a package builds with either:
