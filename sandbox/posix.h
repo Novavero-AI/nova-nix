@@ -13,13 +13,17 @@
 #include <sys/types.h>
 
 /* The status channel's descriptor: standard output until
- * backend_prepare_run moves it, and -1 once posix_close_status has closed
- * it. */
+ * backend_prepare_run moves it, the descriptor posix_report_to names once
+ * it has been called, and -1 once posix_close_status has closed it. */
 int posix_status_fd(void);
 
 /* Close the status channel, once the builder is released and nothing is
  * left to report on it. */
 void posix_close_status(void);
+
+/* Report on FD from now on, in place of the status channel: a child that
+ * reports its failures to the process that made it, which relays them. */
+void posix_report_to(int fd);
 
 /* Put SIGCHLD back to its default, as upstream's initNix does (in
  * shared.cc at 2.24.9): a SIGCHLD ignored where this program was

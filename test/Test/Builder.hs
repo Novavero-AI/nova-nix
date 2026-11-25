@@ -84,7 +84,7 @@ import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Tuple (swap)
 import Data.Word (Word64, Word8)
-import Foreign.C.Error (Errno (..), eACCES, eAGAIN, eINVAL, eNOENT, eNOTDIR, getErrno)
+import Foreign.C.Error (Errno (..), eACCES, eAGAIN, eINVAL, eIO, eMFILE, eNOENT, eNOTDIR, getErrno)
 import Foreign.C.String (withCString)
 import Foreign.C.Types (CChar, CInt (..), CLong (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca, free)
@@ -1014,6 +1014,8 @@ testSandboxPure = do
               `andThen` assertEqual "fork" "while setting up the build environment: unable to fork: Resource temporarily unavailable" (message Sandbox.DarwinStageFork (errno eAGAIN))
               `andThen` assertEqual "exec" "while setting up the build environment: executing '/bin/sh': Operation not permitted" (message Sandbox.DarwinStageExec 1)
               `andThen` assertEqual "the build log, unwatched" "the sandbox helper cannot watch the build log, which must be pollable (a pipe or a regular file, not /dev/null): Bad file descriptor" (message Sandbox.DarwinStageLogWatch 9)
+              `andThen` assertEqual "the report's pipe" "while setting up the build environment: creating pipe: Too many open files" (message Sandbox.DarwinStageReport (errno eMFILE))
+              `andThen` assertEqual "the report, unread" "the sandbox helper cannot read the builder's report of its setup: Input/output error" (message Sandbox.DarwinStageRelay (errno eIO))
               `andThen` assertEqual "a Linux stage" (Sandbox.SetupIncomplete "the sandbox helper wrote a status that cannot be read: 'hostname 1 -1\n'") (outcome (Right ()) (ExitFailure 1) "hostname 1 -1\n")
               `andThen` assertEqual "builder" (Sandbox.BuilderRan (ExitFailure 3)) (outcome (Right ()) (ExitFailure 3) ""),
       runTest "on macOS a sandbox that cannot be made fails the build in upstream's words, whatever sandbox-fallback says, which Linux heeds" $
