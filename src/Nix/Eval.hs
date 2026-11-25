@@ -3743,13 +3743,14 @@ builtinScopedImport scopeArg pathVal = do
 builtinFetchurl :: (MonadEval m) => NixValue -> m NixValue
 builtinFetchurl (VStr url _) = do
   urlText <- decodedText "builtins.fetchurl" url
-  fetchUrlSimple urlText Nothing
+  fetchUrlSimple urlText Nothing Nothing
 builtinFetchurl (VAttrs attrs) = do
   url <- forceAttrStr "builtins.fetchurl" "url" attrs
   -- The pin is read with the arguments, before anything is fetched, as
   -- upstream's fetch in fetchTree.cc reads it.
   sha256 <- traverse decodeSha256Pin =<< forceOptionalAttrStr attrs "sha256"
-  fetchUrlSimple url sha256
+  name <- attrSetLookup "name" attrs >>= traverse (force >=> structuredStringValue RefuseContext >=> decodedText "builtins.fetchurl")
+  fetchUrlSimple url sha256 name
 builtinFetchurl other =
   throwEvalError ("builtins.fetchurl: expected a string or set, got " <> typeName other)
 
@@ -4430,16 +4431,20 @@ decodeDecimal ctx t = case TR.decimal t of
   Right (n, rest) | T.null rest -> pure n
   _ -> throwEvalError (ctx <> ": expected a decimal integer from git, got " <> t)
 
--- | Fetch a URL and optionally verify its hash.
-fetchUrlSimple :: (MonadEval m) => Text -> Maybe BS.ByteString -> m NixValue
-fetchUrlSimple url pin = do
+-- | Fetch a URL, optionally verifying its hash, under the name given or,
+-- when none or an empty one is, the URL's base name, as upstream names
+-- it.
+fetchUrlSimple :: (MonadEval m) => Text -> Maybe BS.ByteString -> Maybe Text -> m NixValue
+fetchUrlSimple url pin given = do
   -- Upstream's order (fetchTree.cc, fetch()): the URI gate, then the
   -- name, then pure mode's hash requirement, all before the download.
   checkUri url
-  -- The store name derives from the URL alone, so an unusable name fails
-  -- here, before the download side effect.  Upstream rejects the same
-  -- names when it adds the fetched file to the store.
-  let name = urlBaseName url
+  -- An unusable name fails here, before the download side effect.
+  -- Upstream rejects the same names when it adds the fetched file to the
+  -- store.
+  let name = case given of
+        Just named | not (T.null named) -> named
+        _ -> urlBaseName url
   case checkStorePathName name of
     Left err -> throwEvalError ("builtins.fetchurl: " <> storePathNameErrorText err)
     Right () -> pure ()
@@ -4512,13 +4517,16 @@ requireFetchPin who pin = do
   when (epPureEval policy && isNothing pin) $
     throwEvalError ("in pure evaluation mode, '" <> who <> "' requires a 'sha256' argument")
 
--- | Store name for a fetched URL: its basename (minus query/fragment), matching
--- C++ Nix's @baseNameOf url@ default so the fixed-output path agrees with it.
+-- | The store name of a fetched URL with no name given, as upstream Nix
+-- names one: what follows the whole URL's last @/@ once trailing ones but
+-- the first character are dropped, a query or fragment included, so the
+-- fixed-output path agrees with upstream's.
 urlBaseName :: Text -> Text
-urlBaseName url =
-  let stripped = T.takeWhile (\c -> c /= '?' && c /= '#') url
-      base = T.takeWhileEnd (/= '/') stripped
-   in if T.null base then "source" else base
+urlBaseName url = T.takeWhileEnd (/= '/') trimmed
+  where
+    trimmed = case T.uncons url of
+      Just (start, rest) -> T.cons start (T.dropWhileEnd (== '/') rest)
+      Nothing -> url
 
 -- | Upstream's refusal of a fetch whose content has another SHA-256 hash
 -- than its pin (@fetch@ in fetchTree.cc), each hash in nix32 after

@@ -8214,6 +8214,29 @@ testRealiseContextIO = do
             (ops, _) <- fakeRealiseStore (== held) Nothing
             answer <- evalWith (readOnlyOver ops) ("builtins.fetchurl { url = " <> nixString (fileUrl (root </> "absent" </> "held-file")) <> "; sha256 = \"" <> Hash.bytesToHexText pin <> "\"; }")
             pure (assertEqual "answer" (Right (storePathStringValue held)) (either (Left . failureMessage) Right answer)),
+          -- The name is the one given, or else the URL's base name, a
+          -- query included, and an empty one counts as none, as upstream
+          -- names a fetch; the pinned early exit shows the path without a
+          -- download.
+          runTestM "fetchurl names the file as its name attribute says, or by the whole URL's base name" $ do
+            let pin = sha256Digest "pinned\n"
+                pinnedAt url extra = "builtins.fetchurl { url = " <> nixString url <> "; sha256 = \"" <> Hash.bytesToHexText pin <> "\";" <> extra <> " }"
+                heldUnder name = either (fail . show) pure (makeFixedOutputPath name "sha256" FlatIngestion pin)
+                answerFor held source = do
+                  (ops, _) <- fakeRealiseStore (== held) Nothing
+                  either (Left . failureMessage) Right <$> evalWith (readOnlyOver ops) source
+            renamed <- heldUnder "renamed"
+            queried <- heldUnder "held-file?x=y"
+            slashed <- heldUnder "held-file"
+            fromName <- answerFor renamed (pinnedAt (fileUrl (root </> "absent" </> "held-file")) " name = \"renamed\";")
+            fromQuery <- answerFor queried (pinnedAt (fileUrl (root </> "absent" </> "held-file") <> "?x=y") "")
+            fromEmptyName <- answerFor queried (pinnedAt (fileUrl (root </> "absent" </> "held-file") <> "?x=y") " name = \"\";")
+            fromSlash <- answerFor slashed (pinnedAt (fileUrl (root </> "absent" </> "held-file") <> "//") "")
+            pure $
+              assertEqual "name" (Right (storePathStringValue renamed)) fromName
+                `andThen` assertEqual "query" (Right (storePathStringValue queried)) fromQuery
+                `andThen` assertEqual "empty name" (Right (storePathStringValue queried)) fromEmptyName
+                `andThen` assertEqual "trailing slashes" (Right (storePathStringValue slashed)) fromSlash,
           runTestM "a pinned fetchTarball the store holds returns its path without downloading" $ do
             let pin = sha256Digest "a tree's NAR"
             held <- either (fail . show) pure (makeFixedOutputPath "source" "sha256" NarIngestion pin)
