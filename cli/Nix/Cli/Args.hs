@@ -68,6 +68,9 @@ data CliOpts = CliOpts
     optNoAllowImportFromDerivation :: !Bool,
     -- | @--fallback@: upstream's fallback, turned on for this run.
     optFallback :: !Bool,
+    -- | @--keep-failed@ or @-K@: upstream's keep-failed, turned on for this
+    -- run.
+    optKeepFailed :: !Bool,
     -- | @--check@: the build checks its derivation, as @nix-build --check@
     -- does.
     optCheck :: !Bool,
@@ -316,6 +319,17 @@ buildsTarget kind = case kind of
   PrintsDevEnv -> False
   TrustsTarget -> False
 
+-- | Whether a target command runs builders whose directories
+-- @keep-failed@ can keep.  @trust@ builds only with builtins, which keep
+-- nothing, so it takes no flag for the setting.
+runsBuilders :: TargetCommand -> Bool
+runsBuilders kind = case kind of
+  BuildsTarget -> True
+  AddsToProfile -> True
+  DevelopsTarget -> True
+  PrintsDevEnv -> True
+  TrustsTarget -> False
+
 -- | Arguments to a target command, while the target is still unknown.
 data BuildArgs = BuildArgs
   { baTarget :: !(Maybe Target),
@@ -365,7 +379,7 @@ emptyPushArgs = PushArgs Nothing Nothing Nothing Nothing False []
 -- silent drop: an unknown or misspelled flag fails the parse, so nothing
 -- after it (a requested @--substituter@, say) is quietly discarded.
 parseArgs :: [String] -> Either String CliOpts
-parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] False False False False False False False Nothing CmdUsage)
+parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] False False False False False False False False Nothing CmdUsage)
   where
     go opts [] = Right opts
     go opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
@@ -395,6 +409,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       go (opts {optNoAllowImportFromDerivation = True}) rest
     go opts ("--fallback" : rest) =
       go (opts {optFallback = True}) rest
+    go opts (flag : rest)
+      | flag `elem` keepFailedFlags = go (opts {optKeepFailed = True}) rest
     go opts ("--read-write-mode" : rest) =
       go (opts {optReadWriteMode = True}) rest
     go opts (flag : rest)
@@ -436,6 +452,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       goEval (opts {optNoAllowImportFromDerivation = True}) rest
     goEval opts ("--fallback" : rest) =
       goEval (opts {optFallback = True}) rest
+    goEval opts (flag : rest)
+      | flag `elem` keepFailedFlags = goEval (opts {optKeepFailed = True}) rest
     goEval opts ("--read-write-mode" : rest) =
       goEval (opts {optReadWriteMode = True}) rest
     goEval opts ("--substituter" : url : rest) =
@@ -484,6 +502,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       goTarget kind (opts {optNoAllowImportFromDerivation = True}) targetArgs rest
     goTarget kind opts targetArgs ("--fallback" : rest) =
       goTarget kind (opts {optFallback = True}) targetArgs rest
+    goTarget kind opts targetArgs (flag : rest)
+      | flag `elem` keepFailedFlags, runsBuilders kind = goTarget kind (opts {optKeepFailed = True}) targetArgs rest
     goTarget BuildsTarget opts targetArgs ("--check" : rest) =
       goTarget BuildsTarget (opts {optCheck = True}) targetArgs rest
     goTarget kind opts targetArgs (flag : rest)
@@ -696,6 +716,9 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     outLinkFlags = ["-o", "--out-link"]
     -- No result link, under both of nix-build's spellings.
     noOutLinkFlags = ["--no-out-link", "--no-link"]
+    -- Upstream's keep-failed, under nix-build's two spellings; nix build
+    -- takes only the long one.
+    keepFailedFlags = ["-K", "--keep-failed"]
     -- develop's flags, under each of upstream's spellings: the short one,
     -- the long one and the name 2.24.9 gave it (the MixEnvironment
     -- constructor in command.cc and the CmdDevelop constructor in develop.cc,

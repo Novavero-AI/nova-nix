@@ -94,7 +94,7 @@ import HttpFixture (Reply (..), httpResponse, withFetchurlServer, withHttpServer
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildLayout (..), BuildPlace (..), BuildResult (..), BuilderInvocation (..), BuilderSpawn (..), ReferenceCycle (..), attrsDelivery, buildDerivation, buildPath, buildWithDeps, builderInvocation, checkDerivation, closureUnder, defaultBuildConfig, execWrapperConfig, execWrapperFor, fetchUrlsFromEnv, orderByReferences, rewriteEnv, rewritePlaceholders, scrubAmbient, spawnFor, substituteFromCaches, substitutePaths, tryFetchUrlsWith, unionEnvs)
-import Nix.Builder.BuildDir (buildDirFor, createBuildDir, withBuildDir)
+import Nix.Builder.BuildDir (BuildEnding (..), FailedBuilds (..), WorkDir (..), buildDirFor, createBuildDir, withBuildDir)
 import Nix.Builder.Buildenv (Activity (..), DerivationsError (..), Element (..), builtinBuildenvBuilder, elementPackages, parseDerivations)
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
@@ -2413,6 +2413,34 @@ testLinuxSandboxBody helper busybox = do
               pure $
                 assertEqual "build" (BuildSuccess (outputAt 'r')) built
                   `andThen` assertEqual ("refused in the chroot: " <> reason) True (T.pack chrootRoot `T.isInfixOf` reason && "suspicious ownership or permission" `T.isInfixOf` reason),
+          -- Upstream keeps the build directory and names the one inside
+          -- it that the sandbox shows at /build; the chroot goes either
+          -- way.
+          runTestM "a sandboxed build that fails under keep-failed keeps its build directory, what the builder left in /build inside it" $
+            withSandboxStore $ \store -> do
+              let outer = buildDirFor (stDir store) (outputAt 'e')
+              result <- buildDerivation (configFor store) {bcFailedBuilds = KeepFailed} store (drvFor 'e' "echo left > /build/left; exit 1") testDrvPath
+              left <- BS.readFile (outer </> "build" </> "left")
+              chrootLeft <- Dir.doesPathExist (Spawn.chrootDirFor outer)
+              pure $
+                assertEqual "build" (BuildFailure "builder failed" 1) result
+                  `andThen` assertEqual "left" "left\n" left
+                  `andThen` assertEqual "the chroot" False chrootLeft,
+          -- The rebuild leaves the chroot by a rename of a canonical, so
+          -- read-only, directory into the store.
+          runTestM "a sandboxed check under keep-failed moves a rebuild that differs out of the chroot to PATH.check" $
+            withSandboxStore $ \store -> do
+              let writing word = drvFor 'o' ("/bin/busybox mkdir $out; echo " <> word <> " > $out/value")
+                  kept = outputFile store 'o' <> ".check"
+              built <- buildDerivation (configFor store) store (writing "first") testDrvPath
+              checked <- checkDerivation (configFor store) {bcFailedBuilds = KeepFailed} store (writing "second") testDrvPath
+              keptValue <- BS.readFile (kept </> "value")
+              ownerWrite <- fmap ((.&. 0o200) . nsPermissions) <$> nodeStatus kept
+              pure $
+                assertEqual "build" (BuildSuccess (outputAt 'o')) built
+                  `andThen` assertEqual "check" (Right (Realise.OutputDiffers (outputAt 'o') Realise.RebuildKept)) checked
+                  `andThen` assertEqual "the kept rebuild" "second\n" keptValue
+                  `andThen` assertEqual "its owner's write bit, cleared as the rebuild was made canonical" (Just 0) ownerWrite,
           runTestM "a sandbox path whose target crosses a link in the chroot is refused, and nothing outside the chroot is made" $
             withSandboxStore $ \store -> do
               let linkSource = root </> "escape-link"
@@ -2726,7 +2754,8 @@ testTrivialBuildIO = do
 -- | Where a build runs ("Nix.Builder.BuildDir"): in a directory under the
 -- store's state directory, named by the first output, that the build
 -- created itself, private to the user on POSIX, and removed when the
--- build ends.  Builds of one derivation into two stores run in two
+-- build ends, unless it failed under keep-failed and its builder is not a
+-- builtin.  Builds of one derivation into two stores run in two
 -- directories.
 testBuildDirIO :: IO [Bool]
 testBuildDirIO = do
@@ -2766,8 +2795,57 @@ testBuildDirIO = do
           | isAlreadyExistsError err -> Pass
           | otherwise -> Fail (label <> ": expected an already-exists error, got: " <> T.pack (show err))
         Right () -> Fail (label <> ": created a directory where one exists")
+      keeping store = (defaultBuildConfig (stDir store)) {bcFailedBuilds = KeepFailed}
+      -- Leaves a file where it works, then fails.
+      failing = mkTestBuildDrv shell outSP "echo left > left; exit 1"
+      leftIn dir = do
+        present <- Dir.doesFileExist (dir </> "left")
+        if present then Just <$> BS.readFile (dir </> "left") else pure Nothing
+      modeOnPosix expected dir
+        | SI.os == "mingw32" = pure Pass
+        | otherwise = assertEqual "mode" (Just expected) . fmap nsPermissions <$> nodeStatus dir
+      isFailure result = case result of
+        BuildFailure _ _ -> True
+        BuildSuccess _ -> False
   sequence
-    [ runTestM "a build runs in a directory under the store's state directory, removed when it ends" $
+    [ -- Upstream keeps the directory and names it; the mode stays the
+      -- build's, the builder having run as the user who asked.
+      runTestM "a build that fails under keep-failed keeps its directory, with what its builder left there, mode 0700 on POSIX" $
+        inStore "keep" $ \store -> do
+          result <- buildDerivation (keeping store) store failing testDrvPath
+          left <- leftIn (expectedDir store)
+          mode <- modeOnPosix 0o700 (expectedDir store)
+          pure (assertEqual "build" (BuildFailure "builder failed" 1) result `andThen` assertEqual "left" (Just "left\n") left `andThen` mode),
+      runTestM "a build that succeeds under keep-failed removes its directory" $
+        inStore "keep-success" $ \store -> do
+          result <- buildDerivation (keeping store) store probe testDrvPath
+          built result (assertEqual "the directory after the build" False <$> Dir.doesPathExist (expectedDir store)),
+      -- A builtin may hold privileged files, so upstream keeps nothing of
+      -- one; a builder named builtin: that nova-nix does not run in
+      -- process is one too.
+      runTestM "a builtin's build that fails under keep-failed keeps nothing" $
+        inStore "keep-builtin" $ \store -> do
+          let named builder = failing {drvBuilder = builder, drvArgs = []}
+          inProcess <- buildDerivation (keeping store) store (named "builtin:buildenv") testDrvPath
+          inProcessLeft <- Dir.doesPathExist (expectedDir store)
+          unknown <- buildDerivation (keeping store) store (named "builtin:nova-nix-test-unknown") testDrvPath
+          unknownLeft <- Dir.doesPathExist (expectedDir store)
+          pure $
+            assertEqual "the builtin failed" True (isFailure inProcess)
+              `andThen` assertEqual "its directory" False inProcessLeft
+              `andThen` assertEqual "the unknown builtin failed" True (isFailure unknown)
+              `andThen` assertEqual "its directory" False unknownLeft,
+      -- The name is the derivation's, so the next build of it starts where
+      -- the kept directory is.
+      runTestM "a directory a failed build kept is removed by the next build of the derivation" $
+        inStore "keep-next" $ \store -> do
+          _ <- buildDerivation (keeping store) store failing testDrvPath
+          kept <- leftIn (expectedDir store)
+          result <- buildDerivation (defaultBuildConfig (stDir store)) store probe testDrvPath
+          built result $ do
+            entries <- recorded store "entries"
+            pure (assertEqual "kept" (Just "left\n") kept `andThen` assertEqual "entries when the next builder started" "" entries),
+      runTestM "a build runs in a directory under the store's state directory, removed when it ends" $
         inStore "location" $ \store -> do
           result <- buildDerivation (defaultBuildConfig (stDir store)) store probe testDrvPath
           built result $ do
@@ -4724,9 +4802,10 @@ testDependentBuildIO = do
 -- | 'buildWithDeps' under 'Realise.BuildCheck', and 'checkDerivation',
 -- against a real store: the builder runs again beside the valid outputs,
 -- what it writes is compared with them, and the rebuild leaves the store
--- as it was whatever the comparison finds.  A rebuild that differs is a
--- derivation with the same output paths and another script, so no case
--- depends on a builder that is itself nondeterministic.
+-- as it was whatever the comparison finds, but under keep-failed the
+-- rebuild of an output that differs, kept beside it.  A rebuild that
+-- differs is a derivation with the same output paths and another script,
+-- so no case depends on a builder that is itself nondeterministic.
 testBuildCheckIO :: IO [Bool]
 testBuildCheckIO = do
   putStrLn "builder/check"
@@ -4741,6 +4820,7 @@ testBuildCheckIO = do
         action store (defaultBuildConfig (stDir store))
           `finally` (closeStore store >> forceRemoveIfExists root)
       checking config = config {bcMode = Realise.BuildCheck}
+      keeping config = config {bcFailedBuilds = KeepFailed}
       -- What a check has to leave as it found it: the store directory's
       -- entries, where a scratch tree would show, and what the database
       -- records of the outputs.
@@ -4767,11 +4847,19 @@ testBuildCheckIO = do
         BuildFailure
           ( "derivation '"
               <> storePathToText defaultStoreDir drvSP
-              <> "' may not be deterministic: output '"
+              <> "' may not be deterministic: output \""
               <> T.pack (storePathToFilePath (stDir store) output)
-              <> "' differs"
+              <> "\" differs"
           )
           104
+      -- Upstream's message under keep-failed, naming the rebuild it kept.
+      differsFromKept store drvSP output =
+        let outPath = T.pack (storePathToFilePath (stDir store) output)
+         in BuildFailure ("derivation '" <> storePathToText defaultStoreDir drvSP <> "' may not be deterministic: output \"" <> outPath <> "\" differs from \"" <> outPath <> ".check\"") 104
+      keptPath store output = storePathToFilePath (stDir store) output <> ".check"
+      -- The name a kept rebuild has in the store directory, as a store
+      -- path, to show the database holds no row for it.
+      keptName output = StorePath (spHash output) (spName output <> ".check")
   sequence
     [ -- The rebuild writes the scratch path it was handed into the output,
       -- so it matches only once that path's hash is rewritten to the
@@ -4802,11 +4890,69 @@ testBuildCheckIO = do
           checked <- buildWithDeps (checking config) store (writing "second") drvSP
           after <- snapshot store [outSP]
           value <- T.strip <$> TIO.readFile (storePathToFilePath (stDir store) outSP </> "value")
+          buildDirLeft <- Dir.doesPathExist (buildDirFor (stDir store) outSP)
           pure $
             assertEqual "build" (BuildSuccess outSP) built
               `andThen` assertEqual "check" (differs store drvSP outSP) checked
               `andThen` assertEqual "store" before after
-              `andThen` assertEqual "value" "first" value,
+              `andThen` assertEqual "value" "first" value
+              `andThen` assertEqual "the build directory" False buildDirLeft,
+      -- Upstream under keep-failed moves the rebuild, as it was compared,
+      -- to the output's path with .check after it, registers nothing, and
+      -- names it; the failure keeps the build directory as any does.
+      runTestM "a check under keep-failed that finds a difference keeps the rebuild as PATH.check, unregistered, and names it" $
+        inStore "keep" $ \store config -> do
+          let outSP = fixture "k" "x" "check-keep"
+              drvSP = fixture "k" "y" "check-keep.drv"
+              outPath = storePathToFilePath (stDir store) outSP
+              writing word = mkTestBuildDrv shell outSP ("mkdir -p $out && echo " <> word <> " > $out/value && echo $out > $out/self")
+          built <- buildWithDeps config store (writing "first") drvSP
+          before <- queryPathInfo (stDB store) outSP
+          checked <- buildWithDeps (keeping (checking config)) store (writing "second") drvSP
+          after <- queryPathInfo (stDB store) outSP
+          value <- T.strip <$> TIO.readFile (outPath </> "value")
+          keptValue <- T.strip <$> TIO.readFile (keptPath store outSP </> "value")
+          keptSelf <- T.strip <$> TIO.readFile (keptPath store outSP </> "self")
+          keptRow <- queryPathInfo (stDB store) (keptName outSP)
+          keptWritable <- Dir.writable <$> getPermissions (keptPath store outSP </> "value")
+          buildDirKept <- Dir.doesDirectoryExist (buildDirFor (stDir store) outSP)
+          pure $
+            assertEqual "build" (BuildSuccess outSP) built
+              `andThen` assertEqual "check" (differsFromKept store drvSP outSP) checked
+              `andThen` assertEqual "the valid output's row" before after
+              `andThen` assertEqual "the valid output" "first" value
+              `andThen` assertEqual "the kept rebuild" "second" keptValue
+              `andThen` assertEqual "its own path, rewritten from the scratch path's" (T.pack outPath) keptSelf
+              `andThen` assertEqual "a row for the kept rebuild" Nothing keptRow
+              `andThen` assertEqual "the kept rebuild's file writable" False keptWritable
+              `andThen` assertEqual "the build directory" True buildDirKept,
+      -- Upstream removes what is at the .check path before it moves the
+      -- rebuild there.
+      runTestM "a check under keep-failed replaces the rebuild an earlier check kept" $
+        inStore "keep-again" $ \store config -> do
+          let outSP = fixture "k" "z" "check-keep-again"
+              drvSP = fixture "k" "0" "check-keep-again.drv"
+              writing word = mkTestBuildDrv shell outSP ("mkdir -p $out && echo " <> word <> " > $out/value")
+          _ <- buildWithDeps config store (writing "first") drvSP
+          _ <- buildWithDeps (keeping (checking config)) store (writing "second") drvSP
+          checked <- buildWithDeps (keeping (checking config)) store (writing "third") drvSP
+          keptValue <- T.strip <$> TIO.readFile (keptPath store outSP </> "value")
+          pure (assertEqual "check" (differsFromKept store drvSP outSP) checked `andThen` assertEqual "the kept rebuild" "third" keptValue),
+      runTestM "a check under keep-failed that passes keeps nothing" $
+        inStore "keep-same" $ \store config -> do
+          let outSP = fixture "k" "t" "check-keep-same"
+              drvSP = fixture "k" "u" "check-keep-same.drv"
+              drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo fixed > $out/value"
+          built <- buildWithDeps config store drv drvSP
+          before <- snapshot store [outSP]
+          checked <- buildWithDeps (keeping (checking config)) store drv drvSP
+          after <- snapshot store [outSP]
+          buildDirLeft <- Dir.doesPathExist (buildDirFor (stDir store) outSP)
+          pure $
+            assertEqual "build" (BuildSuccess outSP) built
+              `andThen` assertEqual "check" (BuildSuccess outSP) checked
+              `andThen` assertEqual "store" before after
+              `andThen` assertEqual "the build directory" False buildDirLeft,
       -- The builder's output is where its log goes, so an empty log is a
       -- builder that never ran.
       runTestM "a check of a derivation with no valid output fails as upstream's does, and runs no builder" $
@@ -4934,6 +5080,21 @@ testBuildCheckIO = do
             assertEqual "build" (BuildSuccess aSP) built
               `andThen` assertEqual "check" (differs store drvSP bSP) checked
               `andThen` assertEqual "store" before after,
+      -- Upstream stops at the first output that differs, having moved
+      -- that one's rebuild alone.
+      runTestM "of two outputs that differ under keep-failed only the rebuild of the one named is kept" $
+        inStore "keep-order" $ \store config -> do
+          let aSP = fixture "m" "1" "check-keep-order-a"
+              bSP = fixture "m" "2" "check-keep-order-b"
+              drvSP = fixture "m" "3" "check-keep-order.drv"
+          _ <- buildWithDeps config store (twoOutputs "check-keep-order" ("a", aSP) ("b", bSP) (bothWriting "first")) drvSP
+          checked <- buildWithDeps (keeping (checking config)) store (twoOutputs "check-keep-order" ("a", aSP) ("b", bSP) (bothWriting "second")) drvSP
+          aKept <- Dir.doesPathExist (keptPath store aSP)
+          bKept <- Dir.doesPathExist (keptPath store bSP)
+          pure $
+            assertEqual "check" (differsFromKept store drvSP bSP) checked
+              `andThen` assertEqual "a's rebuild kept" False aKept
+              `andThen` assertEqual "b's rebuild kept" True bKept,
       -- The rebuilt outputs are ordered before any is compared, so two
       -- that record each other fail the check as they would fail a build,
       -- with upstream's message for the cycle and not for a difference.
@@ -4991,10 +5152,12 @@ testBuildCheckIO = do
           built <- buildDerivation config store (writing "first") drvSP
           same <- checkDerivation config store (writing "first") drvSP
           other <- checkDerivation config store (writing "second") drvSP
+          kept <- checkDerivation (keeping config) store (writing "second") drvSP
           pure $
             assertEqual "build" (BuildSuccess outSP) built
               `andThen` assertEqual "same" (Right Realise.OutputsMatch) same
-              `andThen` assertEqual "other" (Right (Realise.OutputDiffers outSP)) other,
+              `andThen` assertEqual "other" (Right (Realise.OutputDiffers outSP Realise.RebuildDiscarded)) other
+              `andThen` assertEqual "kept" (Right (Realise.OutputDiffers outSP Realise.RebuildKept)) kept,
       -- A derivation with no output has nothing to compare, and a check
       -- that compared nothing has not passed.
       runTestM "checkDerivation fails for a derivation with no outputs" $
@@ -6994,7 +7157,7 @@ testBuilder = do
             Proc.callProcess "chflags" ["uchg", dir </> "stuck" </> "f"]
             -- The flag comes off whatever happens, so the store can go.
             ( do
-                ran <- withBuildDir storeDir firstOutput Dir.doesDirectoryExist
+                ran <- withBuildDir storeDir firstOutput WorksInBuildDir RemoveFailed (const BuildSucceeded) Dir.doesDirectoryExist
                 movedAside <- Dir.doesPathExist (aside </> "stuck" </> "f")
                 pure (assertEqual "the build" True ran `andThen` assertEqual "moved aside" True movedAside)
               )

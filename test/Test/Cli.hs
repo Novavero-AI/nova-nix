@@ -36,7 +36,7 @@ import qualified Data.ByteString.Lazy as BL
 import Data.Char (isAsciiLower, isAsciiUpper)
 import Data.Foldable (toList)
 import Data.Functor.Identity (Identity (..))
-import Data.List (inits, intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub, sort)
+import Data.List (findIndex, inits, intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub, sort, stripPrefix)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe, maybeToList)
@@ -1125,10 +1125,11 @@ testImportFromDerivationCLI = do
           ]
     )
 
--- | @build --check@ through the real CLI, which the tests of the build
--- itself cannot show: that the flag reaches the build, that a check which
--- passes prints the path a build prints, and that one which finds a
--- difference exits with upstream's status for it.
+-- | @build --check@ and @keep-failed@ through the real CLI, which the
+-- tests of the build itself cannot show: that the flags and the setting
+-- reach the build, that a check which passes prints the path a build
+-- prints, that one which finds a difference exits with upstream's status
+-- for it, and what a build that fails keeps and names on stderr.
 testCheckCLI :: IO [Bool]
 testCheckCLI = do
   putStrLn "cli/check"
@@ -1136,13 +1137,13 @@ testCheckCLI = do
   tmpBase <- getTemporaryDirectory
   ambient <- getEnvironment
   let root = tmpBase </> "nova-nix-test-cli-check"
-      isolatedEnv =
-        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
+      isolatedEnv configText =
+        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n" <> configText)
           : ("XDG_CONFIG_HOME", root </> "config")
           : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
-      runCLI args =
+      runCLIWith configText args =
         Proc.readCreateProcessWithExitCode
-          ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
+          ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just (isolatedEnv configText)})
           ""
       nixString text = "\"" <> T.replace "${" "\\${" (T.replace "\"" "\\\"" (T.replace "\\" "\\\\" text)) <> "\""
       expression name script =
@@ -1165,9 +1166,25 @@ testCheckCLI = do
         expression
           "check-differs"
           "stem=${out%-check-differs}; front=${stem%????????????????}; printf '%s\\n%s\\n' \"$front\" \"${stem#\"$front\"}\" > \"$out\""
-      build source store flags = runCLI (["build", "--expr", source, "--store", root </> store, "--no-out-link"] ++ flags)
+      -- It leaves a file where it works, then fails.
+      failing = expression "keep-failed" "echo left > left; exit 1"
+      buildWith configText source store flags = runCLIWith configText (["build", "--expr", source, "--store", root </> store, "--no-out-link"] ++ flags)
+      build = buildWith ""
       printed out = listToMaybe (reverse (filter (not . null) (lines (filter (/= '\r') out))))
       outcome (code, out, err) = "exit " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err
+      stderrLines err = lines (filter (/= '\r') err)
+      -- The directories upstream's note names, in the order it names them.
+      keptDirs err = [dir | line <- stderrLines err, Just quoted <- [stripPrefix "note: keeping build directory \"" line], Just dir <- [stripSuffix "\"" quoted]]
+      stripSuffix suffix text = reverse <$> stripPrefix (reverse suffix) (reverse text)
+      -- What the builder left in the directory a note names, if it is
+      -- there.
+      leftIn dir = do
+        present <- Dir.doesFileExist (dir </> "left")
+        if present then Just <$> BS.readFile (dir </> "left") else pure Nothing
+      buildsUnder store = do
+        let builds = root </> store </> ".nova-nix" </> "builds"
+        present <- doesDirectoryExist builds
+        if present then Dir.listDirectory builds else pure []
   bracket_
     (forceRemoveIfExists root >> createDirectoryIfMissing True root)
     (forceRemoveIfExists root)
@@ -1177,6 +1194,14 @@ testCheckCLI = do
         unbuilt@(unbuiltCode, _, unbuiltErr) <- build same "unbuilt" ["--check"]
         differingBuilt@(_, differingOut, _) <- build differing "differing" []
         differingChecked@(differingCode, _, differingErr) <- build differing "differing" ["--check"]
+        keptChecked@(keptCode, _, keptErr) <- build differing "differing" ["--check", "--keep-failed"]
+        keptRebuild <- traverse (\path -> Dir.doesPathExist (path <> ".check")) (printed differingOut)
+        flagKept@(flagKeptCode, _, flagKeptErr) <- build failing "failing-flag" ["-K"]
+        flagLeft <- traverse leftIn (keptDirs flagKeptErr)
+        configKept@(configKeptCode, _, configKeptErr) <- buildWith "keep-failed = true\n" failing "failing-config" []
+        configLeft <- traverse leftIn (keptDirs configKeptErr)
+        removed@(removedCode, _, removedErr) <- build failing "failing-removed" []
+        removedLeft <- buildsUnder "failing-removed"
         sequence
           [ runTest "a check that passes exits 0 and prints the path the build printed" $
               case (printed sameOut, sameCode) of
@@ -1191,9 +1216,35 @@ testCheckCLI = do
               case printed differingOut of
                 Just path
                   | differingCode == ExitFailure 104
-                      && ("may not be deterministic: output '" <> T.pack path <> "' differs") `T.isInfixOf` T.pack differingErr ->
+                      && ("may not be deterministic: output \"" <> T.pack path <> "\" differs\n") `T.isInfixOf` T.pack differingErr
+                      && null (keptDirs differingErr) ->
                       Pass
-                _ -> Fail ("build: " <> outcome differingBuilt <> "; check: " <> outcome differingChecked)
+                _ -> Fail ("build: " <> outcome differingBuilt <> "; check: " <> outcome differingChecked),
+            -- The check's failure keeps its build directory too, as any
+            -- failure does under keep-failed.
+            runTest "a check under --keep-failed that finds a difference keeps the rebuild as PATH.check and names it" $
+              case (printed differingOut, keptDirs keptErr) of
+                (Just path, [_])
+                  | keptCode == ExitFailure 104
+                      && ("may not be deterministic: output \"" <> T.pack path <> "\" differs from \"" <> T.pack path <> ".check\"") `T.isInfixOf` T.pack keptErr
+                      && keptRebuild == Just True ->
+                      Pass
+                _ -> Fail ("check: " <> outcome keptChecked <> "; kept: " <> T.pack (show keptRebuild)),
+            -- Upstream prints its note when it cleans up after the
+            -- builder, before the failure is reported.
+            runTest "a build that fails under -K keeps the directory its builder worked in and names it before the failure" $
+              case (flagLeft, findIndex ("note: keeping build directory " `isPrefixOf`) (stderrLines flagKeptErr), findIndex ("build failed" `isPrefixOf`) (stderrLines flagKeptErr)) of
+                ([Just "left\n"], Just note, Just failure)
+                  | flagKeptCode == ExitFailure 1 && note < failure -> Pass
+                _ -> Fail (outcome flagKept <> "; left: " <> T.pack (show flagLeft)),
+            runTest "a build that fails with keep-failed in nix.conf keeps its directory" $
+              if configKeptCode == ExitFailure 1 && configLeft == [Just "left\n"]
+                then Pass
+                else Fail (outcome configKept <> "; left: " <> T.pack (show configLeft)),
+            runTest "a build that fails without keep-failed keeps no directory and names none" $
+              if removedCode == ExitFailure 1 && null (keptDirs removedErr) && null removedLeft
+                then Pass
+                else Fail (outcome removed <> "; left under builds: " <> T.pack (show removedLeft))
           ]
     )
 
@@ -2359,6 +2410,7 @@ testNixConfig = do
       subs = fmap ncSubstituters . resolveTexts
       keys = fmap ncTrustedPublicKeys . resolveTexts
       fallback = fmap ncFallback . resolveTexts
+      keepFailed = fmap ncKeepFailed . resolveTexts
       alwaysAllowSubstitutes = fmap ncAlwaysAllowSubstitutes . resolveTexts
       uris = fmap ncAllowedUris . resolveTexts
       cascade =
@@ -2415,6 +2467,11 @@ testNixConfig = do
           `andThen` assertEqual "typo" (Left "Boolean setting 'fallback' has invalid value 'ture'") (fallback ["fallback = ture"]),
       runTest "an invalid build-fallback is refused naming fallback, as upstream's error names the setting" $
         assertEqual "alias-typo" (Left "Boolean setting 'fallback' has invalid value 'maybe'") (fallback ["build-fallback = maybe"]),
+      runTest "keep-failed is a Boolean, off by default" $
+        assertEqual "default" (Right False) (keepFailed [])
+          `andThen` assertEqual "on" (Right True) (keepFailed ["keep-failed = yes"])
+          `andThen` assertEqual "replaced" (Right False) (keepFailed ["keep-failed = true", "keep-failed = false"])
+          `andThen` assertEqual "typo" (Left "Boolean setting 'keep-failed' has invalid value 'maybe'") (keepFailed ["keep-failed = maybe"]),
       runTest "always-allow-substitutes is a Boolean, off by default" $
         assertEqual "default" (Right False) (alwaysAllowSubstitutes [])
           `andThen` assertEqual "on" (Right True) (alwaysAllowSubstitutes ["always-allow-substitutes = true"])

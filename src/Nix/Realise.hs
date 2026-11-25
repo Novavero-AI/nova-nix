@@ -61,6 +61,8 @@ module Nix.Realise
     RealiseSettings (..),
     RealiseEffects (..),
     CheckVerdict (..),
+    DifferingRebuild (..),
+    checkedOutputPath,
     Realised (..),
     RealiseFailure (..),
     realiseFailureMessage,
@@ -570,8 +572,9 @@ data RealiseFailure
     -- compared with.
     OutputsNotValid !StorePath
   | -- | Under 'BuildCheck', rebuilding this derivation gave this output
-    -- other contents than the store holds ('OutputDiffers').
-    NotDeterministic !StorePath !StorePath
+    -- other contents than the store holds, and the rebuild was kept or
+    -- discarded ('OutputDiffers').
+    NotDeterministic !StorePath !StorePath !DifferingRebuild
   | -- | Under 'BuildCheck', the graph holds no derivation at the root, so
     -- nothing was built again or compared.
     MissingDerivation !StorePath
@@ -581,23 +584,19 @@ data RealiseFailure
   deriving (Eq, Show)
 
 -- | A failure as the build reports it, given the directory the store's
--- files are in.  A failed substitute reads as upstream's
--- (@DerivationGoal::outputsSubstitutionTried@ at 2.24.9), less the space
--- its format string ends in, a check that cannot start as that function's
--- other error, and a check that found a difference as the error upstream's
--- @registerOutputs@ raises when neither @keep-failed@ nor @run-diff-hook@
--- is set (local-derivation-goal.cc at 2.24.9, derivation-builder-impl.cc at
--- 2.36.0).  A root the graph does not hold reads as upstream's goal for a
--- derivation it cannot load (@DerivationGoal::loadDerivation@), and an output
--- asked of a derivation that does not have it as upstream's
--- @checkPathValidity@ refuses it.
+-- files are in, each in upstream's words: a failed substitute less the
+-- space upstream's message ends in, a check that cannot start, a check
+-- that found a difference, with each path in double quotes as upstream
+-- quotes a path and the rebuilt output named where it was kept, a root
+-- the graph does not hold as upstream reports a derivation it cannot
+-- load, and an output asked of a derivation that does not have it.
 --
 -- A @.drv@ is named under the logical store directory, wherever the
--- store's files live, as upstream's @printStorePath@ names it: a store
--- kept elsewhere still has @/nix/store@ as its @storeDir@ and only its
--- @realStoreDir@ moves.  The output that differs is named where its files
--- are, as upstream's @toRealPath@ names it there, which is also how a
--- build prints the output it made.
+-- store's files live, as upstream names one: a store kept elsewhere
+-- still has @/nix/store@ as its store directory, and only the directory
+-- its files are in moves.  The output that differs is named where its
+-- files are, as upstream names it, which is also how a build prints the
+-- output it made.
 realiseFailureMessage :: StoreDir -> RealiseFailure -> Text
 realiseFailureMessage realDir failure = case failure of
   BuildFailed report -> report
@@ -609,18 +608,22 @@ realiseFailureMessage realDir failure = case failure of
       <> "' failed (usually happens due to networking issues); try '--fallback' to build derivation from source"
   OutputsNotValid drvPath ->
     "some outputs of '" <> logical drvPath <> "' are not valid, so checking is not possible"
-  NotDeterministic drvPath output ->
+  NotDeterministic drvPath output rebuild ->
     "derivation '"
       <> logical drvPath
-      <> "' may not be deterministic: output '"
-      <> T.pack (storePathToFilePath realDir output)
-      <> "' differs"
+      <> "' may not be deterministic: output "
+      <> quotedPath (storePathToFilePath realDir output)
+      <> " differs"
+      <> case rebuild of
+        RebuildDiscarded -> ""
+        RebuildKept -> " from " <> quotedPath (checkedOutputPath realDir output)
   MissingDerivation drvPath ->
     "cannot build missing derivation '" <> logical drvPath <> "'"
   MissingOutputs drvPath names ->
     "derivation '" <> logical drvPath <> "' does not have wanted outputs " <> T.intercalate ", " ["'" <> name <> "'" | name <- NE.toList names]
   where
     logical = storePathToText defaultStoreDir
+    quotedPath path = "\"" <> T.pack path <> "\""
 
 -- | Upstream's exit status for a build whose one failure is a check that
 -- found a difference: the check-mismatch bit and the two bits every status
@@ -641,7 +644,7 @@ failureStatus = 1
 -- fixed-output fails, 102 when a fixed output has the wrong hash.
 realiseFailureStatus :: RealiseFailure -> Int
 realiseFailureStatus failure = case failure of
-  NotDeterministic _ _ -> checkMismatchStatus
+  NotDeterministic {} -> checkMismatchStatus
   BuildFailed _ -> failureStatus
   CacheQueryFailed _ -> failureStatus
   SubstitutesFailed _ -> failureStatus
@@ -667,10 +670,27 @@ data Realised
 data CheckVerdict
   = -- | Every output came out as the store holds it.
     OutputsMatch
-  | -- | This output came out with other contents.  It is the first that
-    -- did, in the order the outputs are compared in.
-    OutputDiffers !StorePath
+  | -- | This output came out with other contents, and its rebuild was
+    -- kept or discarded.  It is the first that did, in the order the
+    -- outputs are compared in.
+    OutputDiffers !StorePath !DifferingRebuild
   deriving (Eq, Show)
+
+-- | What became of a rebuilt output that differs from the valid one.
+data DifferingRebuild
+  = -- | It was discarded with everything else the rebuild wrote.
+    RebuildDiscarded
+  | -- | It was kept beside the valid output ('checkedOutputPath'), as
+    -- upstream keeps it under @keep-failed@.
+    RebuildKept
+  deriving (Eq, Show)
+
+-- | Where a check keeps the rebuild of an output that differs, given the
+-- directory the store's files are in: the output's path with @.check@
+-- after it, where upstream keeps it.  Nothing registers it, so it is not
+-- a valid path.
+checkedOutputPath :: StoreDir -> StorePath -> FilePath
+checkedOutputPath realDir output = storePathToFilePath realDir output <> ".check"
 
 -- | What realising a graph needs from the outside.
 data RealiseEffects s m = RealiseEffects
@@ -684,7 +704,8 @@ data RealiseEffects s m = RealiseEffects
     -- | Build one derivation, whose outputs are valid and whose inputs are
     -- realised, again beside those outputs, given its @.drv@ path, and
     -- compare what comes out with what the store holds.  It registers
-    -- nothing and keeps nothing it built.
+    -- nothing, and keeps nothing it built but a rebuild that differs,
+    -- where the verdict says it was kept.
     reCheck :: !(Derivation -> StorePath -> m (Either Text CheckVerdict)),
     -- | Report how a derivation was realised.
     reReport :: !(Realised -> Derivation -> m ())
@@ -778,7 +799,7 @@ checkRoot settings effects graph root = case Map.lookup root (unDepGraph graph) 
         Left err -> pure (Left err)
         Right _ -> reCheck effects drv root >>= either (pure . Left . BuildFailed) (checked drv)
     checked drv OutputsMatch = Right () <$ reReport effects Checked drv
-    checked _ (OutputDiffers output) = pure (Left (NotDeterministic root output))
+    checked _ (OutputDiffers output differing) = pure (Left (NotDeterministic root output differing))
 
 -- | Substitute outputs of a derivation, if it may be substituted.  One
 -- that must build asks no cache, which leaves it where one that no cache
@@ -984,7 +1005,7 @@ failureReach :: RealiseFailure -> FailureReach
 failureReach failure = case failure of
   BuildFailed _ -> EndsRequest
   SubstitutesFailed _ -> EndsRequest
-  NotDeterministic _ _ -> EndsRequest
+  NotDeterministic {} -> EndsRequest
   MissingDerivation _ -> EndsRequest
   CacheQueryFailed _ -> EndsCall
   InvalidDerivation _ -> EndsCall

@@ -155,7 +155,7 @@ fakeRealiseEffects failing =
         pure $
           if Set.member name failing
             then Left ("building " <> name <> " failed")
-            else Right (maybe Realise.OutputsMatch Realise.OutputDiffers (find (`Set.member` unstable) (map doPath (drvOutputs drv)))),
+            else Right (maybe Realise.OutputsMatch (`Realise.OutputDiffers` Realise.RebuildDiscarded) (find (`Set.member` unstable) (map doPath (drvOutputs drv)))),
       Realise.reReport = \status drv -> fakeEvent (EvReported status (fakeDrvName drv))
     }
 
@@ -480,7 +480,7 @@ checkLaw checkCase =
     checked = not (null checks)
     rebuilt
       | root `elem` ccFailing checkCase = Left (Realise.BuildFailed ("building " <> rootName <> " failed"))
-      | otherwise = maybe (Right ()) (Left . Realise.NotDeterministic rootDrv . fakePath) (find (`elem` ccUnstable checkCase) (outputsOf root))
+      | otherwise = maybe (Right ()) (\output -> Left (Realise.NotDeterministic rootDrv (fakePath output) Realise.RebuildDiscarded)) (find (`elem` ccUnstable checkCase) (outputsOf root))
     -- Without a rebuild the check can only have failed.
     resultIsRebuilds
       | checked = result == rebuilt
@@ -1063,19 +1063,31 @@ testRealise = do
       runTest "a rebuilt output that differs stops the check with upstream's message and status" $
         let (result, events, _) =
               runCheckIn Realise.NoFallback (fakeWorld [] ["hello-out"]) {fwUnstable = Set.singleton helloOut} Set.empty [fakeNode "hello" ["hello-out"] []] "hello"
-            differs = Realise.NotDeterministic helloDrv helloOut
+            differs = Realise.NotDeterministic helloDrv helloOut Realise.RebuildDiscarded
          in assertEqual "check" (Left differs, [EvChecked "hello-out"], []) (result, realiseWork events, [status | EvReported status _ <- events])
               `andThen` assertEqual
                 "message"
-                ("derivation '" <> helloDrvText <> "' may not be deterministic: output '" <> T.pack (storePathToFilePath defaultStoreDir helloOut) <> "' differs")
+                ("derivation '" <> helloDrvText <> "' may not be deterministic: output \"" <> T.pack (storePathToFilePath defaultStoreDir helloOut) <> "\" differs")
                 (Realise.realiseFailureMessage defaultStoreDir differs)
               `andThen` assertEqual "status" 104 (Realise.realiseFailureStatus differs),
       -- printStorePath for the derivation, toRealPath for the output.
       runTest "the output that differs is named where the store's files are, and the derivation under the store's own directory" $
         assertEqual
           "message"
-          ("derivation '" <> helloDrvText <> "' may not be deterministic: output '" <> T.pack (storePathToFilePath elsewhere helloOut) <> "' differs")
-          (Realise.realiseFailureMessage elsewhere (Realise.NotDeterministic helloDrv helloOut)),
+          ("derivation '" <> helloDrvText <> "' may not be deterministic: output \"" <> T.pack (storePathToFilePath elsewhere helloOut) <> "\" differs")
+          (Realise.realiseFailureMessage elsewhere (Realise.NotDeterministic helloDrv helloOut Realise.RebuildDiscarded)),
+      -- Upstream under keep-failed moves the rebuild to the output's path
+      -- with .check after it, which its message names, and the status is
+      -- the same.
+      runTest "a rebuild kept beside the output is named in the message as the output's path with .check after it" $
+        let kept = Realise.NotDeterministic helloDrv helloOut Realise.RebuildKept
+            outPath = T.pack (storePathToFilePath elsewhere helloOut)
+         in assertEqual
+              "message"
+              ("derivation '" <> helloDrvText <> "' may not be deterministic: output \"" <> outPath <> "\" differs from \"" <> outPath <> ".check\"")
+              (Realise.realiseFailureMessage elsewhere kept)
+              `andThen` assertEqual "path" (T.unpack outPath <> ".check") (Realise.checkedOutputPath elsewhere helloOut)
+              `andThen` assertEqual "status" 104 (Realise.realiseFailureStatus kept),
       -- Which output a rebuild finds different, and in what order it
       -- compares them, is the check effect's to say ("builder/check" pins
       -- the real one); the failure only passes its answer on.
@@ -1087,7 +1099,7 @@ testRealise = do
                 Set.empty
                 [fakeNode "pkg" ["pkg-bin", "pkg-lib"] []]
                 "pkg"
-         in assertEqual "check" (Left (Realise.NotDeterministic (fakePath "pkg.drv") (fakePath "pkg-lib"))) result,
+         in assertEqual "check" (Left (Realise.NotDeterministic (fakePath "pkg.drv") (fakePath "pkg-lib") Realise.RebuildDiscarded)) result,
       -- Upstream's goal for a derivation it cannot load fails; a check
       -- that built nothing again and compared nothing has not passed.
       runTest "a check of a root the graph does not hold fails, where a build of one realises nothing and succeeds" $
@@ -1170,7 +1182,7 @@ testRealise = do
           [104, 1, 1, 1, 1, 1, 1, 1]
           ( map
               Realise.realiseFailureStatus
-              [ Realise.NotDeterministic helloDrv helloOut,
+              [ Realise.NotDeterministic helloDrv helloOut Realise.RebuildDiscarded,
                 Realise.BuildFailed "",
                 Realise.CacheQueryFailed "",
                 Realise.SubstitutesFailed helloDrv,
@@ -1308,7 +1320,7 @@ testRealise = do
             (result, _) = runState (Realise.realiseRequests settings (fakeRealiseEffects Set.empty) (DepGraph.DepGraph (Map.singleton drvPath twoOutputs)) [(drvPath, Set.fromList ["dev", "out"])]) world
          in assertEqual "requests" (Left (Realise.FailedWith (Realise.CacheQueryFailed (fakeQueryFailure out)))) result,
       runTest "a call exits with its one failure's status, however it is reported" $
-        let differs = Realise.NotDeterministic helloDrv helloOut
+        let differs = Realise.NotDeterministic helloDrv helloOut Realise.RebuildDiscarded
          in assertEqual
               "statuses"
               [104, 104]

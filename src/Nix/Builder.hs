@@ -24,9 +24,10 @@
 -- Under 'BuildCheck', upstream's @nix-build --check@, 'buildWithDeps'
 -- builds its derivation again beside the valid outputs and compares what
 -- comes out with them ('checkDerivation').  That rebuild registers nothing
--- and leaves the outputs as they are.  What comes before it adds to the
--- store as any build does: an output that is not valid is substituted
--- first, and the inputs are substituted or built.
+-- and leaves the outputs as they are, and under 'KeepFailed' keeps the
+-- rebuild of an output that differs beside it.  What comes before it adds
+-- to the store as any build does: an output that is not valid is
+-- substituted first, and the inputs are substituted or built.
 --
 -- == On Windows
 --
@@ -110,7 +111,7 @@ import Data.Word (Word32)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder.BuildDir (createBuildDir, sandboxedBuildDir, withBuildDir)
+import Nix.Builder.BuildDir (BuildEnding (..), FailedBuilds (..), WorkDir (..), sandboxedBuildDir, withBuildDir)
 import Nix.Builder.Buildenv (builtinBuildenvBuilder, runBuiltinBuildenv)
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
 import Nix.Builder.Sandbox (DarwinOptions (..), DarwinPathInputs (..), DarwinPaths (..), DarwinPlan (..), DarwinProfile (..), HelperOutcome (..), Network, PathPresence (..), PlanInputs (..), SandboxBackend (..), SandboxConfig (..), SandboxFallback (..), SandboxPath (..), SandboxUse (..), backendFallback, chrootSkeleton, darwinOptions, darwinParameters, darwinPathsInSandbox, darwinProfile, darwinSetupFailureMessage, darwinStageName, defaultSandboxConfig, helperOutcome, hostSandboxBackend, renderDarwinPlan, renderPlan, rootRefusal, sandboxHome, sandboxPlan, sandboxUse, setupFailureMessage, setupStageName, unavailableMessage)
@@ -122,8 +123,8 @@ import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, r
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Push (narHashMatches)
-import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, Fallback (..), FetchOutcome (..), Offer (QueryFailed), RealiseEffects (..), RealiseSettings (..), Realised (..), Registration (..), SubstEffects (..), SubstitutesSetting (..), Undelivered (..), noWriteAccessMessage, realise, realiseFailureMessage, realiseFailureStatus, realiseRequests, requestsFailureMessage, requestsFailureStatus, substituteClosure)
-import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, canonicalizeMetadata, finishNarUnpack, freshCopyPath, isValid, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, replaceWithCopy, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
+import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, DifferingRebuild (..), Fallback (..), FetchOutcome (..), Offer (QueryFailed), RealiseEffects (..), RealiseSettings (..), Realised (..), Registration (..), SubstEffects (..), SubstitutesSetting (..), Undelivered (..), checkedOutputPath, noWriteAccessMessage, realise, realiseFailureMessage, realiseFailureStatus, realiseRequests, requestsFailureMessage, requestsFailureStatus, substituteClosure)
+import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, canonicalizeMetadata, finishNarUnpack, freshCopyPath, isValid, moveOutput, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, replaceWithCopy, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (foreignOwnedNode, isPlainFile, writableByOthers)
 import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathPrefix, storePathToFilePath, storePathToText, unStoreDir)
@@ -206,6 +207,11 @@ envPath = "PATH"
 -- Bytes, matching the 'drvBuilder' field it is compared against.
 builtinFetchurlBuilder :: BS.ByteString
 builtinFetchurlBuilder = "builtin:fetchurl"
+
+-- | What every builtin builder's name starts with, which is how upstream
+-- tells a builtin from a program.
+builtinPrefix :: BS.ByteString
+builtinPrefix = "builtin:"
 
 -- | Derivation environment keys read by @builtin:fetchurl@.
 envUrl, envUrls, envOut, envUnpack, envExecutable :: Text
@@ -326,7 +332,12 @@ data BuildConfig = BuildConfig
     bcBuildLog :: !System.IO.Handle,
     -- | Whether, and how, a spawned builder runs in a sandbox
     -- ("Nix.Builder.Sandbox").
-    bcSandbox :: !SandboxConfig
+    bcSandbox :: !SandboxConfig,
+    -- | What a build that does not succeed leaves, upstream's
+    -- @keep-failed@: its directory ("Nix.Builder.BuildDir"), unless its
+    -- builder is a builtin, and for a check that found an output
+    -- different, the rebuild of that output ('checkDerivation').
+    bcFailedBuilds :: !FailedBuilds
   }
   deriving (Eq, Show)
 
@@ -348,7 +359,8 @@ data SubstitutionAccess
 -- ('baselineCores'), where upstream's default is the machine's count,
 -- which takes IO to find ("Nix.Builder.Cores"), and runs unsandboxed
 -- ('defaultSandboxConfig'), where upstream sandboxes on Linux, since
--- finding the sandbox's helper takes IO too.
+-- finding the sandbox's helper takes IO too.  A build that fails keeps
+-- nothing, as upstream's @keep-failed@ defaults off.
 defaultBuildConfig :: StoreDir -> BuildConfig
 defaultBuildConfig dir =
   BuildConfig
@@ -363,7 +375,8 @@ defaultBuildConfig dir =
       bcUnpackLimits = defaultUnpackLimits,
       bcFetchRetry = defaultFetchRetryPolicy,
       bcBuildLog = System.IO.stderr,
-      bcSandbox = defaultSandboxConfig
+      bcSandbox = defaultSandboxConfig,
+      bcFailedBuilds = RemoveFailed
     }
 
 -- | The cores 'defaultBuildConfig' tells a builder of: one, which is what
@@ -387,13 +400,15 @@ data BuildResult
 -- as upstream's do: run its builder and capture output.
 --
 -- 1. Validate all inputs exist in the store
--- 2. Create the build directory ('withBuildDir')
--- 3. Set up environment from derivation + standard vars
--- 4. Run the builder process, which writes each output at its store path
--- 5. On success: scan the outputs for references and register them,
+-- 2. Decide how the builder runs, refusing a sandbox that cannot be had
+-- 3. Create the build directory ('withBuildDir')
+-- 4. Set up environment from derivation + standard vars
+-- 5. Run the builder process, which writes each output at its store path
+-- 6. On success: scan the outputs for references and register them,
 --    failing on a reference cycle between them ('registerOutputs')
--- 6. On failure: clean up and report error
--- 7. Exception safety: synchronous exceptions convert to BuildFailure;
+-- 7. On failure: clean up and report error, keeping the build directory
+--    under 'KeepFailed' ('failedBuildsFor')
+-- 8. Exception safety: synchronous exceptions convert to BuildFailure;
 --    asynchronous exceptions propagate ('catchSync') - an interrupt
 --    must abort the build, never be reported as a build failure.
 --
@@ -428,7 +443,7 @@ buildOutputs config store drv drvPath =
   stoppingOnException $
     withOutputLocks config store drv (maybe build (pure . Right))
   where
-    build = buildUnderLock config store drvPath drv RedirectValid (registerOutputs store drv drvPath)
+    build = buildUnderLock config store drvPath drv RedirectValid (const BuildSucceeded) (registerOutputs store drv drvPath)
 
 -- | Check a derivation, given its @.drv@ path: build it again beside its
 -- valid outputs and compare what comes out with what the store holds.
@@ -436,12 +451,16 @@ buildOutputs config store drv drvPath =
 -- before it: "Nix.Realise" substitutes an output that is not valid and
 -- realises the inputs, and 'buildWithDeps' under 'BuildCheck' does both.
 --
--- The rebuild registers nothing, leaves the outputs as they are, and keeps
--- nothing it wrote.  'Left' is why there was no comparison to answer with,
--- naming the derivation as 'buildWithDeps' names one that failed to build:
--- its builder failed; an output is not valid, so there is nothing to
--- compare a rebuild with; or the store is one upstream Nix's database may
--- also manage, refused before anything is touched ("Nix.Store.Upstream").
+-- The rebuild registers nothing and leaves the outputs as they are.  It
+-- keeps nothing it wrote, but under 'KeepFailed' the rebuild of the first
+-- output that differs, which it moves to the output's path with @.check@
+-- after it ('checkedOutputPath'), removing what was there, as upstream
+-- does.  The verdict says which ('DifferingRebuild').  'Left' is why
+-- there was no comparison to answer with, naming the derivation as
+-- 'buildWithDeps' names one that failed to build: its builder failed; an
+-- output is not valid, so there is nothing to compare a rebuild with; or
+-- the store is one upstream Nix's database may also manage, refused
+-- before anything is touched ("Nix.Store.Upstream").
 checkDerivation :: BuildConfig -> Store -> Derivation -> StorePath -> IO (Either Text CheckVerdict)
 checkDerivation config store drv drvPath =
   first (stopReport drv) <$> checkOutputs config store drv drvPath
@@ -450,7 +469,7 @@ checkDerivation config store drv drvPath =
 -- through a check as through any build (@DerivationGoal::tryToBuild@ at
 -- 2.24.9).  The builder writes every output to a scratch path
 -- ('RedirectAll'), so the store's copies stay as they are, and what it
--- wrote is gone when this returns.
+-- wrote is gone when this returns, but for a rebuild 'KeepFailed' keeps.
 --
 -- What a check compares with is each output's registration, so that is
 -- what it asks for once the locks are held, and it is the one place that
@@ -472,7 +491,15 @@ checkOutputs config store drv drvPath =
         -- A check that compared nothing has not passed.
         Just [] -> pure (Left (BuildStop noOutputsMessage 1))
         Just registrations ->
-          buildUnderLock config store drvPath drv RedirectAll (compareOutputs store drv drvPath (map piNarHash registrations))
+          buildUnderLock config store drvPath drv RedirectAll verdictEnding (compareOutputs (bcFailedBuilds config) store drv drvPath (map piNarHash registrations))
+
+-- | How a check ended: one that found an output different failed, as
+-- upstream's does, so it keeps the build's directory under @keep-failed@
+-- as any failure does.
+verdictEnding :: CheckVerdict -> BuildEnding
+verdictEnding verdict = case verdict of
+  OutputsMatch -> BuildSucceeded
+  OutputDiffers _ _ -> BuildFailed
 
 -- | Upstream's failure for a check that finds an output it was to compare
 -- with not valid (@DerivationGoal::assertPathValidity@, derivation-goal.cc
@@ -586,37 +613,99 @@ data Redirected
     RedirectAll
 
 -- | The build itself, of the derivation at a @.drv@ path, with every
--- output's lock already held.
-buildUnderLock :: BuildConfig -> Store -> StorePath -> Derivation -> Redirected -> Finish a -> IO (Either BuildStop a)
-buildUnderLock config store drvPath drv redirected finish = do
+-- output's lock already held, given how its result says it ended, which
+-- decides whether a build directory is kept ("Nix.Builder.BuildDir").
+buildUnderLock :: BuildConfig -> Store -> StorePath -> Derivation -> Redirected -> (a -> BuildEnding) -> Finish a -> IO (Either BuildStop a)
+buildUnderLock config store drvPath drv redirected succeeded finish = runExceptT $ do
   -- 1. Validate inputs (sources + input-derivation outputs) exist, and
   --    take their closure: what an output may reference besides the
   --    derivation's own outputs.
-  inputs <- validateInputs config store drv >>= either (pure . Left) (inputClosure store)
-  case inputs of
-    Left errMsg -> pure (Left (BuildStop errMsg 1))
-    Right inputPaths -> case drvOutputs drv of
-      -- The build directory is named by the first output, whose lock
-      -- keeps it to one build at a time.  A derivation with no output
-      -- has no lock to name one by, and its build fails whatever its
-      -- builder does ('registerOutputs'), so it fails here, before a
-      -- directory is made or a builder runs.
-      [] -> pure (Left (BuildStop noOutputsMessage 1))
-      -- 2. Create the build directory, empty, and remove it however the
-      --    build ends.
-      firstOutput : _ -> withBuildDir (bcStoreDir config) (doPath firstOutput) $ \buildDir -> do
-        -- 3. Compute output paths (but do NOT pre-create them - the builder
-        --    is responsible for creating $out, $dev, etc.).
-        --
-        --    $out is the final store path, as upstream's is: a
-        --    temporary path recorded by the build (a compiler driver, a
-        --    libtool archive) would outlive the directory it named.
-        outputValidity <- case redirected of
-          RedirectValid -> mapM (isValid store . doPath) (drvOutputs drv)
-          RedirectAll -> pure (map (const True) (drvOutputs drv))
-        case traverse outputPlan (zip (drvOutputs drv) outputValidity) of
-          Left nameErr -> pure (Left (BuildStop ("output name is not a store path name: " <> T.pack (show nameErr)) 1))
-          Right plans -> runPlannedBuild config (BuildContext store drvPath inputPaths) drv buildDir plans (finish inputPaths plans)
+  inputPaths <- withExceptT stopped (ExceptT (validateInputs config store drv >>= either (pure . Left) (inputClosure store)))
+  -- The build directory is named by the first output, whose lock keeps
+  -- it to one build at a time.  A derivation with no output has no lock
+  -- to name one by, and its build fails whatever its builder does
+  -- ('registerOutputs'), so it fails here, before a directory is made or
+  -- a builder runs.
+  firstOutput <- case drvOutputs drv of
+    [] -> throwError (stopped noOutputsMessage)
+    output : _ -> pure output
+  -- 2. Compute output paths (but do NOT pre-create them - the builder is
+  --    responsible for creating $out, $dev, etc.).
+  --
+  --    $out is the final store path, as upstream's is: a temporary path
+  --    recorded by the build (a compiler driver, a libtool archive) would
+  --    outlive the directory it named.
+  outputValidity <- liftIO $ case redirected of
+    RedirectValid -> mapM (isValid store . doPath) (drvOutputs drv)
+    RedirectAll -> pure (map (const True) (drvOutputs drv))
+  plans <- liftEither (first (\nameErr -> stopped ("output name is not a store path name: " <> T.pack (show nameErr))) (traverse outputPlan (zip (drvOutputs drv) outputValidity)))
+  -- 3. Decide how the builder runs, which says where in the build
+  --    directory it works, refusing a sandbox that cannot be had before
+  --    a directory is made, as upstream refuses one before it makes its
+  --    own.
+  let context = BuildContext store drvPath inputPaths
+  run <- withExceptT stopped (ExceptT (builderRunFor config context drv))
+  -- 4. Create the build directory, empty, and remove it however the
+  --    build ends, unless it failed and keeps it ('failedBuildsFor').
+  ExceptT $
+    withBuildDir (bcStoreDir config) (doPath firstOutput) (runWorkDir run) (failedBuildsFor config drv) (either (const BuildFailed) succeeded) $ \buildDir ->
+      runPlannedBuild config context drv run buildDir plans (finish inputPaths plans)
+  where
+    stopped reason = BuildStop reason 1
+
+-- | What a build that does not succeed leaves of its directory: what
+-- 'bcFailedBuilds' says, unless its builder is a builtin, of which
+-- upstream keeps nothing, since one might hold privileged files, such as
+-- a copy of netrc.  A builtin is a builder named with upstream's prefix
+-- ('builtinPrefix'), whether or not nova-nix runs it.
+failedBuildsFor :: BuildConfig -> Derivation -> FailedBuilds
+failedBuildsFor config drv
+  | builtinPrefix `BS.isPrefixOf` drvBuilder drv = RemoveFailed
+  | otherwise = bcFailedBuilds config
+
+-- | How a derivation's builder runs, decided before its build directory
+-- is made.
+data BuilderRun
+  = -- | In this process, a builtin, given where each output, by name, is
+    -- on disk.
+    RunsBuiltin !([(Text, FilePath)] -> IO (Either (Int, Text) ()))
+  | -- | Spawned, where 'placementFor' put it.
+    RunsSpawned !Placement
+
+-- | Where a spawned builder runs.
+data Placement
+  = -- | Where its directory and outputs are, with no sandbox.
+    PlacedUnsandboxed
+  | -- | In the Linux sandbox, through this helper, on this network.
+    PlacedInLinuxSandbox !FilePath !Network
+  | -- | Under macOS's sandbox profile, through this helper, on this
+    -- network.
+    PlacedInDarwinSandbox !FilePath !Network
+
+-- | The builtins nova-nix runs in this process, and every other builder
+-- spawned where 'placementFor' puts it.  'Left' is why it cannot run.
+-- @builtin:fetchurl@ restores a NAR's names under the store volume's case
+-- sensitivity.
+builderRunFor :: BuildConfig -> BuildContext -> Derivation -> IO (Either Text BuilderRun)
+builderRunFor config context drv = case drvBuilder drv of
+  b
+    | b == builtinFetchurlBuilder -> builtin (runBuiltinFetchurl (bcFetchRetry config) (stCaseSensitivity (bxStore context)) drv)
+    | b == builtinUnpackBuilder -> builtin (runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv)
+    | b == builtinBuildenvBuilder -> builtin (runBuiltinBuildenv (bcStoreDir config) drv)
+  _ -> fmap RunsSpawned <$> placementFor config context drv
+  where
+    builtin = pure . Right . RunsBuiltin
+
+-- | Where in its build directory a builder works: a builder in the Linux
+-- sandbox in the directory inside it that the sandbox shows at
+-- @sandbox-build-dir@ ('Nix.Builder.BuildDir.sandboxedBuildDir'), as
+-- upstream's Linux sandbox does, and every other in the directory itself.
+runWorkDir :: BuilderRun -> WorkDir
+runWorkDir run = case run of
+  RunsSpawned (PlacedInLinuxSandbox _ _) -> WorksInSandboxedBuildDir
+  RunsSpawned (PlacedInDarwinSandbox _ _) -> WorksInBuildDir
+  RunsSpawned PlacedUnsandboxed -> WorksInBuildDir
+  RunsBuiltin _ -> WorksInBuildDir
 
 -- | Where the builder writes each output, and where that has to end up.
 --
@@ -742,14 +831,12 @@ data BuildContext = BuildContext
   }
 
 -- | The build, once every output knows where it is written and where it
--- belongs: run the builder, then @finish@ with where each output it wrote
--- is now.  The store volume's case sensitivity is what
--- @builtin:fetchurl@ restores a NAR's names under.
-runPlannedBuild :: BuildConfig -> BuildContext -> Derivation -> FilePath -> [OutputPlan] -> (Written -> Commit -> IO (Either BuildStop a)) -> IO (Either BuildStop a)
-runPlannedBuild config context drv buildDir plans finish = do
+-- belongs and the builder where it runs: run the builder, then @finish@
+-- with where each output it wrote is now.
+runPlannedBuild :: BuildConfig -> BuildContext -> Derivation -> BuilderRun -> FilePath -> [OutputPlan] -> (Written -> Commit -> IO (Either BuildStop a)) -> IO (Either BuildStop a)
+runPlannedBuild config context drv run buildDir plans finish = do
   let scratchDir = scratchPathOf config
       outputDirs = [(opName p, scratchDir p) | p <- plans]
-      sensitivity = stCaseSensitivity (bxStore context)
       -- Every scratch path is the build's to use: the ones that are final
       -- paths may hold a tree an interrupted run left behind, and the
       -- fallbacks may hold one an interrupted run failed to discard, as
@@ -769,7 +856,7 @@ runPlannedBuild config context drv buildDir plans finish = do
         done <- readIORef committed
         unless done clearScratch
       commit registration = uninterruptibleMask_ (registration *> writeIORef committed True)
-      -- 5. Success: validate that the builder created all expected
+      -- 6. Success: validate that the builder created all expected
       --    outputs, wherever they are now.  Outputs may be files or
       --    directories - both are valid (real Nix allows $out to be a
       --    single file, a directory tree, or a symlink).
@@ -793,24 +880,22 @@ runPlannedBuild config context drv buildDir plans finish = do
                 -- that were already valid, which upstream discards
                 -- unread.  After a check they are every output the
                 -- builder wrote, compared by now and not kept, whatever
-                -- the comparison found.  A sandboxed build's are still in
-                -- its chroot, which goes with them.
+                -- the comparison found, but a rebuild that differs, which
+                -- under 'KeepFailed' is at its @.check@ path by now.  A
+                -- sandboxed build's are still in its chroot, which goes
+                -- with them.
                 for_ [p | p <- plans, opValid p] (removePathForcibly . scratchDir)
               Left _ -> clearScratch
             pure finished
       inStore = Written scratchDir (writableByOthers . scratchDir)
-      builtin run = run >>= either (pure . Left . uncurry BuilderRefused) (\() -> Right <$> afterBuilder inStore)
   ( do
-      -- 4. Run the builder.  A builtin builder runs in this process and
+      -- 5. Run the builder.  A builtin builder runs in this process and
       --    writes the outputs where they are on disk; a spawned one runs
-      --    as 'runSpawnedBuilder' decides, and what follows it runs while
+      --    where 'placementFor' put it, and what follows it runs while
       --    its outputs are where it left them.
-      ran <- case drvBuilder drv of
-        b
-          | b == builtinFetchurlBuilder -> builtin (runBuiltinFetchurl (bcFetchRetry config) sensitivity drv outputDirs)
-          | b == builtinUnpackBuilder -> builtin (runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv outputDirs)
-          | b == builtinBuildenvBuilder -> builtin (runBuiltinBuildenv (bcStoreDir config) drv outputDirs)
-        _ -> runSpawnedBuilder config context drv buildDir plans afterBuilder
+      ran <- case run of
+        RunsBuiltin builtin -> builtin outputDirs >>= either (pure . Left . uncurry BuilderRefused) (\() -> Right <$> afterBuilder inStore)
+        RunsSpawned placement -> runSpawnedBuilder config context drv placement buildDir plans afterBuilder
       case ran of
         Left failure -> do
           -- Whatever the builder wrote is in the store now, so failure has
@@ -826,36 +911,42 @@ runPlannedBuild config context drv buildDir plans finish = do
 scratchPathOf :: BuildConfig -> OutputPlan -> FilePath
 scratchPathOf config p = storePathToFilePath (bcStoreDir config) (opScratch p)
 
--- | Run a derivation's spawned builder: in the sandbox when the settings
--- and the derivation ask for it ('sandboxUse') and this system can make
--- one, otherwise where its directory and outputs are.  A Linux system
--- that cannot make the sandbox runs the build unsandboxed under
+-- | Where a derivation's spawned builder runs: in the sandbox when the
+-- settings and the derivation ask for it ('sandboxUse') and this system
+-- can make one, otherwise where its directory and outputs are.  A Linux
+-- system that cannot make the sandbox runs the build unsandboxed under
 -- @sandbox-fallback@, after one warning a process ('warnFallback'), and
--- fails it otherwise, as upstream does (@tryLocalBuild@ in
--- local-derivation-goal.cc at 2.24.9, @makeDerivationBuilder@ in
--- unix-derivation-builder.cc at 2.36.0); on macOS it fails the build
--- whatever @sandbox-fallback@ says ('backendFallback'), as upstream
--- 2.36.0 does.  Once the builder has succeeded, @continue@ runs with
--- where its outputs are.
-runSpawnedBuilder :: BuildConfig -> BuildContext -> Derivation -> FilePath -> [OutputPlan] -> (Written -> IO r) -> IO (Either BuilderFailure r)
-runSpawnedBuilder config context drv buildDir plans continue =
+-- refuses it otherwise, as upstream does; on macOS it refuses the build
+-- whatever @sandbox-fallback@ says ('backendFallback'), as upstream does
+-- too.  'Left' is the refusal, in upstream's words ("Nix.Builder.Sandbox").
+placementFor :: BuildConfig -> BuildContext -> Derivation -> IO (Either Text Placement)
+placementFor config context drv =
   case sandboxUse hostSandboxBackend (scMode sandbox) (bxDrvPath context) drv of
-    Left reason -> pure (Left (BuilderSandboxFailed reason))
-    Right Unsandboxed -> unsandboxed
+    Left reason -> pure (Left reason)
+    Right Unsandboxed -> pure (Right PlacedUnsandboxed)
     Right (Sandboxed network) -> do
       root <- processIsRoot
       -- Before anything is made, and whatever sandbox-fallback says.
       if root
-        then pure (Left (BuilderSandboxFailed rootRefusal))
+        then pure (Left rootRefusal)
         else do
           available <- sandboxAvailability (scHelper sandbox)
           case (available, backendFallback hostSandboxBackend (scFallback sandbox)) of
-            (Right (LinuxBackend, helper), _) -> runSandboxedBuild config context drv buildDir plans helper network continue
-            (Right (DarwinBackend, helper), _) -> runDarwinSandboxedBuild config context drv buildDir plans helper network continue
-            (Left cause, FallBackUnsandboxed) -> warnFallback cause *> unsandboxed
-            (Left cause, RefuseUnsandboxed) -> pure (Left (BuilderSandboxFailed (unavailableMessage hostSandboxBackend cause)))
+            (Right (LinuxBackend, helper), _) -> pure (Right (PlacedInLinuxSandbox helper network))
+            (Right (DarwinBackend, helper), _) -> pure (Right (PlacedInDarwinSandbox helper network))
+            (Left cause, FallBackUnsandboxed) -> Right PlacedUnsandboxed <$ warnFallback cause
+            (Left cause, RefuseUnsandboxed) -> pure (Left (unavailableMessage hostSandboxBackend cause))
   where
     sandbox = bcSandbox config
+
+-- | Run a derivation's spawned builder where 'placementFor' put it.  Once
+-- the builder has succeeded, @continue@ runs with where its outputs are.
+runSpawnedBuilder :: BuildConfig -> BuildContext -> Derivation -> Placement -> FilePath -> [OutputPlan] -> (Written -> IO r) -> IO (Either BuilderFailure r)
+runSpawnedBuilder config context drv placement buildDir plans continue = case placement of
+  PlacedUnsandboxed -> unsandboxed
+  PlacedInLinuxSandbox helper network -> runSandboxedBuild config context drv buildDir plans helper network continue
+  PlacedInDarwinSandbox helper network -> runDarwinSandboxedBuild config context drv buildDir plans helper network continue
+  where
     -- The builder runs where its directory and outputs are, so it is told
     -- of each where it is on disk.
     layout = BuildLayout (inPlace buildDir) [(opName p, inPlace (scratchPathOf config p)) | p <- plans] buildDir
@@ -878,8 +969,9 @@ runSpawnedBuilder config context drv buildDir plans continue =
 -- (@registerOutputs@ in local-derivation-goal.cc at 2.24.9).  The chroot is
 -- in the store's state directory, so the move into the store is a rename
 -- ('Nix.Store.placeInStore').  The directory the builder sees is one inside
--- the build directory ('sandboxedBuildDir').  An @--exec-wrapper@ launcher is
--- bound into the chroot as a @sandbox-paths@ entry naming itself.
+-- the build directory, made with it ('sandboxedBuildDir').  An
+-- @--exec-wrapper@ launcher is bound into the chroot as a @sandbox-paths@
+-- entry naming itself.
 runSandboxedBuild :: BuildConfig -> BuildContext -> Derivation -> FilePath -> [OutputPlan] -> FilePath -> Network -> (Written -> IO r) -> IO (Either BuilderFailure r)
 runSandboxedBuild config context drv outerBuildDir plans helper network continue = do
   paths <- buildSandboxPaths config drv
@@ -888,7 +980,6 @@ runSandboxedBuild config context drv outerBuildDir plans helper network continue
     Left reason -> pure (Left (BuilderSandboxFailed reason))
     Right closurePaths -> do
       let buildDir = sandboxedBuildDir outerBuildDir
-      createBuildDir buildDir
       storeBytes <- filePathBytes (unStoreDir (bcStoreDir config))
       buildDirBytes <- filePathBytes buildDir
       seenBuildDir <- bytesFilePath (scBuildDir sandbox)
@@ -2046,10 +2137,16 @@ registerOutputs store drv drvPath inputPaths plans written commit = runExceptT $
 -- the siblings it references, and the first that differs ends the
 -- comparison, where upstream's loop throws (its @bmCheck@ branch).
 --
--- Nothing is registered and no output is moved.  Upstream marks a path it
--- has checked as ultimately trusted and signs it (the end of that
--- branch); the store database here records neither.
+-- Nothing is registered and no valid output is touched.  The rebuild of
+-- the output that differs is discarded with the rest, or under
+-- 'KeepFailed' moved to the output's path with @.check@ after it
+-- ('checkedOutputPath'), as upstream moves it under @keep-failed@:
+-- rewritten and canonical, as it was compared, unregistered, and
+-- replacing whatever was at that path.  Upstream marks a path it has
+-- checked as ultimately trusted and signs it; the store database here
+-- records neither.
 compareOutputs ::
+  FailedBuilds ->
   Store ->
   Derivation ->
   StorePath ->
@@ -2059,10 +2156,11 @@ compareOutputs ::
   Written ->
   Commit ->
   IO (Either BuildStop CheckVerdict)
-compareOutputs store drv drvPath recordedHashes inputPaths plans written _ = runExceptT $ do
+compareOutputs failedBuilds store drv drvPath recordedHashes inputPaths plans written _ = runExceptT $ do
   built <- withExceptT scanStop (traverse rebuilt (zip3 (drvOutputs drv) plans recordedHashes))
   ordered <- liftEither (orderScanned drvPath (siblings . boReferences . fst) built)
-  ExceptT (firstDifference (volumeCaseHack (stCaseSensitivity store)) drvPath (map snd ordered))
+  differing <- ExceptT (firstDifference (volumeCaseHack (stCaseSensitivity store)) drvPath (map snd ordered))
+  liftIO (maybe (pure OutputsMatch) (differingVerdict failedBuilds store) differing)
   where
     scan = outputScan drv inputPaths plans
     siblings = siblingNames (drvOutputs drv)
@@ -2241,14 +2339,26 @@ siblingsReferenced outputs = referencedBy
     referencedBy (NeedsRegistering built) = siblings (boReferences built)
 
 -- | Compare rebuilt outputs, each with the NAR hash the store recorded for
--- it, in order, up to the first that differs or cannot be compared.
-firstDifference :: NAR.CaseHack -> StorePath -> [(BuiltOutput, Text)] -> IO (Either BuildStop CheckVerdict)
-firstDifference _ _ [] = pure (Right OutputsMatch)
+-- it, in order, up to the first that differs, which is answered, or
+-- cannot be compared.
+firstDifference :: NAR.CaseHack -> StorePath -> [(BuiltOutput, Text)] -> IO (Either BuildStop (Maybe BuiltOutput))
+firstDifference _ _ [] = pure (Right Nothing)
 firstDifference caseHack drvPath (rebuilt : rest) = do
   compared <- compareOutput caseHack drvPath rebuilt
   case compared of
-    Right OutputsMatch -> firstDifference caseHack drvPath rest
+    Right Nothing -> firstDifference caseHack drvPath rest
     ended -> pure ended
+
+-- | The verdict on a rebuilt output that differs from the valid one, its
+-- rebuild kept or discarded as 'compareOutputs' says.
+differingVerdict :: FailedBuilds -> Store -> BuiltOutput -> IO CheckVerdict
+differingVerdict failedBuilds store built =
+  OutputDiffers output <$> case failedBuilds of
+    RemoveFailed -> pure RebuildDiscarded
+    KeepFailed -> RebuildKept <$ (removePathForcibly kept *> moveOutput (boDir built) kept)
+  where
+    output = doPath (boOutput built)
+    kept = checkedOutputPath (stDir store) output
 
 -- | Compare one rebuilt output with the NAR hash the store recorded for
 -- the valid one, which is all upstream compares (@newInfo.narHash !=
@@ -2262,14 +2372,15 @@ firstDifference caseHack drvPath (rebuilt : rest) = do
 -- upstream raises that mismatch for a checked fixed output and never
 -- reaches the comparison (the @CAFixed@ case, the @bmCheck@ branch and the
 -- final rethrow of @delayedException@ in @registerOutputs@ at 2.24.9).
-compareOutput :: NAR.CaseHack -> StorePath -> (BuiltOutput, Text) -> IO (Either BuildStop CheckVerdict)
+-- 'Right' answers the output when it differs.
+compareOutput :: NAR.CaseHack -> StorePath -> (BuiltOutput, Text) -> IO (Either BuildStop (Maybe BuiltOutput))
 compareOutput caseHack drvPath (built, recorded) = do
   fixedCheck <- verifyFixedOutput caseHack drvPath (boOutput built) (boReferences built) (boDir built)
   case fixedCheck of
     Left err -> pure (Left (scanStop err))
     Right () -> do
       rebuilt <- Hash.formatNixHash <$> ExecBit.narHashOfPath caseHack (boDir built)
-      pure (Right (if narHashMatches recorded rebuilt then OutputsMatch else OutputDiffers (doPath (boOutput built))))
+      pure (Right (if narHashMatches recorded rebuilt then Nothing else Just built))
 
 -- | Place a scanned output in the store and check a fixed output's
 -- content, returning its 'PathRegistration'; @Nothing@ for an output

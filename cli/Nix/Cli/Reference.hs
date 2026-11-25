@@ -254,7 +254,7 @@ command name = case name of
                  Form "--expr 'EXPR'" "Build a derivation from an inline expression"
                ],
         commandDescription =
-          "Evaluates " <> targetSource <> ", selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. " <> targetCalls <> " A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. The outputs of a derivation whose `allowSubstitutes` attribute is false are built instead, unless `always-allow-substitutes` is on. A substituter that fails stops the build unless `fallback` is on. With `--check` the derivation is checked as `nix-build --check` checks one: an output of its that is not valid is first downloaded from a substituter that holds it, the derivations it depends on are built or downloaded as ever, and then it is built again beside its outputs, never downloaded, and each output is compared with the one in the store. The rebuild changes nothing in the store and what it wrote is discarded; the downloads and builds before it add to the store as in any build. An output that comes out different fails the command with status 104, so a path a substituter supplied can be held to a build. The output is linked from `./result`, or from the path `--out-link` gives, with `-NAME` appended for an output `NAME` other than `out`, as `nix-build` links it, and the link is a root the garbage collector keeps; it replaces a link already there that points into the store, and anything else there fails the command. With `--no-out-link` nothing is linked. Where `sandbox` is on, as it is by default on Linux, a builder runs in a sandbox: it sees its inputs, the paths `sandbox-paths` names and its build directory, which on Linux it sees at `sandbox-build-dir`, and unless its derivation is fixed-output it reaches no network, which on Linux leaves it a loopback of its own; a system that cannot make the sandbox builds without it after a warning, or with `sandbox-fallback` off fails the build. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is evaluated.",
+          "Evaluates " <> targetSource <> ", selects the attribute `-A` names when it is given, builds the derivation that results and every derivation it depends on, and prints the path of the output its `outputName` names, the first of its outputs unless the expression selects another, as `nix-build` does. " <> targetCalls <> " A derivation whose outputs a substituter holds is downloaded instead of built, from the substituters `nix.conf` configures and the one `--substituter` adds, and only a path signed by a trusted key is accepted. The outputs of a derivation whose `allowSubstitutes` attribute is false are built instead, unless `always-allow-substitutes` is on. A substituter that fails stops the build unless `fallback` is on. With `--check` the derivation is checked as `nix-build --check` checks one: an output of its that is not valid is first downloaded from a substituter that holds it, the derivations it depends on are built or downloaded as ever, and then it is built again beside its outputs, never downloaded, and each output is compared with the one in the store. The rebuild changes nothing in the store and what it wrote is discarded; the downloads and builds before it add to the store as in any build. An output that comes out different fails the command with status 104, so a path a substituter supplied can be held to a build. With `keep-failed` on, a build that fails keeps its directory, under the store's `.nova-nix/builds`, until the derivation is next built, and names the directory its builder worked in on stderr, unless its builder is a builtin; and a check that finds an output different keeps that output's rebuild beside it as `PATH.check`, which nothing registers and the garbage collector removes, and names it in its error. The output is linked from `./result`, or from the path `--out-link` gives, with `-NAME` appended for an output `NAME` other than `out`, as `nix-build` links it, and the link is a root the garbage collector keeps; it replaces a link already there that points into the store, and anything else there fails the command. With `--no-out-link` nothing is linked. Where `sandbox` is on, as it is by default on Linux, a builder runs in a sandbox: it sees its inputs, the paths `sandbox-paths` names and its build directory, which on Linux it sees at `sandbox-build-dir`, and unless its derivation is fixed-output it reaches no network, which on Linux leaves it a loopback of its own; a system that cannot make the sandbox builds without it after a warning, or with `sandbox-fallback` off fails the build. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused before anything is evaluated.",
         commandExamples =
           Example
             "Build GNU Hello for Windows from the directory a release unpacks to, with the public cache as a substituter."
@@ -502,6 +502,7 @@ data FlagName
   | SubstituterFlag
   | TrustedKeyFlag
   | FallbackFlag
+  | KeepFailedFlag
   | CheckFlag
   | ShellCommandFlag
   | PhaseFlag
@@ -621,6 +622,8 @@ flag name = case name of
     long "trusted-key" (Just "KEY") "Trust signatures by this public key (`NAME:BASE64`) from any substituter" evaluating
   FallbackFlag ->
     long "fallback" Nothing "Build from source if substitution fails" evaluating
+  KeepFailedFlag ->
+    short 'K' "keep-failed" Nothing "Keep the directory of a build that fails, and the rebuild of an output `--check` finds different as `PATH.check`" building
   CheckFlag ->
     long "check" Nothing "Build the derivation again beside its valid outputs, and fail with status 104 if an output comes out different" buildOnly
   ShellCommandFlag ->
@@ -700,6 +703,9 @@ flag name = case name of
     -- those that evaluate.
     selecting = CommandFlag (BuildCommand :| [DevelopCommand, PrintDevEnvCommand, TrustCommand, ProfileAddCommand])
     evaluating = CommandFlag (EvalCommand :| [BuildCommand, DevelopCommand, PrintDevEnvCommand, TrustCommand, ProfileAddCommand])
+    -- The commands whose builds keep-failed can keep: trust builds only
+    -- with builtins, which keep nothing.
+    building = CommandFlag (EvalCommand :| [BuildCommand, DevelopCommand, PrintDevEnvCommand, ProfileAddCommand])
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -733,6 +739,7 @@ configuration =
         Setting "substituters" "Binary caches a build substitutes from" (Just SubstituterFlag)
           :| [ Setting "trusted-public-keys" "Public keys, one of whose signatures a substituted path must carry" (Just TrustedKeyFlag),
                Setting "fallback" "Build from source when a substitute fails" (Just FallbackFlag),
+               Setting "keep-failed" "Keep the directory of a build that fails, and the rebuild of an output `--check` finds different as `PATH.check` (default `false`)" (Just KeepFailedFlag),
                Setting "always-allow-substitutes" "Substitute a derivation whose `allowSubstitutes` attribute is false" Nothing,
                Setting "cores" "The `NIX_BUILD_CORES` a builder is given, `0` asking it to use every core (default: the CPU limit of the process's cgroup on Linux, otherwise the hardware threads)" Nothing,
                Setting "max-call-depth" ("How many function calls may be active around a new one before evaluation refuses it (default " <> T.pack (show defaultMaxCallDepth) <> ")") Nothing,

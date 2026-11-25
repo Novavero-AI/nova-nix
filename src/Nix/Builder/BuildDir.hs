@@ -35,17 +35,47 @@
 -- (file-system.cc).  On Windows it is created with a protected access control
 -- list granting that user alone full control, which what the build makes in
 -- it inherits ("Nix.Store.Access").
+--
+-- == When a build fails
+--
+-- A build's directory is removed when the build ends, however it ends,
+-- unless the build did not succeed and @keep-failed@ is on ('KeepFailed'):
+-- then it stays, and the directory the builder worked in is named on
+-- standard error, as upstream keeps and names it.  A build that does not
+-- succeed is one that stopped short of registering its outputs, or a
+-- check that found one different, whether it stopped with a failure or an
+-- exception, an interrupt included, as upstream keeps the directory of
+-- every build that does not succeed.
+--
+-- Three things differ from upstream.  The directory keeps mode 0700, where
+-- upstream opens it, and the directory its builder worked in, with 0755:
+-- upstream's builder ran as a build user, so the directory is that user's
+-- and the user who asked for it could not otherwise read it, while here
+-- the builder ran as the user nova-nix runs as, who can.  A kept directory
+-- stays until the next build of the same derivation, which removes it as
+-- it removes any directory an earlier build left at the name
+-- ('clearLeftover'), where upstream's stays until it is removed by hand,
+-- its name being one no later build takes.  The name is what makes a
+-- rebuild see the paths the first build saw, which a check relies on
+-- ("Nix.Builder"), so keeping a directory cannot be what moves the next
+-- build elsewhere.  And on Windows a failed build's directory is kept too,
+-- where upstream's Windows builds remove theirs whatever @keep-failed@
+-- says.
 module Nix.Builder.BuildDir
   ( -- * The directory
     buildDirFor,
     sandboxedBuildDir,
+    WorkDir (..),
+    workDirIn,
+    FailedBuilds (..),
+    BuildEnding (..),
     withBuildDir,
     clearLeftover,
     createBuildDir,
   )
 where
 
-import Control.Exception (IOException, bracket_, catch, displayException, throwIO)
+import Control.Exception (IOException, catch, displayException, mask, onException, throwIO)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Nix.Store.Access (DirAccess (OwnerAccess), createDirectoryWith)
@@ -75,6 +105,40 @@ buildDirFor dir firstOutput =
 sandboxedBuildDir :: FilePath -> FilePath
 sandboxedBuildDir dir = dir </> "build"
 
+-- | Where in its build directory a build's builder works.
+data WorkDir
+  = -- | In the build directory itself, as an unsandboxed builder does and
+    -- one in macOS's sandbox, which sees the directory where it is.
+    WorksInBuildDir
+  | -- | In the directory inside it that a sandboxed build on Linux shows
+    -- the builder ('sandboxedBuildDir').
+    WorksInSandboxedBuildDir
+  deriving (Eq, Show)
+
+-- | The directory a builder works in, given its build directory.
+workDirIn :: WorkDir -> FilePath -> FilePath
+workDirIn workDir dir = case workDir of
+  WorksInBuildDir -> dir
+  WorksInSandboxedBuildDir -> sandboxedBuildDir dir
+
+-- | What becomes of a build's directory when the build does not succeed:
+-- upstream's @keep-failed@.
+data FailedBuilds
+  = -- | It is removed, as it is when the build succeeds.
+    RemoveFailed
+  | -- | It is kept, and the directory the builder worked in is named on
+    -- standard error.
+    KeepFailed
+  deriving (Eq, Show)
+
+-- | How a build ended, which decides whether its directory may be kept.
+data BuildEnding
+  = -- | It registered its outputs, or its check found them the same.
+    BuildSucceeded
+  | -- | It did not.
+    BuildFailed
+  deriving (Eq, Show)
+
 -- | Remove what an earlier build left at a path, or where it cannot be
 -- removed, move it aside, to the first free name of the path with
 -- @.leftover.@ and a number after it, beside it in the state directory,
@@ -97,18 +161,40 @@ clearLeftover path = removePathForcibly path `catch` setAside
       if taken then freeName (number + 1) else pure candidate
 
 -- | Run a build in its directory ('buildDirFor'), given the derivation's
--- first output, whose path lock the caller holds: what an earlier build
--- left at the name is removed, or moved aside ('clearLeftover'), the
--- directory is created ('createBuildDir'), and it is removed when the
--- build ends, however it ends.  When the creation fails, whatever took the name first is left as
--- it is, since this build did not make it.
-withBuildDir :: StoreDir -> StorePath -> (FilePath -> IO a) -> IO a
-withBuildDir storeDir firstOutput build = do
+-- first output, whose path lock the caller holds, where in the directory
+-- its builder works, what becomes of the directory if the build fails, and
+-- how the build's result says it ended.  What an earlier build left at the
+-- name is removed, or moved aside ('clearLeftover'), and the directory is
+-- created ('createBuildDir'), with the one the builder works in when that
+-- is inside it, so the directory a failed build names is always there.
+-- The build is given the build directory.  When it ends, however it ends,
+-- the directory is removed, unless the build failed under 'KeepFailed';
+-- an exception is a failure.  When the creation fails, whatever took the
+-- name first is left as it is, since this build did not make it.
+withBuildDir :: StoreDir -> StorePath -> WorkDir -> FailedBuilds -> (a -> BuildEnding) -> (FilePath -> IO a) -> IO a
+withBuildDir storeDir firstOutput workDir failedBuilds ending build = do
   createDirectoryIfMissing True (takeDirectory dir)
   clearLeftover dir
-  bracket_ (createBuildDir dir) (removeBuildDir dir) (build dir)
+  mask $ \restore -> do
+    createBuildDir dir
+    createWorkDir `onException` removeBuildDir dir
+    result <- restore (build dir) `onException` leave BuildFailed
+    leave (ending result)
+    pure result
   where
     dir = buildDirFor storeDir firstOutput
+    createWorkDir = case workDir of
+      WorksInBuildDir -> pure ()
+      WorksInSandboxedBuildDir -> createBuildDir (sandboxedBuildDir dir)
+    leave BuildSucceeded = removeBuildDir dir
+    leave BuildFailed = case failedBuilds of
+      RemoveFailed -> removeBuildDir dir
+      KeepFailed -> TIO.hPutStrLn stderr (keptMessage (workDirIn workDir dir))
+
+-- | The note naming a kept build directory, in upstream's words, the path
+-- in the double quotes upstream puts a path in.
+keptMessage :: FilePath -> T.Text
+keptMessage path = "note: keeping build directory \"" <> T.pack path <> "\""
 
 -- | Create a build directory, open to the user nova-nix runs as alone
 -- ('OwnerAccess'), failing with an

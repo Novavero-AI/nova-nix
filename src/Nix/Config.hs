@@ -10,7 +10,8 @@
 -- (@allow-import-from-derivation@, @trace-import-from-derivation@), how
 -- builds are sandboxed (@sandbox@ and the settings beside it, macOS's
 -- @allowed-impure-host-deps@ and @darwin-log-sandbox-violations@ among
--- them), where the link to the default profile is
+-- them), what a build that fails leaves (@keep-failed@), where the link to
+-- the default profile is
 -- (@use-xdg-base-directories@), and the prompt of a @develop@ shell
 -- (@bash-prompt@ and its prefix and suffix).
 --
@@ -218,7 +219,10 @@ data NixConfig = NixConfig
     -- macOS's alone, the caller's to apply.
     ncAllowedImpureHostDeps :: !PathSetValue,
     -- | Upstream's @darwin-log-sandbox-violations@.
-    ncDarwinLogSandboxViolations :: !Bool
+    ncDarwinLogSandboxViolations :: !Bool,
+    -- | Upstream's @keep-failed@: a build that fails keeps its directory,
+    -- and a check its rebuild of an output that differs.
+    ncKeepFailed :: !Bool
   }
   deriving (Eq, Show)
 
@@ -243,8 +247,9 @@ data DefaultUse = KeepsDefault | ReplacesDefault
 -- URIs, both evaluation modes off, @trace-verbose@ off, an import from
 -- derivation allowed and not traced, upstream's sandbox settings,
 -- those whose defaults take the platform or IO unset or kept for the
--- caller, the default profile's link in the home, and the three prompt
--- settings empty, as upstream's are.  The empty
+-- caller, the default profile's link in the home, the three prompt
+-- settings empty, as upstream's are, and nothing kept of a build that
+-- fails.  The empty
 -- substituter list is nova-nix's existing default (nothing is substituted
 -- unless configured), a deliberate divergence from upstream's
 -- cache.nixos.org default: turning a cache on for every machine is the
@@ -277,7 +282,8 @@ defaultNixConfig =
       ncBashPromptPrefix = "",
       ncBashPromptSuffix = "",
       ncAllowedImpureHostDeps = PathSetValue KeepsDefault Set.empty,
-      ncDarwinLogSandboxViolations = False
+      ncDarwinLogSandboxViolations = False,
+      ncKeepFailed = False
     }
 
 -- ---------------------------------------------------------------------------
@@ -721,6 +727,7 @@ resolveName name =
       | n == sandboxPathsKey || n `elem` sandboxPathsAliases = Just (PathSetSetting SandboxPathsField)
       | n == allowedImpureHostDepsKey = Just (PathSetSetting AllowedImpureHostDepsField)
       | n == darwinLogSandboxViolationsKey = Just (BoolSetting DarwinLogSandboxViolationsField)
+      | n == keepFailedKey = Just (BoolSetting KeepFailedField)
       | n == sandboxBuildDirKey = Just (BytesSetting SandboxBuildDirField)
       | n == sandboxDevShmSizeKey = Just (BytesSetting SandboxDevShmSizeField)
       | n == requireDropGroupsKey = Just (BoolSetting RequireDropGroupsField)
@@ -764,6 +771,7 @@ data BoolField
   | RequireDropGroupsField
   | UseXdgBaseDirectoriesField
   | DarwinLogSandboxViolationsField
+  | KeepFailedField
   deriving (Eq, Show)
 
 -- | The settings whose value is a string, kept as bytes.
@@ -819,6 +827,7 @@ boolFieldKey SandboxFallbackField = sandboxFallbackKey
 boolFieldKey RequireDropGroupsField = requireDropGroupsKey
 boolFieldKey UseXdgBaseDirectoriesField = useXdgBaseDirectoriesKey
 boolFieldKey DarwinLogSandboxViolationsField = darwinLogSandboxViolationsKey
+boolFieldKey KeepFailedField = keepFailedKey
 
 setBool :: BoolField -> Bool -> NixConfig -> NixConfig
 setBool FallbackField v config = config {ncFallback = v}
@@ -832,6 +841,7 @@ setBool SandboxFallbackField v config = config {ncSandboxFallback = v}
 setBool RequireDropGroupsField v config = config {ncRequireDropSupplementaryGroups = Just v}
 setBool UseXdgBaseDirectoriesField v config = config {ncUseXdgBaseDirectories = v}
 setBool DarwinLogSandboxViolationsField v config = config {ncDarwinLogSandboxViolations = v}
+setBool KeepFailedField v config = config {ncKeepFailed = v}
 
 getPathSet :: PathSetField -> NixConfig -> PathSetValue
 getPathSet SandboxPathsField = ncSandboxPaths
@@ -939,6 +949,11 @@ bashPromptSuffixKey = "bash-prompt-suffix"
 allowedImpureHostDepsKey, darwinLogSandboxViolationsKey :: ByteString
 allowedImpureHostDepsKey = "allowed-impure-host-deps"
 darwinLogSandboxViolationsKey = "darwin-log-sandbox-violations"
+
+-- | The setting for what a build that fails leaves, which upstream gives no
+-- other name.
+keepFailedKey :: ByteString
+keepFailedKey = "keep-failed"
 
 -- | Upstream's older names for @sandbox@ and @sandbox-paths@
 -- (the aliases of @sandboxMode@ and @sandboxPaths@ in globals.hh at
