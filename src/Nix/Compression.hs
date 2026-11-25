@@ -1,6 +1,6 @@
 -- | The narinfo compression register - one vocabulary for every
--- consumer (the substituter's dispatch, and push once it writes
--- compressed objects), so the accepted set exists exactly once and
+-- consumer (the substituter's dispatch, and push, which writes zstd
+-- objects), so the accepted set exists exactly once and
 -- cannot drift between encodings.
 --
 -- Upstream note: C++ Nix decodes an absent or empty @Compression@

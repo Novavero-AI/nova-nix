@@ -9,8 +9,11 @@
 -- it references transitively.  Roots live under the store's metadata
 -- directory, @\<store\>\/.nova-nix\/gcroots@.  Upstream keeps them under
 -- its state directory (@\/nix\/var\/nix\/gcroots@); this store has no
--- state directory apart from @.nova-nix@, and roots beside the database
--- mean a store copied or moved as one directory keeps them.  Two kinds:
+-- state directory apart from @.nova-nix@, so its roots are beside its
+-- database.  A store copied or moved as one directory takes them along,
+-- but its rows still name each path under the old directory's spelling,
+-- so at the new one no path is valid (see the spelling section below).
+-- Two kinds:
 --
 -- * __Permanent roots__ are entries anywhere under @gcroots@ except
 --   @auto@: a symlink whose target lies in the store roots the store

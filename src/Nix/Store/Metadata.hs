@@ -217,8 +217,10 @@ storeModificationTime = 1
 -- ---------------------------------------------------------------------------
 
 -- | Make every node of a tree canonical, the root included, without
--- following a symlink.  A node that cannot be read or changed fails
--- with the 'Control.Exception.IOException' the system call raised.
+-- following a symlink.  On POSIX a node that cannot be read or changed
+-- fails with the 'Control.Exception.IOException' the system call raised,
+-- and one of a type a store path cannot hold fails too; on Windows a node
+-- the walk finds absent, or cannot probe, is passed over.
 canonicalizeMetadata :: FilePath -> IO ()
 
 -- | Whether a node is a regular file its owner may not execute, read

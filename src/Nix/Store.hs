@@ -7,9 +7,13 @@
 --
 -- When Nix builds a package, the output goes into the store:
 --
--- 1. Builder runs in a temp directory, produces output files
+-- 1. Builder runs in a build directory under the store's state directory
+--    and writes the output at its store path, or for a Linux sandboxed
+--    build at that path beneath its chroot ("Nix.Builder")
 -- 2. Output is scanned for references to other store paths
--- 3. Output is moved to @\/nix\/store\/\<hash\>-\<name\>@
+-- 3. A Linux sandboxed build's output is moved to
+--    @\/nix\/store\/\<hash\>-\<name\>@; any other build's is there
+--    already
 -- 4. Its files' modes and times are made canonical: read-only, and one
 --    modification time ("Nix.Store.Metadata")
 -- 5. Path is registered in the SQLite DB with its references
@@ -18,11 +22,11 @@
 --
 -- 1. Fetch @\<hash\>.narinfo@ from cache - contains NAR hash, size, refs
 -- 2. Fetch the @.nar.xz@ file
--- 3. Verify file hash matches narinfo
--- 4. Decompress and unpack NAR into store path
--- 5. Make its files' modes and times canonical, as a build's
--- 6. Verify NAR hash matches narinfo
--- 7. Register path in DB with references from narinfo
+-- 3. Decompress and unpack NAR into store path, checking its NAR hash
+--    and size against the narinfo as it streams
+-- 4. Make its files' modes and times canonical, as a build's
+-- 5. Verify NAR hash matches narinfo, on disk
+-- 6. Register path in DB with references from narinfo
 --
 -- Both paths end the same way: a registered, immutable store path.
 --
@@ -219,7 +223,8 @@ resolveDeleteTarget storeDir raw = storeEntryName basename >>= underThisStore
 -- | Move a build output (file or directory) to the store path, make its
 -- metadata canonical ('canonicalizeMetadata'), and register.
 --
--- If @renamePath@ fails (cross-device move), falls back to copy + remove.
+-- If @renamePath@ fails across volumes (on Windows, for any reason), falls
+-- back to copy + remove.
 addToStore ::
   Store ->
   FilePath ->
@@ -319,8 +324,10 @@ moveOutput src dest
 -- the hash rather than a store-dir-prefixed path keeps the scan
 -- independent of the spelling the builder embedded (canonical
 -- @\/nix\/store\/...@, @C:\\nix\\store\\...@, @C:\/nix\/store\/...@):
--- eval injects canonical forward-slash text into builder environments,
--- which a platform-store-dir prefix never matches on Windows.
+-- a builder is handed its store paths under the store's real directory
+-- (the derivation's canonical spelling is rewritten at the spawn, in
+-- "Nix.Builder"), and what it writes from them may spell that directory
+-- any of these ways.
 scanReferences :: [StorePath] -> FilePath -> IO [StorePath]
 scanReferences candidates dir = do
   let candidateSet = Set.fromList [(spHash sp, sp) | sp <- candidates]
@@ -365,8 +372,8 @@ rewriteStoreHashes rewrites root = rewriteAt id root
         when taken (ioError (userError ("rewriting a store hash would overwrite " <> (dir </> renamed))))
         whileWritable dir (renamePath (dir </> entry) (dir </> renamed))
 
--- | Change a regular file's bytes in place, never following a link.  On
--- POSIX the file is opened without following one, read and written
+-- | Change a regular file's bytes in place.  On POSIX it never follows a
+-- link: the file is opened without following one, read and written
 -- through descriptors that name the inode the first open found, a second
 -- open that finds another refused, and made writable for the write
 -- through its own descriptor, its mode put back after: a link put at the
@@ -425,13 +432,12 @@ writeWhole fd bytes
 #endif
 
 -- | Replace a node with a fresh copy of itself, as upstream replaces a
--- fixed-output output before it hashes one (the @CAFixed@ case of
--- @registerOutputs@ in local-derivation-goal.cc at 2.24.9,
--- @moveOutputToTempDir@ in derivation-builder-impl.cc at 2.36.0): a
+-- fixed-output output before it hashes one: a
 -- descriptor the builder passed out of its build names the old inode, which
 -- the copy leaves behind, so nothing written through it reaches what is
--- registered.  The copy is made beside the node ('freshCopyPath'), then
--- renamed over it, and removed should the replacement fail.
+-- registered.  The copy is made beside the node ('freshCopyPath'), the
+-- node is removed and the copy renamed to its name, and the copy is
+-- removed should the replacement fail.
 replaceWithCopy :: FilePath -> IO ()
 replaceWithCopy path = do
   let copy = freshCopyPath path
@@ -531,14 +537,13 @@ foldlIO z (x : xs) f = do
   foldlIO acc xs f
 
 -- | Write an already-serialized derivation ATerm to its store path and make
--- its metadata canonical ('canonicalizeMetadata'), as upstream's
--- @writeDerivation@ adds a @.drv@ through @addToStoreFromDump@
--- (derivations.cc and local-store.cc).  Used to materialize the input @.drv@
+-- its metadata canonical ('canonicalizeMetadata'), as upstream Nix adds a
+-- @.drv@.  Used to materialize the input @.drv@
 -- closure (root plus every transitive input) before a dependency-aware build:
--- evaluation computes these ATerms but does no store IO, so the build driver
--- writes them here.  A file that already holds exactly these bytes is kept as
--- it is, read-only from the write that made it; one holding anything else,
--- which an interrupted write can leave, is replaced.
+-- evaluation computes these ATerms and records them without writing them,
+-- so the build driver writes them here.  A file that already holds exactly
+-- these bytes is kept as it is, read-only from the write that made it; one
+-- holding anything else, which an interrupted write can leave, is replaced.
 writeDrvAterm :: Store -> StorePath -> BS.ByteString -> IO ()
 writeDrvAterm store sp aterm = do
   let destPath = storePathToFilePath (stDir store) sp
@@ -848,10 +853,8 @@ unpackNamedChildren sensitivity path entries = do
 -- order - each link is created after every pending link its target
 -- resolves at or through - so the Windows link flavor (file vs
 -- directory) is read off the real target with one probe per link.
--- (The previous ready-set rounds re-stat'd every remaining link per
--- round: quadratic filesystem stats on a link chain.)  Links on a
--- dependency cycle have no knowable kind and default to file links,
--- exactly as dangling links always have.
+-- Links on a dependency cycle have no knowable kind and default to file
+-- links, as dangling links do.
 createSymlinks :: [(OsPath, OsPath)] -> IO (Either Text ())
 createSymlinks pending = createAll (orderLinks pending)
   where
@@ -1115,10 +1118,11 @@ sinkNarStream sink source = go Hash.hashInit 0 Stream.narStream `onException` ab
 -- | Restore the copies of eval-coerced paths into the store and register
 -- them.  Each entry is a copy's fixed-output store path with the
 -- path-value text of the tree evaluation hashed for it, the path with its
--- symlinks resolved (text only - eval performs no store writes).  Each
--- entry not already valid is restored from a dump of that tree
--- ('restoreSource'), its metadata made canonical
--- ('canonicalizeMetadata'), and registered.  A source carries no
+-- symlinks resolved (text only: evaluation writes no copy of a coerced
+-- path).  Each entry not already valid is adopted when the tree already at
+-- its path reproduces its address, and otherwise restored from a dump of
+-- that tree ('restoreSource'); its metadata is made canonical
+-- ('canonicalizeMetadata'), and it is registered.  A source carries no
 -- references.  A store upstream Nix's database may also manage is
 -- refused before any entry is looked at, by an
 -- 'IOException' carrying the reason ("Nix.Store.Upstream"): a tree on
@@ -1138,12 +1142,12 @@ materializeEvalSources store sourceCache = do
     -- would wedge the store permanently) and has only their metadata made
     -- canonical, since the tree may be one a restore left before it got
     -- that far, or one an evaluation wrote; a failed one clears and
-    -- restores.  Mirrors the builder's own prepareOutput recovery.
+    -- restores.
     -- The whole check-then-act runs under the path's cross-process
-    -- lock, validity re-checked once held: without it, two processes
-    -- materializing the same source raced isValid, and the loser's
-    -- removePathForcibly deleted the tree the winner had just
-    -- registered.  Same protocol as the builder's withOutputLocks.
+    -- lock, validity re-checked once held, so of two processes
+    -- materializing the same source the second finds the path valid
+    -- rather than clearing the tree the first registered.  Same protocol
+    -- as the builder's withOutputLocks.
     adopt (sp, srcText) =
       withPathLock (stDir store) sp $ \_ -> do
         valid <- isValid store sp

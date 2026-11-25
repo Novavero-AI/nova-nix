@@ -53,8 +53,9 @@ import System.FilePath ((</>))
 
 -- | An open store with database and configuration.  'stDir' is the
 -- canonical spelling ('canonicalStoreDir'); 'stGcLease' is the handle's
--- shared hold on the collector lock, swapped, never released early, by
--- 'withCollectorLock'.
+-- shared hold on the collector lock, which 'withCollectorLock' swaps for
+-- the exclusive lock and back; after a failed renewal the handle holds
+-- none until it is closed.
 data Store = Store
   { stDir :: !StoreDir,
     stDB :: !StoreDB,

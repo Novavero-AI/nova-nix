@@ -7,8 +7,9 @@
 -- object file, or an ar archive, whose members are not read.  A file that
 -- is a tar archive, plain or compressed with gzip, bzip2, xz or zstd, is
 -- opened instead, and each regular file in it is read the same way; an
--- archive inside it is not opened.  A file in another archive format the
--- scan knows is reported as not read, never as holding no prebuilt code.
+-- archive inside it is not opened, nor reported as not read.  A file of
+-- the output in another archive format the scan knows is reported as not
+-- read, never as holding no prebuilt code.
 -- The bytes say which a file is, never its name: a source archive and a
 -- prebuilt package share their suffixes.  A symbolic link is not
 -- followed: a target inside the tree is read where it is, and one outside

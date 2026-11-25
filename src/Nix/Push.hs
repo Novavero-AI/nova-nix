@@ -376,8 +376,7 @@ narFileName narHash = stripHashPrefix narHash <> narExtension
 -- | The uploadable artifact for one NAR under the configured
 -- compression: the bytes the cache stores, the file fields the
 -- narinfo declares, and the object name.  With 'PushNone' every field
--- equals the NAR's own, byte-identical to what this module always
--- pushed.
+-- equals the NAR's own.
 data PushArtifact = PushArtifact
   { paBytes :: !BS.ByteString,
     paFileHash :: !Text,
@@ -465,8 +464,9 @@ splitParts size bytes
 --
 -- Serializes one NAR at a time (bounded memory), uploads all NARs before
 -- any narinfo, and finishes with a signed round-trip check.  Any failure
--- aborts with an error; a partial push leaves only orphaned NARs behind,
--- which are invisible to clients.  An interrupt is not a failure: it
+-- aborts with an error.  One before the first narinfo leaves only NARs no
+-- narinfo names, which are invisible to clients; one after it leaves the
+-- narinfos already published as well.  An interrupt is not a failure: it
 -- stops the push and propagates.
 pushPaths :: PushConfig -> Store -> [StorePath] -> IO (Either Text PushSummary)
 pushPaths cfg store roots =
@@ -582,9 +582,8 @@ checkRecordedNarHash recorded narHash sp = case recorded of
 
 -- | Recorded and computed NAR hashes match when both parse as
 -- @sha256:@ and nix-base32 and their decoded digests agree.  A recorded
--- value that does not parse, such as a foreign cache's base16, falls
--- back to exact text equality, keeping legacy rows comparable rather
--- than un-checkable.
+-- value that does not parse, such as base16, falls back to exact text
+-- equality, so it stays comparable rather than un-checkable.
 narHashMatches :: Text -> Text -> Bool
 narHashMatches recorded computed =
   case (Hash.parseNixHash recorded, Hash.parseNixHash computed) of

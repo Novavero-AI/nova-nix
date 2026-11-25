@@ -4,11 +4,13 @@
 -- which of them its builds run as builders and which hold prebuilt code,
 -- and the builders and sources it takes from outside itself.
 --
--- A fixed-output derivation's output is held to the hash its recipe
--- states, whatever makes it: its bytes are what the hash says, from a
--- download, a cache or a build.  Every one in the closure is an input
--- the closure relies on ('fixedOutputInputs'), whether a builtin fetches
--- it or the closure builds it, and each says which ('Provenance').
+-- A fixed-output derivation's output is named by the hash its recipe
+-- states, whatever makes it.  A download or a build is checked against
+-- that hash before it is registered ("Nix.Builder"); a substitute is
+-- checked against the NarHash its cache's signed narinfo declares
+-- ("Nix.Substituter"), not the recipe's hash.  Every one in the closure is an
+-- input the closure relies on ('fixedOutputInputs'), whether a builtin
+-- fetches it or the closure builds it, and each says which ('Provenance').
 --
 -- Each fixed-output input is classified by two kinds of fact.  One is in
 -- the graph: a derivation whose builder is inside the input's output runs
@@ -359,7 +361,9 @@ data UnreadFile = UnreadFile
 
 -- | What a scan of a fetched output found in its bytes: the files of
 -- prebuilt code, and the files it did not read in full.  Both empty
--- means every file was read and none is prebuilt code.
+-- means every file the scan reached was read and none is prebuilt code; a
+-- member of a tar archive is read by its header alone, so an archive or
+-- compressed stream inside one is neither opened nor reported as not read.
 data ContentFacts = ContentFacts
   { cfCode :: ![FoundCode],
     cfUnread :: ![UnreadFile]
@@ -488,7 +492,8 @@ data Scan
   deriving (Eq, Show)
 
 -- | How a fixed-output input's bytes come to be, each case with its
--- builder.  Either way the hash pins them.
+-- builder.  Either way the recipe's hash pins them when nova-nix fetches
+-- or builds them; bytes a cache supplies are held to its signed NarHash.
 data Provenance
   = -- | A builtin fetches them, such as @builtin:fetchurl@.
     FetchedBy !ByteString
@@ -527,7 +532,8 @@ data InputClass
   | -- | Its bytes were not read, or not all of them, and no prebuilt
     -- code was found in what was.
     NotFullyRead
-  | -- | Every file was read, and none is prebuilt code.
+  | -- | Every file the scan reached was read, and none is prebuilt code
+    -- (an archive inside a tar archive is not opened, "Nix.Trust.Scan").
     HoldsNoPrebuiltCode
   deriving (Eq, Ord, Show, Enum, Bounded)
 

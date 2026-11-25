@@ -8,8 +8,7 @@
 -- * __References__: which other store paths does this path depend on?
 --   (Needed for garbage collection - can't delete a path that others
 --   reference.)
--- * __Registrant__: who put this path here? (Substituted from cache?
---   Built locally?)
+-- * __Registration time__: when the path was registered.
 -- * __Deriver__: which .drv file produced this output? (For @nix-store -q
 --   --deriver@.)
 -- * __NAR hash__: SHA-256 of the path's NAR serialization. (For integrity
@@ -247,9 +246,9 @@ registerPath db reg = registerPaths db [reg]
 -- | Register several store paths as valid in one transaction.
 --
 -- ALL path rows are inserted BEFORE any reference edge, so references among the
--- paths in this batch - e.g. intra-derivation cross-output references - are
--- never dropped.  (Registering one path at a time loses an edge whenever a
--- referrer is registered before its referent.)
+-- paths in this batch - e.g. intra-derivation cross-output references -
+-- resolve whatever the batch order.  (Registering one path at a time would
+-- refuse a referrer registered before its referent.)
 --
 -- Re-registering an existing path refreshes its metadata (NAR hash, size,
 -- deriver) via @ON CONFLICT DO UPDATE@, so a path first registered with a
@@ -355,8 +354,8 @@ queryReferences db sp = do
       IO [Only Text]
   pure [p | Only p <- rows]
 
--- | Query every registered valid path, as full path text in registration
--- order of the table (sorted for determinism).
+-- | Query every registered valid path, as full path text, sorted by that
+-- text for determinism.
 queryAllValidPaths :: StoreDB -> IO [Text]
 queryAllValidPaths db = do
   rows <- query (sdbConn db) "SELECT path FROM ValidPaths ORDER BY path" () :: IO [Only Text]
