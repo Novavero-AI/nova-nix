@@ -211,6 +211,18 @@ pathextValue = ".COM;.EXE;.BAT;.CMD"
 envPath :: Text
 envPath = "PATH"
 
+-- | A Unix build's @PATH@ unless the derivation sets one: upstream's
+-- value, which names no directory there is, so the builder finds no
+-- program its derivation does not name, and a shell does not fall back
+-- to a search path of its own as it would were @PATH@ unset.
+pathNotSet :: Text
+pathNotSet = "/path-not-set"
+
+-- | The system's directories a Windows build's @PATH@ ends with, where
+-- @cmd.exe@ and the programs a job needs are.
+windowsSystemDirs :: [FilePath]
+windowsSystemDirs = ["C:\\Windows\\System32", "C:\\Windows"]
+
 -- | The magic builder string for the built-in URL fetcher.  A derivation with
 -- this builder is not executed as a process - the Builder downloads its @url@
 -- and verifies it against @outputHash@ (see 'runBuiltinFetchurl').
@@ -1611,29 +1623,24 @@ scrubAmbient ambient
                   ]
        in unionEnvs [allowed, synthesized]
 
--- | Construct the build PATH from the builder's location.
--- Includes the builder's directory, its sibling @usr\/bin@ (for MSYS2
--- coreutils bundled with Git for Windows), and system directories,
--- which follow it even when the builder's directory is a store path.
+-- | Construct the build PATH from the builder's location.  On Unix it is
+-- 'pathNotSet', as upstream Nix's is.  On Windows it includes the
+-- builder's directory, its sibling @usr\/bin@ (for MSYS2 coreutils
+-- bundled with Git for Windows), and 'windowsSystemDirs', which follow it
+-- even when the builder's directory is a store path.
 --
--- A bare-name or dot-relative builder has no directory to derive: @.@
--- here would put the BUILD WORKING DIRECTORY first on PATH, so a file
--- dropped into the build dir would resolve ahead of every tool.  Such
--- builders get the system directories only.
+-- A bare-name or dot-relative builder adds no directory: @.@ there
+-- would put the build working directory first on PATH, so a file dropped
+-- into the build directory would resolve ahead of every tool.
 buildPath :: FilePath -> Text
-buildPath builderPath =
-  let builderDir = takeDirectory builderPath
-      parentDir = takeDirectory builderDir
-      -- Builder's own dir + coreutils sibling (Git for Windows' layout)
-      builderDirs
-        | builderDir == "." = []
-        | otherwise = [builderDir, parentDir </> "usr" </> "bin"]
-      systemDirs =
-        if System.Info.os == "mingw32"
-          then ["C:\\Windows\\System32", "C:\\Windows"]
-          else ["/usr/bin", "/bin", "/usr/local/bin"]
-      sep = if System.Info.os == "mingw32" then ";" else ":"
-   in T.intercalate sep (map T.pack (builderDirs ++ systemDirs))
+buildPath builderPath
+  | isWindows = T.intercalate ";" (map T.pack (builderDirs ++ windowsSystemDirs))
+  | otherwise = pathNotSet
+  where
+    builderDir = takeDirectory builderPath
+    builderDirs
+      | builderDir == "." = []
+      | otherwise = [builderDir, takeDirectory builderDir </> "usr" </> "bin"]
 
 -- | The home directory environment variable name (platform-dependent).
 homeEnvVar :: Text

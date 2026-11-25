@@ -186,9 +186,9 @@ runs its builtins, is [#682]. Any other builder is a program, spawned with:
 - `NIX_BUILD_TOP`, `TMPDIR`, `TEMPDIR`, `TMP` and `TEMP` naming the build
   directory, `HOME` (on Windows `USERPROFILE`) naming it too outside the
   sandbox, `NIX_STORE`, `NIX_BUILD_CORES` from `cores`,
-  `SOURCE_DATE_EPOCH`, and a `PATH` of the builder's own directory, that
-  directory's sibling `usr/bin` and the system's directories, each unless
-  the derivation sets it;
+  `SOURCE_DATE_EPOCH`, and `PATH`, which on Linux and macOS is upstream's
+  `/path-not-set` and on Windows is [its own](windows.md#how-a-build-runs),
+  each unless the derivation sets it;
 - nothing from nova-nix's own environment, but the variables a
   fixed-output derivation's `impureEnvVars` names, and on Windows the few
   the system needs ([Windows](windows.md#how-a-build-runs)).
