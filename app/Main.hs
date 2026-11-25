@@ -112,7 +112,8 @@ nixDataDirVar = "NIX_DATA_DIR"
 nixConfigVar :: BS.ByteString
 nixConfigVar = "NIX_CONFIG"
 
--- | The directory holding the system nix.conf, in place of @/etc/nix@.
+-- | The directory holding the system nix.conf, in place of
+-- 'platformSystemConfDir'.
 nixConfDirVar :: BS.ByteString
 nixConfDirVar = "NIX_CONF_DIR"
 
@@ -147,11 +148,11 @@ dataDirMarker = "nix" </> "fetchurl.nix"
 -- a released binary would resolve @\<nix/fetchurl.nix\>@ to a directory that
 -- does not exist on the host running it.
 --
--- @NIX_DATA_DIR@ wins when set, since an operator setting upstream's own
--- variable means it.  Otherwise a release layout (@bin/@ beside @share/@)
--- answers from the executable's own location, which needs no configuration
--- at all.  The Cabal path remains the fallback, so a local install is
--- unaffected.
+-- @NIX_DATA_DIR@ wins when set and not empty, since an operator setting
+-- upstream's own variable means it.  Otherwise a release layout (@bin/@ beside
+-- @share/@) answers from the executable's own location, which needs no
+-- configuration at all.  The Cabal path remains the fallback, so a local
+-- install is unaffected.
 resolveDataDir :: IO FilePath
 resolveDataDir = do
   fromEnv <- lookupEnv nixDataDirVar
@@ -347,15 +348,15 @@ importFromDerivationFor opts config
 -- | Run an action in the evaluation session of one command
 -- ('withEvalSession'), its state's roots allowed.  Every value the
 -- action evaluates is used inside it: the session's end frees them.
--- Upstream's constructor decides the same things in the same order
--- (eval.cc at 2.24.9): under pure-eval the lookup path is empty, so neither
--- @--nix-path@ nor @NIX_PATH@ contributes, and only the bundled @<nix/*>@
--- directory remains, which upstream serves from an in-memory corepkgs
--- filesystem and this binary serves from its data directory (so it stays
--- visible in @builtins.nixPath@, where upstream shows nothing); under
--- either mode every search path root is allowed, as @resolveLookupPathPath@
--- allows the lookup path, so @-I nixpkgs=...@ is what makes a nixpkgs
--- tree readable.
+-- Upstream Nix decides the same things in the same order: under pure-eval
+-- the lookup path is empty, so neither @--nix-path@ nor @NIX_PATH@
+-- contributes, and only the bundled @<nix/*>@ directory remains, which
+-- upstream serves from an in-memory corepkgs filesystem and this binary
+-- serves from its data directory (so it stays visible in
+-- @builtins.nixPath@, where upstream shows nothing); under either mode
+-- every search path root is allowed but a pseudo-URL entry and one with no
+-- UTF-8 reading, as upstream allows the lookup path, so
+-- @--nix-path nixpkgs=...@ is what makes a nixpkgs tree readable.
 --
 -- Each root is allowed under its given spelling and under its resolved
 -- one.  The access walk follows symlinks, so a root reached through a
@@ -491,11 +492,10 @@ evalOrExit st action =
 
 -- | Evaluate a target and print its value.  A function is called first
 -- when an argument is given, as @nix-instantiate --eval@ calls it only
--- then (the @--eval@ branch of @processExpr@ in nix-instantiate.cc).  The
--- session is read-only, as @nix-instantiate --eval@'s is
+-- then.  The session is read-only, as @nix-instantiate --eval@'s is
 -- ('withReadOnlySession'), unless @--read-write-mode@ asks for a read-write
--- one, as it asks @nix-instantiate@'s (@main_nix_instantiate@ in
--- nix-instantiate.cc): then what evaluation made is added to the store once
+-- one, as it asks @nix-instantiate@'s: then what evaluation made is added
+-- to the store before a context's realisation that needs it and once
 -- evaluation succeeds, where upstream adds each object as it makes it.  An
 -- evaluation that made nothing adds nothing, so it asks nothing of a store
 -- upstream Nix manages.
@@ -649,17 +649,16 @@ forceDerivationAttrs val = case val of
   _ -> pure ()
 
 -- | What a build needs forced: the marker, the path whose closure the
--- build driver writes, and the output it realizes.
+-- build driver writes, and the output it prints and links.
 derivationAttrKeys :: [T.Text]
 derivationAttrKeys = ["type", "drvPath", "outputName"]
 
--- | Evaluate a build or trust target and select the attribute path, when
+-- | Evaluate a target command's target and select the attribute path, when
 -- one is given, with the attributes 'derivationPath' reads forced, and
 -- run an action in the session with the state the evaluation recorded
 -- and the selected value.  A function is called with the command line's
 -- arguments before each component of the path is selected from it, and
--- once the path has selected it, as @nix-build@ calls one
--- (@findAlongAttrPath@ in attr-path.cc and @getDerivations@ in get-drvs.cc).
+-- once the path has selected it, as @nix-build@ calls one.
 -- The action reads what the command needs out of them: the session's end
 -- frees the value.  A failure is reported and exits.
 evalTarget :: NixConfig -> CliOpts -> StoreDir -> SessionStore -> FilePath -> Target -> Maybe T.Text -> (EvalState -> NixValue -> IO a) -> IO a
@@ -797,9 +796,10 @@ data BuildCommandStop
 -- store holds, and print what the closure relies on ("Nix.Trust").  The
 -- graph is read from the recipes evaluation recorded.  The evaluation is
 -- read-only ('withReadOnlySession'), so it writes only what a fetcher
--- fetches, and otherwise only the fetches and substitutions of
--- fixed-output inputs write to the store: a closure with no fixed-output
--- input does not open it.  A store directory upstream Nix's database
+-- fetches and what a context's realisation builds, and otherwise only the
+-- fetches and substitutions of fixed-output inputs write to the store: a
+-- closure with no fixed-output input does not open it after evaluation.
+-- A store directory upstream Nix's database
 -- also manages is refused before those are made, as a build refuses one
 -- ("Nix.Store.Upstream").
 trustCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> IO ()
@@ -878,9 +878,9 @@ derivationPath (VAttrs attrs) = do
     _ -> failWith "error: derivation result missing drvPath"
 derivationPath _ = failWith "error: result is not a derivation"
 
--- | The output a build realizes and prints: the value's @outputName@, the
--- first of its @outputs@, which is what upstream's nix-build builds and
--- prints for a derivation (nix-build.cc, @queryOutputName@), with its
+-- | The output a build prints and links, of the outputs it realises: the
+-- value's @outputName@, the first of its @outputs@, which is what
+-- upstream's nix-build builds and prints for a derivation, with its
 -- message for a set that lacks the attribute.
 defaultOutputName :: StorePath -> NixValue -> IO T.Text
 defaultOutputName drvSP val = do
@@ -1921,9 +1921,8 @@ resolvePushRoots store pushArgs
     refuseDerivations roots = case filter isDerivationPath roots of
       [] -> Right roots
       drv : _ -> Left ("push: " <> storePathBasename drv <> " is a derivation; a binary cache serves build outputs, not recipes")
-    -- DB rows are rendered with the OPENED store's dir - parsing against
-    -- platformStoreDir made 'push --all --store DIR' fail on every row of
-    -- a non-default store.
+    -- DB rows are spelled with the opened store's directory, which under
+    -- --store is not platformStoreDir, so each row parses against it.
     parseDbPath txt =
       maybe (Left ("unparseable store DB path: " <> txt)) Right (parseStorePath (stDir store) txt)
     parseArgPath raw =

@@ -70,9 +70,11 @@
 -- prefixed assignment APPENDS to a list.  An @extra-@ on a Boolean or a
 -- scalar names no setting (upstream appends only to an appendable
 -- setting, so @extra-max-call-depth@ is an unknown name) and is ignored
--- like any unknown name.  The caller supplies the sources in order
--- (built-in default, then files, then @NIX_CONFIG@, then the command
--- line), so the command line wins, exactly as upstream orders them.
+-- like any unknown name.  'loadConfig' folds over the built-in default
+-- the files, in the order the caller lists them, then @NIX_CONFIG@, so
+-- @NIX_CONFIG@ overrides every file, as upstream Nix orders them.  The
+-- command line is not a source here: the CLI applies its flags over the
+-- resolved settings.
 --
 -- == Security
 --
@@ -565,9 +567,9 @@ data ConfigAssignment = ConfigAssignment
   deriving (Eq, Show)
 
 -- | Parse one source's bytes into its lines.  Comments and blank lines
--- drop out; a malformed line (fewer than @name = value@, a missing @=@,
+-- drop out; a malformed line (fewer than @name =@, a missing @=@,
 -- or an include with other than exactly one path) is a loud error rather
--- than a silent skip, matching upstream's @UsageError@ - a typo in a
+-- than a silent skip, as upstream Nix makes it - a typo in a
 -- security-relevant file must not pass for an empty setting.  The error
 -- quotes the line as upstream does, comment-truncated and otherwise
 -- verbatim, leading whitespace included.
@@ -648,11 +650,12 @@ unitBase = 1024
 -- @build-fallback@ -> @fallback@, @build-cores@ -> @cores@,
 -- @build-use-chroot@ and @build-use-sandbox@ -> @sandbox@,
 -- @build-chroot-dirs@ and @build-sandbox-paths@ -> @sandbox-paths@) and the
--- @extra-@ prefix (append rather than replace, list settings only).  A name
+-- @extra-@ prefix (append rather than replace, list and path-set settings
+-- only).  A name
 -- outside the known set is ignored, not an error: upstream warns and
 -- continues, and refusing every unknown key would reject a config that
 -- also carries settings this layer does not model.  A value that does
--- not parse for its setting is an error, as upstream's @UsageError@ is:
+-- not parse for its setting is an error, as it is in upstream Nix:
 -- @pure-eval = ture@ must not pass for off.
 applyAssignment :: NixConfig -> ConfigAssignment -> Either Text NixConfig
 applyAssignment config (ConfigAssignment name value) =
@@ -696,8 +699,8 @@ listItems field value = maybe (Left refusal) Right (traverse decoded (configToke
 
 -- | Which setting a name targets, once the @extra-@ prefix and the aliases
 -- are resolved, and whether it replaces or appends.  @extra-@ composes
--- with a list only: upstream looks the base name up and appends when the
--- setting is appendable, and a Boolean or a scalar is not.
+-- with a list or a path set only: upstream looks the base name up and appends
+-- when the setting is appendable, and a Boolean or a scalar is not.
 resolveName :: ByteString -> Maybe (Setting, ApplyMode)
 resolveName name =
   case BS.stripPrefix extraPrefix name of

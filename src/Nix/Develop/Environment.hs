@@ -510,7 +510,8 @@ data Prompt = Prompt
 --   that is not empty;
 --
 -- and last @SHELL@ set to the shell.  The rcfile path, phase and shell go
--- in as they are, unquoted, as upstream writes them.
+-- in as they are, unescaped (the path between single quotes, the shell
+-- between double quotes, the phase bare), as upstream writes them.
 --
 -- Upstream also writes @set -x@ at debug verbosity, and after @SHELL@ a
 -- @PATH@ line naming @nixpkgs#bashInteractive@'s directory when it finds

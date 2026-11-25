@@ -1,10 +1,10 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | A profile: a link to the newest of its generations, each a link to a
--- store path holding the profile's tree and its @manifest.json@, and each
--- a root the collector keeps, in upstream's layout (src\/libstore\/profiles.cc
--- at 2.35.4).
+-- | A profile: a link to its current generation, which a switch made here
+-- always makes the newest; each generation a link to a store path holding
+-- the profile's tree and its @manifest.json@, and each a root the
+-- collector keeps, in upstream Nix's layout.
 --
 -- A user's profiles are in @profiles@ under the state directory:
 -- @$NIX_STATE_HOME@, else @$XDG_STATE_HOME\/nix@, else

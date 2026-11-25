@@ -474,7 +474,8 @@ developRefusals = "A store directory that upstream Nix's database also manages, 
 callRule :: Text
 callRule = "a set with `__functor` stands for what its functor returns given the set, which is called in turn; a function with a set pattern is called with every argument when it takes `...` and otherwise with those its formals name, its defaults filling the rest, and a formal with neither an argument nor a default fails the command; any other value is left as it is."
 
--- | When @build@ and @trust@ call a function, as @nix-build@ does.
+-- | When the commands that take a target call a function, as @nix-build@
+-- does.
 targetCalls :: Text
 targetCalls = "Before each component of the `-A` path is selected from it, and once the path has selected it, the value is called as `nix-build` calls it, with the arguments from `--arg` and `--argstr` or with none: " <> callRule
 
@@ -726,7 +727,8 @@ data Setting = Setting
     -- | What it does, in a line.
     settingDescription :: !Text,
     -- | The flag that adds to it on one invocation, where there is one: an
-    -- entry to a list, or a Boolean moved from its default.
+    -- entry to a list, or a Boolean moved from its default; for @sandbox@,
+    -- the mode the flag names, in place of the configured one.
     settingFlag :: !(Maybe FlagName)
   }
   deriving (Eq, Show)

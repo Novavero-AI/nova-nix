@@ -3,12 +3,13 @@
 -- Handles all Nix tokens including string interpolation via a mode stack.
 -- Entirely pure - no IO.
 --
--- The source is bytes, as upstream's flex scanner reads it (lexer.l at
--- 2.24.9).  Every token class is ASCII, as upstream's are, so a byte
+-- The source is bytes, as upstream's flex scanner reads it.  Every token
+-- class is ASCII, as upstream's are, so a byte
 -- outside ASCII never continues an identifier, number, path, URI or run of
 -- whitespace, while string literals and comments hold whatever bytes they
 -- hold: a string chunk is the source's bytes with its escapes resolved,
--- which is what the eval string gets.  Bytes are matched as Latin-1
+-- and in a double-quoted string each line ending read as one LF, which is
+-- what the eval string gets.  Bytes are matched as Latin-1
 -- 'Char's through "Data.ByteString.Char8" so the grammar reads as
 -- character literals, which is why no predicate here is one of
 -- "Data.Char"'s Unicode classes: 'Data.Char.isAlpha' calls the byte 0xE9
@@ -92,7 +93,8 @@ data Token
   | TokStringClose
   | TokIndStringOpen
   | TokIndStringClose
-  | -- | A literal chunk of a string: the source's bytes, escapes resolved.
+  | -- | A literal chunk of a string: the source's bytes, escapes resolved,
+    -- and in a double-quoted string each line ending read as LF.
     TokStringLit !ByteString
   | -- | Resolved escape text inside an indented string (@'''@, @''$@,
     -- @''${@, @''\x@).  Kept apart from 'TokStringLit' because upstream's

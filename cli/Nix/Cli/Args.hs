@@ -75,8 +75,9 @@ data CliOpts = CliOpts
     -- does.
     optCheck :: !Bool,
     -- | @--read-write-mode@: @eval@ writes what evaluation makes to the
-    -- store and realises what a path's context names, as
-    -- @nix-instantiate --eval --read-write-mode@ does.
+    -- store and builds or substitutes what a path's context names, as
+    -- @nix-instantiate --eval --read-write-mode@ does; without it, eval
+    -- realises those with every substitution refused.
     optReadWriteMode :: !Bool,
     -- | @--sandbox@, @--no-sandbox@ or @--relaxed-sandbox@, the last given:
     -- upstream's @sandbox@ on this run.
@@ -87,7 +88,8 @@ data CliOpts = CliOpts
 
 -- | The command an invocation runs.
 data Command
-  = -- | @eval@: evaluate the target and print its value.
+  = -- | @eval@: evaluate the target and print its value, or under
+    -- @--aterm@ the ATerm of the derivation it evaluates to.
     CmdEval !Target
   | CmdBuild !Target !(Maybe T.Text) !OutLink
   | -- | @develop@: start a shell with the build environment of the
@@ -112,7 +114,8 @@ data Command
     CmdProfileRemove !ProfileSelection !RemoveSelection
   | -- | @profile list@: print what a profile holds.
     CmdProfileList !ProfileSelection !ListFormat
-  | -- | No command given.  Usage on stderr, non-zero: a bare invocation is
+  | -- | No command given, or @eval@ given no target.  Usage on stderr,
+    -- non-zero: a bare invocation is
     -- a usage error, and a caller testing the exit status must see one.
     CmdUsage
   | -- | @--help@.  The same text on stdout, zero: it is a request that
@@ -130,9 +133,8 @@ data Target
     -- upstream's @resolveExprPath@ reads one (eval.cc).  Relative paths
     -- inside it resolve beside the file.
     TargetFile !FilePath
-  | -- | @\<NAME\>@: the file the search path finds for the name, as
-    -- @\<NAME\>@ in an expression finds it, read as 'TargetFile' reads
-    -- one.
+  | -- | @\<NAME\>@: the file the search path finds for the name, found
+    -- and read as @import \<NAME\>@ in an expression finds and reads it.
     TargetSearchPath !String
   | -- | An inline expression.  Relative paths inside it resolve against the
     -- working directory, since there is no file to sit beside.
@@ -473,8 +475,9 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     goEval _ (arg@('-' : _) : _) = Left ("unknown eval flag: " ++ arg)
     goEval opts (path : rest) =
       go (opts {optCommand = CmdEval (fileTarget path)}) rest
-    -- Sub-parser for build and trust: the target, -A, and the shared flags
-    -- in any order, and for build its own flags.  The shared flags are
+    -- Sub-parser for the target commands (build, develop, print-dev-env,
+    -- trust and profile add): the target, -A, and the shared flags in any
+    -- order, and each command's own flags.  The shared flags are
     -- handled here rather than deferred back to 'go' so that one can follow
     -- the file argument, which is where a caller reaches for it, and so
     -- that -A is still recognised after it.

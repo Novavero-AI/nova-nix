@@ -2,9 +2,9 @@
 
 -- | A path as the host's file API takes it ('OsPath'), spelled from the
 -- bytes nova-nix holds for it, and shown back in a message.  One spelling
--- serves every such path: a NAR's entry names and link targets
--- ("Nix.Store.EntryName"), and nix.conf's include targets and directories
--- ("Nix.Config").
+-- serves every such path, among them a NAR's entry names and link
+-- targets ("Nix.Store.EntryName"), and nix.conf's include targets and
+-- directories ("Nix.Config").
 --
 -- Upstream keeps such a path as the bytes it read and hands them to the
 -- file system unchanged (@RestoreSink@ in fs-sink.cc, @parseConfigFiles@
