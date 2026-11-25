@@ -14,7 +14,8 @@
 --    @URL@ field names, and, in one bounded streaming pass, decompress,
 --    hash, parse, and unpack into the store path
 -- 6. Verify the declared NAR hash and size against the streamed bytes,
---    then re-verify the materialized tree from disk
+--    then re-verify the materialized tree from disk and hold it to the
+--    content address the narinfo states ('checkStatedAddress')
 -- 7. Register in the store DB with references from narinfo
 --
 -- A build reads a path's narinfo before anything is downloaded, to realise
@@ -95,6 +96,7 @@ module Nix.Substituter
     verifySigs,
     verifyNarHash,
     verifyNarSize,
+    checkStatedAddress,
     narInfoMatchesPath,
     decompressorFor,
     decompressNar,
@@ -132,12 +134,15 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Compression (NarCompression (..), parseNarCompression)
+import Nix.Daemon.Protocol (ContentAddressMethod (..), caAlgo, caDigest, caMethod, parseContentAddress)
+import Nix.Hash (FileIngestionMethod (..), ModuloHash, moduloHashFinalize, moduloHashInit, moduloHashUpdate)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, fetchStatusFailure, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Realise (Fallback (..), Offer (..))
 import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), UpstreamHazard (..), abortNarUnpack, acquirePathLock, canonicalizeMetadata, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, sinkNarStream, unpackNarEntry, upstreamManagedRefusal, volumeCaseHack)
 import Nix.Store.DB (PathRegistration (..))
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Path (StoreDir, StorePath (spHash, spName), parseStorePathBaseName, storePathHashLen, storePathToFilePath)
+import Nix.Store.Path (StoreDir, StorePath (spHash, spName), parseStorePathBaseName, storePathHashLen, storePathToFilePath, storePathToText)
+import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Bzip2 as Bzip2
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
@@ -147,7 +152,7 @@ import qualified NovaCache.Validate as Validate
 import qualified NovaCache.Xz as Xz
 import qualified NovaCache.Zstd as Zstd
 import qualified System.Directory as Dir
-import System.IO (stderr)
+import System.IO (IOMode (ReadMode), stderr, withBinaryFile)
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -488,7 +493,9 @@ renderValidationError verr = case verr of
       field <> " '" <> raw <> "' does not parse: " <> T.pack parseErr
 
 -- | NAR bytes that passed 'verifyNar': they hash to the narinfo's
--- signed NarHash and count its signed NarSize.  The constructor is not
+-- signed NarHash and count its signed NarSize, with the content address
+-- the narinfo states, which the unpacked tree is held to
+-- ('checkStatedAddress').  The constructor is not
 -- exported, so 'verifyNar' is the only way to obtain one and
 -- 'unpackVerifiedNar', the strict pipeline's unpack sink, cannot be
 -- reached with bytes that skipped the check: verify-then-unpack is a
@@ -499,17 +506,21 @@ renderValidationError verr = case verr of
 -- writes to disk before the hash can be known (upstream's ordering)
 -- and relies on its cleanup contract instead
 -- ('materializeNarFromSource').
-data VerifiedNar = VerifiedNar !BS.ByteString !Hash.NixHash
+data VerifiedNar = VerifiedNar !BS.ByteString !Hash.NixHash !(Maybe Text)
   deriving (Eq, Show)
 
 -- | The verified bytes.
 verifiedNarBytes :: VerifiedNar -> BS.ByteString
-verifiedNarBytes (VerifiedNar bytes _) = bytes
+verifiedNarBytes (VerifiedNar bytes _ _) = bytes
 
 -- | The digest the verified bytes hash to, decoded from the narinfo's
 -- NarHash.
 verifiedNarDigest :: VerifiedNar -> Hash.NixHash
-verifiedNarDigest (VerifiedNar _ digest) = digest
+verifiedNarDigest (VerifiedNar _ digest _) = digest
+
+-- | The content address the narinfo states, if it states one.
+verifiedNarAddress :: VerifiedNar -> Maybe Text
+verifiedNarAddress (VerifiedNar _ _ address) = address
 
 -- | The only constructor of a t'VerifiedNar': the hash check, then the
 -- size check, with the decoded declared digest carried out.  The NAR
@@ -520,7 +531,7 @@ verifyNar :: NarInfo.NarInfo -> BS.ByteString -> Either Text VerifiedNar
 verifyNar narInfo rawNar = do
   declared <- verifyNarHash narInfo rawNar
   verifyNarSize narInfo rawNar
-  pure (VerifiedNar rawNar declared)
+  pure (VerifiedNar rawNar declared (NarInfo.niCA narInfo))
 
 -- | Verify the NAR hash and size, deserialize, unpack to the store, and
 -- set permissions: 'verifyNar', then 'unpackVerifiedNar'.  Returns the
@@ -595,16 +606,15 @@ unpackVerifiedNar store sp verified refs deriver =
               -- is removed - left in place it would be adopted by
               -- existence checks at this path.
               onDisk <- ExecBit.serialiseFromPath (volumeCaseHack (stCaseSensitivity store)) destPath
-              if Hash.hashBytes (NAR.serialise onDisk) /= digest
-                then do
+              addressed <-
+                if Hash.hashBytes (NAR.serialise onDisk) /= digest
+                  then pure (Left ("unpacked tree does not reproduce the declared NAR hash at " <> T.pack destPath))
+                  else checkStatedAddress (volumeCaseHack (stCaseSensitivity store)) (stDir store) sp destPath (verifiedNarAddress verified)
+              case addressed of
+                Left err -> do
                   Dir.removePathForcibly destPath
-                  pure
-                    ( SubstError
-                        ( "unpacked tree does not reproduce the declared NAR hash at "
-                            <> T.pack destPath
-                        )
-                    )
-                else
+                  pure (SubstError err)
+                Right () ->
                   pure $
                     SubstSuccess
                       PathRegistration
@@ -621,6 +631,61 @@ unpackVerifiedNar store sp verified refs deriver =
                           prReferences = refs
                         }
                       lock
+
+-- | Hold a substituted tree to the content address its narinfo states, as
+-- upstream's store holds a path it adds once the NAR's hash and size are
+-- checked: the tree is hashed as the address's method reads it, its NAR,
+-- or for a flat or text address the bytes of the regular file it must
+-- be, modulo the path's hash part, and refused in upstream's words when
+-- that differs.  A narinfo that states no address holds the tree to its
+-- NarHash alone, as upstream's does.
+checkStatedAddress :: NAR.CaseHack -> StoreDir -> StorePath -> FilePath -> Maybe Text -> IO (Either Text ())
+checkStatedAddress caseHack dir sp destPath stated = case stated of
+  Nothing -> pure (Right ())
+  Just spelled -> case parseContentAddress spelled of
+    Left err -> pure (Left ("narinfo CA '" <> spelled <> "' does not parse: " <> err))
+    Right address -> case moduloHashInit (caAlgo address) (TE.encodeUtf8 (spHash sp)) of
+      Nothing -> pure (Left ("narinfo CA '" <> spelled <> "' names an algorithm nova-nix cannot hash with"))
+      Just start -> (>>= compared address) <$> treeDigest caseHack (caMethod address) start destPath
+  where
+    compared address got
+      | got == caDigest address = Right ()
+      | otherwise =
+          Left
+            ( "ca hash mismatch importing path '"
+                <> storePathToText dir sp
+                <> "';\n  specified: "
+                <> caAlgo address
+                <> ":"
+                <> Nix32.encode (caDigest address)
+                <> "\n  got:       "
+                <> caAlgo address
+                <> ":"
+                <> Nix32.encode got
+            )
+
+-- | A tree's digest modulo a hash part as a content address's method
+-- reads the tree: its NAR, or the bytes of the regular file a flat or
+-- text address names.
+treeDigest :: NAR.CaseHack -> ContentAddressMethod -> ModuloHash -> FilePath -> IO (Either Text BS.ByteString)
+treeDigest caseHack method start path = case method of
+  FixedMethod NarIngestion -> Right <$> ExecBit.withNarSource caseHack path (absorb start)
+  FixedMethod FlatIngestion -> fileDigest
+  TextMethod -> fileDigest
+  where
+    absorb !state pull = do
+      chunk <- pull
+      if BS.null chunk then pure (moduloHashFinalize state) else absorb (moduloHashUpdate state chunk) pull
+    fileDigest = do
+      link <- Dir.pathIsSymbolicLink path
+      regular <- if link then pure False else Dir.doesFileExist path
+      if regular
+        then Right <$> withBinaryFile path ReadMode (\handle -> absorb start (BS.hGetSome handle fileReadChunkBytes))
+        else pure (Left ("'" <> T.pack path <> "' is not a regular file, which its flat content address names"))
+
+-- | How many bytes of a file 'treeDigest' reads at a time.
+fileReadChunkBytes :: Int
+fileReadChunkBytes = 64 * 1024
 
 -- | Verify that the downloaded NAR bytes hash to the narinfo's declared
 -- NarHash, returning the decoded digest on success so registration can
@@ -921,11 +986,15 @@ materializeNarFromSource store sp narInfo declaredDigest refs deriver source =
           -- would reject exactly the paths this representation exists for.
           -- On Unix it is still the streaming hash.
           onDiskDigest <- ExecBit.narHashOfPath (volumeCaseHack (stCaseSensitivity store)) destPath
-          if onDiskDigest /= declaredDigest
-            then do
+          addressed <-
+            if onDiskDigest /= declaredDigest
+              then pure (Left ("unpacked tree does not reproduce the declared NAR hash at " <> T.pack destPath))
+              else checkStatedAddress (volumeCaseHack (stCaseSensitivity store)) (stDir store) sp destPath (NarInfo.niCA narInfo)
+          case addressed of
+            Left err -> do
               Dir.removePathForcibly destPath
-              pure (Left (FatalFailure ("unpacked tree does not reproduce the declared NAR hash at " <> T.pack destPath)))
-            else
+              pure (Left (FatalFailure err))
+            Right () ->
               pure $
                 Right
                   PathRegistration

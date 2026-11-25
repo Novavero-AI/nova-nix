@@ -76,6 +76,7 @@ module Nix.Daemon.Protocol
     caMethod,
     caAlgo,
     caDigest,
+    parseContentAddress,
     getContentAddress,
     putContentAddress,
     getOptionalContentAddress,

@@ -28,7 +28,7 @@ import Test.Pkgs (testBinutilsNativeX8664Windows, testBinutilsWindows, testBinut
 import Test.Push (testPushClosureIO, testPushDirectory, testPushMultipart, testPushPure)
 import Test.Realise (testDepGraph, testRealise)
 import Test.Store (testCaseSensitiveVolumeIO, testExecBit, testFoldingVolumeIO, testGcPure, testHashHelpers, testLinkOrdering, testNarKnownAnswer, testNarNameSafety, testParseStorePath, testPathLocks, testSerialiseIfReadableIO, testStoreAccessIO, testStoreDB, testStoreDelete, testStoreGC, testStoreGCUpstreamManaged, testStoreMetadata, testStoreNameSinks, testStoreNameSinksIO, testStoreOps, testStoreOpsIO, testStorePaths, testStoreWritesUpstreamManaged, testSymlinkWalksIO)
-import Test.Substituter (testNarInfoValidation, testSubstituter, testSubstituterRetry, testVerifySigs)
+import Test.Substituter (testNarInfoValidation, testStatedContentAddress, testSubstituter, testSubstituterRetry, testVerifySigs)
 import Test.Trust (testTrust, testTrustScanIO, testTrustWindowsGraphs)
 
 main :: IO ()
@@ -262,6 +262,7 @@ runSuite = do
           testRealiseContext,
           testRealiseContextIO,
           testSubstituter,
+          testStatedContentAddress,
           testCaseSensitiveVolumeIO,
           testFoldingVolumeIO,
           testPathLocks,
