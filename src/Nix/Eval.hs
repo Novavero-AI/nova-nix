@@ -2232,12 +2232,15 @@ builtinPartition predFn (VList cl) = do
 builtinPartition _ other =
   throwEvalError ("builtins.partition: expected a list, got " <> typeName other)
 
--- | Tail-recursive partition with accumulator to avoid stack overflow.
+-- | Each element, forced before the function is applied to it, as
+-- upstream forces each one, in the side the function puts it on.
+-- Tail-recursive with accumulators to avoid stack overflow.
 partitionThunks :: (MonadEval m) => NixValue -> [Thunk] -> m ([Thunk], [Thunk])
 partitionThunks predFn = go [] []
   where
     go !rs !ws [] = pure (reverse rs, reverse ws)
     go !rs !ws (thunk : rest) = do
+      _ <- force thunk
       result <- applyValueLazy predFn thunk
       case result of
         VBool True -> go (thunk : rs) ws rest

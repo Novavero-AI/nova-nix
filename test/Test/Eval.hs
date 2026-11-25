@@ -3555,6 +3555,10 @@ testBuiltinArgumentOrder = do
            yields "builtins.foldl' { __functor = self: acc: x: acc + x; } 0 [ 1 2 ] == 3" (VBool True),
            yields "builtins.length (builtins.genericClosure { startSet = [ { key = 1; } ]; operator = { __functor = self: item: [ ]; }; }) == 1" (VBool True)
          ]
+      -- partition forces each element before the function sees it.
+      <> [ fails "builtins.partition (x: true) [ (throw \"element\") ]" "element",
+           yields "builtins.any (x: true) [ (throw \"element\") ]" (VBool True)
+         ]
 
 -- ---------------------------------------------------------------------------
 -- Tests: Batch 1 - Trivial pure builtins + constants
