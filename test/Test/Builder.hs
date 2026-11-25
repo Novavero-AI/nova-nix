@@ -56,7 +56,7 @@ import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.GZip as GZip
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (async, cancel, wait, waitCatch, withAsync, withAsyncBound)
+import Control.Concurrent.Async (async, cancel, poll, wait, waitCatch, withAsync, withAsyncBound)
 import Control.Exception (AsyncException (..), IOException, bracket, bracket_, catches, finally, fromException, throwIO, toException, try)
 import Control.Monad (guard, replicateM, replicateM_, unless, void, when, (>=>))
 import Control.Monad.Except (runExceptT)
@@ -2028,10 +2028,11 @@ testDarwinSandboxBody helper = do
             let marker = "987655"
                 sleeper = (("/bin/sleep " <> TE.encodeUtf8 marker) `BS.isPrefixOf`)
                 sleepers = length . filter sleeper <$> runningCommands
-                script = "/bin/sleep " <> marker <> "1 & /bin/sleep " <> marker <> "2; echo ran > $out"
+                script = startedScript <> "/bin/sleep " <> marker <> "1 & /bin/sleep " <> marker <> "2; echo ran > $out"
                 buildDir = buildDirFor (stDir store) (outputAt 'f')
             withAsync (buildDerivation (configFor store) store (drvFor 'f' script) testDrvPath) $ \build -> do
-              appeared <- waitUntil ((== 2) <$> sleepers)
+              started <- awaitStart buildDir (isJust <$> poll build)
+              appeared <- (started &&) <$> waitUntilWithin startWaitMicros ((== 2) <$> sleepers)
               cancel build
               gone <- waitUntil ((== 0) <$> sleepers)
               buildDirLeft <- Dir.doesPathExist buildDir
@@ -2051,12 +2052,13 @@ testDarwinSandboxBody helper = do
         runTestM "USR1 sent to the helper ends every process of the build, one that left the builder's group included" $
           withSandboxStore $ \store -> do
             let marker = "987656"
-                script = escapeScript <> "/bin/sleep " <> marker <> "; echo ran > $out"
+                script = startedScript <> escapeScript <> "/bin/sleep " <> marker <> "; echo ran > $out"
             withAsync (buildDerivation (escapeConfig store) store (drvFor 'p' script) testDrvPath) $ \build -> do
-              appeared <- waitUntil ((== (1, 1)) <$> ((,) <$> sleepersWith marker <*> escapees))
+              started <- awaitStart (buildDirFor (stDir store) (outputAt 'p')) (isJust <$> poll build)
+              appeared <- (started &&) <$> waitUntilWithin startWaitMicros ((== (1, 1)) <$> ((,) <$> sleepersWith marker <*> escapees))
               helpers <- helperProcesses
               traverse_ (\pid -> Proc.callProcess "/bin/kill" ["-USR1", pid]) helpers
-              result <- timeout processWaitMicros (wait build)
+              result <- timeout startWaitMicros (wait build)
               gone <- waitUntil ((== (0, 0)) <$> ((,) <$> sleepersWith marker <*> escapees))
               pure $
                 assertEqual "started" True appeared
@@ -2067,7 +2069,7 @@ testDarwinSandboxBody helper = do
           withSandboxStore $ \store -> withSandboxStore $ \other -> do
             let marker = "987657"
                 unrelatedMarker = "987659"
-                script = "/bin/sleep " <> marker <> "1 & /bin/sleep " <> marker <> "2; echo ran > $out"
+                script = startedScript <> "/bin/sleep " <> marker <> "1 & /bin/sleep " <> marker <> "2; echo ran > $out"
                 unrelatedProfile =
                   unlines
                     [ "(version 1)",
@@ -2078,7 +2080,8 @@ testDarwinSandboxBody helper = do
                 unrelatedSpec = Proc.proc "/usr/bin/sandbox-exec" ["-p", unrelatedProfile, "/bin/sleep", T.unpack unrelatedMarker]
             bracket (Proc.createProcess unrelatedSpec) (\(_, _, _, handle) -> Proc.terminateProcess handle *> void (Proc.waitForProcess handle)) $ \_ ->
               withAsync (buildDerivation (configFor store) store (drvFor 'q' script) testDrvPath) $ \running -> do
-                appeared <- waitUntil ((== (2, 1)) <$> ((,) <$> sleepersWith marker <*> sleepersWith unrelatedMarker))
+                started <- awaitStart (buildDirFor (stDir store) (outputAt 'q')) (isJust <$> poll running)
+                appeared <- (started &&) <$> waitUntilWithin startWaitMicros ((== (2, 1)) <$> ((,) <$> sleepersWith marker <*> sleepersWith unrelatedMarker))
                 ended <- buildDerivation (configFor other) other (drvFor 'r' "echo ran > $out") testDrvPath
                 left <- (,) <$> sleepersWith marker <*> sleepersWith unrelatedMarker
                 cancel running
@@ -2100,7 +2103,7 @@ testDarwinSandboxBody helper = do
             afterSandboxed <- accepted
             unsandboxed <- buildDerivation (unsandboxedConfig store) store (drvFor 'v' script) testDrvPath
             unsandboxedExit <- readOutput store 'v'
-            reached <- waitUntil ((== 1) <$> accepted)
+            reached <- waitUntilWithin startWaitMicros ((== 1) <$> accepted)
             pure $
               assertEqual "sandboxed" (BuildSuccess (outputAt 's')) sandboxed
                 `andThen` assertEqual "nc's exit, sandboxed" "1\n" sandboxedExit
@@ -2161,9 +2164,10 @@ testDarwinSandboxBody helper = do
                 writers = length . filter (TE.encodeUtf8 writer `BS.isPrefixOf`) <$> runningCommands
             -- Not withAsync, which would wait for a build that cannot end,
             -- so a cancel that never returns fails the test at the timeout.
-            build <- async (buildDerivation (configFor store) {bcBuildLog = discard} store (drvFor '0' (writer <> "; echo ran > $out")) testDrvPath)
-            started <- waitUntil ((== 1) <$> writers)
-            cancelled <- timeout processWaitMicros (cancel build)
+            build <- async (buildDerivation (configFor store) {bcBuildLog = discard} store (drvFor '0' (startedScript <> writer <> "; echo ran > $out")) testDrvPath)
+            running <- awaitStart (buildDirFor (stDir store) (outputAt '0')) (isJust <$> poll build)
+            started <- (running &&) <$> waitUntilWithin startWaitMicros ((== 1) <$> writers)
+            cancelled <- timeout startWaitMicros (cancel build)
             gone <- waitUntil ((== 0) <$> writers)
             pure $
               assertEqual "started" True started
@@ -2187,12 +2191,15 @@ testDarwinSandboxBody helper = do
                       Sandbox.dprNetwork = Sandbox.PrivateNetwork,
                       Sandbox.dprStoreDir = realStore,
                       Sandbox.dprOutputs = [],
-                      Sandbox.dprPaths = [Sandbox.Literal "/usr/bin/yes", Sandbox.Subpath "/usr/lib", Sandbox.Subpath "/System/Library/Frameworks"],
-                      Sandbox.dprAncestry = Set.toAscList (Set.fromList (concatMap ancestors ["/usr/bin", "/System/Library", realScratch])),
+                      Sandbox.dprPaths = [Sandbox.Literal "/bin/sh", Sandbox.Literal "/bin/bash", Sandbox.Literal "/usr/bin/yes", Sandbox.Subpath "/usr/lib", Sandbox.Subpath "/System/Library/Frameworks"],
+                      Sandbox.dprAncestry = Set.toAscList (Set.fromList (concatMap ancestors ["/bin", "/usr/bin", "/System/Library", realScratch])),
                       Sandbox.dprExtra = ""
                     }
               plan = Sandbox.DarwinPlan realScratch profile (Sandbox.darwinParameters realScratch Sandbox.LocalNetworkingDenied) []
-              spec = (Proc.proc helper ["run", "/usr/bin/yes", T.unpack marker]) {Proc.cwd = Just scratch, Proc.env = Just [], Proc.std_in = Proc.CreatePipe, Proc.std_out = Proc.CreatePipe, Proc.std_err = Proc.CreatePipe}
+              -- The builder says it runs, in the build directory it starts
+              -- in, then becomes the writer.
+              builder = ["/bin/sh", "-c", ": > " <> buildStartedName <> "; exec /usr/bin/yes " <> T.unpack marker]
+              spec = (Proc.proc helper ("run" : builder)) {Proc.cwd = Just scratch, Proc.env = Just [], Proc.std_in = Proc.CreatePipe, Proc.std_out = Proc.CreatePipe, Proc.std_err = Proc.CreatePipe}
               -- Kill what a helper that never ended leaves, all of it
               -- started here, so a failure does not outlive the test.
               -- A process that has ended by now makes kill fail, which
@@ -2211,7 +2218,8 @@ testDarwinSandboxBody helper = do
                 case spawned of
                   (Just planIn, Just statusOut, Just logOut, process) -> do
                     BS.hPut planIn (Sandbox.renderDarwinPlan plan) *> hFlush planIn
-                    started <- waitUntil ((== 1) <$> writers)
+                    running <- awaitStart scratch (isJust <$> Proc.getProcessExitCode process)
+                    started <- (running &&) <$> waitUntilWithin startWaitMicros ((== 1) <$> writers)
                     stop planIn process :: IO ()
                     ended <- timeout helperEndMicros (Proc.waitForProcess process)
                     when (isNothing ended) (killLeft process)
@@ -2220,8 +2228,9 @@ testDarwinSandboxBody helper = do
                     traverse_ (\handle -> void (try (hClose handle) :: IO (Either IOException ()))) [planIn, statusOut, logOut]
                     pure (started, isJust ended, gone)
                   _ -> pure (False, False, False)
-          terminated <- unread (\_ process -> Proc.terminateProcess process)
-          cutOff <- unread (\planIn _ -> hClose planIn)
+          let fresh = Dir.removePathForcibly (scratch </> buildStartedName)
+          terminated <- fresh *> unread (\_ process -> Proc.terminateProcess process)
+          cutOff <- fresh *> unread (\planIn _ -> hClose planIn)
           pure $
             assertEqual "SIGTERM: started, ended, builder gone" (True, True, True) terminated
               `andThen` assertEqual "lifeline: started, ended, builder gone" (True, True, True) cutOff,
@@ -2236,15 +2245,18 @@ testDarwinSandboxBody helper = do
         runTestM "a SIGHUP the helper started out ignoring, as under nohup, leaves the build running" $
           withSandboxStore $ \store -> withHangupIgnored $ do
             let goFile = "\"$NIX_BUILD_TOP/go\""
-                script = awaitPathScript goFile <> "; [ -e " <> goFile <> " ] || exit 3; echo ran > $out"
-                waiting = length . filter (BS.isInfixOf "NIX_BUILD_TOP/go") <$> runningCommands
+                script = startedScript <> awaitPathScript goFile <> "; [ -e " <> goFile <> " ] || exit 3; echo ran > $out"
+                buildDir = buildDirFor (stDir store) (outputAt 'l')
+                -- The builder's own shell, which the helper's command line,
+                -- holding the same script, is not.
+                builderRunning = any (\command -> "/bin/sh -c " `BS.isPrefixOf` command && "NIX_BUILD_TOP/go" `BS.isInfixOf` command) <$> runningCommands
             withAsync (buildDerivation (configFor store) store (drvFor 'l' script) testDrvPath) $ \build -> do
-              started <- waitUntil ((== 1) <$> waiting)
+              started <- awaitStart buildDir (isJust <$> poll build)
               helpers <- helperProcesses
               traverse_ (\pid -> Proc.callProcess "/bin/kill" ["-HUP", pid]) helpers
-              ended <- waitUntilWithin signalSettleMicros ((== 0) <$> waiting)
-              unless ended $ BS.writeFile (buildDirFor (stDir store) (outputAt 'l') </> "go") ""
-              result <- timeout processWaitMicros (wait build)
+              ended <- waitUntilWithin signalSettleMicros (not <$> builderRunning)
+              unless ended $ BS.writeFile (buildDir </> "go") ""
+              result <- timeout startWaitMicros (wait build)
               pure $
                 assertEqual "started" True started
                   `andThen` assertEqual "helpers signalled" 1 (length helpers)
@@ -2651,13 +2663,42 @@ waitUntilWithin micros condition = go (micros `div` pollMicros)
       done <- condition
       if done then pure True else threadDelay pollMicros >> go (remaining - 1)
 
--- | A shell command that waits, as 'waitUntil' does, for a path to exist.
+-- | How long a test waits for a build, or a process it starts, to get
+-- going or to finish before taking it as never doing so: long enough for a
+-- loaded CI runner.  A wait ends the moment what it waits for holds, so
+-- the bound costs time only when a test fails.
+startWaitMicros :: Int
+startWaitMicros = 12 * processWaitMicros
+
+-- | A shell command that waits, checking every 'pollMicros', for a path to
+-- exist, for at most 'startWaitMicros'.
 awaitPathScript :: T.Text -> T.Text
 awaitPathScript path =
   T.concat
-    [ "polls=0; while [ ! -e " <> path <> " ] && [ $polls -lt " <> T.pack (show (processWaitMicros `div` pollMicros)) <> " ]; ",
+    [ "polls=0; while [ ! -e " <> path <> " ] && [ $polls -lt " <> T.pack (show (startWaitMicros `div` pollMicros)) <> " ]; ",
       "do /bin/sleep " <> T.pack (show (fromIntegral pollMicros / 1000000 :: Double)) <> "; polls=$((polls + 1)); done"
     ]
+
+-- | The file a test's build makes in its directory once it runs.
+buildStartedName :: FilePath
+buildStartedName = "started"
+
+-- | The shell command a test's build starts with, which says it runs
+-- ('awaitStart').
+startedScript :: T.Text
+startedScript = ": > \"$NIX_BUILD_TOP/" <> T.pack buildStartedName <> "\"; "
+
+-- | Whether a build said it runs, by making 'buildStartedName' in the
+-- given directory, before the given check found it ended or
+-- 'startWaitMicros' ran out.
+awaitStart :: FilePath -> IO Bool -> IO Bool
+awaitStart directory ended = go (startWaitMicros `div` pollMicros)
+  where
+    go :: Int -> IO Bool
+    go remaining = do
+      started <- Dir.doesFileExist (directory </> buildStartedName)
+      over <- ended
+      if started || over || remaining <= 0 then pure started else threadDelay pollMicros *> go (remaining - 1)
 
 -- | Step 1 of the Windows-stdenv ladder: prove the Builder can run a
 -- trivial derivation end-to-end natively - a recipe that writes to @$out@,
