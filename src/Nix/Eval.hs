@@ -146,7 +146,7 @@ import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CStr (cstrText)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), BcCaptureInfo (..), BcInheritedName (..), BcShares (..), decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, foldBcBindings, foldBcInheritedNames, foldBcShares, reassembleDouble, reassembleInt64)
-import Nix.Eval.Context (contextIsEmpty, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, plainContext)
+import Nix.Eval.Context (contextIsEmpty, encodedElement, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, inUpstreamOrder, plainContext)
 import Nix.Eval.EvalFormals (FormalDefault (..), LambdaName, hasDefault, lambdaNameText)
 import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdateChain, expectInt, expectedFailure, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
 import Nix.Eval.Policy (fileUrlPrefix, isAbsolutePath)
@@ -3691,7 +3691,7 @@ builtinToFile nameVal contentsArg = do
   argValue contentsArg >>= \case
     VStr contents ctx -> do
       fileName <- decodedText "builtins.toFile" name
-      refs <- toFileRefs ctx
+      refs <- toFileRefs fileName ctx
       -- The contents are stored (and hashed) as their raw bytes.
       storePath <- writeToStore fileName contents refs
       -- Upstream returns a STRING whose context is the new path itself; the
@@ -3700,12 +3700,16 @@ builtinToFile nameVal contentsArg = do
       pure (VStr (TE.encodeUtf8 storePath) selfContext)
     other -> throwEvalError ("builtins.toFile: expected a string, got " <> typeName other)
 
--- | The store-path references a toFile output may carry: the contents'
--- plain-path context, in sorted order.  A derivation or derivation-output
--- reference is an error, as upstream makes it one, in words of nova-nix's
--- own: upstream's message also names the file and the reference.
-toFileRefs :: (MonadEval m) => StringContext -> m [StorePath]
-toFileRefs (StringContext elems) = mapM refOf (Set.toAscList elems)
+-- | The store-path references a toFile output named so may carry: the
+-- contents' plain-path context, in sorted order.  A derivation or
+-- derivation-output reference is an error, as upstream makes it one, in
+-- upstream's words, which name the file and the first such reference in
+-- upstream's order of a context.
+toFileRefs :: (MonadEval m) => Text -> StringContext -> m [StorePath]
+toFileRefs fileName ctx = case [element | element <- inUpstreamOrder ctx, not (isPlain element)] of
+  [] -> pure [sp | SCPlain sp <- Set.toAscList (unStringContext ctx)]
+  element : _ ->
+    throwEvalError ("files created by builtins.toFile may not reference derivations, but " <> fileName <> " references " <> encodedElement element)
   where
     isPlain element = case element of
       SCPlain _ -> True
