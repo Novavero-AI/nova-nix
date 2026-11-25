@@ -418,6 +418,10 @@ check "a set comparison decides at the pair whose name was interned first" '{ zb
 refused "a set comparison compares a pair's values before a later pair's names" '{ zq1 = throw "x"; zq2 = 1; } == { zq1 = 1; zq3 = 1; }'
 echo
 
+echo "== which builtins call a set with __functor =="
+check "a set with __functor is a function to the builtins that call one" 'let f = { __functor = self: x: x > 1; }; v = [ (builtins.filter f [ 1 2 ]) (builtins.any f [ 2 ]) (builtins.partition f [ 1 2 ]) ]; in builtins.deepSeq v v'
+echo
+
 echo "== what a call, a select and abort refuse =="
 refusedAtPosition "a missing argument is reported before an unexpected one" '({ a }: a) { b = 1; }' "from call site"
 refusedAtPosition "a missing argument names an anonymous function" '({ a }: a) { }' "from call site"
