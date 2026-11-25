@@ -4,6 +4,7 @@
 module Test.Substituter
   ( testSubstituter,
     testSubstituterRetry,
+    testStatedContentAddress,
     testVerifySigs,
     testNarInfoValidation,
   )
@@ -16,7 +17,7 @@ import qualified Data.ByteString as BS
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -25,6 +26,7 @@ import HttpFixture (Reply (..), httpResponse, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, substitutePaths)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), currentPlatform)
+import Nix.Hash (moduloHashFinalize, moduloHashInit, moduloHashUpdate, rawHashWithAlgo)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), defaultFetchRetryPolicy, ioRetryEffects)
 import qualified Nix.Realise as Realise
 import Nix.Store (Store (..), caseHackDiskNames, closeStore, onDiskNameKey, openStore, releasePathLock, tryAcquirePathLock, unpackNarEntry, writeDrv)
@@ -35,6 +37,7 @@ import Nix.Store.Metadata (executablePermissions, readOnlyPermissions)
 import Nix.Store.Path (StoreDir (..), defaultStoreDir, storePathToFilePath, storePathToText)
 import Nix.Store.Path.Internal (StorePath (..))
 import qualified Nix.Substituter as Subst
+import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
 import qualified NovaCache.Hash as CHash
 import qualified NovaCache.NAR as NAR
@@ -46,6 +49,7 @@ import qualified System.Directory as Dir
 import System.FilePath ((</>))
 import qualified System.Info as SI
 import Test.Harness (TestResult (..), andThen, assertEqual, assertLeft, canonicalAs, chunkReader, forceRemoveIfExists, narRequest, offeredSubstitute, offeredThenFetched, posixOnlyEntries, quotedAsCxx, runTest, runTestM, servedPaths, sigTestKeyText, sigTestWrongKeyText)
+import qualified Test.QuickCheck as QC
 
 -- ---------------------------------------------------------------------------
 -- Tests: Substituter (Phase 3, Batch 6)
@@ -1389,6 +1393,75 @@ testSubstituter = do
 -- ---------------------------------------------------------------------------
 -- Tests: Push (pure narinfo construction + closure computation)
 -- ---------------------------------------------------------------------------
+
+-- | A substituted tree is held to the content address its narinfo
+-- states, as upstream's store holds a path it adds: hashed as the
+-- address's method reads it, its NAR or the bytes of the one file a flat
+-- or text address names, modulo the path's hash part, and refused in
+-- upstream's words when that differs.
+testStatedContentAddress :: IO [Bool]
+testStatedContentAddress = do
+  putStrLn "substituter/stated-content-address"
+  tmpBase <- getTemporaryDirectory
+  let root = tmpBase </> "nova-nix-test-stated-ca"
+      dir = StoreDir root
+      hashPart = T.replicate 32 "c"
+      sp = StorePath hashPart "addressed"
+      dest = storePathToFilePath dir sp
+      digestOf algo bytes = fromMaybe BS.empty (rawHashWithAlgo algo bytes)
+      spelled prefix algo digest = prefix <> algo <> ":" <> Nix32.encode digest
+      directory = NAR.NarDirectory [("f", NAR.NarRegular False "contents")]
+      holdingHashPart = "before " <> TE.encodeUtf8 hashPart <> " after"
+      -- Each tree checked against each address, the tree written fresh.
+      checked tree address = do
+        forceRemoveIfExists root
+        createDirectoryIfMissing True root
+        sensitivity <- probeCaseSensitivity root
+        written <- unpackNarEntry sensitivity dest tree
+        result <- either (pure . Left . ("unpack: " <>)) (const (Subst.checkStatedAddress (volumeCaseHack sensitivity) dir sp dest address)) written
+        forceRemoveIfExists root
+        pure result
+      holds label tree address = runTestM label $ assertEqual label (Right ()) <$> checked tree (Just address)
+      mismatch label tree address = runTestM label $ do
+        result <- checked tree (Just address)
+        pure $ case result of
+          Left err
+            | ("ca hash mismatch importing path '" <> storePathToText dir sp <> "';\n  specified: ") `T.isPrefixOf` err -> Pass
+          other -> Fail ("expected upstream's mismatch, got: " <> T.pack (show other))
+      chunkings :: [Int] -> BS.ByteString -> [BS.ByteString]
+      chunkings sizes bytes = case sizes of
+        _ | BS.null bytes -> []
+        size : rest -> BS.take size bytes : chunkings (rest <> [size]) (BS.drop size bytes)
+        [] -> [bytes]
+      moduloDigest modulus chunks = (\start -> moduloHashFinalize (foldl' moduloHashUpdate start chunks)) <$> moduloHashInit "sha256" modulus
+  sequence
+    [ runTestM "a narinfo with no content address holds the tree to its NarHash alone" $
+        assertEqual "none" (Right ()) <$> checked directory Nothing,
+      holds "a tree whose NAR has the recursive address stated is held" directory (spelled "fixed:r:" "sha256" (digestOf "sha256" (NAR.serialise directory))),
+      holds "an address in another algorithm is read in that one" directory (spelled "fixed:r:" "sha1" (digestOf "sha1" (NAR.serialise directory))),
+      mismatch "a tree whose NAR has another digest is refused in upstream's words" directory (spelled "fixed:r:" "sha256" (digestOf "sha256" "something else")),
+      holds "a flat address is of the file's bytes" (NAR.NarRegular False "contents") (spelled "fixed:" "sha256" (digestOf "sha256" "contents")),
+      holds "a text address is of the file's bytes" (NAR.NarRegular False "contents") (spelled "text:" "sha256" (digestOf "sha256" "contents")),
+      runTestM "a flat address names a regular file, and a directory is refused" $ do
+        result <- checked directory (Just (spelled "fixed:" "sha256" (digestOf "sha256" "contents")))
+        pure (either (const Pass) (const (Fail "a directory was held to a flat address")) result),
+      -- Each occurrence of the hash part is hashed as zeros, and its
+      -- offset follows the bytes as |OFFSET.
+      holds
+        "the tree is hashed modulo the path's hash part"
+        (NAR.NarRegular False holdingHashPart)
+        (spelled "fixed:" "sha256" (digestOf "sha256" ("before " <> BS.replicate 32 0 <> " after" <> "|7"))),
+      mismatch "the hash part is not hashed as itself" (NAR.NarRegular False holdingHashPart) (spelled "fixed:" "sha256" (digestOf "sha256" holdingHashPart)),
+      runTest "a stream without the hash part hashes as it is" $
+        assertEqual "plain" (Just (digestOf "sha256" "abc def")) (moduloDigest "xyz" ["abc ", "def"]),
+      runTestM "a digest modulo a hash part is the same however the stream is split" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll ((,) <$> QC.listOf (QC.elements "abc") <*> QC.listOf1 (QC.choose (1, 5))) $ \(text, sizes) ->
+              let bytes = TE.encodeUtf8 (T.pack text)
+               in moduloDigest "abc" (chunkings sizes bytes) QC.=== moduloDigest "abc" [bytes]
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+    ]
 
 -- | The case sensitivity of the suite's temp directory, so a test
 -- materializing a NAR there keys sibling names the way a store on that

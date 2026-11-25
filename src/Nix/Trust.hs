@@ -7,9 +7,10 @@
 -- A fixed-output derivation's output is named by the hash its recipe
 -- states, whatever makes it.  A download or a build is checked against
 -- that hash before it is registered ("Nix.Builder"); a substitute is
--- checked against the NarHash its cache's signed narinfo declares
--- ("Nix.Substituter"), not the recipe's hash.  Every one in the closure is an
--- input the closure relies on ('fixedOutputInputs'), whether a builtin
+-- checked against the NarHash its cache's signed narinfo declares, and
+-- against the content address the narinfo states when it states one
+-- ("Nix.Substituter"), not the recipe's hash.  Every one in the closure is
+-- an input the closure relies on ('fixedOutputInputs'), whether a builtin
 -- fetches it or the closure builds it, and each says which ('Provenance').
 --
 -- Each fixed-output input is classified by two kinds of fact.  One is in
@@ -493,7 +494,8 @@ data Scan
 
 -- | How a fixed-output input's bytes come to be, each case with its
 -- builder.  Either way the recipe's hash pins them when nova-nix fetches
--- or builds them; bytes a cache supplies are held to its signed NarHash.
+-- or builds them; bytes a cache supplies are held to its signed NarHash
+-- and to the content address its narinfo states.
 data Provenance
   = -- | A builtin fetches them, such as @builtin:fetchurl@.
     FetchedBy !ByteString

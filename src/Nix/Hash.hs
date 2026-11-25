@@ -48,6 +48,10 @@ module Nix.Hash
     hashInitWithAlgo,
     hashUpdateChunk,
     hashFinalizeBytes,
+    ModuloHash,
+    moduloHashInit,
+    moduloHashUpdate,
+    moduloHashFinalize,
     hashAlgoBytes,
     hexHashLen,
     nix32HashLen,
@@ -242,6 +246,67 @@ hashUpdateChunk (IncrementalHash ctx) chunk = IncrementalHash (CH.hashUpdate ctx
 -- produces for the concatenated chunks.
 hashFinalizeBytes :: IncrementalHash -> BS.ByteString
 hashFinalizeBytes (IncrementalHash ctx) = BA.convert (CH.hashFinalize ctx)
+
+-- | An in-progress digest of a stream modulo a store path's hash part, as
+-- upstream hashes a content-addressed path's contents: every occurrence
+-- of the hash part, found left to right, is hashed as as many zero
+-- bytes, and once the stream ends the offset of each follows as
+-- @|OFFSET@, so a stream holding the hash part and one holding zeros there
+-- do not collide.  A stream without the hash part hashes as it is.
+data ModuloHash = ModuloHash
+  { mhHash :: !IncrementalHash,
+    -- | The hash part.
+    mhModulus :: !BS.ByteString,
+    -- | The bytes held back, too few to hold the hash part, so that one
+    -- split across chunks is still found.
+    mhHeld :: !BS.ByteString,
+    -- | How many bytes have been hashed.
+    mhHashed :: !Int,
+    -- | The offset of each occurrence, the latest first.
+    mhOffsets :: ![Int]
+  }
+
+-- | Start a digest modulo a hash part under a named algorithm, or
+-- 'Nothing' for an unknown algorithm or an empty hash part.
+moduloHashInit :: Text -> BS.ByteString -> Maybe ModuloHash
+moduloHashInit algo modulus
+  | BS.null modulus = Nothing
+  | otherwise = (\hash -> ModuloHash hash modulus BS.empty 0 []) <$> hashInitWithAlgo algo
+
+-- | Absorb one chunk.  What it gives the digest is the same however the
+-- stream is split into chunks.
+moduloHashUpdate :: ModuloHash -> BS.ByteString -> ModuloHash
+moduloHashUpdate state chunk =
+  state
+    { mhHash = hashUpdateChunk (mhHash state) settled,
+      mhHeld = held,
+      mhHashed = mhHashed state + BS.length settled,
+      mhOffsets = foldl' (\offsets offset -> let !absolute = offset + mhHashed state in absolute : offsets) (mhOffsets state) found
+    }
+  where
+    (masked, found) = maskOccurrences (mhModulus state) (mhHeld state <> chunk)
+    (settled, held) = BS.splitAt (BS.length masked - min (BS.length masked) (BS.length (mhModulus state) - 1)) masked
+
+-- | Finish: the held bytes, then the offset of each occurrence, first to
+-- last.
+moduloHashFinalize :: ModuloHash -> BS.ByteString
+moduloHashFinalize state =
+  hashFinalizeBytes (foldl' hashUpdateChunk (hashUpdateChunk (mhHash state) (mhHeld state)) offsets)
+  where
+    offsets = [encodeUtf8 ("|" <> T.pack (show offset)) | offset <- reverse (mhOffsets state)]
+
+-- | The bytes with every occurrence of a needle, found left to right,
+-- replaced by as many zero bytes, and the offset of each.
+maskOccurrences :: BS.ByteString -> BS.ByteString -> (BS.ByteString, [Int])
+maskOccurrences needle = go 0 [] []
+  where
+    width = BS.length needle
+    go !at pieces offsets rest = case BS.breakSubstring needle rest of
+      (before, after)
+        | BS.null after -> (BS.concat (reverse (before : pieces)), reverse offsets)
+        | otherwise ->
+            let offset = at + BS.length before
+             in go (offset + width) (BS.replicate width 0 : before : pieces) (offset : offsets) (BS.drop width after)
 
 -- | Raw digest size in bytes of a supported hash algorithm.  'Nothing' for
 -- an unknown algorithm name.
