@@ -3604,6 +3604,14 @@ testBatch1 = do
         assertEval "baseName-path" "builtins.baseNameOf ./foo/bar" (mkStr "bar"),
       runTest "baseNameOf no slash" $
         assertEval "baseName-flat" "builtins.baseNameOf \"filename\"" (mkStr "filename"),
+      -- Upstream drops one trailing slash, not every one.
+      runTest "baseNameOf drops a single trailing slash" $
+        foldr
+          andThen
+          Pass
+          [ assertEval (T.pack (show subject)) ("builtins.baseNameOf \"" <> subject <> "\"") (mkStr expected)
+          | (subject, expected) <- [("a/", "a"), ("a//", ""), ("a/b//", ""), ("/a/", "a"), ("/", ""), ("//", ""), ("", "")]
+          ],
       runTest "baseNameOf type error" $
         assertEvalFail "baseName-err" "builtins.baseNameOf 42",
       -- dirOf

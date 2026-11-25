@@ -2619,11 +2619,10 @@ parseContextAttrs attrs = do
         VStr s _ -> decodedText "builtins.appendContext" s
         _ -> throwEvalError "builtins.appendContext: output name must be a string"
 
--- | For a STRING operand the rule is textual: the last component between
--- @/@s that is not empty ('lastComponentBytes').  Upstream drops one
--- trailing @/@ and then takes everything after the final @/@, which agrees
--- but for a string ending in two or more slashes, where upstream gives the
--- empty string.  For a PATH operand the value may be native-spelled
+-- | For a STRING operand the rule is textual, as upstream Nix reads it
+-- ('lastComponentBytes'): one trailing @/@ is dropped and everything after
+-- the final @/@ is the name, so a string ending in two or more slashes has
+-- an empty one.  For a PATH operand the value may be native-spelled
 -- (eval's base dir can be a native Windows path), so the split is
 -- separator-aware via 'canonBaseName'.
 builtinBaseNameOf :: (MonadEval m) => NixValue -> m NixValue
@@ -2635,12 +2634,17 @@ builtinBaseNameOf other = do
   (s, ctx) <- coerceToString False force applyValue coercePathVerbatim other
   pure (VStr (lastComponentBytes s) ctx)
 
--- | Byte-level last component for string operands ('/' is a single byte
--- in UTF-8 and never occurs inside a multi-byte sequence).
+-- | A string operand's base name, as upstream reads one: a single
+-- trailing @/@ is dropped unless it is the whole string, and the name is
+-- what follows the last @/@ before it, so @"a/"@ is @"a"@ and @"a//"@ is
+-- empty.  Read as bytes, since @/@ is one byte in UTF-8 and never occurs
+-- inside a multi-byte sequence.
 lastComponentBytes :: BS.ByteString -> BS.ByteString
-lastComponentBytes t = case reverse (filter (not . BS.null) (BC.split '/' t)) of
-  [] -> ""
-  (final : _) -> final
+lastComponentBytes t = BC.takeWhileEnd (/= '/') trimmed
+  where
+    trimmed = case BC.unsnoc t of
+      Just (rest, '/') | not (BS.null rest) -> rest
+      _ -> t
 
 -- | String operands keep upstream's textual '/'-only rule
 -- ('dirComponentBytes'); path operands may be native-spelled and split

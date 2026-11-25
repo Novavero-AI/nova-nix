@@ -224,6 +224,10 @@ check "literal read through scopedImport" 'builtins.scopedImport { q = ./data.tx
 check "literal against the working directory" './data.txt'
 echo
 
+echo "== what baseNameOf makes of a trailing slash =="
+check "baseNameOf drops one trailing slash, not every one" 'let v = [ (baseNameOf "a/") (baseNameOf "a//") (baseNameOf "/") (baseNameOf "/a/") ]; in builtins.deepSeq v v'
+echo
+
 echo "== what a value shows before it is forced =="
 check "int literals in a list" '[ 1 2 3 ]'
 check "float literals in a list" '[ 1.5 2.5 ]'
