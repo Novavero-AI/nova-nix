@@ -51,11 +51,14 @@ execStreamPath :: FilePath -> FilePath
 execStreamPath path = path ++ ":" ++ execStreamName
 
 -- | Whether a regular file is executable, by whichever representation the
--- platform keeps it in.
+-- platform keeps it in.  On Unix that is the owner-execute bit of the
+-- file's own mode, as upstream's dump reads it, not what this process may
+-- do, which root or an access control entry would answer otherwise;
+-- the flag lands in NAR bytes, so a divergence moves a hash.
 isExecutable :: FilePath -> IO Bool
 isExecutable path
   | usesStream = Dir.doesFileExist (execStreamPath path)
-  | otherwise = Dir.executable <$> Dir.getPermissions path
+  | otherwise = NAR.defaultExecBitResolver path
 
 -- | Mark a regular file executable.
 --

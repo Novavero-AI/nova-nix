@@ -32,7 +32,7 @@ where
 
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Exception (IOException, SomeException, bracket, bracket_, evaluate, finally, throwIO, try)
-import Control.Monad (filterM, when)
+import Control.Monad (filterM, forM, when)
 import Data.Bits (xor, (.&.))
 import qualified Data.ByteString as BS
 import Data.Char (isDigit)
@@ -87,6 +87,7 @@ import System.FilePath (dropDrive, joinPath, pathSeparator, splitDirectories, ta
 import System.IO.Error (ioeGetErrorString, ioeGetFileName, isAlreadyExistsError)
 import qualified System.Info as SI
 import qualified System.OsPath as OP
+import qualified System.Process as Proc
 import System.Timeout (timeout)
 import Test.Harness (TestResult (..), andThen, assertEqual, assertEvalErrorIO, bytesText, canonicalAs, chunkReader, deleteNamed, evalAndBuild, evalNix, evalNixIOIn, evalNixIOStore, findTestShell, forceRemoveIfExists, genDrvName, genFixturePath, mkTestBuildDrv, narInfoRequest, narSpecFileVector, narSpecVector, offeredThenFetched, parseErrorTag, posixOnlyEntries, quotedAsCxx, removeIfExists, runTest, runTestM, servedPaths, sigTestKeyText, simpleTestDrv, symlinksAvailable, testDrvPath, testEvalState, walkWatchdogMicros, withTempStore)
 import qualified Test.QuickCheck as QC
@@ -359,6 +360,38 @@ testExecBit = do
           (True, False) -> Pass
           (False, _) -> Fail "a marked file did not read back executable"
           (_, True) -> Fail "an unmarked file read back executable",
+      -- On Unix the flag is the owner-execute bit of the file's own mode,
+      -- as upstream's dump reads it, whatever the group's and others' bits.
+      runTestM "on Unix the flag is the owner-execute bit of the file's mode" $
+        if SI.os == "mingw32"
+          then pure Pass
+          else do
+            dir <- freshExecBitDir "owner-bit"
+            let file = dir </> "f"
+            BS.writeFile file "x"
+            flags <- forM ["644", "744", "611", "100", "755"] $ \mode -> do
+              Proc.callProcess "/bin/chmod" [mode, file]
+              (,) mode <$> ExecBit.isExecutable file
+            Proc.callProcess "/bin/chmod" ["644", file]
+            forceRemoveIfExists dir
+            pure (assertEqual "flags" [("644", False), ("744", True), ("611", False), ("100", True), ("755", True)] flags),
+      -- An access control entry on macOS can refuse the owner execution of
+      -- a file whose mode allows it: access(2) then says no, and the flag
+      -- is still the mode's.
+      runTestM "on macOS a file whose access control refuses execution keeps its mode's flag" $
+        if SI.os /= "darwin"
+          then pure Pass
+          else do
+            dir <- freshExecBitDir "acl"
+            let file = dir </> "f"
+            BS.writeFile file "#!x"
+            Proc.callProcess "/bin/chmod" ["755", file]
+            Proc.callProcess "/bin/chmod" ["+a", "everyone deny execute", file]
+            refused <- not . Dir.executable <$> Dir.getPermissions file
+            flag <- ExecBit.isExecutable file
+            Proc.callProcess "/bin/chmod" ["-N", file]
+            forceRemoveIfExists dir
+            pure (assertEqual "access refuses, the flag stays" (True, True) (refused, flag)),
       -- copyExecMark out of a sealed store path.  canonicalizeMetadata is
       -- what placeInStore does, and on Windows copyFile propagates that
       -- attribute to the copy, where a mark cannot be written until it is
