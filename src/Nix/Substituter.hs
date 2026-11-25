@@ -724,23 +724,24 @@ verifyNarSize narInfo rawNar
             <> T.pack (show (BS.length rawNar))
         )
 
--- | Whether a served narinfo describes the requested path: the hash component
--- of its declared StorePath must equal the requested path's hash.  Only the
--- hash is compared; 'validateNarInfoFields', which 'judgeNarInfo' runs
--- first, holds the StorePath to the canonical store directory.
+-- | Whether a served narinfo describes the requested path: the hash and
+-- name components of its declared StorePath must equal the requested
+-- path's, as upstream Nix holds one.  Only the base name is compared;
+-- 'validateNarInfoFields', which 'judgeNarInfo' runs first, holds the
+-- StorePath to the canonical store directory.
 narInfoMatchesPath :: StorePath -> NarInfo.NarInfo -> Bool
 narInfoMatchesPath sp narInfo =
-  storePathHashOf (NarInfo.niStorePath narInfo) == Just (spHash sp)
+  storePathBaseOf (NarInfo.niStorePath narInfo) == Just (spHash sp, spName sp)
 
--- | Extract the leading hash from a full store path's basename, if well-formed
+-- | The hash and the name of a full store path's base name, if well-formed
 -- (@\<hash\>-\<name\>@ with a hash of the expected length).
-storePathHashOf :: Text -> Maybe Text
-storePathHashOf path =
+storePathBaseOf :: Text -> Maybe (Text, Text)
+storePathBaseOf path =
   let base = T.takeWhileEnd (\c -> c /= '/' && c /= '\\') path
       (hashPart, rest) = T.splitAt storePathHashLen base
-   in if T.length hashPart == storePathHashLen && T.isPrefixOf "-" rest
-        then Just hashPart
-        else Nothing
+   in case T.stripPrefix "-" rest of
+        Just name | T.length hashPart == storePathHashLen -> Just (hashPart, name)
+        _ -> Nothing
 
 -- ---------------------------------------------------------------------------
 -- HTTP fetching
