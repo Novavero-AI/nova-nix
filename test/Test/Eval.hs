@@ -3547,6 +3547,48 @@ testBuiltinArgumentOrder = do
            yields "builtins.all (builtins.elem (throw \"a\")) [ [ ] ]" (VBool False),
            yields "builtins.foldl' builtins.elem 1 [ [ 1 ] [ true ] ]" (VBool True)
          ]
+      -- An argument is checked before a later one is forced, so with the
+      -- earlier one of the wrong type and the later one throwing, the
+      -- earlier one's refusal is the error.
+      <> [ fails (call <> " (throw \"later\")") expected
+         | (call, expected) <-
+             [ ("builtins.hasAttr 1", notAString),
+               ("builtins.getAttr 1", notAString),
+               ("builtins.catAttrs 1", notAString),
+               ("builtins.match 1", notAString),
+               ("builtins.split 1", notAString),
+               ("builtins.compareVersions 1", notAString),
+               ("builtins.toFile 1", notAString),
+               ("builtins.concatStringsSep 1", notAString),
+               ("builtins.appendContext 1", notAString),
+               ("builtins.hashString \"nope\"", unknownNope),
+               ("builtins.hashFile \"nope\"", unknownNope),
+               ("builtins.bitAnd \"x\"", notAnInteger),
+               ("builtins.bitOr \"x\"", notAnInteger),
+               ("builtins.bitXor \"x\"", notAnInteger),
+               ("builtins.removeAttrs 1", notASet),
+               ("builtins.intersectAttrs 1", notASet),
+               ("builtins.findFile [ 1 ]", notASet),
+               ("builtins.substring 0 \"x\"", notAnInteger),
+               ("builtins.replaceStrings [ ] [ \"a\" ]", "'from' and 'to' arguments passed to builtins.replaceStrings have different lengths"),
+               ("builtins.replaceStrings [ 1 ] [ \"a\" ]", notAString),
+               ("builtins.concatMap 1", notAFunction),
+               ("builtins.any 1", notAFunction),
+               ("builtins.all 1", notAFunction),
+               ("builtins.partition 1", notAFunction),
+               ("builtins.groupBy 1", notAFunction),
+               ("builtins.foldl' 1 0", notAFunction)
+             ]
+         ]
+      <> [ fails "builtins.substring (-1) (throw \"later\") \"s\"" "negative start position in 'substring'",
+           -- The function is checked even for an empty list.
+           fails "builtins.concatMap 1 [ ]" notAFunction,
+           fails "builtins.any 1 [ ]" notAFunction,
+           fails "builtins.all 1 [ ]" notAFunction,
+           fails "builtins.partition 1 [ ]" notAFunction,
+           fails "builtins.groupBy 1 [ ]" notAFunction,
+           fails "builtins.foldl' 1 0 [ ]" notAFunction
+         ]
       -- A set with __functor is a function to every builtin that calls
       -- one, as upstream Nix calls one.
       <> [ yields "builtins.any { __functor = self: x: x; } [ true ]" (VBool True),
@@ -3559,6 +3601,12 @@ testBuiltinArgumentOrder = do
       <> [ fails "builtins.partition (x: true) [ (throw \"element\") ]" "element",
            yields "builtins.any (x: true) [ (throw \"element\") ]" (VBool True)
          ]
+  where
+    notAString = "expected a string but found an integer: 1"
+    notAnInteger = "expected an integer but found a string: \"x\""
+    notASet = "expected a set but found an integer: 1"
+    notAFunction = "expected a function but found an integer: 1"
+    unknownNope = "unknown hash algorithm 'nope', expect 'md5', 'sha1', 'sha256', or 'sha512'"
 
 -- ---------------------------------------------------------------------------
 -- Tests: Batch 1 - Trivial pure builtins + constants
@@ -5629,7 +5677,16 @@ testBatchC = do
       runTest "findFile type error arg1" $
         assertEvalFail "findFile-err1" "builtins.findFile 42 \"foo\"",
       runTest "findFile type error arg2" $
-        assertEvalFail "findFile-err2" "builtins.findFile [ ] 42"
+        assertEvalFail "findFile-err2" "builtins.findFile [ ] 42",
+      -- An entry's prefix may be absent, which reads as empty, and its
+      -- path is coerced, so a lookup through either misses as any other
+      -- does, a failure tryEval catches.
+      runTest "a search path entry without a prefix is an entry" $
+        assertEval "findFile-no-prefix" "(builtins.tryEval (builtins.findFile [ { path = \"/nonexistent-nova-nix-entry\"; } ] \"x\")).success" (VBool False),
+      runTest "a search path entry's path is coerced" $
+        assertEval "findFile-coerced-path" "(builtins.tryEval (builtins.findFile [ { prefix = \"\"; path = { outPath = \"/nonexistent-nova-nix-entry\"; }; } ] \"x\")).success" (VBool False),
+      runTest "a search path entry without a path is refused" $
+        assertEvalError "findFile-no-path" "builtins.findFile [ { prefix = \"x\"; } ] \"x\"" "attribute 'path' missing"
     ]
 
 testBatchCIO :: IO [Bool]
@@ -10865,6 +10922,7 @@ testEvalPolicyIO = do
             expectLeft "pure mode refuses with its own clause" (forbidden purePolicy outside) (pureRun ("builtins.readFile " <> lit (outside </> "secret.txt"))),
             expectRight "pure mode still reads under an allowed root" (mkStr "hello\n") (pureRun ("builtins.readFile " <> lit (allowed </> "data.txt"))),
             expectRight "pure mode has no currentTime" (VBool False) (pureRun "builtins ? currentTime"),
+            expectLeft "pure mode refuses storePath before it forces the argument" "'builtins.storePath' is not allowed in pure evaluation mode" (pureRun "builtins.storePath (throw \"later\")"),
             expectLeft "pure mode words the search path miss differently" "cannot look up '<nope>' in pure evaluation mode (use '--impure' to override)" (pureRun "<nope>"),
             expectRight "the pure miss is catchable too" (VBool False) (pureRun "(builtins.tryEval <nope>).success"),
             expectLeft "storePath is refused in pure mode before its argument is read" "'builtins.storePath' is not allowed in pure evaluation mode" (pureRun "builtins.storePath 42"),
