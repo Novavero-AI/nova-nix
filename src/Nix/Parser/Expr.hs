@@ -1,19 +1,17 @@
 -- | Recursive descent expression parser for the Nix language.
 --
--- 14 precedence levels, lowest (top) to highest (deepest):
+-- Precedence levels, lowest (top) to highest (deepest), as upstream
+-- Nix's grammar declares them:
 --
 -- @
 -- lambda / -> / || / && / == != / < > <= >= / //
--- ! / ++ / + - / * \\/ / negate / ? / application / selection
+-- ! / + - / * \\/ / ++ / ? / negate / application / selection
 -- @
 --
--- Close to upstream Nix's parser, with two deviations: here @++@ binds
--- looser than multiplication\/addition (upstream binds it tighter) and
--- unary negate binds looser than @?@ (upstream makes negate tightest).
--- The first only affects mixed expressions that are type errors
--- regardless.  The second does not: @-x ? a@ is @(-x) ? a@ upstream,
--- false for a number @x@, and @-(x ? a)@ here, which negates a Boolean
--- and fails.
+-- The infix operators are read by precedence climbing ('parseBounded'),
+-- and a prefix operator's operand runs as far as the operators tighter
+-- than it, as upstream Nix's parser reads one: @-x ? a@ is @(-x) ? a@,
+-- and @a + !b + c@ is @a + !(b + c)@.
 -- Entirely pure. No IO, no Megaparsec, no Parsec.
 --
 -- The parser notes each name ('recordName') where upstream's parser
@@ -71,7 +69,7 @@ parseExpr = do
   case tok of
     TokLBrace -> parseLambdaOrAttrSet
     TokIdent _ -> parseLambdaOrIdent
-    _ -> parseImplication
+    _ -> parseOperators
 
 -- ---------------------------------------------------------------------------
 -- Lambda detection
@@ -94,7 +92,7 @@ parseLambdaOrIdent = do
       case named of
         Right body -> body
         Left namedErr -> do
-          plain <- tryParserKeepError parseImplication
+          plain <- tryParserKeepError parseOperators
           case plain of
             Right e -> pure e
             Left plainErr ->
@@ -136,7 +134,7 @@ parseLambdaOrAttrSet = do
   case headed of
     Right body -> body
     Left lambdaErr -> do
-      alt <- tryParserKeepError parseImplication
+      alt <- tryParserKeepError parseOperators
       case alt of
         Right e -> pure e
         Left attrErr -> failWithError (deeperError lambdaErr attrErr)
@@ -215,175 +213,135 @@ parseFormalsList acc = do
     _ -> parseError ("expected ',' or '}' in formals, got " <> showToken tok)
 
 -- ---------------------------------------------------------------------------
--- Precedence levels (lowest to highest)
+-- Operators
 -- ---------------------------------------------------------------------------
 
--- | Level 1: Implication (@->@, right-associative).
-parseImplication :: Parser Expr
-parseImplication = do
-  lhs <- parseLogicalOr
-  tok <- peekMaybe
-  case tok of
-    Just TokImpl -> do
-      _ <- advance
-      EBinary OpImpl lhs <$> parseImplication
-    _ -> pure lhs
+-- | How tightly an operator binds, loosest first: the precedence each
+-- operator of upstream Nix's grammar declares.
+data Level
+  = LevelImplication
+  | LevelOr
+  | LevelAnd
+  | LevelEquality
+  | LevelComparison
+  | LevelUpdate
+  | LevelNot
+  | LevelAddition
+  | LevelMultiplication
+  | LevelConcat
+  | LevelHasAttr
+  | LevelNegate
+  deriving (Eq, Ord)
 
--- | Level 2: Logical OR (@||@, left-associative).
-parseLogicalOr :: Parser Expr
-parseLogicalOr = do
-  lhs <- parseLogicalAnd
-  loopOr lhs
+-- | How an infix operator meets another of its own level: grouped to the
+-- left, grouped to the right, or refused.
+data Grouping = GroupsLeft | GroupsRight | GroupsNone
+
+-- | What an infix operator builds from its left operand and what follows.
+data Operation
+  = -- | A binary operator over two expressions.
+    Binary !BinaryOp
+  | -- | @?@, whose right operand is an attribute path.  Nothing can follow
+    -- an attribute path inside it, so a @?@ after one applies to the
+    -- whole, as it does upstream, where the grammar's no-chaining rule for
+    -- @?@ never meets a second one: @a ? b ? c@ is @(a ? b) ? c@.
+    HasAttr
+
+-- | An infix operator: its level, grouping and operation.
+data Infix = Infix !Level !Grouping !Operation
+
+-- | The infix operator a token is, if it is one.
+infixOperator :: Token -> Maybe Infix
+infixOperator tok = case tok of
+  TokImpl -> Just (Infix LevelImplication GroupsRight (Binary OpImpl))
+  TokOr -> Just (Infix LevelOr GroupsLeft (Binary OpOr))
+  TokAnd -> Just (Infix LevelAnd GroupsLeft (Binary OpAnd))
+  TokEq -> Just (Infix LevelEquality GroupsNone (Binary OpEq))
+  TokNeq -> Just (Infix LevelEquality GroupsNone (Binary OpNeq))
+  TokLt -> Just (Infix LevelComparison GroupsNone (Binary OpLt))
+  TokGt -> Just (Infix LevelComparison GroupsNone (Binary OpGt))
+  TokLte -> Just (Infix LevelComparison GroupsNone (Binary OpLte))
+  TokGte -> Just (Infix LevelComparison GroupsNone (Binary OpGte))
+  TokUpdate -> Just (Infix LevelUpdate GroupsRight (Binary OpUpdate))
+  TokPlus -> Just (Infix LevelAddition GroupsLeft (Binary OpAdd))
+  TokMinus -> Just (Infix LevelAddition GroupsLeft (Binary OpSub))
+  TokStar -> Just (Infix LevelMultiplication GroupsLeft (Binary OpMul))
+  TokSlash -> Just (Infix LevelMultiplication GroupsLeft (Binary OpDiv))
+  TokConcat -> Just (Infix LevelConcat GroupsRight (Binary OpConcat))
+  TokQuestion -> Just (Infix LevelHasAttr GroupsLeft HasAttr)
+  _ -> Nothing
+
+-- | Which levels an operator expression takes in.
+data Bound
+  = -- | This level and every tighter one.
+    AtLeast !Level
+  | -- | Only the levels tighter than this one.
+    Tighter !Level
+
+-- | Whether a bound takes in an operator of a level.
+admits :: Bound -> Level -> Bool
+admits (AtLeast lowest) level = level >= lowest
+admits (Tighter lowest) level = level > lowest
+
+-- | An operator expression: an operand and every infix operator after it.
+parseOperators :: Parser Expr
+parseOperators = parseBounded (AtLeast LevelImplication)
+
+-- | An operand and the infix operators the bound takes in after it, as
+-- upstream's grammar resolves its precedences.  A prefix operator's
+-- operand runs to the end of the tighter operators after it, so
+-- @!a + b@ is @!(a + b)@, @1 + !a + b@ is @1 + !(a + b)@ and @-a ? b@ is
+-- @(-a) ? b@.  Two operators of a level that groups neither way, such as
+-- @a == b == c@ or @a < b > c@, are refused at the second.
+parseBounded :: Bound -> Parser Expr
+parseBounded bound = parseOperand >>= extend
   where
-    loopOr lhs = do
-      found <- match TokOr
-      if found
-        then do
-          rhs <- parseLogicalAnd
-          loopOr (EBinary OpOr lhs rhs)
-        else pure lhs
-
--- | Level 3: Logical AND (@&&@, left-associative).
-parseLogicalAnd :: Parser Expr
-parseLogicalAnd = do
-  lhs <- parseEquality
-  loopAnd lhs
-  where
-    loopAnd lhs = do
-      found <- match TokAnd
-      if found
-        then do
-          rhs <- parseEquality
-          loopAnd (EBinary OpAnd lhs rhs)
-        else pure lhs
-
--- | Level 4: Equality (@==@, @!=@, non-associative).
-parseEquality :: Parser Expr
-parseEquality = do
-  lhs <- parseComparison
-  tok <- peekMaybe
-  case tok of
-    Just TokEq -> do
-      _ <- advance
-      EBinary OpEq lhs <$> parseComparison
-    Just TokNeq -> do
-      _ <- advance
-      EBinary OpNeq lhs <$> parseComparison
-    _ -> pure lhs
-
--- | Level 5: Comparison (@<@, @>@, @<=@, @>=@, non-associative).
-parseComparison :: Parser Expr
-parseComparison = do
-  lhs <- parseUpdate
-  tok <- peekMaybe
-  case tok of
-    Just TokLt -> do
-      _ <- advance
-      EBinary OpLt lhs <$> parseUpdate
-    Just TokGt -> do
-      _ <- advance
-      EBinary OpGt lhs <$> parseUpdate
-    Just TokLte -> do
-      _ <- advance
-      EBinary OpLte lhs <$> parseUpdate
-    Just TokGte -> do
-      _ <- advance
-      EBinary OpGte lhs <$> parseUpdate
-    _ -> pure lhs
-
--- | Level 6: Update (@//@, right-associative).
-parseUpdate :: Parser Expr
-parseUpdate = do
-  lhs <- parseNot
-  tok <- peekMaybe
-  case tok of
-    Just TokUpdate -> do
-      _ <- advance
-      EBinary OpUpdate lhs <$> parseUpdate
-    _ -> pure lhs
-
--- | Level 7: Logical NOT (@!@, prefix).
-parseNot :: Parser Expr
-parseNot = do
-  tok <- peek
-  case tok of
-    TokNot -> do
-      _ <- advance
-      EUnary OpNot <$> parseNot
-    _ -> parseConcat
-
--- | Level 8: List concatenation (@++@, right-associative).
-parseConcat :: Parser Expr
-parseConcat = do
-  lhs <- parseAddSub
-  tok <- peekMaybe
-  case tok of
-    Just TokConcat -> do
-      _ <- advance
-      EBinary OpConcat lhs <$> parseConcat
-    _ -> pure lhs
-
--- | Level 9: Addition and subtraction (@+@, @-@, left-associative).
-parseAddSub :: Parser Expr
-parseAddSub = do
-  lhs <- parseMulDiv
-  loopAddSub lhs
-  where
-    loopAddSub lhs = do
-      tok <- peekMaybe
-      case tok of
-        Just TokPlus -> do
-          _ <- advance
-          rhs <- parseMulDiv
-          loopAddSub (EBinary OpAdd lhs rhs)
-        Just TokMinus -> do
-          _ <- advance
-          rhs <- parseMulDiv
-          loopAddSub (EBinary OpSub lhs rhs)
+    extend lhs = do
+      next <- peekMaybe
+      case next >>= infixOperator of
+        Just (Infix level grouping operation)
+          | admits bound level -> do
+              _ <- advance
+              combined <- case operation of
+                Binary op -> EBinary op lhs <$> parseBounded (rightBound grouping level)
+                HasAttr -> EHasAttr lhs <$> parseAttrPath
+              refuseRepeat grouping level
+              extend combined
         _ -> pure lhs
 
--- | Level 10: Multiplication and division (@*@, @/@, left-associative).
-parseMulDiv :: Parser Expr
-parseMulDiv = do
-  lhs <- parseNegate
-  loopMulDiv lhs
-  where
-    loopMulDiv lhs = do
-      tok <- peekMaybe
-      case tok of
-        Just TokStar -> do
-          _ <- advance
-          rhs <- parseNegate
-          loopMulDiv (EBinary OpMul lhs rhs)
-        Just TokSlash -> do
-          _ <- advance
-          rhs <- parseNegate
-          loopMulDiv (EBinary OpDiv lhs rhs)
-        _ -> pure lhs
+-- | The bound of an infix operator's right operand.
+rightBound :: Grouping -> Level -> Bound
+rightBound grouping level = case grouping of
+  GroupsRight -> AtLeast level
+  GroupsLeft -> Tighter level
+  GroupsNone -> Tighter level
 
--- | Level 11: Arithmetic negation (@-@, prefix).
-parseNegate :: Parser Expr
-parseNegate = do
+-- | Refuse an operator of the level just parsed when that level groups
+-- neither way.
+refuseRepeat :: Grouping -> Level -> Parser ()
+refuseRepeat grouping level = case grouping of
+  GroupsNone -> do
+    next <- peekMaybe
+    case next of
+      Just tok
+        | Just (Infix nextLevel _ _) <- infixOperator tok,
+          nextLevel == level ->
+            parseError ("unexpected " <> showToken tok <> ": the operator does not chain")
+      _ -> pure ()
+  GroupsLeft -> pure ()
+  GroupsRight -> pure ()
+
+-- | An operand: a prefix operator and its operand, or an application.
+-- @!@'s operand takes in the operators tighter than it, and @-@'s none.
+parseOperand :: Parser Expr
+parseOperand = do
   tok <- peek
   case tok of
-    TokMinus -> do
-      _ <- advance
-      EUnary OpNegate <$> parseNegate
-    _ -> parseHasAttr
+    TokNot -> advance *> (EUnary OpNot <$> parseBounded (Tighter LevelNot))
+    TokMinus -> advance *> (EUnary OpNegate <$> parseBounded (Tighter LevelNegate))
+    _ -> parseApp
 
--- | Level 12: Has-attribute (@?@, non-associative).
--- Right operand is an attr path, not a full expression.
-parseHasAttr :: Parser Expr
-parseHasAttr = do
-  lhs <- parseApp
-  tok <- peekMaybe
-  case tok of
-    Just TokQuestion -> do
-      _ <- advance
-      EHasAttr lhs <$> parseAttrPath
-    _ -> pure lhs
-
--- | Level 13: Function application (juxtaposition, left-associative).
+-- | Function application (juxtaposition, left-associative).
 parseApp :: Parser Expr
 parseApp = do
   func <- parseSelect
@@ -397,7 +355,7 @@ parseApp = do
           loopApp (EApp func arg)
         _ -> pure func
 
--- | Level 14: Attribute selection (@e.a@, @e.a or default@).
+-- | Attribute selection (@e.a@, @e.a or default@).
 parseSelect :: Parser Expr
 parseSelect = do
   expr <- parseAtom
