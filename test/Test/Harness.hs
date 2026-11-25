@@ -86,6 +86,9 @@ module Test.Harness
     genTextOf,
     testDrvPath,
     mkTestBuildDrv,
+    hostToolsEnv,
+    withHostTools,
+    hostToolsAttrs,
     evalAndBuild,
     unexpectedOps,
     trustPe,
@@ -1039,25 +1042,46 @@ testDrvPath = StorePath (T.replicate 32 "d") "test-build.drv"
 
 -- | Create a minimal Derivation for builder tests.
 -- The shell path is discovered once via 'findTestShell' and threaded through.
--- All scripts are POSIX shell - bash is used on every platform.
+-- All scripts are POSIX shell - bash is used on every platform - and may
+-- run the host's own tools ('withHostTools').
 mkTestBuildDrv :: Text -> StorePath -> Text -> Derivation
 mkTestBuildDrv shell outSP script =
-  Derivation
-    { drvOutputs =
-        [ DerivationOutput
-            { doName = "out",
-              doPath = outSP,
-              doHashAlgo = "",
-              doHash = ""
-            }
-        ],
-      drvInputDrvs = Map.empty,
-      drvInputSrcs = [],
-      drvPlatform = currentPlatform,
-      drvBuilder = TE.encodeUtf8 shell,
-      drvArgs = ["-c", TE.encodeUtf8 script],
-      drvEnv = Map.fromList [("name", "test-build"), ("system", TE.encodeUtf8 (platformToText currentPlatform))]
-    }
+  withHostTools
+    Derivation
+      { drvOutputs =
+          [ DerivationOutput
+              { doName = "out",
+                doPath = outSP,
+                doHashAlgo = "",
+                doHash = ""
+              }
+          ],
+        drvInputDrvs = Map.empty,
+        drvInputSrcs = [],
+        drvPlatform = currentPlatform,
+        drvBuilder = TE.encodeUtf8 shell,
+        drvArgs = ["-c", TE.encodeUtf8 script],
+        drvEnv = Map.fromList [("name", "test-build"), ("system", TE.encodeUtf8 (platformToText currentPlatform))]
+      }
+
+-- | What a test derivation that runs the host's own tools sets so that it
+-- finds them, as any derivation must name the programs it runs: on Unix
+-- a @PATH@ of the directories they are in, since a build's own names none;
+-- on Windows nothing, since a build's @PATH@ there holds the test shell's
+-- own tools.
+hostToolsEnv :: Map.Map Text BS.ByteString
+hostToolsEnv
+  | SI.os == "mingw32" = Map.empty
+  | otherwise = Map.singleton "PATH" "/usr/bin:/bin"
+
+-- | A test derivation with 'hostToolsEnv' among its variables, its own
+-- winning.
+withHostTools :: Derivation -> Derivation
+withHostTools drv = drv {drvEnv = Map.union (drvEnv drv) hostToolsEnv}
+
+-- | 'hostToolsEnv' as attributes of a derivation written in source.
+hostToolsAttrs :: Text
+hostToolsAttrs = Map.foldrWithKey (\name value rest -> name <> " = \"" <> TE.decodeUtf8 value <> "\"; " <> rest) "" hostToolsEnv
 
 -- ---------------------------------------------------------------------------
 -- Tests: CLI Integration (Phase 2, Batch 5)

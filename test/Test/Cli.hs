@@ -78,7 +78,7 @@ import System.IO.Error (ioeGetErrorString)
 import qualified System.Info as SI
 import qualified System.OsPath as OP
 import qualified System.Process as Proc
-import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertLeft, assertRight, canonicalAs, envSpelling, evalAndBuild, evalNixIOStore, fetchedStorePath, findTestShell, forceRemoveIfExists, genJson, makeGitFixture, nixQuotedPath, profileFixture, runTest, runTestM, selfHoldingDerivation, selfHoldingPrinted, selfHoldingPrintedStrict, signedTestNarInfo, symlinksAvailable, tarFile, throwawayKey, trustPe)
+import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertLeft, assertRight, canonicalAs, envSpelling, evalAndBuild, evalNixIOStore, fetchedStorePath, findTestShell, forceRemoveIfExists, genJson, hostToolsAttrs, makeGitFixture, nixQuotedPath, profileFixture, runTest, runTestM, selfHoldingDerivation, selfHoldingPrinted, selfHoldingPrintedStrict, signedTestNarInfo, symlinksAvailable, tarFile, throwawayKey, trustPe)
 import qualified Test.QuickCheck as QC
 import Text.Read (readMaybe)
 
@@ -355,7 +355,7 @@ testE2E = do
         let nixEscape = T.concatMap (\c -> if c == '\\' then "\\\\" else if c == '"' then "\\\"" else T.singleton c)
             e2eSource =
               T.concat
-                [ "derivation { name = \"e2e-test\"; system = builtins.currentSystem; ",
+                [ "derivation { name = \"e2e-test\"; system = builtins.currentSystem; " <> hostToolsAttrs,
                   "builder = \"" <> nixEscape shell <> "\"; ",
                   "args = [\"-c\" \"mkdir -p $out && echo e2e > $out/e2e.txt\"]; }"
                 ]
@@ -887,7 +887,7 @@ testImportFromDerivationCLI = do
       nixString text = "\"" <> T.replace "${" "\\${" (T.replace "\"" "\\\"" (T.replace "\\" "\\\\" text)) <> "\""
       system = nixString (platformToText currentPlatform)
       derivationOf name script extra =
-        "derivation { name = " <> nixString name <> "; system = " <> system <> "; builder = " <> nixString shell <> "; args = [ \"-c\" " <> nixString script <> " ]; " <> extra <> " }"
+        "derivation { name = " <> nixString name <> "; system = " <> system <> "; builder = " <> nixString shell <> "; args = [ \"-c\" " <> nixString script <> " ]; " <> hostToolsAttrs <> extra <> " }"
       -- A build of its own makes the file the expression imports and the
       -- one it reads; what the top derivation writes is what it read.
       ifd = derivationOf "ifd-made" "mkdir $out && printf '{ v = \"built\"; }' > $out/default.nix && printf data > $out/data" ""
@@ -1714,7 +1714,7 @@ testTargetArgsCLI = do
       -- A store path holding a default.nix whose value is a path literal,
       -- which names a place in the store path when the file is read as
       -- import reads it, and the file's on-disk directory otherwise.
-      storeDerivation = "derivation { name = \"store-target\"; system = builtins.currentSystem; builder = " <> builder <> "; args = [ \"-c\" \"mkdir $out; printf ./data > $out/default.nix; printf hi > $out/data\" ]; }"
+      storeDerivation = "derivation { name = \"store-target\"; system = builtins.currentSystem; " <> hostToolsAttrs <> "builder = " <> builder <> "; args = [ \"-c\" \"mkdir $out; printf ./data > $out/default.nix; printf hi > $out/data\" ]; }"
       md5OfFf = "\"00594fd4f42ba43fc1ca0427a0576295\""
       lastLine out = listToMaybe (reverse (filter (not . null) (lines (filter (/= '\r') out))))
       printed (code, out, _) = case code of

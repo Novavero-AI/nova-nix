@@ -234,7 +234,7 @@ import System.FilePath (dropDrive, makeRelative, takeDirectory, takeFileName, (<
 import qualified System.Info as SI
 import qualified System.Process as Proc
 import System.Timeout (timeout)
-import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertEval, assertEvalError, assertEvalErrorIO, assertEvalFail, assertLeft, assertParse, assertParseFail, assertRight, bytesText, canonicalAs, censusStoreHash, compiledBindings, decodeFormals, emits, envSpelling, evalAndBuild, evalDerivationIO, evalDerivationIOStore, evalNix, evalNixIO, evalNixIOIn, evalNixIOStore, evalNixIOStoreDir, evalNixInFile, evalNixWith, fetchedStorePath, findTestShell, fixtureGit, forceRemoveIfExists, inTestSession, jsonInFile, makeGitFixture, nixQuotedPath, positionJson, positionsFile, purePolicy, removeIfExists, repeatedMarker, restrictedPolicy, runTest, runTestIO, runTestM, selfHoldingDerivation, selfHoldingPrinted, selfHoldingPrintedStrict, setLayerRhsMax, setMaxLayers, sitesAdded, storePathStringValue, symlinksAvailable, testBaseDir, testEvalState, testOrigin, testPos, testSessionStore, unexpectedOps, upstreamBaseEnvNames, walkWatchdogMicros, withEnvVar, withGlobals)
+import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertEval, assertEvalError, assertEvalErrorIO, assertEvalFail, assertLeft, assertParse, assertParseFail, assertRight, bytesText, canonicalAs, censusStoreHash, compiledBindings, decodeFormals, emits, envSpelling, evalAndBuild, evalDerivationIO, evalDerivationIOStore, evalNix, evalNixIO, evalNixIOIn, evalNixIOStore, evalNixIOStoreDir, evalNixInFile, evalNixWith, fetchedStorePath, findTestShell, fixtureGit, forceRemoveIfExists, hostToolsAttrs, inTestSession, jsonInFile, makeGitFixture, nixQuotedPath, positionJson, positionsFile, purePolicy, removeIfExists, repeatedMarker, restrictedPolicy, runTest, runTestIO, runTestM, selfHoldingDerivation, selfHoldingPrinted, selfHoldingPrintedStrict, setLayerRhsMax, setMaxLayers, sitesAdded, storePathStringValue, symlinksAvailable, testBaseDir, testEvalState, testOrigin, testPos, testSessionStore, unexpectedOps, upstreamBaseEnvNames, walkWatchdogMicros, withEnvVar, withGlobals)
 import qualified Test.QuickCheck as QC
 
 -- ---------------------------------------------------------------------------
@@ -9984,10 +9984,10 @@ testInStoreCopyIO = do
         BS.writeFile (dir </> "use.nix") "\"${./data.txt}\"\n"
         BS.writeFile
           (dir </> "buildlink.nix")
-          "shell: derivation { name = \"in-store-link\"; system = builtins.currentSystem; builder = shell; args = [ \"-c\" \"cp $src $out\" ]; src = ./abslink/f; }\n"
+          (TE.encodeUtf8 ("shell: derivation { name = \"in-store-link\"; system = builtins.currentSystem; " <> hostToolsAttrs <> "builder = shell; args = [ \"-c\" \"cp $src $out\" ]; src = ./abslink/f; }\n"))
         BS.writeFile
           (dir </> "build.nix")
-          "shell: derivation { name = \"in-store-build\"; system = builtins.currentSystem; builder = shell; args = [ ./run.sh ./data.txt ]; }\n"
+          (TE.encodeUtf8 ("shell: derivation { name = \"in-store-build\"; system = builtins.currentSystem; " <> hostToolsAttrs <> "builder = shell; args = [ ./run.sh ./data.txt ]; }\n"))
         BS.writeFile (storeDir </> T.unpack fileBase) smallContents
       copyOf name entry = either (fail . show) pure (makeFixedOutputPath name "sha256" NarIngestion (sha256Digest (NAR.serialise entry)))
       -- What a build gave: its output checked when it succeeded.
@@ -10009,7 +10009,7 @@ testInStoreCopyIO = do
         result <-
           evalAndBuild (StoreDir buildStore) $
             T.concat
-              [ "derivation { name = \"link-source\"; system = builtins.currentSystem; builder = \"" <> nixEscape shell <> "\"; ",
+              [ "derivation { name = \"link-source\"; system = builtins.currentSystem; " <> hostToolsAttrs <> "builder = \"" <> nixEscape shell <> "\"; ",
                 "args = [ \"-c\" \"" <> builderScript <> "\" ]; src = " <> srcOf (canonPathValue (T.pack linkSources)) <> "; }"
               ]
         outcome <- builtFrom buildStore result check

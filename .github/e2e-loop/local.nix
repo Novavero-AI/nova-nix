@@ -9,6 +9,9 @@ derivation {
   name = "e2e-loop-local";
   system = builtins.currentSystem;
   builder = "/bin/sh";
+  # A build's PATH is /path-not-set unless its derivation sets one, as
+  # upstream's is, so the tools the script runs are named here.
+  PATH = "/usr/bin:/bin";
   args = [
     "-c"
     ''

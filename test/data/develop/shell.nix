@@ -19,6 +19,8 @@ let
       "-c"
       "mkdir -p $out/bin && printf '#!/bin/sh\\necho tool ran\\n' > $out/bin/develop-tool && chmod +x $out/bin/develop-tool"
     ];
+    # A build's own PATH names no directory, so the host's tools are named.
+    PATH = "/usr/bin:/bin";
   };
 in
 derivation (

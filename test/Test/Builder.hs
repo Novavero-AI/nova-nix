@@ -143,7 +143,7 @@ import System.OsPath (OsPath)
 import qualified System.OsPath as OP
 import qualified System.Process as Proc
 import System.Timeout (timeout)
-import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertLeft, assertRight, bytesText, canonicalAs, deleteNamed, evalDerivationIO, evalNixIO, findTestShell, forceRemoveIfExists, genFixturePath, genTextOf, mkTestBuildDrv, narInfoRequest, narRequest, narSpecFileVector, narSpecStr, narSpecVector, offeredSubstitute, profileFixture, pureDepGraph, runTest, runTestM, servedPaths, signedTestNarInfo, symlinksAvailable, tarDir, tarFile, tarPathOrDie, testDrvPath, withEnvVar, withTempStore)
+import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertLeft, assertRight, bytesText, canonicalAs, deleteNamed, evalDerivationIO, evalNixIO, findTestShell, forceRemoveIfExists, genFixturePath, genTextOf, hostToolsEnv, mkTestBuildDrv, narInfoRequest, narRequest, narSpecFileVector, narSpecStr, narSpecVector, offeredSubstitute, profileFixture, pureDepGraph, runTest, runTestM, servedPaths, signedTestNarInfo, symlinksAvailable, tarDir, tarFile, tarPathOrDie, testDrvPath, withEnvVar, withTempStore)
 import qualified Test.QuickCheck as QC
 import Text.Read (readMaybe)
 import UserResources (continueProcess, newSession, withHangupIgnored, withPseudoTerminal, withUnixListener)
@@ -167,17 +167,29 @@ testBuildOrchestrator = do
         request0 <- HTTP.parseRequest "http://127.0.0.1/narinfo-hashes"
         let stale = request0 {HTTP.requestHeaders = [("User-Agent", "curl/0"), ("Accept", "*/*")]}
         pure (assertEqual "headers" [("User-Agent", userAgent), ("Accept", "*/*")] (HTTP.requestHeaders (withUserAgent stale))),
-      -- The build PATH must never open with the build working directory:
-      -- a bare-name builder has no directory to derive.
-      runTest "bare-name builder derives no PATH entry" $
-        let entries = T.splitOn (if SI.os == "mingw32" then ";" else ":") (buildPath "bash")
-         in assertEqual "no-dot" False (any (\e -> e == "." || T.isPrefixOf "./" e || T.isPrefixOf ".\\" e) entries),
-      runTest "dot-relative builder derives no PATH entry" $
-        let entries = T.splitOn (if SI.os == "mingw32" then ";" else ":") (buildPath "./bash")
-         in assertEqual "no-dot-rel" False (any (\e -> e == "." || T.isPrefixOf "./" e || T.isPrefixOf ".\\" e) entries),
-      runTest "absolute builder opens PATH with its own directory" $
-        let path = buildPath ("/store/aaa-bootstrap/bin" </> "bash")
-         in assertEqual "builder-dir-first" (Just "/store/aaa-bootstrap/bin") (listToMaybe (T.splitOn (if SI.os == "mingw32" then ";" else ":") path)),
+      -- On Unix the build's PATH is upstream's, naming no directory
+      -- whatever the builder is.
+      runTest "a Unix build's PATH is upstream's /path-not-set" $
+        if SI.os == "mingw32"
+          then Pass
+          else
+            foldr
+              andThen
+              Pass
+              [assertEqual (T.pack builder) "/path-not-set" (buildPath builder) | builder <- ["bash", "./bash", "./tools/bash", "/store/aaa-bootstrap/bin/bash"]],
+      -- A Windows build's PATH must never open with the build working
+      -- directory: a bare-name or dot-relative builder adds none.
+      runTest "a bare-name or dot-relative builder adds no PATH entry" $
+        foldr
+          andThen
+          Pass
+          [ assertEqual (T.pack builder) False (any (\e -> e == "." || "./" `T.isPrefixOf` e || ".\\" `T.isPrefixOf` e) (T.splitOn ";" (buildPath builder)))
+          | builder <- ["bash", "./bash"]
+          ],
+      runTest "an absolute builder opens a Windows build's PATH with its own directory" $
+        if SI.os == "mingw32"
+          then assertEqual "builder-dir-first" (Just "/store/aaa-bootstrap/bin") (listToMaybe (T.splitOn ";" (buildPath ("/store/aaa-bootstrap/bin" </> "bash"))))
+          else Pass,
       -- unionEnvs: earlier maps win; on Windows displacement is
       -- case-insensitive and keeps the winner's spelling.
       runTest "unionEnvs left map wins" $
@@ -4880,7 +4892,7 @@ testBuildCheckIO = do
             drvPlatform = currentPlatform,
             drvBuilder = TE.encodeUtf8 shell,
             drvArgs = ["-c", script],
-            drvEnv = Map.fromList [("name", name)]
+            drvEnv = Map.union (Map.fromList [("name", name)]) hostToolsEnv
           }
       -- Output a records output b's path, and each holds the word.
       bothWriting word = "mkdir -p $a $b && echo $b > $a/sibling && echo " <> word <> " > $a/value && echo " <> word <> " > $b/value"
@@ -5043,7 +5055,7 @@ testBuildCheckIO = do
                     drvPlatform = currentPlatform,
                     drvBuilder = TE.encodeUtf8 shell,
                     drvArgs = ["-c", "mkdir -p $out $dev && echo $dev > $out/sibling && echo " <> word <> " > $dev/value"],
-                    drvEnv = Map.fromList [("name", "check-siblings")]
+                    drvEnv = Map.union (Map.fromList [("name", "check-siblings")]) hostToolsEnv
                   }
           built <- buildWithDeps config store (writing "first") drvSP
           before <- snapshot store [outSP, devSP]
@@ -5437,7 +5449,7 @@ testOutputCycleBuildIO = do
                     drvPlatform = currentPlatform,
                     drvBuilder = TE.encodeUtf8 shell,
                     drvArgs = ["-c", script],
-                    drvEnv = Map.singleton "name" name
+                    drvEnv = Map.union (Map.singleton "name" name) hostToolsEnv
                   }
           writeDrv store drv drvSP
           buildWithDeps config store drv drvSP
@@ -6481,8 +6493,10 @@ testBuilder = do
             script =
               T.unlines
                 [ "probe=\"${out-unset}|${__json-unset}|${greeting-unset}\"",
-                  "out=$(sed -n \"/^declare -A outputs=/s/.*\\['out'\\]='\\([^']*\\)'.*/\\1/p\" \"$NIX_ATTRS_SH_FILE\")",
-                  "mkdir \"$out\" && cp \"$NIX_ATTRS_JSON_FILE\" \"$out/attrs.json\" && cp \"$NIX_ATTRS_SH_FILE\" \"$out/attrs.sh\" && printf '%s' \"$probe\" > \"$out/env\""
+                  -- Under structured attributes no variable the derivation
+                  -- sets reaches the builder, so the tools are named whole.
+                  "out=$(/usr/bin/sed -n \"/^declare -A outputs=/s/.*\\['out'\\]='\\([^']*\\)'.*/\\1/p\" \"$NIX_ATTRS_SH_FILE\")",
+                  "/bin/mkdir \"$out\" && /bin/cp \"$NIX_ATTRS_JSON_FILE\" \"$out/attrs.json\" && /bin/cp \"$NIX_ATTRS_SH_FILE\" \"$out/attrs.sh\" && printf '%s' \"$probe\" > \"$out/env\""
                 ]
             drv =
               (mkTestBuildDrv shell outSP script)
@@ -6635,7 +6649,7 @@ testBuilder = do
                   drvPlatform = currentPlatform,
                   drvBuilder = TE.encodeUtf8 shell,
                   drvArgs = ["-c", "mkdir -p $out && echo lib > $out/lib.txt && mkdir -p $dev && echo headers > $dev/include.h"],
-                  drvEnv = Map.fromList [("name", "multi")]
+                  drvEnv = Map.union (Map.fromList [("name", "multi")]) hostToolsEnv
                 }
             config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
@@ -6706,7 +6720,7 @@ testBuilder = do
                   drvPlatform = currentPlatform,
                   drvBuilder = TE.encodeUtf8 shell,
                   drvArgs = ["-c", script],
-                  drvEnv = Map.fromList [("name", "partial-valid")]
+                  drvEnv = Map.union (Map.fromList [("name", "partial-valid")]) hostToolsEnv
                 }
             config = defaultBuildConfig (stDir store)
             devPath = storePathToFilePath (stDir store) devSP
@@ -6746,7 +6760,7 @@ testBuilder = do
                   drvPlatform = currentPlatform,
                   drvBuilder = TE.encodeUtf8 shell,
                   drvArgs = ["-c", script],
-                  drvEnv = Map.fromList [("name", "partial-both")]
+                  drvEnv = Map.union (Map.fromList [("name", "partial-both")]) hostToolsEnv
                 }
             config = defaultBuildConfig (stDir store)
             devPath = storePathToFilePath (stDir store) devSP
@@ -6795,7 +6809,7 @@ testBuilder = do
                   drvPlatform = currentPlatform,
                   drvBuilder = TE.encodeUtf8 shell,
                   drvArgs = ["-c", script],
-                  drvEnv = Map.fromList [("name", "scratch-leak")]
+                  drvEnv = Map.union (Map.fromList [("name", "scratch-leak")]) hostToolsEnv
                 }
             config = defaultBuildConfig (stDir store)
             devPath = storePathToFilePath (stDir store) devSP
@@ -6859,7 +6873,7 @@ testBuilder = do
                   drvPlatform = currentPlatform,
                   drvBuilder = TE.encodeUtf8 shell,
                   drvArgs = ["-c", "mkdir -p $out && echo orphan > $out/value"],
-                  drvEnv = Map.fromList [("name", "partial-missing")]
+                  drvEnv = Map.union (Map.fromList [("name", "partial-missing")]) hostToolsEnv
                 }
             config = defaultBuildConfig (stDir store)
             outPath = storePathToFilePath (stDir store) outSP
