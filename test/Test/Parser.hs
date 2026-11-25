@@ -567,6 +567,42 @@ testParserExprs = do
           "update"
           "a // b // c"
           (EBinary OpUpdate (EVar "a") (EBinary OpUpdate (EVar "b") (EVar "c"))),
+      -- Upstream's grammar binds -, then ?, then ++ tighter than * and +.
+      runTest "negation binds tighter than ?" $
+        assertParseIn ["a"] "negate over has-attr" "-a ? b" (EHasAttr (EUnary OpNegate (EVar "a")) [StaticKey "b"]),
+      runTest "negation's operand is an application" $
+        assertParseIn ["f", "x"] "negate an application" "-f x ? y" (EHasAttr (EUnary OpNegate (EApp (EVar "f") (EVar "x"))) [StaticKey "y"]),
+      runTest "? binds tighter than ++" $
+        assertParseIn ["a", "b"] "has-attr over concat" "a ++ b ? c" (EBinary OpConcat (EVar "a") (EHasAttr (EVar "b") [StaticKey "c"])),
+      runTest "++ binds tighter than * and +" $
+        assertParseIn
+          ["a", "b", "c", "d"]
+          "concat over arithmetic"
+          "a * b ++ c + d"
+          (EBinary OpAdd (EBinary OpMul (EVar "a") (EBinary OpConcat (EVar "b") (EVar "c"))) (EVar "d")),
+      -- A prefix operator's operand runs to the end of the operators
+      -- tighter than it, wherever the prefix operator stands.
+      runTest "! as the operand of a tighter operator takes in the operators tighter than !" $
+        assertParseIn
+          ["a", "b", "c"]
+          "not under add"
+          "a + !b + c"
+          (EBinary OpAdd (EVar "a") (EUnary OpNot (EBinary OpAdd (EVar "b") (EVar "c")))),
+      runTest "! binds tighter than //" $
+        assertParseIn ["a", "b"] "not over update" "!a // b" (EBinary OpUpdate (EUnary OpNot (EVar "a")) (EVar "b")),
+      runTest "negation of ! takes in what ! takes in" $
+        assertParseIn ["a", "b"] "negate a not" "-!a + b" (EUnary OpNegate (EUnary OpNot (EBinary OpAdd (EVar "a") (EVar "b")))),
+      runTest "operators that group neither way do not chain" $
+        foldr
+          andThen
+          Pass
+          [assertParseFail source source | source <- ["1 == 2 == 3", "1 == 2 != 3", "1 < 2 > 3", "1 == 2 < 3 == 4"]],
+      runTest "a second ? applies to the first's whole" $
+        assertParseIn ["a"] "has-attr twice" "a ? b ? c" (EHasAttr (EHasAttr (EVar "a") [StaticKey "b"]) [StaticKey "c"]),
+      runTest "a negated number has no attribute, as upstream reads -5 ? a" $
+        assertEval "negate has-attr" "-5 ? a" (VBool False),
+      runTest "! under a tighter operator parses, and an unforced binding of it never fails" $
+        assertEval "not under add, unforced" "let x = 1 + !true; in 2" (VInt 2),
       -- Lambda
       -- After variable resolution, lambda-bound vars become EResolvedVar.
       -- FormalName "x" maps to slot 0; FormalSet [a,b] maps to a=0, b=1;

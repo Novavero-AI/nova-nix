@@ -389,6 +389,20 @@ if upstreamAtLeast 2.34.0; then
 fi
 echo
 
+echo "== how tightly operators bind =="
+# Inside a let, since an expression that starts with a dash reads as a flag
+# on the command line.
+check "negation binds tighter than ?" 'let x = -5 ? a; in x'
+check "a second ? applies to the first's whole" '{ a = { }; } ? a ? b'
+# 1 * ([ ] ++ throw "c") reaches the throw; (1 * [ ]) ++ throw "c" would
+# fail on the product first, which tryEval does not catch.
+check "++ binds tighter than *" 'builtins.tryEval (1 * [ ] ++ throw "c")'
+check "! as the operand of a tighter operator parses" 'let x = 1 + !true; in 2'
+check "! takes in the tighter operators after it" '!{ } ? a'
+unparsed "== does not chain" '1 == 2 == 3'
+unparsed "< does not chain" '1 < 2 > 3'
+echo
+
 echo "== arithmetic and comparison as upstream's primops do them =="
 check "unary minus is 0 - e, so a float zero negates to positive zero" '[ (-(0.0)) (-(-0.0)) ]'
 check "division by a float, and integer division truncating toward zero" '[ (1 / 4.0) (7 / 2) ((-7) / 2) ]'
