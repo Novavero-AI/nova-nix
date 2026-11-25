@@ -1,27 +1,30 @@
 -- | Regions (@cbits\/nn_region.h@): the C data layer's collector, which
--- frees at the end of each force of a thunk what the force allocated
--- that nothing reaches, and a census of what collectors would free there,
--- which frees nothing.
+-- frees, at the end of the forces of thunks it marks at, what they
+-- allocated that nothing reaches, and a census of what collectors would
+-- free there, which frees nothing.
 --
 -- A session runs its regions for its arena's whole life ('withRegions'),
 -- and each force in it opens a region as it starts and closes it once its
--- value is stored or it throws ('inRegion').  Under 'RegionsCollect' each
--- close the collector marks at frees the attribute sets, list headers,
--- lambdas, builtins' partial applications and strings with context that
--- the force allocated and nothing reaches, and the lines of thunk blocks,
--- env pages and string blocks that hold nothing it reached, which the
--- allocators then bump from again.  Under 'RegionsCensus' each
--- close marks, among what the force allocated, what its writes into older
--- cells and with-scopes and the roots it registered still reach, and
--- frees nothing.  'regionFigures' reads the census's counts
--- by size of region, and a simulation of collectors that mark only at
--- the closes of regions past a threshold of bytes, freeing single objects,
--- whole blocks of each of several sizes, or whole lines of a block of each
--- of two lengths.  It also counts what a close reached after an earlier
--- close found it unreached, which a collector would have freed under a
--- live pointer.  And it simulates, each as a t'Tenure', collectors that
--- tenure what their closes marked and mark it again only where a close
--- marks its region whole.
+-- value is stored or it throws ('inRegion').  Under 'RegionsCollect' the
+-- collector marks at the close of a force that allocated at least the
+-- tenure threshold (@NN_REGION_TENURE_THRESHOLD@), and frees the attribute
+-- sets, list headers, lambdas, builtins' partial applications and strings
+-- with context that the force allocated, that no close inside it tenured,
+-- and that nothing reaches, and the lines of thunk blocks, env pages and
+-- string blocks that hold nothing it reached, which the allocators then
+-- bump from again.  What closes inside it tenured is marked too where a
+-- close marks its region whole: at an outermost close, and where the
+-- region holds 1 MiB tenured since its last whole mark.  Under 'RegionsCensus'
+-- each close marks, among what the force allocated, what its writes into
+-- older cells and with-scopes and the roots it registered still reach, and
+-- frees nothing.  'regionFigures' reads the census's counts by size of region,
+-- and a simulation of collectors that mark only at the closes of regions past
+-- a threshold of bytes, freeing single objects, whole blocks of each of
+-- several sizes, or whole lines of a block of each of two lengths.  It also
+-- counts what a close reached after an earlier close found it unreached,
+-- which a collector would have freed under a live pointer.  And it simulates,
+-- each as a t'Tenure', collectors that tenure what their closes marked and
+-- mark it again only where a close marks its region whole.
 --
 -- Under 'RegionsOff' a force pays for regions one match on its session's
 -- setting, and the allocators one flag test per block, tracked object

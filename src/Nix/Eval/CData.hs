@@ -7,8 +7,10 @@
 -- bytecode the evaluator runs all live in C (@cbits/@), reached through
 -- the bindings in the @Nix.Eval.C*@ modules, "Nix.Eval.Symbol" and
 -- "Nix.Eval.SourcePos".  Every read of,
--- write to and allocation in that memory is a t'CData' action, and the
--- evaluator runs one in its own monad through 'MonadCData'.  An action
+-- write to and allocation in that memory the evaluator makes is a
+-- t'CData' action, and the evaluator runs one in its own monad through
+-- 'MonadCData'; the arena's lifecycle, the regions, the census and the
+-- counters ('Nix.Eval.Symbol.symbolCount') call the layer in 'IO'.  An action
 -- runs where the evaluation reaches it, in order with the actions around
 -- it: a read sees memory as it is at that point and not whenever a lazy
 -- value happens to be demanded, and an allocation happens once each time

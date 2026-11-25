@@ -2,9 +2,11 @@
 
 -- | Binary and unary operator evaluation for Nix.
 --
--- Short-circuiting operators ('OpAnd', 'OpOr', 'OpImpl') are handled
--- directly in @Nix.Eval.eval@ because they must not evaluate both
--- operands.  Everything else lives here.
+-- Short-circuiting operators ('OpAnd', 'OpOr', 'OpImpl') are handled in
+-- "Nix.Eval" because they must not evaluate both operands, and so is @+@
+-- ('OpAdd'), which coerces strings and paths through the evaluator and
+-- comes here for its numeric cases ('addToInteger', 'addToFloat').
+-- Everything else lives here.
 module Nix.Eval.Operator
   ( evalBinary,
     evalUnary,
@@ -56,8 +58,9 @@ type Force m = Thunk -> m NixValue
 -- The caller must handle 'OpAdd' and the short-circuit operators
 -- ('OpAnd', 'OpOr', 'OpImpl') before calling this: each looks at its left
 -- operand before the right is evaluated, and @+@ coerces through the
--- evaluator.  The @Force@ function is used only for deep structural
--- equality on compound values.
+-- evaluator.  The @Force@ function is used only to force the elements of
+-- compound values: for deep structural equality, and for the element-wise
+-- ordering of lists.
 evalBinary :: (MonadEval m) => Force m -> BinaryOp -> NixValue -> NixValue -> m NixValue
 evalBinary forceFn op left right = case op of
   OpSub -> primSub left right
@@ -393,15 +396,14 @@ evalUpdate evalLeft evalRight = evalUpdateChain (evalLeft :| [evalRight])
 -- | A chain of @//@, given its operands first to last.
 --
 -- Each operand is evaluated and checked for a set in turn, last to
--- first, as the update queue of 2.34 and later gathers a chain: each
--- update evaluates its right operand and then its left, through
--- @evalAttrs@ (@ExprOpUpdate::evalForUpdate@ in eval.cc at 2.34.9).  A
--- non-set fails before an operand before it is evaluated at all, and the
--- refusal is @evalAttrs@'s message.  2.24.9 evaluates and checks the left
+-- first, as upstream Nix gathers a chain: each update evaluates its right
+-- operand and then its left.  A non-set fails before an operand before it
+-- is evaluated at all, and the refusal is upstream's message for a value
+-- that is not a set.  Older upstream releases evaluate and check the left
 -- operand first; the newest pinned release is followed.  Upstream adds a
 -- trace line naming the operand ("in the left operand of the update (//)
--- operator") above the message; nova-nix's errors carry no trace, so only
--- the final line is reproduced.
+-- operator") above the message; this refusal adds no line of context, so
+-- only the final line is reproduced.
 --
 -- Once every operand is a set, the sets are merged from the first, each
 -- into the result of those before it, as the update queue folds a chain

@@ -3,13 +3,13 @@
  * allocates on its own.
  *
  * Attribute sets, list headers, lambdas, builtins' partial applications
- * and strings with context are malloc'd one object at a time, a set or a
- * lambda in more than one block.  Each kind keeps a tracker, adds every
- * object to it as the object is made, and frees them all at once at
- * arena teardown through its own free function.  A census (nn_stats.h)
+ * and strings with context are malloc'd one object at a time, a set, and
+ * a lambda with formals, in more than one block.  Each kind keeps a tracker,
+ * adds every object to it as the object is made, and frees them all at once
+ * at arena teardown through its own free function.  A census (nn_stats.h)
  * reads the objects back from it, and the region collector (nn_region.h)
- * frees the objects a close finds unreached through a sweep, which keeps
- * the rest in the order they were added.
+ * frees the objects a close finds unreached through a sweep, which keeps the
+ * rest in the order they were added.
  *
  * A tracker takes objects only while an evaluation session holds the
  * arena (nn_arena.h).  An object made outside every session would sit

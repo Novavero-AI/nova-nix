@@ -14,7 +14,8 @@
  * lambda is tracked for bulk cleanup via nn_lambda_free_all().
  *
  * Lifecycle: constructed during evaluation, freed via
- * nn_lambda_free_all() at arena teardown.  Not thread-safe.
+ * nn_lambda_free_all() at arena teardown, or by nn_lambda_sweep when the
+ * region collector finds it unreached.  Not thread-safe.
  */
 
 #ifndef NN_LAMBDA_H

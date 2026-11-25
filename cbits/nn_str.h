@@ -19,11 +19,13 @@
  * is nn_str_empty().
  *
  * Strings are made in arenas: blocks a string is bumped from, freed
- * together.  An nn_str_t never moves.  A block can be walked: each string
- * starts on an NN_STR_ALIGNMENT boundary, and the next one starts
- * nn_str_object_bytes after it.  The values an evaluation makes live in
- * the value arena (nn_str_new); the bytecode keeps its literals' bytes in
- * an arena of its own, freed with the code (nn_bytecode.h).
+ * together.  An nn_str_t never moves.  Each string starts on an
+ * NN_STR_ALIGNMENT boundary, and within one room the next one starts
+ * nn_str_object_bytes after it; while the region collector runs a block
+ * can hold several rooms with unused bytes between them.  The values an
+ * evaluation makes live in the value arena (nn_str_new); the bytecode keeps
+ * its literals' bytes in an arena of its own, freed with the code
+ * (nn_bytecode.h).
  *
  * A string's length is a uint32_t, so a string holds at most UINT32_MAX
  * bytes, the per-allocation limit used across the C data layer.
@@ -79,7 +81,9 @@ typedef struct {
 /* Copy len bytes into a new string in the arena.  (NULL, 0) is the empty
  * string, which is nn_str_empty() and takes no room.  Returns NULL when
  * len is past NN_STR_MAX_LEN, refused before a byte is read, or when the
- * allocator refuses a block; the arena is then as it was. */
+ * allocator refuses a block; the arena then holds the strings it held,
+ * though while the region collector runs the room it bumped from has
+ * ended (nn_region_refill). */
 nn_str_t *nn_str_arena_new(nn_str_arena_t *arena, const char *bytes, size_t len);
 
 /* Free every block.  The arena is empty after, and every string it made

@@ -1,8 +1,8 @@
 /*
- * nn_region.h - Regions: the C data layer's collector, which frees at the
- * end of each force of a thunk what the force allocated that nothing
- * reaches, and a census that measures what it and other collectors would
- * free there, freeing nothing.
+ * nn_region.h - Regions: the C data layer's collector, which frees, at
+ * the end of the forces of thunks it marks at (The collector, below), what
+ * they allocated that nothing reaches, and a census that measures what it
+ * and other collectors would free there, freeing nothing.
  *
  * A region is the extent of one force: everything the data layer
  * allocates from the force's start to the store of its value, inner

@@ -255,9 +255,10 @@ formatNixFloatFixed n
   | isInfinite n = if n > 0 then "inf" else "-inf"
   | otherwise = T.pack (showFFloat (Just 6) n "")
 
--- | Format a float for value display and JSON: 6 fixed decimal places,
--- then strip trailing zeros and an unnecessary decimal point.  E.g.
--- @1.0@ becomes @"1"@, @3.14@ becomes @"3.14"@.
+-- | Format a float for a message, as @builtins.ceil@ and @builtins.floor@
+-- report one out of integer range: 6 fixed decimal places, then strip
+-- trailing zeros and an unnecessary decimal point.  E.g. @1.0@ becomes
+-- @"1"@, @3.14@ becomes @"3.14"@.
 formatNixFloat :: Double -> Text
 formatNixFloat n
   | isNaN n = "nan"

@@ -266,11 +266,12 @@ abortingThunk message = evaluated (mkStr message) >>= deferApply (VBuiltin Built
 -- Format: colon-separated entries, each either @name=path@ or plain @path@,
 -- split at the first @=@.  A plain path gets an empty prefix (matching
 -- real Nix behaviour).  The prefix and path keep the entry's bytes, as
--- upstream's @LookupPath::Elem::parse@ keeps them
--- (src/libexpr/search-path.cc at Nix 2.24.9).
+-- upstream Nix keeps them.
 --
--- >>> parseNixPath "nixpkgs=/home/user/nixpkgs:custom=/opt/custom"
--- [Evaluated (VAttrs {"prefix": "nixpkgs", "path": "/home/user/nixpkgs"}), ...]
+-- @parseNixPath "nixpkgs=\/home\/user\/nixpkgs:custom=\/opt\/custom"@ gives
+-- two evaluated thunks, @{ prefix = "nixpkgs"; path =
+-- "\/home\/user\/nixpkgs"; }@ and @{ prefix = "custom"; path =
+-- "\/opt\/custom"; }@.
 parseNixPath :: (MonadCData m) => ByteString -> m [Thunk]
 parseNixPath raw
   | BS.null raw = pure []

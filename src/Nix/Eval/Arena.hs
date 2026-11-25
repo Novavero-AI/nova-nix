@@ -11,12 +11,12 @@
 -- 'Nix.Eval.force', the value constructors that make a cell or intern a
 -- name) raises 'Nix.Eval.CStatus.ArenaNotInitialized' naming the C entry
 -- point that refused, rather than dereferencing state that does not
--- exist.  The tracked objects (sets, lambdas, strings with context,
--- partial applications) are malloc'd, so the binding modules' own
--- constructors for them work outside a session, and the next teardown
--- frees what they made.  A list's header is malloc'd too, but its items
--- live in the env pages, so outside a session the one list there is to
--- make is the empty one, which has neither.  Parsing ("Nix.Parser") is
+-- exist.  The tracked objects (sets, list headers, lambdas, strings with
+-- context, partial applications) are malloc'd, but their trackers take
+-- one only while a session holds the arena (@cbits\/nn_tracker.h@), so
+-- the binding modules' own constructors for them raise it too.  Outside
+-- a session the one list there is to make is the empty one, which is a
+-- null pointer and allocates nothing.  Parsing ("Nix.Parser") is
 -- pure and needs no arena.  The @null@, @true@, @false@ and empty list
 -- cells and each builtin's own cell are C statics outside every arena, so
 -- forcing one needs no session and survives every one.

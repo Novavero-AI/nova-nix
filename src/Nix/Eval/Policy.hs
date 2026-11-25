@@ -5,17 +5,18 @@
 -- @trace-import-from-derivation@, which decide whether a path reader may
 -- build what its argument's context names.
 --
--- Upstream gates evaluation in two layers (@src/libexpr/eval.cc@ at
--- 2.24.9).  Under either setting the root filesystem is wrapped in an
--- @AllowListSourceAccessor@ that admits a path when it lies within an
--- allowed prefix or is an ancestor of one (@CanonPath::isAllowed@), and
--- the allowed set starts as the search path roots and grows as the
--- evaluation copies, fetches or writes store objects (@allowPath@).
--- Under @restrict-eval@ alone a fetch is also checked against
--- @allowed-uris@ (@checkURI@).  @pure-eval@ additionally empties the
+-- Upstream gates evaluation in two layers.  Under either setting the root
+-- filesystem is wrapped in an accessor that admits a path when it lies
+-- within an allowed prefix or is an ancestor of one, and the allowed set
+-- starts as the search path roots and grows as the evaluation copies,
+-- fetches or writes store objects.  Under @restrict-eval@ alone a fetch is
+-- also checked against @allowed-uris@.  @pure-eval@ additionally empties the
 -- search path, hides the impure constants, and makes the fetchers demand
--- a hash or revision; those decisions live with the builtins and consult
--- t'EvalPolicy' through 'Nix.Eval.Types.MonadEval'.
+-- a hash or revision.  The search path is the caller's to choose as it
+-- starts the session, the constants are left out by
+-- 'Nix.Builtins.builtinEnv' from the policy it is given, and the fetchers'
+-- demand lives with the builtins and consults t'EvalPolicy' through
+-- 'Nix.Eval.Types.MonadEval'.
 --
 -- Everything here is pure so each rule can be tested on its own, the
 -- walk of a path through its symlinks included ('walkPath'), which takes

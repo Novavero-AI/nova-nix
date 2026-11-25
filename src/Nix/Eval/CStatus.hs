@@ -9,8 +9,10 @@
 -- has no memory, or the arena is live and could not grow.  Only the C
 -- side knows which, so the failure path asks it once, through
 -- @nn_arena_live@, and raises a 'CStatusError' that names the C entry
--- point.  The question is asked only after a failure, so the hot path
--- pays the sentinel comparison and nothing more.
+-- point.  The boundary asks only after a failure, so on the Haskell side
+-- the hot path pays the sentinel comparison and nothing more; the C side
+-- asks as well, as each tracked object joins its tracker
+-- (@cbits\/nn_tracker.h@).
 --
 -- A third kind of failure is a defect in this library: an answer from
 -- the C side that its own invariants rule out.  A thunk refuses a state
@@ -98,8 +100,8 @@ cStatusFailure site detail = do
 
 -- | Raise 'CInvariantViolated' for an answer from @site@ that this
 -- library's invariants rule out.  Unlike
--- 'cStatusFailure' it does not ask whether the arena is live: the caller
--- holds a cell the arena handed out, so liveness is not the question.
+-- 'cStatusFailure' it does not ask whether the arena is live: the answer
+-- is a defect whatever the arena's state, so liveness is not the question.
 cInvariantViolated :: String -> String -> IO a
 cInvariantViolated site detail = throwIO (CInvariantViolated site detail)
 

@@ -7,7 +7,10 @@
  *
  * The items array is allocated via nn_env_alloc_items (page-based bump
  * allocator).  The nn_list_t header is malloc'd and tracked for bulk
- * cleanup via nn_list_free_all().  Both are freed at arena teardown.
+ * cleanup via nn_list_free_all().  Both are freed at arena teardown,
+ * unless the region collector frees them first: a header through
+ * nn_list_sweep, an items array with the lines of the page that hold it
+ * (nn_region.h).
  *
  * Lists are immutable after construction: allocate with nn_list_new,
  * fill via nn_list_set, then read with nn_list_get/nn_list_count.
@@ -18,7 +21,8 @@
  * failure: each returns 0 or -1 and hands the list back through `out`.
  *
  * Lifecycle: constructed during evaluation, freed via nn_list_free_all()
- * at arena teardown.  Not thread-safe - single-threaded evaluation only.
+ * at arena teardown or by nn_list_sweep.  Not thread-safe -
+ * single-threaded evaluation only.
  */
 
 #ifndef NN_LIST_H
@@ -50,7 +54,7 @@ int nn_list_new(nn_list_t **out, uint32_t count);
 
 /* The elements of `list` from index `n` on, as a new tracked header over
  * the same items array: O(1) whatever the length, where a copy would
- * add count - n slots to pages nothing frees before evaluation end.
+ * add count - n slots to the env pages.
  * Returns 0 with *out the suffix, or NULL when no element remains
  * (`list` empty or n >= count); returns -1 with *out NULL when the
  * header cannot be allocated. */

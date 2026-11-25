@@ -23,8 +23,9 @@ import Data.Word (Word32)
 
 -- | What makes an environment.
 data EnvSite
-  = -- | The root environment: an evaluation's, each imported file's, a
-    -- @scopedImport@'s and the @derivation@ wrapper's.
+  = -- | The root environment: an evaluation session's, which every
+    -- imported file is evaluated in, a @scopedImport@'s and the
+    -- @derivation@ wrapper's.
     EnvRoot
   | -- | A call of a lambda with an argument name: the argument.
     EnvCall
@@ -71,9 +72,9 @@ envSiteName site = case site of
 -- | What makes an attribute set.
 data SetSite
   = -- | The root environment's sets: @builtins@, the names around every
-    -- expression, a @scopedImport@'s scope, the @derivation@ wrapper's
-    -- scope, the search path's entries, and the argument a command line's
-    -- target is called with ("Nix.Eval.AutoCall").
+    -- expression, the @derivation@ wrapper's scope, the search path's
+    -- entries, and the argument a command line's target is called with
+    -- ("Nix.Eval.AutoCall").
     SetRoot
   | -- | A non-recursive attribute set literal.
     SetLiteral

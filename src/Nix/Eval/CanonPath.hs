@@ -46,7 +46,7 @@ import System.FilePath (isPathSeparator, pathSeparator)
 -- and passes through untouched - upstream's semantics - while on
 -- Windows it is a separator and folds to @/@.  Every site that
 -- produces a 'Nix.Eval.Types.VPath' from platform-tainted text (literal resolution,
--- base-dir joins, fetcher scratch dirs, search-path entries) goes
+-- base-dir joins, search-path entries) goes
 -- through this gate; store-path text is canonical by construction.
 canonPathValue :: Text -> Text
 canonPathValue t = canonPath (if T.any needsFold t then T.map foldSeparator t else t)

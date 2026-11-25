@@ -4,9 +4,11 @@
  * Arena-allocated envs (nn_env.h), with-scope arrays, list items arrays
  * and deferred applications' cells.  Pages are NN_ENV_PAGE_SIZE bytes, or
  * a request's own size when it is larger, allocated on demand as a linked
- * list.  Each allocation bumps a pointer within the current page.
+ * list.  Each allocation bumps a pointer within the current room: a new
+ * page, or, while the region collector runs, a run of a page's free lines
+ * (nn_region_refill).
  *
- * All memory is freed in bulk via nn_env_destroy().
+ * Pages are freed only in bulk, by nn_env_destroy().
  */
 
 #include "nn_env.h"
