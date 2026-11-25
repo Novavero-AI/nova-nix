@@ -53,6 +53,7 @@ module Nix.Store
     addSourceTree,
     copyPathInto,
     placeInStore,
+    moveOutput,
     registrationFor,
     materializeEvalSources,
     materializeEvalStoreWrites,

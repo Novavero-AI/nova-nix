@@ -36,6 +36,7 @@ import Foreign.C.Error (Errno (..), ePIPE)
 import GHC.IO.Exception (IOException (..))
 import GHC.Profiling (requestHeapCensus)
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuildStop (..), SubstitutionAccess (..), buildWithDeps, defaultBuildConfig, execWrapperConfig, substituteFromCaches)
+import Nix.Builder.BuildDir (FailedBuilds (..))
 import Nix.Builder.Buildenv (Activity (..))
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Sandbox (DropGroups (..), SandboxConfig (..), SandboxFallback (..), SandboxMode (..), ViolationLog (..), darwinImpureHostPrefixes, darwinSandboxPaths, parseSandboxPaths)
@@ -748,8 +749,8 @@ reportStop stop = case stop of
   LinkRefused err -> failWith ("build: " <> err)
 
 -- | The configuration a command's builds run under: the caches, fallback,
--- substitution setting, cores, launchers and sandbox its options and
--- nix.conf give.
+-- substitution setting, cores, launchers, sandbox and what a failed build
+-- keeps that its options and nix.conf give.
 buildConfigFor :: NixConfig -> CliOpts -> StoreDir -> IO BuildConfig
 buildConfigFor config opts storeDir = do
   wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
@@ -762,7 +763,8 @@ buildConfigFor config opts storeDir = do
         bcSubstitutes = substitutesFor config,
         bcCores = cores,
         bcExecWrappers = wrappers,
-        bcSandbox = sandbox
+        bcSandbox = sandbox,
+        bcFailedBuilds = failedBuildsFor opts config
       }
 
 -- | Run an action with a read-only session's store for the store in a
@@ -959,6 +961,14 @@ fallbackFor :: CliOpts -> NixConfig -> Fallback
 fallbackFor opts config
   | optFallback opts || ncFallback config = BuildFromSource
   | otherwise = NoFallback
+
+-- | What a build that fails keeps on this run.  The flag only turns
+-- keep-failed on, as nix-build's @-K@ does, so it adds to the config's
+-- setting.
+failedBuildsFor :: CliOpts -> NixConfig -> FailedBuilds
+failedBuildsFor opts config
+  | optKeepFailed opts || ncKeepFailed config = KeepFailed
+  | otherwise = RemoveFailed
 
 -- | Whether a derivation's @allowSubstitutes@ attribute is heeded on this
 -- run: the config's @always-allow-substitutes@.

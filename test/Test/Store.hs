@@ -2208,6 +2208,15 @@ testGcPure = do
               "plan"
               SweepPlan {spDeadRows = [at lockNamed], spTrees = [at lockNamed]}
               (sweepPlan sd valid live (map T.pack [liveName, lockNamed])),
+      -- Nothing registers the rebuild a check keeps under keep-failed, so
+      -- a collection removes it even beside a live path, as upstream's
+      -- removes it unless the path is a temporary root at the time.
+      runTest "sweepPlan removes the rebuild a check kept beside a live path" $
+        let live = Set.fromList [at liveName]
+         in assertEqual
+              "plan"
+              SweepPlan {spDeadRows = [], spTrees = [at (liveName <> ".check")]}
+              (sweepPlan sd live live (map T.pack [liveName, liveName <> ".check"])),
       runTest "parseStorePathPrefix names the path for itself, a trailing separator and anything beneath, and nothing outside" $
         let sp = StorePath (T.replicate 32 "a") "gc-live"
             dirText = T.pack (unStoreDir sd)

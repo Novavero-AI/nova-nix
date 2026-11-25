@@ -328,7 +328,7 @@ small_check_status=0
   cat "$SMALL_CHECK_LOG" >&2
   fail "the check of small.nix exited $small_check_status, not $CHECK_MISMATCH_STATUS"
 }
-grep -Fq "may not be deterministic: output '$OUT_B' differs" "$SMALL_CHECK_LOG" || {
+grep -Fq "may not be deterministic: output \"$OUT_B\" differs" "$SMALL_CHECK_LOG" || {
   cat "$SMALL_CHECK_LOG" >&2
   fail "the check of small.nix did not name the output that differs"
 }
