@@ -63,8 +63,8 @@ jobs:
   # nova-cache-server builds with too: E2E (substitute loop) installs the
   # server on Linux and Ladder (nova-nix and handoff server) on Windows,
   # each in this project, so cabal resolves it under cabal.project's
-  # index-state.  On macOS, the GHC installation Build (macos-latest)
-  # restores as well.
+  # index-state.  On macOS, the GHC installation Build (macos-latest) and
+  # Sandboxed build (macos-latest) restore as well.
   cabal-store:
     name: Cabal store (${{ matrix.os }})
     if: github.ref == 'refs/heads/main'
