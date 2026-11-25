@@ -8,7 +8,8 @@ description: >-
   installing it, and ghcup finds an installation by its directory under
   ~/.ghcup/ghc, so a directory kept here is used as it is, and setup
   installs the version as before where none is.  caches.yml saves the
-  installation from main; Build (macos-latest) restores it.
+  installation from main; Build (macos-latest) and Sandboxed build
+  (macos-latest) restore it.
 inputs:
   ghc-version:
     description: The GHC version, as haskell-actions/setup's ghc-version input names it
