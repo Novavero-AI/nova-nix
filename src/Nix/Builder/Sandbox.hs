@@ -38,9 +38,10 @@
 -- output the helper writes at most one record, @STAGE ERRNO INDEX@, for a
 -- step that failed ('parseStatus'), so nothing there means the builder
 -- ran.  On Linux the builder's start closes that output; on macOS the
--- helper keeps it open to report a failure to watch the build log, which
--- can come after the builder ran.  The stage names here
--- and in the helper are one list.
+-- helper alone writes it, relaying a failed step the builder's process
+-- reports and reporting a failure to watch the build log, which can come
+-- after the builder ran.  The stage names here and in the helper are one
+-- list.
 module Nix.Builder.Sandbox
   ( -- * Settings
     SandboxMode (..),
@@ -1581,7 +1582,9 @@ data DarwinStage
   | DarwinStageStdin
   | DarwinStageLog
   | DarwinStageLogMode
+  | DarwinStageReport
   | DarwinStageLogWatch
+  | DarwinStageRelay
   | DarwinStageOutput
   | DarwinStageSweep
   | DarwinStageSignals
@@ -1601,7 +1604,9 @@ darwinStageName stage = case stage of
   DarwinStageStdin -> "stdin"
   DarwinStageLog -> "log"
   DarwinStageLogMode -> "logmode"
+  DarwinStageReport -> "report"
   DarwinStageLogWatch -> "logwatch"
+  DarwinStageRelay -> "relay"
   DarwinStageOutput -> "output"
   DarwinStageSweep -> "sweep"
   DarwinStageSignals -> "signals"
@@ -1622,7 +1627,10 @@ darwinStageName stage = case stage of
 -- messages.  A failure to watch the build log goes on the status channel,
 -- since the log it could not watch cannot carry it: before the builder
 -- starts when the log cannot be watched at all, as @\/dev\/null@ cannot,
--- or once the build has ended when watching it fails during the build.
+-- or once the build has ended when watching it fails during the build,
+-- and then only when the builder's process reported no failed step of
+-- its own, which the helper relays, so the channel holds one record at
+-- most.  A failure to read that report is the helper's own.
 darwinSetupFailureMessage :: DarwinPlan -> ByteString -> StatusRecord DarwinStage -> Text
 darwinSetupFailureMessage plan program record = case recordStage record of
   DarwinStageStdout -> setup (sys "cannot dup stderr into stdout")
@@ -1631,7 +1639,9 @@ darwinSetupFailureMessage plan program record = case recordStage record of
   DarwinStageStdin -> setup (sys "opening '/dev/null'")
   DarwinStageLog -> setup (sys "preparing the pipe the builder writes its log to")
   DarwinStageLogMode -> setup (sys "making writes to the build log non-blocking")
+  DarwinStageReport -> setup (sys "creating pipe")
   DarwinStageLogWatch -> sys "the sandbox helper cannot watch the build log, which must be pollable (a pipe or a regular file, not /dev/null)"
+  DarwinStageRelay -> sys "the sandbox helper cannot read the builder's report of its setup"
   DarwinStageOutput -> setup (sys "redirecting the builder's output to its log pipe")
   DarwinStageSweep -> setup (sys "the sandbox helper cannot prepare to end the build's processes")
   DarwinStageSignals -> setup (sys "setting signal handlers")

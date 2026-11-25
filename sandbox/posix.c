@@ -28,9 +28,10 @@
  * limit says where they end. */
 #define CLOSE_FALLBACK_TOP 1024
 
-/* The status channel's descriptor.  It is the process's, so it lives at
- * file scope: every failure of the setup is reported on it, a child's
- * before its exec included. */
+/* The status channel's descriptor, or the descriptor posix_report_to
+ * names in its place.  It is the process's, so it lives at file scope:
+ * every failure of the setup is reported on it, a child's before its exec
+ * included. */
 static int status_fd = STDOUT_FILENO;
 
 int posix_status_fd(void)
@@ -42,6 +43,11 @@ void posix_close_status(void)
 {
     close(status_fd);
     status_fd = -1;
+}
+
+void posix_report_to(int fd)
+{
+    status_fd = fd;
 }
 
 void backend_write_status(const char *bytes, size_t length)

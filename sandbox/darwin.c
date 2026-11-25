@@ -126,6 +126,10 @@ extern const int SANDBOX_CHECK_NO_REPORT;
 /* How long a message of the helper's to the build log may be. */
 #define LOG_MESSAGE_BYTES 512
 
+/* The most the builder's report of a failed setup step holds: one status
+ * record, with room to spare. */
+#define REPORT_BYTES_MAX 256
+
 /* The backend this file is. */
 const enum plan_backend backend_plan = PLAN_DARWIN;
 
@@ -437,11 +441,15 @@ static void apply_profile(const struct plan *plan, const char *const *parameters
 
 /* The child the helper forks, which becomes the builder: upstream's
  * runChild for a build that is not a builtin.  LOG_FD is the writing end
- * of the pipe the helper copies into the build log. */
-static void child_main(const struct plan *plan, const char *const *parameters, int log_fd, char **argv,
+ * of the pipe the helper copies into the build log, and REPORT_FD that of
+ * the pipe the child reports a failed setup step on, which its exec
+ * closes, and which the helper relays to the status channel. */
+static void child_main(const struct plan *plan, const char *const *parameters, int log_fd, int report_fd, char **argv,
                        const sigset_t *original_mask)
 {
     struct rlimit core;
+
+    posix_report_to(report_fd);
 
     /* No controlling terminal, and no terminal signals; the builder leads
      * the process group the helper kills (commonChildInit). */
@@ -454,7 +462,7 @@ static void child_main(const struct plan *plan, const char *const *parameters, i
     if (dup2(log_fd, STDOUT_FILENO) < 0 || dup2(log_fd, STDERR_FILENO) < 0)
         status_fail("output", errno, NO_INDEX);
 
-    /* Every descriptor but the status pipe, which closes when the builder
+    /* Every descriptor but the report pipe, which closes when the builder
      * starts (runChild's closeExtraFDs). */
     posix_close_descriptors(descriptor_listing, posix_status_fd());
 
@@ -1022,6 +1030,31 @@ static int wait_for_builder(pid_t child, struct watch *watch, struct log_copy *c
     }
 }
 
+/* Relay to the status channel what the child reported on its pipe, read
+ * from FD once the child has ended or executed the builder, either of
+ * which closes its end.  Answers 1 when it reported a failed step, and 0
+ * when it reported nothing; a read that fails ends the helper with its
+ * own record. */
+static int relay_report(int fd)
+{
+    char report[REPORT_BYTES_MAX];
+    size_t got = 0;
+    for (;;) {
+        ssize_t read_now = read(fd, report + got, sizeof report - got);
+        if (read_now < 0 && errno == EINTR)
+            continue;
+        if (read_now < 0)
+            status_fail("relay", errno, NO_INDEX);
+        if (read_now == 0 || (got += (size_t)read_now) == sizeof report)
+            break;
+    }
+    close(fd);
+    if (got == 0)
+        return 0;
+    backend_write_status(report, got);
+    return 1;
+}
+
 /* Set O_NONBLOCK on FD.  Answers 0, or -1 with errno set. */
 static int set_nonblocking(int fd)
 {
@@ -1033,6 +1066,8 @@ int backend_run(const struct plan *plan, char **argv)
 {
     int null_fd;
     int log_pipe[2];
+    int report_pipe[2];
+    int reported;
     int error;
     int sweep_error = 0;
     size_t i;
@@ -1067,6 +1102,12 @@ int backend_run(const struct plan *plan, char **argv)
     /* The helper writes the log without waiting either. */
     if (set_nonblocking(STDERR_FILENO) < 0)
         status_fail("logmode", errno, NO_INDEX);
+    /* The child's report of a failed setup step, both ends closed on
+     * exec, so that the helper alone writes the status channel once the
+     * child exists and writes at most one record. */
+    if (pipe(report_pipe) < 0 || fcntl(report_pipe[0], F_SETFD, FD_CLOEXEC) < 0
+        || fcntl(report_pipe[1], F_SETFD, FD_CLOEXEC) < 0)
+        status_fail("report", errno, NO_INDEX);
     copy.from = log_pipe[0];
     copy.start = copy.end = 0;
     copy.gone = 0;
@@ -1101,21 +1142,26 @@ int backend_run(const struct plan *plan, char **argv)
     if (child < 0)
         status_fail("fork", errno, NO_INDEX);
     if (child == 0) {
-        child_main(plan, parameters, log_pipe[1], argv, &original_mask);
+        close(report_pipe[0]);
+        child_main(plan, parameters, log_pipe[1], report_pipe[1], argv, &original_mask);
         _exit(EXIT_FAILURE);
     }
-    /* The child reports on its own copy of the status pipe until its exec
-     * closes it.  The helper keeps its own, for the one failure the build
-     * log cannot carry: one to watch the log itself. */
+    /* The child reports a failed setup step on its pipe, which its exec
+     * closes, and the helper relays it.  The helper keeps the status
+     * channel for that and for the one failure the build log cannot carry,
+     * one to watch the log itself, which it reports only when the child
+     * reported nothing, so the channel never holds two records. */
     close(log_pipe[1]);
+    close(report_pipe[1]);
     free(parameters);
 
     /* The queue stays open past the builder's end, so the drain and the
      * last messages wait on the log only while the build is not to end. */
     error = wait_for_builder(child, &watch, &copy, &wait_status);
+    reported = relay_report(report_pipe[0]);
     sweep = sweep_build(&mark, &sweep_error);
     drain = log_drain(&watch, &copy);
-    if (copy.unwatched != 0)
+    if (copy.unwatched != 0 && !reported)
         status_fail("logwatch", copy.unwatched, NO_INDEX);
     /* Every other reason goes to the build log. */
     if (error != 0) {
