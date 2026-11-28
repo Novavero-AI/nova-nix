@@ -129,7 +129,7 @@ import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, canonicalizeMetadata, closeStore, collectGarbage, freshCopyPath, gcRootsDir, isValid, openStore, pathLockFilePath, releasePathLock, replaceWithCopy, rewriteRegularFile, tryAcquirePathLock, waitingForLockMessage, writeDrv)
 import qualified Nix.Store.Access as Access
 import Nix.Store.CaseSensitive (volumeCaseHack)
-import Nix.Store.DB (PathInfo (..), PathRegistration (..), metaDirName, queryDeriver, queryPathInfo, queryReferences, registerPaths)
+import Nix.Store.DB (PathInfo (..), PathRegistration (..), Ultimate (..), metaDirName, queryDeriver, queryPathInfo, queryReferences, registerPaths)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Ops (StoreOps (..), StoreQueries (..), withLocalStore)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, storePathToFilePath, storePathToText)
@@ -2923,7 +2923,11 @@ testTrivialBuildIO = do
             runTest "trivial build records a real NAR hash + size" $
               if realNarHash
                 then Pass
-                else Fail ("NAR hash/size not real: " <> T.pack (show narInfo))
+                else Fail ("NAR hash/size not real: " <> T.pack (show narInfo)),
+            -- Upstream marks an output it built ultimately trusted; one
+            -- that is not fixed has no content address.
+            runTest "trivial build's output is ultimately trusted, unsigned and with no content address" $
+              assertEqual "trust" (Just (Ultimate, Set.empty, Nothing)) ((\info -> (piUltimate info, piSignatures info, piContentAddress info)) <$> narInfo)
           ]
       BuildFailure msg code ->
         sequence
@@ -5604,7 +5608,7 @@ testReferenceClosureIO = do
         plant sp = do
           createDirectoryIfMissing True (onDisk sp)
           BS.writeFile (onDisk sp </> "data") (TE.encodeUtf8 (spName sp))
-        registration sp = PathRegistration sp ("sha256:" <> T.replicate 52 "0") 1 Nothing
+        registration sp refs = PathRegistration sp ("sha256:" <> T.replicate 52 "0") 1 Nothing refs NotUltimate Set.empty Nothing
         -- The input derivation's output records libRuntime, and the input
         -- source records srcRuntime.
         lib = StorePath (T.replicate 32 "k") "closure-lib"
@@ -7259,12 +7263,16 @@ testBuilder = do
             config = defaultBuildConfig (stDir store)
         result <- buildDerivation config store drv testDrvPath
         registered <- isValid store outSP
+        info <- queryPathInfo (stDB store) outSP
         closeStore store
         forceRemoveIfExists tmpStore
+        -- The address the output was checked against, as upstream records
+        -- a fixed output's.
+        let address = Hash.rawHashWithAlgo "sha256" payload >>= Proto.contentAddressFromParts (Proto.FixedMethod FlatIngestion) "sha256"
         pure $ case result of
           BuildSuccess _
-            | registered -> Pass
-            | otherwise -> Fail "built but not registered valid"
+            | not registered -> Fail "built but not registered valid"
+            | otherwise -> assertEqual "trust" (Just (Ultimate, address)) ((\recorded -> (piUltimate recorded, piContentAddress recorded)) <$> info)
           BuildFailure msg code -> Fail ("expected success (" <> T.pack (show code) <> "): " <> msg),
       -- The impureEnvVars carve-out: a fixed-output derivation's
       -- listed ambient variables reach the scrubbed build, an absent

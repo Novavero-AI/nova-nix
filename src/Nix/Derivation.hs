@@ -64,6 +64,7 @@ module Nix.Derivation
     fromATerm,
 
     -- * The .drv file
+    drvExtension,
     DrvFile,
     drvFileDerivation,
     drvFileATerm,

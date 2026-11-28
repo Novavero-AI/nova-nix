@@ -109,6 +109,8 @@ module Test.Harness
     evalNixWith,
     withEnvVar,
     testLogger,
+    genSignatures,
+    genContentAddress,
   )
 where
 
@@ -118,11 +120,13 @@ import Control.Monad (filterM, unless, when)
 import Control.Monad.State.Strict (evalStateT)
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import Data.Functor.Identity (Identity (..))
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -135,6 +139,7 @@ import GHC.IO.Encoding (getFileSystemEncoding)
 import HttpFixture (Reply (..), httpResponse)
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuildStop (..), buildDerivation, defaultBuildConfig)
 import Nix.Builtins (builtinEnv, rootScopeNames)
+import qualified Nix.Daemon.Protocol as Proto
 import qualified Nix.DependencyGraph as DepGraph
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..), currentPlatform, platformToText)
 import Nix.Eval (EvalPolicy (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), attrSetLookup, evalParsed, force, mkStr, runPureEval, typeName, unrestrictedPolicy)
@@ -146,6 +151,7 @@ import Nix.Eval.EvalFormals (EvalFormals (..))
 import Nix.Eval.IO (EvalState (..), SessionSettings (..), SessionStore (..), evalBaseEnv, newEvalStateWith, runEvalIO, sourceCopies, withEvalSession)
 import Nix.Expr.Resolve (staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
+import Nix.Hash (FileIngestionMethod (..), hashAlgoBytes)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..))
 import Nix.Json (Json (..))
 import Nix.Logger (EscapeFilter (..), Logger, handleLogger)
@@ -1439,3 +1445,25 @@ withEnvVar name value action =
 -- writes them, with every escape sequence dropped from a build line.
 testLogger :: Logger
 testLogger = handleLogger DropEscapes stderr
+
+-- ---------------------------------------------------------------------------
+-- Generators shared by the daemon and store tests
+-- ---------------------------------------------------------------------------
+
+-- | A signature: a key name of letters, dashes, dots and digits, and
+-- bytes that are not empty.
+genSignature :: QC.Gen Proto.Signature
+genSignature = QC.suchThatMap ((,) <$> keyName <*> (BS.pack <$> QC.resize 70 (QC.listOf1 QC.arbitrary))) (uncurry Proto.signatureFromParts)
+  where
+    keyName = BS8.pack <$> QC.listOf1 (QC.elements (['a' .. 'z'] ++ "-.0"))
+
+-- | A few signatures, possibly none.
+genSignatures :: QC.Gen (Set.Set Proto.Signature)
+genSignatures = Set.fromList <$> QC.resize 3 (QC.listOf genSignature)
+
+-- | A content address under each method and algorithm upstream's has.
+genContentAddress :: QC.Gen Proto.ContentAddress
+genContentAddress = do
+  method <- QC.elements [Proto.TextMethod, Proto.FixedMethod FlatIngestion, Proto.FixedMethod NarIngestion]
+  algo <- QC.elements ["md5", "sha1", "sha256", "sha512"]
+  QC.suchThatMap (BS.pack <$> QC.vectorOf (fromMaybe 0 (hashAlgoBytes algo)) QC.arbitrary) (Proto.contentAddressFromParts method algo)

@@ -18,6 +18,7 @@ import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -25,13 +26,14 @@ import GHC.IO.Encoding (getFileSystemEncoding, mkTextEncoding, setFileSystemEnco
 import HttpFixture (Reply (..), httpResponse, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, substitutePaths)
+import Nix.Daemon.Protocol (parseContentAddress, parseSignature)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), currentPlatform)
 import Nix.Hash (moduloHashFinalize, moduloHashInit, moduloHashUpdate, rawHashWithAlgo)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), defaultFetchRetryPolicy, ioRetryEffects)
 import qualified Nix.Realise as Realise
 import Nix.Store (ArchiveEnd (..), Store (..), caseHackDiskNames, closeStore, newNarUnpackSink, onDiskNameKey, openStore, releasePathLock, sinkNarStream, tryAcquirePathLock, unpackNarEntry, writeDrv)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, trySetCaseSensitiveDir, volumeCaseHack)
-import Nix.Store.DB (PathRegistration (..))
+import Nix.Store.DB (PathRegistration (..), Ultimate (..))
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (executablePermissions, readOnlyPermissions)
 import Nix.Store.Path (StoreDir (..), defaultStoreDir, storePathToFilePath, storePathToText)
@@ -537,6 +539,28 @@ testSubstituter = do
             | prNarSize reg /= BS.length streamTestNar -> Fail "registration NarSize diverges"
             | prNarHash reg /= CHash.formatNixHash streamTestDigest -> Fail "registration NarHash diverges"
             | otherwise -> Pass,
+      -- A substituted path keeps the signatures its narinfo carries and
+      -- the content address its tree was held to, as upstream registers
+      -- the path info it copies; a Sig line that does not parse is left
+      -- out.
+      runTestM "materialize registers the narinfo's signatures and the content address it checked" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-materialize-trust"
+            address = case streamTestDigest of
+              CHash.NixHash digest -> "fixed:r:sha256:" <> Nix32.encode digest
+            signature = "cache.example.org-1:AQI="
+            narInfo = (streamTestNarInfo streamTestNar) {NarInfo.niSigs = [signature, "not a signature"], NarInfo.niCA = Just address}
+        forceRemoveIfExists tmpStore
+        createDirectoryIfMissing True tmpStore
+        store <- openStore testLogger (StoreDir tmpStore)
+        source <- chunkReader (streamChunks 7 streamTestNar)
+        result <- Subst.materializeNarFromSource store (StorePath sampleHash "stream") narInfo streamTestDigest [] Nothing source
+        closeStore store
+        forceRemoveIfExists tmpStore
+        let expected = (NotUltimate, either (const Set.empty) Set.singleton (parseSignature (TE.encodeUtf8 signature)), either (const Nothing) Just (parseContentAddress address))
+        pure $ case result of
+          Left err -> Fail ("materialize failed: " <> Subst.attemptFailureMessage err)
+          Right reg -> assertEqual "trust" expected (prUltimate reg, prSignatures reg, prContentAddress reg),
       runTestM "materialize removes the tree on a digest mismatch" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-materialize-digest"
@@ -1491,7 +1515,7 @@ testStatedContentAddress = do
         result <- either (pure . Left . ("unpack: " <>)) (const (Subst.checkStatedAddress (volumeCaseHack sensitivity) dir sp dest address)) written
         forceRemoveIfExists root
         pure result
-      holds label tree address = runTestM label $ assertEqual label (Right ()) <$> checked tree (Just address)
+      holds label tree address = runTestM label $ assertEqual label (Right (either (const Nothing) Just (parseContentAddress address))) <$> checked tree (Just address)
       mismatch label tree address = runTestM label $ do
         result <- checked tree (Just address)
         pure $ case result of
@@ -1506,7 +1530,7 @@ testStatedContentAddress = do
       moduloDigest modulus chunks = (\start -> moduloHashFinalize (foldl' moduloHashUpdate start chunks)) <$> moduloHashInit "sha256" modulus
   sequence
     [ runTestM "a narinfo with no content address holds the tree to its NarHash alone" $
-        assertEqual "none" (Right ()) <$> checked directory Nothing,
+        assertEqual "none" (Right Nothing) <$> checked directory Nothing,
       holds "a tree whose NAR has the recursive address stated is held" directory (spelled "fixed:r:" "sha256" (digestOf "sha256" (NAR.serialise directory))),
       holds "an address in another algorithm is read in that one" directory (spelled "fixed:r:" "sha1" (digestOf "sha1" (NAR.serialise directory))),
       mismatch "a tree whose NAR has another digest is refused in upstream's words" directory (spelled "fixed:r:" "sha256" (digestOf "sha256" "something else")),
