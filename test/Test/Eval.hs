@@ -9307,8 +9307,10 @@ callFailure function what = EvalFailure ["from call site"] ("function '" <> func
 -- registered primop not gated on an experimental feature in the order it
 -- registers (primops.cc from @primop_scopedImport@, then
 -- primops/context.cc, fetchMercurial.cc, fetchTree.cc and fromTOML.cc),
--- and @derivation@, interning each name and then that name less a @__@
--- prefix (@addConstant@ and @addPrimOp@ in eval.cc).  Last come the names
+-- the flake primops 2.36.0's @nix@ adds to every evaluator
+-- (@extraPrimOps@), and @derivation@, interning each name and then that
+-- name less a @__@ prefix (@addConstant@ and @addPrimOp@ in eval.cc),
+-- the internal @fetchFinalTree@ under its one name.  Last come the names
 -- the @derivation@ wrapper's parser interns that nothing before it did
 -- (primops/derivation.nix, the grammar actions of parser.y).
 upstreamStartupTable :: [Text]
@@ -9557,11 +9559,18 @@ upstreamStartupTable =
     "__appendContext",
     "appendContext",
     "fetchMercurial",
+    "fetchFinalTree",
     "__fetchurl",
     "fetchurl",
     "fetchTarball",
     "fetchGit",
     "fromTOML",
+    "__getFlake",
+    "getFlake",
+    "__parseFlakeRef",
+    "parseFlakeRef",
+    "__flakeRefToString",
+    "flakeRefToString",
     "derivation",
     "strict",
     "drvAttrs",
@@ -9601,8 +9610,7 @@ testStartupSymbolsIO = do
           ("builtins.toJSON (builtins.filter (name: !(builtins.elem name [ " <> T.unwords (map (\name -> "\"" <> name <> "\"") startupSymbols) <> " ])) (builtins.attrNames builtins))")
           (mkStr "[]"),
       -- Upstream registers fetchTree, fetchClosure and outputOf only with
-      -- an experimental feature on, and nova-nix has no experimental
-      -- feature to turn on.
+      -- an experimental feature on, and nova-nix implements none of them.
       runTest "builtins holds no primop upstream registers only behind an experimental feature" $
         assertEval "gated" "builtins.toJSON (builtins.filter (name: builtins.hasAttr name builtins) [ \"fetchTree\" \"fetchClosure\" \"outputOf\" ])" (mkStr "[]"),
       failsInChild "a name upstream's derivation wrapper brings precedes a program's" "({ }: null) { zzz = 1; x = 2; }" (unexpected "x"),
@@ -9613,6 +9621,10 @@ testStartupSymbolsIO = do
       failsInChild "primops/context.cc's primops precede fetchMercurial.cc's" "({ }: null) { fetchMercurial = 1; unsafeDiscardStringContext = 2; }" (unexpected "unsafeDiscardStringContext"),
       failsInChild "fetchMercurial.cc's primop precedes fetchTree.cc's" "({ }: null) { fetchGit = 1; fetchMercurial = 2; }" (unexpected "fetchMercurial"),
       failsInChild "a primop's name precedes the derivation wrapper's" "({ }: null) { commonAttrs = 1; toString = 2; }" (unexpected "toString"),
+      failsInChild "fetchTree.cc's internal primop precedes its fetchurl" "({ }: null) { fetchurl = 1; fetchFinalTree = 2; }" (unexpected "fetchFinalTree"),
+      failsInChild "fromTOML.cc's primop precedes the flake primops" "({ }: null) { getFlake = 1; fromTOML = 2; }" (unexpected "fromTOML"),
+      failsInChild "the flake primops come in the order libflake adds them" "({ }: null) { flakeRefToString = 1; parseFlakeRef = 2; }" (unexpected "parseFlakeRef"),
+      failsInChild "the flake primops precede the derivation wrapper's names" "({ }: null) { strict = 1; flakeRefToString = 2; }" (unexpected "flakeRefToString"),
       -- The main program's environment holds the wrapper, so a name only
       -- this evaluator's wrapper used would be interned before the file
       -- imported after it names it, and ahead of zz.

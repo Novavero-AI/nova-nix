@@ -559,6 +559,7 @@ data FlagName
   | PureEvalFlag
   | TraceVerboseFlag
   | NoAllowImportFromDerivationFlag
+  | ExtraExperimentalFeaturesFlag
   | SubstituterFlag
   | TrustedKeyFlag
   | FallbackFlag
@@ -679,6 +680,8 @@ flag name = case name of
     long "trace-verbose" Nothing "Make `builtins.traceVerbose` behave as `builtins.trace`; without it, the first argument is never forced" evaluating
   NoAllowImportFromDerivationFlag ->
     long "no-allow-import-from-derivation" Nothing "Refuse to build or substitute what a path's context names when `import` or another builtin reads the path, even an output already valid" evaluating
+  ExtraExperimentalFeaturesFlag ->
+    long "extra-experimental-features" (Just "FEATURES") "Turn on the experimental features `FEATURES` names, upstream's names separated by spaces, beside those `experimental-features` turns on: `flakes` lets `builtins.parseFlakeRef` and `builtins.flakeRefToString` read a GitHub, GitLab, sourcehut, path or registry reference" evaluating
   SubstituterFlag ->
     long "substituter" (Just "URL") "Try this binary cache before building" evaluating
   TrustedKeyFlag ->
@@ -819,6 +822,7 @@ configuration =
                Setting "trace-verbose" "Make `builtins.traceVerbose` trace" (Just TraceVerboseFlag),
                Setting "allow-import-from-derivation" "Let a builtin that reads a path build or substitute what the path's context names (default: true)" (Just NoAllowImportFromDerivationFlag),
                Setting "trace-import-from-derivation" "Warn, naming the first output, when a builtin that reads a path realises what its context names" Nothing,
+               Setting "experimental-features" "Experimental features to turn on, by upstream's names (default: none); a name upstream does not know is dropped with a warning" (Just ExtraExperimentalFeaturesFlag),
                Setting "sandbox" "Whether a build runs in a sandbox: `true`, `relaxed` (a build that is fixed-output or sets `__noChroot` does not) or `false` (default: `true` on Linux, `false` elsewhere)" (Just SandboxFlag),
                Setting "sandbox-fallback" "Build unsandboxed, after a warning, where a Linux system cannot make the sandbox; on macOS such a build fails (default `true`)" Nothing,
                Setting "sandbox-paths" "Host paths a sandboxed build sees, each `TARGET=SOURCE` or a path naming itself, with `?` after one that may be missing (default: on Linux `/bin/sh` as a release archive's bundled shell; on macOS `/System/Library/Frameworks`, `/System/Library/PrivateFrameworks`, `/bin/sh`, `/bin/bash` and `/usr/lib`)" Nothing,

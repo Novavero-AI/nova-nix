@@ -66,7 +66,7 @@
  * a site is below its bound.  Nix.Eval.AllocSite enumerates exactly
  * these many. */
 #define NN_STATS_ENV_SITES 10u
-#define NN_STATS_SET_SITES 22u
+#define NN_STATS_SET_SITES 23u
 
 /* Envs by the slots they hold: one bucket for each count below
  * NN_STATS_ENV_SIZES - 1, and the last for every larger count. */

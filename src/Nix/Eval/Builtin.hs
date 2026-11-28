@@ -57,6 +57,7 @@ data Builtin
   | Filter
   | FilterSource
   | FindFile
+  | FlakeRefToString
   | Floor
   | FoldlStrict
   | FromJSON
@@ -67,6 +68,7 @@ data Builtin
   | GetAttr
   | GetContext
   | GetEnv
+  | GetFlake
   | GroupBy
   | HasAttr
   | HasContext
@@ -92,6 +94,7 @@ data Builtin
   | Match
   | Mul
   | ParseDrvName
+  | ParseFlakeRef
   | Partition
   | Path
   | PathExists
@@ -165,6 +168,7 @@ builtinName builtin = case builtin of
   Filter -> "filter"
   FilterSource -> "filterSource"
   FindFile -> "findFile"
+  FlakeRefToString -> "flakeRefToString"
   Floor -> "floor"
   FoldlStrict -> "foldl'"
   FromJSON -> "fromJSON"
@@ -175,6 +179,7 @@ builtinName builtin = case builtin of
   GetAttr -> "getAttr"
   GetContext -> "getContext"
   GetEnv -> "getEnv"
+  GetFlake -> "getFlake"
   GroupBy -> "groupBy"
   HasAttr -> "hasAttr"
   HasContext -> "hasContext"
@@ -200,6 +205,7 @@ builtinName builtin = case builtin of
   Match -> "match"
   Mul -> "mul"
   ParseDrvName -> "parseDrvName"
+  ParseFlakeRef -> "parseFlakeRef"
   Partition -> "partition"
   Path -> "path"
   PathExists -> "pathExists"

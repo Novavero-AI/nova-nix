@@ -134,6 +134,11 @@ library
     Nix.Daemon.Protocol
     Nix.Daemon.Wire
     Nix.Environment
+    Nix.ExperimentalFeature
+    Nix.Fetch.Attrs
+    Nix.Fetch.Input
+    Nix.Fetch.Url
+    Nix.Flake.Ref
     Nix.HostPath
     Nix.Profile.Generation
     Nix.Profile.Manifest
@@ -377,6 +382,7 @@ test-suite nova-nix-test
     Test.Derivation
     Test.Eval
     Test.Exceptions
+    Test.Fetch
     Test.Harness
     Test.Parser
     Test.Pkgs

@@ -178,9 +178,12 @@ resolveVar fullStack name = go fullStack 0 False
 -- in @builtins@, so @__typeOf@ and @builtins.typeOf@ are one value.  The
 -- set is @createBaseEnv@'s (primops.cc) with every @RegisterPrimOp@ not
 -- gated on an experimental feature, which leaves out @__fetchClosure@,
--- @__outputOf@, @fetchTree@ and the flake builtins, and with
--- @__importNative@ and @__exec@, which need
--- @allow-unsafe-native-code-during-evaluation@, left out too.
+-- @__outputOf@ and @fetchTree@, and with @__importNative@ and @__exec@,
+-- which need @allow-unsafe-native-code-during-evaluation@, left out too.
+-- It holds the three flake builtins, which upstream's @nix@ adds to every
+-- evaluator it makes whatever the features (@configureEvalSettings@ in
+-- libflake's settings.cc, the @extraPrimOps@ in @createBaseEnv@, at
+-- 2.36.0).
 -- 'impureOnlyGlobalNames' are dropped from it under @pure-eval@.
 --
 -- A name here is never a with-variable: the global binds at parse time and
@@ -248,6 +251,7 @@ staticGlobalNames =
         "filter",
         "filterSource",
         "findFile",
+        "flakeRefToString",
         "floor",
         "foldl'",
         "fromJSON",
@@ -257,6 +261,7 @@ staticGlobalNames =
         "getAttr",
         "getContext",
         "getEnv",
+        "getFlake",
         "groupBy",
         "hasAttr",
         "hasContext",
@@ -282,6 +287,7 @@ staticGlobalNames =
         "nixPath",
         "nixVersion",
         "parseDrvName",
+        "parseFlakeRef",
         "partition",
         "path",
         "pathExists",

@@ -114,6 +114,8 @@ data SetSite
     SetReadDir
   | -- | @fetchGit@.
     SetFetchGit
+  | -- | @parseFlakeRef@.
+    SetParseFlakeRef
   | -- | @derivationStrict@.
     SetDerivationStrict
   | -- | A position's value, as @unsafeGetAttrPos@ and @__curPos@ make it.
@@ -147,5 +149,6 @@ setSiteName site = case site of
   SetFromTOML -> "fromTOML"
   SetReadDir -> "readDir"
   SetFetchGit -> "fetchGit"
+  SetParseFlakeRef -> "parseFlakeRef"
   SetDerivationStrict -> "derivationStrict"
   SetPosition -> "position"

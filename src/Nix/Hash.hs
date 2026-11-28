@@ -61,6 +61,8 @@ module Nix.Hash
     unknownHashAlgo,
     parseHashAlgo,
     parseAnyHash,
+    parseSriHash,
+    parseNarHash,
     digestByLength,
     sriDigest,
 
@@ -374,6 +376,27 @@ parseAnyHash expected original =
     agreeing algo decoded = case expected of
       Just want | want /= algo -> Left ("hash '" <> original <> "' should have type '" <> want <> "'")
       _ -> (algo,) <$> decoded
+
+-- | Parse an SRI hash as upstream's @Hash::parseSRI@ does (hash.cc): the
+-- algorithm before the first @-@ and a base64 digest after it.  A hash in
+-- any other spelling is refused.
+parseSriHash :: Text -> Either Text (Text, BS.ByteString)
+parseSriHash original = case T.breakOn "-" original of
+  (algo, rest) | Just digest <- T.stripPrefix "-" rest -> (algo,) <$> sriDigest algo digest
+  _ -> Left ("hash '" <> original <> "' is not SRI")
+
+-- | A declared @narHash@'s SHA-256 digest, read as upstream's
+-- @Input::getNarHash@ reads it (fetchers.cc): an SRI hash, which must be
+-- SHA-256, or the empty string, which is a digest whose every byte is zero.
+parseNarHash :: Text -> Either Text BS.ByteString
+parseNarHash declared
+  | T.null declared = Right (BS.replicate sha256DigestSize 0)
+  | otherwise =
+      parseSriHash declared >>= \case
+        ("sha256", digest) -> Right digest
+        _ -> Left "narHash must use SHA-256"
+  where
+    sha256DigestSize = 32
 
 -- | Decode a digest that is not SRI, keyed by its length as upstream's
 -- @Hash@ constructor keys it (hash.cc at 2.24.9, @baseFromSize@ there at

@@ -65,11 +65,12 @@ import Nix.Eval.Policy (ImportFromDerivation (..))
 import Nix.Eval.Print (printAmbiguous)
 import Nix.Eval.Symbol (symbolIntern)
 import Nix.Eval.Types (clistThunks, mkStrBytes, mkThunkBc)
+import Nix.ExperimentalFeature (addFeatures, featureSetWarnings, parseFeatures)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.HostPath (hostPathFromBytes, hostPathText)
 import Nix.Http (defaultFetchRetryPolicy)
 import Nix.Json (Json, renderJson)
-import Nix.Logger (Logger, escapeFilterFor, handleLogger)
+import Nix.Logger (Logger, escapeFilterFor, handleLogger, logWarning)
 import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Profile.Generation (Change (..), Changes (..), DatedGeneration (..), Generation (..), GenerationNumber (..), ProfileFailure (..), ProfileLinkPlace (..), RollbackTarget (..), WipeScope (..), absolutePath, checkProfileStore, currentEpochSeconds, cutoffBefore, findGenerations, generationDate, parseOlderThan, readGenerationNumber, readManifest, readProfileEnvironment, resolveDefaultProfile, switchGeneration, updateProfile, wipeHistory)
 import Nix.Profile.Manifest (Conflict (..), ConflictSide (..), Element (..), FlakeSource (..), Manifest (..), Matcher (..), Selection (..), Selector (..), addElement, changeLine, defaultPriority, elementIdentifier, emptyManifest, flakeAttribute, manifestChanges, manifestErrorText, manifestJson, regexMatcher, selectElements)
@@ -197,7 +198,7 @@ main = do
   args <- getArgs
   dataDir <- resolveDataDir
   opts <- either (failWith . T.pack) pure (parseArgs args)
-  config <- loadNixConfig
+  config <- loadNixConfig >>= withCommandLineFeatures opts
   storeDir <- chosenStoreDir opts
   -- SIGINT reaches the main thread as UserInterrupt, which uncaught ends
   -- the process by the signal with nothing said, and an I/O failure no
@@ -342,7 +343,8 @@ evalPolicyFor opts config =
       epPureEval = optPureEval opts || ncPureEval config,
       epAllowedUris = ncAllowedUris config,
       epTraceVerbose = optTraceVerbose opts || ncTraceVerbose config,
-      epImportFromDerivation = importFromDerivationFor opts config
+      epImportFromDerivation = importFromDerivationFor opts config,
+      epExperimentalFeatures = ncExperimentalFeatures config
     }
 
 -- | What @allow-import-from-derivation@ and @trace-import-from-derivation@
@@ -1168,6 +1170,18 @@ loadNixConfig = do
     >>= either configError pure
   where
     configError = failWith . ("error: " <>)
+
+-- | The configuration with each @--extra-experimental-features@ value's
+-- features added, as upstream applies a setting flag over the files, and
+-- the warnings parsing the setting's values gave reported, the
+-- configuration's first, as upstream gives them while it reads them.
+withCommandLineFeatures :: CliOpts -> NixConfig -> IO NixConfig
+withCommandLineFeatures opts config = do
+  values <- traverse (commandLineBytes "--extra-experimental-features") (optExtraExperimentalFeatures opts)
+  let features = foldl addFeatures (ncExperimentalFeatures config) (map parseFeatures values)
+  logger <- cliLogger
+  mapM_ (logWarning logger) (featureSetWarnings features)
+  pure config {ncExperimentalFeatures = features}
 
 -- | A variable the CLI reads, as its bytes, the way upstream's
 -- @getEnv@ reads it.  A Windows value holding an unpaired UTF-16

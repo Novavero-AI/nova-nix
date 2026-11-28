@@ -115,8 +115,13 @@ installedNames name = name : maybeToList (T.stripPrefix "__" name)
 -- runs the files' initializers in the reverse order, primops.cc's last.
 -- An experimental feature leaves out @__outputOf@
 -- (dynamic-derivations), @__fetchClosure@ (fetch-closure) and @fetchTree@
--- (fetch-tree, which flakes implies), and the flake primops register
--- only with flakes on.
+-- (fetch-tree, which flakes implies).  fetchTree.cc registers the
+-- internal @fetchFinalTree@ with no feature, which interns its name alone,
+-- as an internal primop is installed nowhere but under it (@addPrimOp@ in
+-- eval.cc at 2.36.0).  After every registered primop come the flake
+-- primops @__getFlake@, @__parseFlakeRef@ and @__flakeRefToString@, which
+-- 2.36.0's @nix@ adds to every evaluator whatever the features (its
+-- @extraPrimOps@, from libflake's settings.cc).
 baseEnvNames :: [Text]
 baseEnvNames =
   [ "builtins",
@@ -134,8 +139,9 @@ baseEnvNames =
     ++ primopsCc
     ++ contextCc
     ++ ["fetchMercurial"]
-    ++ ["__fetchurl", "fetchTarball", "fetchGit"]
+    ++ ["fetchFinalTree", "__fetchurl", "fetchTarball", "fetchGit"]
     ++ ["fromTOML"]
+    ++ ["__getFlake", "__parseFlakeRef", "__flakeRefToString"]
     ++ ["derivation"]
   where
     -- The RegisterPrimOp entries of primops.cc at 2.24.9.
