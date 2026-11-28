@@ -126,7 +126,7 @@ import Data.Time.Clock.POSIX (getPOSIXTime, posixSecondsToUTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import Data.Word (Word64)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
-import Nix.HostPath (hostPathBytes, hostPathFromBytes, hostPathText)
+import Nix.HostPath (absolutePath, hostPathBytes, hostPathFromBytes, hostPathText)
 import Nix.Logger (Logger (..), logWarning)
 import Nix.Profile.Manifest (Conflict, Manifest, ManifestError, attributeConflict, emptyManifest, manifestPackages, manifestReferences, parseManifest, renderManifest)
 import Nix.Profile.Tree (BuildEnvFailure (..), Built (..), Node (..), Package (..), Tree, buildProfile, storeTreeReader, warningText)
@@ -210,25 +210,6 @@ profileLinkPath place env = case place of
 -- | The default profile the link is made to: @profiles\/profile@.
 defaultProfilePath :: ProfileEnvironment -> OsPath
 defaultProfilePath env = profilesDirectory env </> ascii "profile"
-
--- | A path made absolute against a directory and collapsed, @.@ dropped
--- and @..@ taking off what precedes it, without reading a link:
--- upstream's @absPath@, which @--profile@ and a link's target go through
--- (@MixProfile::updateProfile@ in command.cc, @getDefaultProfile@ in
--- profiles.cc).
-absolutePath :: OsPath -> OsPath -> OsPath
-absolutePath base path = OP.joinPath (reverse (foldl' step [] (OP.splitDirectories joined)))
-  where
-    joined
-      | OP.isAbsolute path = path
-      | otherwise = base </> path
-    -- The components kept so far, last first.  A @..@ at the root stays
-    -- at the root.
-    step kept component
-      | component == ascii "." = kept
-      | component == ascii "..", parent : rest <- kept, not (OP.isAbsolute parent), parent /= component = rest
-      | component == ascii "..", root : _ <- kept, OP.isAbsolute root = kept
-      | otherwise = component : kept
 
 -- | Read where this user's profiles are from the environment, as upstream
 -- does: @NIX_STATE_HOME@, then on Unix @XDG_STATE_HOME@ and on Windows

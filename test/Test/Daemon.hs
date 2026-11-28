@@ -31,7 +31,7 @@ import qualified NovaCache.Base32 as Nix32
 import qualified System.Directory as Dir
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
-import Test.Harness (TestResult (..), andThen, assertEqual, assertRight, runTest, runTestM)
+import Test.Harness (TestResult (..), andThen, assertEqual, assertRight, genContentAddress, genSignatures, runTest, runTestM)
 import qualified Test.QuickCheck as QC
 
 -- ---------------------------------------------------------------------------
@@ -230,22 +230,8 @@ genOutputsSpec = QC.oneof [pure Proto.AllOutputs, QC.suchThatMap (Set.fromList <
 genDerivedPath :: QC.Gen Proto.DerivedPath
 genDerivedPath = QC.oneof [Proto.DerivedOpaque <$> genWireStorePath, Proto.DerivedBuilt <$> genWireStorePath <*> genOutputsSpec]
 
-genSignature :: QC.Gen Proto.Signature
-genSignature = QC.suchThatMap ((,) <$> keyName <*> (BS.pack <$> QC.resize 70 (QC.listOf1 QC.arbitrary))) (uncurry Proto.signatureFromParts)
-  where
-    keyName = BS8.pack <$> QC.listOf1 (QC.elements (['a' .. 'z'] ++ "-.0"))
-
-genSignatures :: QC.Gen (Set.Set Proto.Signature)
-genSignatures = Set.fromList <$> QC.resize 3 (QC.listOf genSignature)
-
 genNarHash :: QC.Gen Proto.NarHash
 genNarHash = QC.suchThatMap (BS.pack <$> QC.vectorOf 32 QC.arbitrary) Proto.narHashFromDigest
-
-genContentAddress :: QC.Gen Proto.ContentAddress
-genContentAddress = do
-  method <- QC.elements [Proto.TextMethod, Proto.FixedMethod FlatIngestion, Proto.FixedMethod NarIngestion]
-  algo <- QC.elements ["md5", "sha1", "sha256", "sha512"]
-  QC.suchThatMap (BS.pack <$> QC.vectorOf (fromMaybe 0 (Hash.hashAlgoBytes algo)) QC.arbitrary) (Proto.contentAddressFromParts method algo)
 
 genPathInfo :: QC.Gen Proto.UnkeyedValidPathInfo
 genPathInfo =
