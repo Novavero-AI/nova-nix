@@ -16,6 +16,7 @@ module Test.Cli
     testTargetArgsCLI,
     testOutLinkCLI,
     testTrustCLI,
+    testSubstituterListingsCLI,
     cliJsonPath,
     writeCliJsonFlag,
     testCliReference,
@@ -2223,6 +2224,61 @@ testTrustCLI = do
       runTest "trust asks the caches for each input no builtin fetches before it reports one as not read" $
         assertEqual "requests" (sort asked) (sort (nub (filter (`elem` asked) seen)))
     ]
+
+-- | A substituter listed twice is asked once, at its first listing, as
+-- upstream drops a repeated one: a loopback cache holds the narinfo of a
+-- builtin:fetchurl output but not its NAR, which is a substitute gone, so
+-- every listing left asks for the NAR again before the build fetches the
+-- file itself.  The NAR is asked for once however the listing repeats,
+-- in nix.conf or between nix.conf and @--substituter@, and twice for two
+-- spellings of the cache, one with a trailing slash, which upstream also
+-- takes for two substituters.
+testSubstituterListingsCLI :: IO [Bool]
+testSubstituterListingsCLI = do
+  putStrLn "cli/substituter-listings"
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-substituter-listings"
+      fileBytes = "what the cache lacks the NAR of\n" :: BS.ByteString
+      narTarget = "/nar/listed.nar"
+      expression base = "derivation { name = \"listed.txt\"; system = \"builtin\"; builder = \"builtin:fetchurl\"; url = \"" <> base <> "/file\"; outputHashMode = \"flat\"; outputHashAlgo = \"sha256\"; outputHash = \"" <> Hash.bytesToHexText (sha256Digest fileBytes) <> "\"; }"
+      environment config =
+        ("NIX_CONFIG", config)
+          : ("NIX_CONF_DIR", root </> "system")
+          : ("NIX_USER_CONF_FILES", "")
+          : filter ((`notElem` ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES"]) . fst) ambient
+  out <- either (fail . show) pure (makeFixedOutputPath "listed.txt" "sha256" FlatIngestion (sha256Digest fileBytes))
+  (trustedKey, narInfo) <- either fail pure (signedTestNarInfo out [] (T.drop 1 (TE.decodeUtf8 narTarget)) (NAR.serialise (NAR.NarRegular False fileBytes)))
+  let route target _
+        | target == "/" <> TE.encodeUtf8 (spHash out) <> ".narinfo" = Send (httpResponse "200 OK" (TE.encodeUtf8 narInfo))
+        | target == "/file" = Send (httpResponse "200 OK" fileBytes)
+        | otherwise = Send (httpResponse "404 Not Found" "missing")
+      -- A build in a store of its own, with nix.conf's substituters as
+      -- given and the flags after them: its status and how often the NAR
+      -- was asked for.
+      buildWith label listed flags = withHttpServer route $ \base requests _ -> do
+        let config = "substituters = " <> T.unwords (map ($ base) listed) <> "\ntrusted-public-keys = " <> trustedKey <> "\n"
+        (code, _, err) <-
+          Proc.readCreateProcessWithExitCode
+            ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--", "build", "--store", root </> label, "--no-out-link", "--expr", T.unpack (expression base)] ++ map ($ T.unpack base) flags)) {Proc.env = Just (environment (T.unpack config))})
+            ""
+        seen <- requests
+        pure (code, length (filter (== narTarget) seen), err)
+      asks expected (code, asked, err)
+        | (code, asked) == (ExitSuccess, expected) = Pass
+        | otherwise = Fail ("exit " <> T.pack (show code) <> ", the NAR asked for " <> T.pack (show asked) <> " times; stderr=" <> T.pack err)
+  bracket_ (forceRemoveIfExists root >> createDirectoryIfMissing True root) (forceRemoveIfExists root) $ do
+    inConfig <- buildWith "in-config" [id, id] []
+    withFlag <- buildWith "with-flag" [id] [const "--substituter", id]
+    spelledTwice <- buildWith "spelled-twice" [id, (<> "/")] []
+    sequence
+      [ runTest "a substituter nix.conf lists twice is asked once" $
+          asks 1 inConfig,
+        runTest "a substituter nix.conf lists and --substituter names again is asked once" $
+          asks 1 withFlag,
+        runTest "a substituter spelled with a trailing slash and without is two, as upstream reads them" $
+          asks 2 spelledTwice
+      ]
 
 -- ---------------------------------------------------------------------------
 -- Tests: the CLI reference
