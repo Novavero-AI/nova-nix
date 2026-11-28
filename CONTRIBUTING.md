@@ -9,6 +9,8 @@ and pull requests are welcome.
 - Code must build warning-clean and pass the test suite. CI runs
   `cabal build --enable-tests --ghc-options="-Werror"`, then the test suite
   (`cabal test` locally).
+- A draft pull request runs no CI. Marking it ready for review runs all
+  of it.
 - Match the existing style: ormolu 0.9.0.0 and hlint 3.10, the versions CI
   pins.
 - Source is ASCII only: CI rejects any other byte in a tracked `.hs`, `.c`,

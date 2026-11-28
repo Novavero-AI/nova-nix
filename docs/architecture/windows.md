@@ -217,8 +217,8 @@ Every rung is an ordinary derivation.
 CI builds the ladder as one job per stage, each starting from the paths
 the stage before built
 ([`seed-ladder.yml`](../../.github/workflows/seed-ladder.yml),
-[`ladder.yml`](../../.github/workflows/ladder.yml)). A pull request that
-changes more than documentation, or a push to main, builds it on x64
+[`ladder.yml`](../../.github/workflows/ladder.yml)). A pull request ready
+for review that changes more than documentation, or a push to main, builds it on x64
 Windows, taking from the public cache each rung the cache holds, and a
 push to main publishes what it holds. The
 daily run, a release and a dispatched run build every rung from the seed

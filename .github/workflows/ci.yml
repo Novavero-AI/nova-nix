@@ -1,16 +1,20 @@
 name: CI
 
-# The checks a change needs before it merges, run on each pull request, in
-# the merge queue and on main.  The seed ladder and the publishing to the
-# public cache are workflows of their own (seed-ladder.yml,
-# public-cache.yml), each with the triggers it needs.
+# The checks a change needs before it merges, run on each pull request
+# that is ready for review, in the merge queue and on main.  The seed
+# ladder and the publishing to the public cache are workflows of their own
+# (seed-ladder.yml, public-cache.yml), each with the triggers it needs.
 on:
   push:
     branches: [main]
   # No base-branch filter on pull_request: a stacked PR bases on its
   # predecessor, not main, and a [main] filter leaves it checkless -
-  # unmergeable under branch protection's required contexts.
+  # unmergeable under branch protection's required contexts.  The types
+  # are GitHub's default three and ready_for_review, which starts the run
+  # of a draft marked ready: a draft runs no job (the comment above ASCII
+  # source).
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   # The merge queue tests each entry against a temporary
   # gh-readonly-queue/main branch, so every required check must also
   # report there or the queue times the context out to a failure and
@@ -19,9 +23,7 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_call:
-  # Run the suite against any branch without opening a pull request:
-  # verifying a fix on a branch otherwise meant a throwaway PR, since
-  # pull_request was the only trigger that reached a non-main ref.
+  # Runs every job on any branch, a draft pull request's included.
   workflow_dispatch:
 
 
@@ -63,11 +65,23 @@ jobs:
   # queue when such a run is re-run.  What a merge group's run does not
   # run, the ladder and the publishing to the public cache, are workflows
   # of their own (seed-ladder.yml, public-cache.yml) and run on every push
-  # to main.  Each job states the condition, rather than leaving it to a
-  # skipped need, so that it holds whatever the job comes to need.
+  # to main.
+  #
+  # A draft pull request runs no job until it is marked ready for review,
+  # which runs every job.  A draft is pushed to again before it merges,
+  # often rebased once the pull request it stacks on merges, so its runs
+  # are mostly thrown away.  A check a draft reports as skipped counts as
+  # passed under branch protection and admits nothing: a draft cannot be
+  # merged, and the merge queue runs every job on its merge group.  Every
+  # other event has no github.event.pull_request, which the
+  # condition reads as no draft; a run that seed.yml or publish.yml calls
+  # has its caller's event, a schedule or a tag's push.
+  #
+  # Each job states both conditions, rather than leaving them to a skipped
+  # need, so that they hold whatever the job comes to need.
   ascii:
     name: ASCII source
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -87,8 +101,9 @@ jobs:
   actionlint:
     name: Actionlint
     needs: [ascii]
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     env:
       ACTIONLINT_VERSION: "1.7.12"
@@ -106,8 +121,9 @@ jobs:
   # one is only noticed while cutting the release, which is the worst time.
   changelog:
     name: Changelog fragments
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -135,8 +151,9 @@ jobs:
   hlint:
     name: HLint
     needs: [ascii]
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -151,8 +168,9 @@ jobs:
   ormolu:
     name: Ormolu
     needs: [ascii]
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -194,8 +212,9 @@ jobs:
   c99-lint:
     name: C99 Strict
     needs: [ascii]
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -216,8 +235,9 @@ jobs:
   cabal-check:
     name: Cabal Check
     needs: [hlint, ormolu, c99-lint]
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -239,8 +259,9 @@ jobs:
   sdist:
     name: Build from sdist
     needs: [cabal-check]
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -291,8 +312,9 @@ jobs:
   sanitizers:
     name: ASan/UBSan
     needs: [cabal-check]
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -364,8 +386,9 @@ jobs:
   build:
     name: Build (${{ matrix.os }})
     needs: [cabal-check]
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     strategy:
       fail-fast: false
       matrix:
@@ -918,8 +941,9 @@ jobs:
   e2e-windows:
     name: E2E (Windows)
     needs: [cabal-check]
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -1090,8 +1114,9 @@ jobs:
   sandboxed-build:
     name: Sandboxed build (${{ matrix.os }})
     needs: [cabal-check]
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     strategy:
       fail-fast: false
       matrix:
@@ -1369,8 +1394,9 @@ jobs:
   stage0-nova-nix:
     name: Stage0 (nova-nix)
     needs: [cabal-check]
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -1422,8 +1448,9 @@ jobs:
   stage0-windows:
     name: Stage0 (${{ matrix.name }})
     needs: [stage0-nova-nix]
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     strategy:
       fail-fast: false
       matrix:
@@ -1747,8 +1774,9 @@ jobs:
   e2e-loop:
     name: E2E (substitute loop)
     needs: [cabal-check]
-    # Skipped on a push by the merge queue (the comment above ASCII source).
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped on a push by the merge queue and on a draft (the comment above
+    # ASCII source).
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
