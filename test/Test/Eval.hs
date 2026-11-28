@@ -210,6 +210,7 @@ import Nix.Eval.StartupSymbols (startupSymbols)
 import Nix.Eval.StringInterp (joinCoercedList)
 import Nix.Eval.Symbol (Symbol (..), symbolCount, symbolIntern, symbolText)
 import Nix.Eval.Types (AttrSet (..), Env (..), Pending (..), attrSetFromEntries, attrSetFromSymbolEntriesSizedFor, attrSetKeys, attrSetRemoveKeys, attrSetToMap, buildCaptureEnv, cheapThunkBc, emptyAttrSet, emptyCList, envLookupResolved, envWithScopesRaw, mkApply2Thunk, mkApplyThunk, mkThunkBc, newEnv, newScopeEnv, pushLazyWithScope, readComputed, readPending, tieFrame, pattern ThunkBlackhole, pattern ThunkComputed)
+import qualified Nix.Eval.Types as EvalTypes
 import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), makeFixedOutputPath, sha256Digest)
 import qualified Nix.Hash as Hash
@@ -4903,7 +4904,16 @@ testPathFilterBody = do
               <> quoted
               <> "; filter = (p: t: true); }"
           )
-          (VBool True)
+          (VBool True),
+        -- A filtered tree reaches the store as the NAR the filter walk
+        -- built, so an archive the parser refuses is refused in the
+        -- parser's words alone, as upstream's restore of its own dump
+        -- refuses one in its parser's.
+        runTestM "a filtered source the NAR parser refuses fails with the parser's refusal" $ do
+          storeDir <- evalNixIOStoreDir
+          st <- testEvalState storeDir srcDir
+          outcome <- runEvalIO st (EvalTypes.addSourceNar "filtered" (NAR.serialise (NAR.NarDirectory [("a/b", NAR.NarRegular False "x")])))
+          pure (assertEqual "refusal" (Left "unsafe NAR directory entry name: \"a/b\"") outcome)
       ]
 
 -- | Interpolating a path that is a symlink copies the link, and one below
@@ -4999,6 +5009,8 @@ testSourceReadErrorsBody = do
   createDirectoryIfMissing True (dir </> "real")
   BS.writeFile (dir </> "file") "f"
   Dir.createDirectoryLink "real" (dir </> "link")
+  createDirectoryIfMissing True (dir </> "withpipe")
+  Proc.callProcess "mkfifo" [dir </> "withpipe" </> "pipe", dir </> "pipe"]
   let resolved = T.pack dir
       given = T.pack dir
       at name = "/. + " <> nixQuotedPath (dir </> name)
@@ -5021,7 +5033,12 @@ testSourceReadErrorsBody = do
         fails "readFile through a link names the resolved path" ("builtins.readFile (" <> at "link/nope" <> ")") ("opening file '" <> resolved <> "/real/nope': No such file or directory"),
         fails "readDir through a link names the resolved path" ("builtins.readDir (" <> at "link/nope" <> ")") ("reading directory " <> resolved <> "/real/nope: No such file or directory"),
         fails "import through a link names the resolved path" ("import (" <> at "link/nope" <> ")") ("path '" <> resolved <> "/real/nope' does not exist"),
-        fails "readFileType through a link refuses the link" ("builtins.readFileType (" <> at "link/nope" <> ")") ("path '" <> given <> "/link' is a symlink")
+        fails "readFileType through a link refuses the link" ("builtins.readFileType (" <> at "link/nope" <> ")") ("path '" <> given <> "/link' is a symlink"),
+        -- The walk refuses an entry of a type a NAR cannot hold in
+        -- upstream's words, as a refusal of its own rather than a failed
+        -- read, whether the entry is below the source or is the source.
+        fails "interpolating a tree holding a FIFO refuses it as upstream's dump does" ("\"${" <> at "withpipe" <> "}\"") ("file '" <> resolved <> "/withpipe/pipe' has an unsupported type"),
+        fails "interpolating a FIFO refuses it as upstream's dump does" ("\"${" <> at "pipe" <> "}\"") ("file '" <> resolved <> "/pipe' has an unsupported type")
       ]
   Dir.removePathForcibly dir
   pure results
