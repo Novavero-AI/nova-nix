@@ -31,7 +31,8 @@ enum nn_spawn_step {
  * Answers 0 with the child's process id in *PID once the program has
  * replaced the child, or the errno of the step that failed, named in
  * *STEP, with no child left behind; EINVAL for uid 0, which is no build
- * user. */
+ * user, and EPERM, before any child exists, for a caller that is not
+ * root, which no other user may become. */
 int nn_spawn_as_user(const char *program, char *const argv[], char *const envp[], const char *cwd, int input_fd,
                      int output_fd, unsigned int uid, unsigned int gid, int group_count, const unsigned int *groups,
                      int *pid, int *step);
@@ -40,8 +41,11 @@ int nn_spawn_as_user(const char *program, char *const argv[], char *const envp[]
  * that user, as kill(-1) reaches only the processes its caller may
  * signal.  Answers 0 with *STATUS 0 once the signal went out, or with
  * *STATUS the child's exit code, or 256 plus the signal that ended it,
- * when the child could not send it; or the errno of a fork or a wait that
- * failed, EINVAL for uid 0, whose kill would reach every process. */
+ * when the child could not send it, the child having checked that its
+ * real and effective uids are UID before any kill; or the errno of a fork
+ * or a wait that failed, EINVAL for uid 0, whose kill would reach every
+ * process, and EPERM, before any child exists, for a caller that is not
+ * root, whose child could only become the caller itself. */
 int nn_kill_user(unsigned int uid, int *status);
 
 /* Wait for the child PID to end, leaving it to be reaped, so its process

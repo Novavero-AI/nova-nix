@@ -195,6 +195,10 @@ int nn_spawn_as_user(const char *program, char *const argv[], char *const envp[]
     *step = NN_SPAWN_UID;
     return EINVAL;
   }
+  if (geteuid() != 0) {
+    *step = NN_SPAWN_UID;
+    return EPERM;
+  }
 
   /* The groups as setgroups takes them, copied before the fork. */
   if (group_count > 0) {
@@ -279,12 +283,19 @@ int nn_kill_user(unsigned int uid, int *status) {
   if (uid == 0) {
     return EINVAL;
   }
+  /* Only root may become another user, so only root's child can be the
+   * build user alone: a caller that is not root is refused before any
+   * child exists, since a setuid to its own uid would succeed and the
+   * kill would end the caller's every other process. */
+  if (geteuid() != 0) {
+    return EPERM;
+  }
   child = fork();
   if (child < 0) {
     return errno;
   }
   if (child == 0) {
-    if (setuid((uid_t)uid) < 0) {
+    if (setuid((uid_t)uid) < 0 || getuid() != (uid_t)uid || geteuid() != (uid_t)uid) {
       _exit(1);
     }
     /* A user with no other process is no failure. */
