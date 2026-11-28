@@ -147,6 +147,7 @@ module Nix.Store.GC
     -- * Reachability (pure)
     referencesMap,
     reachableFrom,
+    referrersFirst,
 
     -- * Collection
     GcResults (..),
@@ -163,19 +164,21 @@ module Nix.Store.GC
     DeleteOutcome (..),
     deleteStorePaths,
     deleteStorePathRaw,
+    deleteSpecificPaths,
 
     -- * Messages
     findingRootsMessage,
     stillAliveMessage,
+    specificStillAliveMessage,
   )
 where
 
 import Control.Exception (IOException, catch, throwIO, try)
 import Control.Monad (join, when)
-import Control.Monad.Except (ExceptT (..), runExceptT)
+import Control.Monad.Except (ExceptT (..), runExceptT, throwError)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString as BS
-import Data.Foldable (traverse_)
+import Data.Foldable (foldlM, traverse_)
 import Data.List (isPrefixOf, sort)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -189,12 +192,12 @@ import GHC.IO.Exception (IOErrorType (InappropriateType))
 import Nix.Hash (sha256Digest)
 import Nix.HostPath (absolutePath, hostPathBytes, hostPathFromBytes)
 import Nix.Logger (Logger (..))
-import Nix.Store.DB (UnregisterResult (..), isValidPath, metaDirName, queryAllReferences, queryAllValidPaths, unregisterPathRow, unregisterPathRows)
+import Nix.Store.DB (UnregisterResult (..), isValidPath, metaDirName, queryAllReferences, queryAllValidPaths, queryReferences, queryReferrers, unregisterPathRow, unregisterPathRows)
 import Nix.Store.Handle (Store (..), withCollectorLock)
 import Nix.Store.Lock (lockFileSuffix, lockedPathOf, withLockFile)
-import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, storePathToFilePath)
+import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, storePathToFilePath, storePathToText)
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode, createSymlinkOfKind)
-import Nix.Store.Upstream (UpstreamHazard (..), upstreamManagedRefusal)
+import Nix.Store.Upstream (UpstreamHazard (..), upstreamManagedRefusal, upstreamStateDir)
 import qualified NovaCache.Base32 as Base32
 import System.Directory (createDirectoryIfMissing, doesPathExist, getFileSize, getSymbolicLinkTarget, listDirectory, pathIsSymbolicLink, removePathForcibly, renamePath)
 import qualified System.Directory.OsPath as OsDir
@@ -284,6 +287,19 @@ stillAliveMessage path =
     <> path
     <> "' since it is still alive. To find out why, use: nova-nix store gc --print-roots"
 
+-- | Upstream's refusal, in its own words, of a path a delete of named
+-- paths leaves alive ('deleteSpecificPaths'), which a client of
+-- upstream's reads.
+specificStillAliveMessage :: Text -> Text
+specificStillAliveMessage path =
+  "Cannot delete path '"
+    <> path
+    <> "' since it is still alive. To find out why, use: nix-store --query --roots and nix-store --query --referrers"
+
+-- | Upstream's progress line before a delete of named paths.
+deletingSpecifiedMessage :: Text
+deletingSpecifiedMessage = "deleting specified paths..."
+
 -- | Upstream's refusal of an out-link inside the store, with this tool's
 -- command in the parenthetical.
 rootInsideStoreMessage :: FilePath -> Text
@@ -336,7 +352,10 @@ data RootCandidate = RootCandidate
   }
 
 -- | Every root the store has, valid paths only, each link once and
--- sorted as @--print-roots@ prints them.  A symlink root naming a path
+-- sorted as @--print-roots@ prints them: those under the store's own
+-- roots directory and, for a store where upstream's local store would
+-- keep its own, those under upstream's @gcroots@ and @profiles@ in its
+-- state directory ('rootDirectories').  A symlink root naming a path
 -- the database does not hold is reported and dropped, a regular-file
 -- root naming one is dropped silently, both as upstream does.  Stale
 -- indirect-root records are removed on the way, and an entry that
@@ -347,7 +366,7 @@ data RootCandidate = RootCandidate
 -- lock as the first step of a collection.
 findRoots :: Store -> IO [GcRoot]
 findRoots store = do
-  candidates <- walkRoots (stLogger store) (stDir store) (gcRootsDir (stDir store))
+  candidates <- concat <$> mapM (walkRoots (stLogger store) (stDir store)) (rootDirectories (stDir store))
   Set.toAscList . Set.fromList . catMaybes <$> mapM validOnly candidates
   where
     validOnly candidate = do
@@ -357,6 +376,19 @@ findRoots store = do
         else do
           mapM_ (logMessage (stLogger store) . skippingInvalidRootMessage (rcLink candidate)) (rcInvalidReport candidate)
           pure Nothing
+
+-- | The directories a store's roots are found under: its own roots
+-- directory, and for a store in a directory upstream's local store uses
+-- ('upstreamStateDir'), upstream's @gcroots@ and @profiles@ beside its
+-- database, where upstream's clients keep their roots and profiles, as
+-- upstream's collector reads them.  A directory that is not there holds
+-- no root.
+rootDirectories :: StoreDir -> [FilePath]
+rootDirectories dir = gcRootsDir dir : maybe [] (\state -> [state </> gcRootsDirName, state </> upstreamProfilesDirName]) (upstreamStateDir (unStoreDir dir))
+
+-- | Upstream's directory of profiles in its state directory.
+upstreamProfilesDirName :: FilePath
+upstreamProfilesDirName = "profiles"
 
 -- | Walk the roots directory.  A directory recurses; a symlink into the
 -- store is a permanent root, and any other symlink is followed one hop
@@ -515,6 +547,22 @@ reachableFrom refs = go Set.empty
       | Set.member path seen = go seen pending
       | otherwise = go (Set.insert path seen) (Map.findWithDefault [] path refs ++ pending)
 
+-- | Paths ordered so that each comes before every one of them it
+-- references, as upstream orders the paths it deletes:
+-- a depth-first walk over the references from each path in order, each
+-- path placed after what it references, the whole reversed.  A reference
+-- outside the paths, or from a path to itself, is not followed, and a
+-- cycle among them is cut where the walk meets a path it entered.
+referrersFirst :: Map Text [Text] -> Set Text -> [Text]
+referrersFirst references paths = snd (foldl' visit (Set.empty, []) (Set.toAscList paths))
+  where
+    visit (seen, placed) path
+      | Set.member path seen = (seen, placed)
+      | otherwise =
+          let followed = [r | r <- sort (Map.findWithDefault [] path references), r /= path, Set.member r paths]
+              (seenAfter, placedAfter) = foldl' visit (Set.insert path seen, placed) followed
+           in (seenAfter, path : placedAfter)
+
 -- ---------------------------------------------------------------------------
 -- The live set
 -- ---------------------------------------------------------------------------
@@ -530,27 +578,31 @@ isLive :: LiveSet -> Text -> Bool
 isLive (LiveSet live) path = Set.member path live
 
 -- | Run a checked delete under the exclusive collector lock with the
--- live set as it stands, after upstream's roots line.  Refused, with
--- the action not run, for a store upstream Nix's database may also
--- manage, before the lock is taken, and when the database holds a path
--- outside the opened directory.  Every caller consumes the set inside
--- the action and returns no part of it.
-withLiveSet :: Store -> (LiveSet -> IO a) -> IO (Either Text a)
-withLiveSet store act = unlessUpstreamManaged store $ withCollectorLock store $ do
+-- live set as it stands, the extra roots given among its roots, after
+-- upstream's roots line.  Refused, with the action not run, for a store
+-- upstream Nix's database may also manage, before the lock is taken,
+-- and when the database holds a path outside the opened directory.
+-- Every caller consumes the set inside the action and returns no part
+-- of it.
+withLiveSet :: Store -> Set StorePath -> (LiveSet -> IO a) -> IO (Either Text a)
+withLiveSet store extraRoots act = unlessUpstreamManaged store $ withCollectorLock store $ do
   checked <- validPathsUnder store
   case checked of
     Left err -> pure (Left err)
     Right _ -> do
       logMessage (stLogger store) findingRootsMessage
-      live <- liveSetOf store
+      live <- liveSetOf store extraRoots
       Right <$> act live
 
--- | The roots' closure as it stands; the caller holds the collector lock.
-liveSetOf :: Store -> IO LiveSet
-liveSetOf store = do
+-- | The closure of the roots as they stand and the extra roots given,
+-- which a caller keeps alive for the paths it is working with, as
+-- upstream's temporary roots are; the caller holds the collector lock.
+liveSetOf :: Store -> Set StorePath -> IO LiveSet
+liveSetOf store extraRoots = do
   roots <- findRoots store
   refs <- referencesMap <$> queryAllReferences (stDB store)
-  pure (LiveSet (reachableFrom refs (map grPath roots)))
+  let extra = [T.pack (storePathToFilePath (stDir store) sp) | sp <- Set.toList extraRoots]
+  pure (LiveSet (reachableFrom refs (map grPath roots <> extra)))
 
 -- | Run a collection or a checked delete unless upstream Nix's database
 -- may also manage the store, as the handle spells its directory or as
@@ -627,15 +679,16 @@ sweepPlan storeDir valid live entries =
         && (Set.member (fullPath entry) valid || not (guardsLivePath entry))
     guardsLivePath entry = maybe False (\guarded -> Set.member (fullPath guarded) live) (lockedPathOf entry)
 
--- | Collect garbage: find the roots, walk the references, remove every
--- dead row in one transaction, then every dead or unregistered tree.
--- Holds the collector lock throughout.  Refused for a store upstream
--- Nix's database may also manage, before the lock is taken, and over a
--- database keyed under another spelling of the directory.
--- The progress lines are upstream's, told to the handle's logger; the
--- summary is the caller's to print ('gcSummaryLine').
-collectGarbage :: Store -> IO (Either Text GcResults)
-collectGarbage store = unlessUpstreamManaged store $ withCollectorLock store $ do
+-- | Collect garbage: find the roots, the extra roots given among them,
+-- walk the references, remove every dead row in one transaction, then
+-- every dead or unregistered tree.  Holds the collector lock throughout.
+-- Refused for a store upstream Nix's database may also manage, before
+-- the lock is taken, and over a database keyed under another spelling of
+-- the directory.  The progress lines are upstream's, told to the
+-- handle's logger; the summary is the caller's to print
+-- ('gcSummaryLine').
+collectGarbage :: Store -> Set StorePath -> IO (Either Text GcResults)
+collectGarbage store extraRoots = unlessUpstreamManaged store $ withCollectorLock store $ do
   checked <- validPathsUnder store
   case checked of
     Left err -> pure (Left err)
@@ -643,7 +696,7 @@ collectGarbage store = unlessUpstreamManaged store $ withCollectorLock store $ d
   where
     sweep valid = do
       logMessage (stLogger store) findingRootsMessage
-      LiveSet live <- liveSetOf store
+      LiveSet live <- liveSetOf store extraRoots
       entries <- map T.pack <$> listDirectory (unStoreDir (stDir store))
       let plan = sweepPlan (stDir store) valid live entries
       logMessage (stLogger store) deletingGarbageMessage
@@ -654,18 +707,22 @@ collectGarbage store = unlessUpstreamManaged store $ withCollectorLock store $ d
           -- dead set would have made its reference live.  Loud, not silent.
           throwIO (userError ("collectGarbage: live paths reference dead ones: " <> show referrers))
         _ -> pure ()
-      freed <- foldlIO 0 (spTrees plan) deleteTree
+      freed <- foldlIO 0 (spTrees plan) (deleteTree store)
       pure GcResults {gcrDeleted = spTrees plan, gcrBytesFreed = freed}
-    deleteTree !acc path = do
-      logMessage (stLogger store) (deletingPathMessage path)
-      let target = T.unpack path
-      node <- classifyWalkNode target
-      case node of
-        WalkAbsent -> pure acc
-        _ -> do
-          bytes <- treeBytes target
-          removePathForcibly target
-          pure (acc + bytes)
+
+-- | Remove a store directory entry's tree, given the bytes freed so far,
+-- with upstream's line for it, and answer the bytes freed with it.
+deleteTree :: Store -> Integer -> Text -> IO Integer
+deleteTree store !acc path = do
+  logMessage (stLogger store) (deletingPathMessage path)
+  let target = T.unpack path
+  node <- classifyWalkNode target
+  case node of
+    WalkAbsent -> pure acc
+    _ -> do
+      bytes <- treeBytes target
+      removePathForcibly target
+      pure (acc + bytes)
 
 -- | The bytes a tree holds, links as leaves: a regular file's size, a
 -- symlink's target length (upstream counts a link's @st_size@, which is
@@ -762,7 +819,7 @@ storeEntryNameText (StoreEntryName name) = name
 -- under another spelling of the directory.
 deleteStorePaths :: Store -> [StoreEntryName] -> (StoreEntryName -> DeleteOutcome -> IO ()) -> IO (Either Text ())
 deleteStorePaths store names report =
-  join <$> withLiveSet store (\live -> runExceptT (traverse_ (deleteAndReport live) names))
+  join <$> withLiveSet store Set.empty (\live -> runExceptT (traverse_ (deleteAndReport live) names))
   where
     deleteAndReport live name = do
       removed <- ExceptT (deleteStorePathChecked store live name)
@@ -793,7 +850,67 @@ deleteStorePaths store names report =
 -- under another spelling of the directory.
 deleteStorePathRaw :: Store -> StoreEntryName -> IO (Either Text DeleteOutcome)
 deleteStorePathRaw store name =
-  join <$> withLiveSet store (\live -> deleteStorePathChecked store live name)
+  join <$> withLiveSet store Set.empty (\live -> deleteStorePathChecked store live name)
+
+-- | Delete store paths as upstream's collector deletes the paths it is
+-- named, with the extra roots given kept alive as upstream's temporary
+-- roots are: each path in path order together with the paths that
+-- reference it, which must all be among those named, the referrers
+-- first ('referrersFirst'), each with upstream's line.  A path that is
+-- live, or that a path not named references, is left, and the delete
+-- stops there with upstream's refusal ('specificStillAliveMessage'), the
+-- paths before it deleted.  So a path and the paths that reference it
+-- delete together in whatever order they are named.  A path the
+-- database does not hold has no referrers, and its tree is deleted.
+-- Naming no path deletes nothing and takes no lock, as upstream returns
+-- at once; otherwise it is refused, with nothing deleted, as
+-- 'collectGarbage' refuses.
+deleteSpecificPaths :: Store -> Set StorePath -> Set StorePath -> IO (Either Text GcResults)
+deleteSpecificPaths store extraRoots targets
+  | Set.null targets = pure (Right (GcResults [] 0))
+  | otherwise = join <$> withLiveSet store extraRoots deleteNamed
+  where
+    pathText = T.pack . storePathToFilePath (stDir store)
+    named = Set.map pathText targets
+    deleteNamed live = do
+      logMessage (stLogger store) deletingSpecifiedMessage
+      outcome <- runExceptT (foldlM (deleteWithReferrers live) (GcResults [] 0, Set.empty) (Set.toAscList targets))
+      pure (fst <$> outcome)
+    deleteWithReferrers :: LiveSet -> (GcResults, Set Text) -> StorePath -> ExceptT Text IO (GcResults, Set Text)
+    deleteWithReferrers live (results, dead) sp = do
+      closure <- liftIO (referrerClosure live dead (pathText sp))
+      (deleted, deadAfter) <- case closure of
+        Nothing -> pure (results, dead)
+        Just visited -> do
+          references <- liftIO (Map.fromList <$> traverse (\path -> (,) path <$> referencesOf path) (Set.toList visited))
+          let order = referrersFirst references visited
+          unregistered <- liftIO (unregisterPathRows (stDB store) order)
+          case unregistered of
+            -- Unreachable: the closure holds every path that references
+            -- one of its paths.  Loud, since the trees would go next.
+            RowReferenced referrers -> throwError ("paths outside the delete reference it: " <> T.intercalate ", " referrers)
+            _ -> pure ()
+          freed <- liftIO (foldlIO (gcrBytesFreed results) order (deleteTree store))
+          pure (GcResults (gcrDeleted results <> order) freed, Set.union dead visited)
+      if Set.member (pathText sp) deadAfter
+        then pure (deleted, deadAfter)
+        else throwError (specificStillAliveMessage (storePathToText defaultStoreDir sp))
+    -- The path with every path that references it, transitively, when
+    -- none is live and all are named; paths already deleted are passed.
+    referrerClosure :: LiveSet -> Set Text -> Text -> IO (Maybe (Set Text))
+    referrerClosure live dead start = go Set.empty [start]
+      where
+        go visited pending = case pending of
+          [] -> pure (Just visited)
+          path : rest
+            | Set.member path visited || Set.member path dead -> go visited rest
+            | isLive live path || not (Set.member path named) -> pure Nothing
+            | otherwise -> do
+                referrers <- referrersOf path
+                go (Set.insert path visited) (rest <> referrers)
+    referrersOf, referencesOf :: Text -> IO [Text]
+    referrersOf path = maybe (pure []) (queryReferrers (stDB store)) (parseStorePath (stDir store) path)
+    referencesOf path = maybe (pure []) (queryReferences (stDB store)) (parseStorePath (stDir store) path)
 
 -- | The delete of one entry given the live set, which stands for the
 -- collector lock being held.  Inside the collector lock the sequence
