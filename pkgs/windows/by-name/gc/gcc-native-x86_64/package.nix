@@ -211,6 +211,10 @@ seedStdenv.mkDerivation {
     configureScript=../gcc-${version}/configure
   '';
 
+  # windres starts its preprocessor itself, without cmd.exe, and WINDRES
+  # is in the environment, since it holds a space (gcc-latest says why).
+  WINDRES = "${target}-windres --use-temp-file";
+
   configureFlags = [
     "--host=${target}"
     "--target=${target}"
@@ -245,7 +249,6 @@ seedStdenv.mkDerivation {
     "CXX=${target}-g++"
     "AR=${target}-ar"
     "LD=${target}-ld"
-    "WINDRES=${target}-windres"
     "CC_FOR_BUILD=${build}-gcc"
     "CXX_FOR_BUILD=${build}-g++"
     "AR_FOR_BUILD=${build}-ar"

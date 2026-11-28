@@ -65,8 +65,13 @@
 # own host, looks windres up under its bare name
 # (NCN_STRICT_CHECK_TOOLS(WINDRES, windres) in configure.ac), as it does the
 # compilers, and hands what it finds to gcc's make (HOST_EXPORTS in
-# Makefile.tpl).  PATH has no windres, and without the flag the build stops
-# there.
+# Makefile.tpl).  PATH has no windres, and without WINDRES the build stops
+# there.  windres reads the output of the preprocessor it runs on the
+# script through popen, which starts the preprocessor through cmd.exe, a
+# program from outside the store, unless --use-temp-file has windres start
+# the preprocessor itself and read its output from a file.  The stdenv
+# splits configureFlags at spaces, so WINDRES, which holds one, is in the
+# environment, where configure takes a tool that is already set.
 #
 # CFLAGS and CXXFLAGS are ng.nix's -O1, and the C++ target library's
 # libstdcxx.nix's -O0, without the -B flags and -dynamic-linker it gives
@@ -193,6 +198,8 @@ seedStdenv.mkDerivation {
     configureScript=../gcc-${version}/configure
   '';
 
+  WINDRES = "${target}-windres --use-temp-file";
+
   configureFlags = [
     "--target=${target}"
     "--with-headers=${mingw-w64-headers-latest}/include"
@@ -233,7 +240,6 @@ seedStdenv.mkDerivation {
     "CXX=${target}-g++"
     "AR=${target}-ar"
     "LD=${target}-ld"
-    "WINDRES=${target}-windres"
     "CFLAGS=-O1"
     "CXXFLAGS=-O1"
     "CFLAGS_FOR_TARGET=-O2"
