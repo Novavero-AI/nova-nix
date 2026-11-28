@@ -843,7 +843,7 @@ configuration =
           <> codeSpan (systemConfDirName PosixHost)
           <> ", or "
           <> codeSpan (systemConfDirName WindowsHost)
-          <> " on Windows; the XDG `nix/nix.conf` files or `$NIX_USER_CONF_FILES`; then `$NIX_CONFIG`. A later source replaces an earlier one's value, an `extra-` prefix on a list setting adds to it instead, and a flag adds to whatever they configure: an entry to a list, or a Boolean moved from its default, which a flag cannot move back."
+          <> " on Windows; the XDG `nix/nix.conf` files, the config home's in `$NIX_CONFIG_HOME` when that is set, or `$NIX_USER_CONF_FILES`; then `$NIX_CONFIG`. A later source replaces an earlier one's value, an `extra-` prefix on a list setting adds to it instead, and a flag adds to whatever they configure: an entry to a list, or a Boolean moved from its default, which a flag cannot move back."
     }
 
 -- ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ module Test.Cli
     testEvalPolicyCLI,
     testResultPrinterCLI,
     testConfigBytesCLI,
+    testNixConfigHomeCLI,
   )
 where
 
@@ -133,7 +134,7 @@ testProfileCLI = do
           isolated given config =
             ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n" <> config)
               : given
-              ++ filter (\(key, _) -> key `notElem` ("NIX_CONFIG" : "NIX_USER_CONF_FILES" : "NIX_PATH" : "NIX_STATE_HOME" : "XDG_STATE_HOME" : colourVariables ++ map fst given)) ambient
+              ++ filter (\(key, _) -> key `notElem` ("NIX_CONFIG" : "NIX_USER_CONF_FILES" : "NIX_CONFIG_HOME" : "NIX_PATH" : "NIX_STATE_HOME" : "XDG_STATE_HOME" : colourVariables ++ map fst given)) ambient
           -- A run's process, given variables that name no location beside
           -- the locations.
           processIn settings given config args = (Proc.proc exe args) {Proc.env = Just (isolated (settings ++ given) config), Proc.cwd = Just (root </> "work")}
@@ -891,7 +892,7 @@ testExecWrapperCLI = do
       isolatedEnv =
         ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
           : ("XDG_CONFIG_HOME", root </> "config")
-          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONFIG_HOME", "XDG_CONFIG_HOME"]) ambient
       runCLI args =
         Proc.readCreateProcessWithExitCode
           ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
@@ -954,7 +955,7 @@ testUncaughtIOFailureCLI = do
       isolatedEnv =
         ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
           : ("XDG_CONFIG_HOME", root </> "config")
-          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONFIG_HOME", "XDG_CONFIG_HOME"]) ambient
   bracket_
     (forceRemoveIfExists root >> createDirectoryIfMissing True root)
     (forceRemoveIfExists root)
@@ -990,7 +991,7 @@ testClosedStdoutCLI = do
       isolatedEnv =
         ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
           : ("XDG_CONFIG_HOME", root </> "config")
-          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONFIG_HOME", "XDG_CONFIG_HOME"]) ambient
       runClosed args =
         bracket Proc.createPipe (\(readEnd, writeEnd) -> hClose readEnd >> hClose writeEnd) $ \(readEnd, writeEnd) -> do
           hClose readEnd
@@ -1042,7 +1043,7 @@ testImportFromDerivationCLI = do
         ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n" <> extraConfig)
           : ("XDG_CONFIG_HOME", root </> "config")
           : ("XDG_CACHE_HOME", root </> "cache")
-          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"]) ambient
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONFIG_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"]) ambient
       runCLIWith extraConfig args =
         Proc.readCreateProcessWithExitCode
           ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just (isolatedEnvWith extraConfig)})
@@ -1304,7 +1305,7 @@ testCheckCLI = do
       isolatedEnv configText =
         ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n" <> configText)
           : ("XDG_CONFIG_HOME", root </> "config")
-          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONFIG_HOME", "XDG_CONFIG_HOME"]) ambient
       runCLIWith configText args =
         Proc.readCreateProcessWithExitCode
           ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just (isolatedEnv configText)})
@@ -1437,7 +1438,7 @@ testDevelopCLI = do
       store = root </> "store"
       marker = root </> "marker"
       shellTemp = root </> "tmp"
-      isolatedNames = ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_STATE_HOME", "XDG_DATA_HOME", "NIX_STATE_HOME", "HOME", "ZDOTDIR", "BASH_ENV", "ENV", "TMPDIR", "NIX_DATA_DIR", "nova_nix_datadir", "DEVELOP_KEEP", "DEVELOP_DROP", "DEVELOP_NEW"]
+      isolatedNames = ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES", "NIX_CONFIG_HOME", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_STATE_HOME", "XDG_DATA_HOME", "NIX_STATE_HOME", "HOME", "ZDOTDIR", "BASH_ENV", "ENV", "TMPDIR", "NIX_DATA_DIR", "nova_nix_datadir", "DEVELOP_KEEP", "DEVELOP_DROP", "DEVELOP_NEW"]
       isolatedEnv dataDir =
         [ ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n"),
           ("NIX_CONF_DIR", root </> "system"),
@@ -1740,7 +1741,7 @@ testSandboxSessionsCLI = do
   tmpBase <- getTemporaryDirectory
   ambient <- getEnvironment
   let root = tmpBase </> "nova-nix-test-cli-sandbox-sessions"
-      configVars = ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"]
+      configVars = ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES", "NIX_CONFIG_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"]
       isolatedEnv =
         ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\nsandbox = true\n")
           : ("NIX_CONF_DIR", root </> "system")
@@ -1865,7 +1866,7 @@ testTargetArgsCLI = do
       isolatedEnv =
         ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
           : ("XDG_CONFIG_HOME", root </> "config")
-          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME", "NIX_PATH"]) ambient
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONFIG_HOME", "XDG_CONFIG_HOME", "NIX_PATH"]) ambient
       runCLI args =
         Proc.readCreateProcessWithExitCode
           ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
@@ -2028,7 +2029,7 @@ testOutLinkCLI = do
       isolatedEnv =
         ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
           : ("XDG_CONFIG_HOME", root </> "config")
-          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONFIG_HOME", "XDG_CONFIG_HOME"]) ambient
       -- cabal finds the project from the directory it runs in, which is
       -- the directory the link is made in, so the project is named.
       runIn dir args =
@@ -2362,7 +2363,7 @@ testCliReference = do
           : ("NIX_CONF_DIR", root </> "system")
           : ("XDG_CONFIG_HOME", root </> "config")
           : ("XDG_CONFIG_DIRS", root </> "config-dirs")
-          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS"]) ambient
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES", "NIX_CONFIG_HOME", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS"]) ambient
       runCLI args =
         Proc.readCreateProcessWithExitCode
           ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just isolatedEnv})
@@ -2691,6 +2692,7 @@ testNixConfig = do
       etcXdg = root </> "etc" </> "xdg"
       etcXdgLocal = root </> "etc" </> "xdg-local"
       configHome = root </> "home" </> "u" </> ".config"
+      nixConfigHome = root </> "home" </> "u" </> "nix-config"
       systemConf = etcNix </> "nix.conf"
       xdgConf dir = dir </> "nix" </> "nix.conf"
       -- The expander's one effect, served from an in-memory map: a path
@@ -2717,6 +2719,7 @@ testNixConfig = do
           { Config.clConfDir = Nothing,
             Config.clSystemConfDir = Just (asciiOsPath etcNix),
             Config.clUserConfFiles = Nothing,
+            Config.clNixConfigHome = Nothing,
             Config.clConfigHome = asciiOsPath configHome,
             Config.clConfigDirs = map asciiOsPath [etcXdg, etcXdgLocal]
           }
@@ -2943,6 +2946,22 @@ testNixConfig = do
       runTest "NIX_USER_CONF_FILES replaces the XDG files, first listed strongest" $
         let listed = cascade {Config.clUserConfFiles = Just (listVar [etcNix </> "a.conf", etcNix </> "b.conf"])}
          in assertEqual "listed" (Right (map asciiOsPath [systemConf, etcNix </> "b.conf", etcNix </> "a.conf"])) (Config.configFilePaths listed),
+      runTest "NIX_CONFIG_HOME holds the config home's nix.conf itself, ahead of XDG_CONFIG_DIRS" $
+        assertEqual
+          "nix-config-home"
+          (Right (map asciiOsPath [systemConf, xdgConf etcXdgLocal, xdgConf etcXdg, nixConfigHome </> "nix.conf"]))
+          (Config.configFilePaths cascade {Config.clNixConfigHome = Just (BS8.pack nixConfigHome)}),
+      runTest "NIX_CONFIG_HOME's nix.conf beats XDG_CONFIG_DIRS, and the XDG config home's is not read" $
+        let files = Map.insert (asciiOsPath (nixConfigHome </> "nix.conf")) "substituters = https://nix-config-home" cascadeFiles
+         in assertEqual "nix-config-home-wins" (Right ["https://nix-config-home"]) (substitutersAt files cascade {Config.clNixConfigHome = Just (BS8.pack nixConfigHome)} Nothing),
+      runTest "an empty NIX_CONFIG_HOME is set, and names nix.conf in the working directory" $
+        assertEqual
+          "nix-config-home-empty"
+          (Right (map asciiOsPath [systemConf, xdgConf etcXdgLocal, xdgConf etcXdg, "nix.conf"]))
+          (Config.configFilePaths cascade {Config.clNixConfigHome = Just ""}),
+      runTest "NIX_USER_CONF_FILES replaces NIX_CONFIG_HOME's file with the rest" $
+        let listed = cascade {Config.clUserConfFiles = Just (listVar [etcNix </> "a.conf"]), Config.clNixConfigHome = Just (BS8.pack nixConfigHome)}
+         in assertEqual "listed-over-home" (Right (map asciiOsPath [systemConf, etcNix </> "a.conf"])) (Config.configFilePaths listed),
       runTest "an empty NIX_USER_CONF_FILES names no user files" $
         assertEqual "none" (Right [asciiOsPath systemConf]) (Config.configFilePaths cascade {Config.clUserConfFiles = Just ""}),
       runTest "empty NIX_USER_CONF_FILES entries are dropped" $
@@ -3002,7 +3021,7 @@ testEvalPolicyCLI = do
       isolate extraConfig =
         ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n" <> extraConfig)
           : ("XDG_CONFIG_HOME", root </> "config")
-          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME", "NIX_PATH"]) ambient
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONFIG_HOME", "XDG_CONFIG_HOME", "NIX_PATH"]) ambient
       runCLI extraConfig args =
         Proc.readCreateProcessWithExitCode
           ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just (isolate extraConfig)})
@@ -3074,7 +3093,7 @@ testResultPrinterCLI = do
       fileString = T.unpack (canonPathValue (T.pack file))
       isolated =
         ("XDG_CONFIG_HOME", root </> "config")
-          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "XDG_CONFIG_HOME"]) ambient
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONFIG_HOME", "XDG_CONFIG_HOME"]) ambient
       cliProcess args = (Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--"] ++ args)) {Proc.env = Just isolated, Proc.std_out = Proc.CreatePipe}
       printsThrough label args expected = runTestM label (Proc.withCreateProcess (cliProcess args) (checkPrinted label expected))
       checkPrinted label expected _ stdoutPipe _ process = case stdoutPipe of
@@ -3103,6 +3122,68 @@ testResultPrinterCLI = do
           "CLI eval --strict prints a derivation, its outputs in all and out as repeated"
           (heapCapped ["eval", "--strict", "--expr", T.unpack selfHoldingDerivation])
           (TE.encodeUtf8 selfHoldingPrintedStrict <> "\n")
+      ]
+
+-- | The user's @nix.conf@ in @NIX_CONFIG_HOME@, as upstream 2.36.0 reads
+-- it: the file there is read in place of the XDG config home's, the XDG
+-- config home's is read when the variable is unset, and an empty one
+-- names @nix.conf@ in the working directory.  @pure-eval@ in the file read
+-- is what each run sees.  Every place a run reads a config file from is
+-- under the test's root, the home and @ZDOTDIR@ included, so the binary is
+-- found by @cabal@ first and run by its path.
+testNixConfigHomeCLI :: IO [Bool]
+testNixConfigHomeCLI = do
+  putStrLn "cli/nix-config-home"
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  _ <- Proc.readCreateProcessWithExitCode (Proc.proc "cabal" ["run", "-v0", "exe:nova-nix", "--", "--version"]) ""
+  (_, listed, _) <- Proc.readCreateProcessWithExitCode (Proc.proc "cabal" ["list-bin", "-v0", "exe:nova-nix"]) ""
+  let exe = fromMaybe "nova-nix" (listToMaybe (reverse (filter (not . null) (lines (filter (/= '\r') listed)))))
+      root = tmpBase </> "nova-nix-test-cli-nix-config-home"
+      home = root </> "home"
+      pureConf dir = createDirectoryIfMissing True dir >> BS.writeFile (dir </> "nix.conf") "pure-eval = true\n"
+      isolatedNames = ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES", "NIX_CONFIG_HOME", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "HOME", "USERPROFILE", "APPDATA", "ZDOTDIR"]
+      environment configHome nixConfigHome =
+        [ ("HOME", home),
+          ("USERPROFILE", home),
+          ("ZDOTDIR", home),
+          ("APPDATA", configHome),
+          ("XDG_CONFIG_HOME", configHome),
+          ("XDG_CONFIG_DIRS", root </> "xdg-dirs"),
+          ("NIX_CONF_DIR", root </> "system")
+        ]
+          ++ [("NIX_CONFIG_HOME", dir) | Just dir <- [nixConfigHome]]
+          ++ filter ((`notElem` isolatedNames) . fst) ambient
+      -- What @builtins ? currentSystem@ prints: false under pure-eval.
+      expect label expected cwd configHome nixConfigHome = runTestM label $ do
+        (code, out, err) <-
+          Proc.readCreateProcessWithExitCode
+            ((Proc.proc exe ["eval", "--expr", "builtins ? currentSystem"]) {Proc.env = Just (environment configHome nixConfigHome), Proc.cwd = Just cwd})
+            ""
+        pure $ case (code, lines out) of
+          (ExitSuccess, line : _) -> assertEqual label expected line
+          _ -> Fail ("CLI: " <> T.pack (show code) <> "; stdout=" <> T.pack out <> "; stderr=" <> T.pack err)
+      work = root </> "work"
+      plainHome = root </> "xdg-plain"
+      pureHome = root </> "xdg-pure"
+      nixHome = root </> "nix-home"
+      emptyNixHome = root </> "nix-home-empty"
+      pureWork = root </> "pure-work"
+  bracket_
+    ( do
+        forceRemoveIfExists root
+        mapM_ (createDirectoryIfMissing True) [home, work, plainHome, emptyNixHome]
+        pureConf nixHome
+        pureConf (pureHome </> "nix")
+        pureConf pureWork
+    )
+    (forceRemoveIfExists root)
+    $ sequence
+      [ expect "NIX_CONFIG_HOME's nix.conf is read" "false" work plainHome (Just nixHome),
+        expect "with NIX_CONFIG_HOME unset, a nix.conf in the directory it would name is not read" "true" work plainHome Nothing,
+        expect "with NIX_CONFIG_HOME unset, the XDG config home's nix.conf is read" "false" work pureHome Nothing,
+        expect "NIX_CONFIG_HOME takes the XDG config home's place" "true" work pureHome (Just emptyNixHome),
+        expect "an empty NIX_CONFIG_HOME names nix.conf in the working directory" "false" pureWork plainHome (Just "")
       ]
 
 -- | nix.conf bytes through the binary: an include target, the

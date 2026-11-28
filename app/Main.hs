@@ -125,6 +125,11 @@ nixConfDirVar = "NIX_CONF_DIR"
 nixUserConfFilesVar :: BS.ByteString
 nixUserConfFilesVar = "NIX_USER_CONF_FILES"
 
+-- | The directory holding the user's own @nix.conf@, in place of @nix@
+-- under the XDG config home.
+nixConfigHomeVar :: BS.ByteString
+nixConfigHomeVar = "NIX_CONFIG_HOME"
+
 -- | The XDG config dirs, searched for @nix\/nix.conf@ after the config home.
 xdgConfigDirsVar :: BS.ByteString
 xdgConfigDirsVar = "XDG_CONFIG_DIRS"
@@ -1251,12 +1256,14 @@ variableHostPath name value =
 -- @%APPDATA%@ on Windows, @XDG_CONFIG_HOME@ only when it is absolute); the
 -- dirs list is filtered the same way, since 'splitSearchPath' turns an
 -- empty POSIX entry into @.@, where upstream's tokenizer drops it, and the
--- XDG spec says a relative entry is ignored.
+-- XDG spec says a relative entry is ignored.  @NIX_CONFIG_HOME@, which
+-- takes the config home's place, is carried as its bytes.
 configLocations :: IO Config.ConfigLocations
 configLocations = do
   confDir <- configVariable nixConfDirVar
   systemConfDir <- platformSystemConfDir
   userFiles <- configVariable nixUserConfFilesVar
+  nixConfigHome <- configVariable nixConfigHomeVar
   home <- OsDir.getXdgDirectory OsDir.XdgConfig mempty
   configDirs <- configVariablePath xdgConfigDirsVar
   defaultConfigDirs <- traverse OP.encodeFS platformConfigDirs
@@ -1265,6 +1272,7 @@ configLocations = do
       { Config.clConfDir = confDir,
         Config.clSystemConfDir = systemConfDir,
         Config.clUserConfFiles = userFiles,
+        Config.clNixConfigHome = nixConfigHome,
         Config.clConfigHome = home,
         Config.clConfigDirs = maybe defaultConfigDirs (filter OP.isAbsolute . OP.splitSearchPath) configDirs
       }
