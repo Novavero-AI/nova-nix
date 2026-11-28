@@ -6,7 +6,9 @@ name: Parity
 # nixpkgs tree.  A derivation store-path hash transitively encodes the hash
 # of every input derivation, so one matching path validates the whole
 # build-time closure at once.  Beside the evaluator, it checks that upstream
-# substitutes from a binary cache that `nova-nix push` writes to a directory.
+# substitutes from a binary cache that `nova-nix push` writes to a directory,
+# and that a profile nova-nix keeps goes through the generations upstream's
+# does.
 #
 # Linux-only on purpose: it is the one place a real Nix exists to diff
 # against.  The "runs natively on Windows" claim is proven separately by the
@@ -174,6 +176,17 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           NOVA_NIX_BIN=$(cabal list-bin exe:nova-nix) .github/parity/push-cases.sh
+
+      # One sequence of changes to a profile on each side, compared after
+      # every step, and a builtin:buildenv derivation in buildenv.nix's shape
+      # built by both.  A profile's tree links into /nix/store, so nova-nix's
+      # side runs in a private mount namespace with a scratch directory over
+      # /nix, as this user, through sudo.  It reads nothing of the nixpkgs
+      # tree, so it runs whatever the evaluator cases found.
+      - name: Profiles and builtin:buildenv vs upstream Nix
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          NOVA_NIX_BIN=$(cabal list-bin exe:nova-nix) .github/parity/profile-cases.sh
 
   # The one context branch protection requires of this workflow, so that
   # bumping a matrix row leaves the required name unchanged.  A required
