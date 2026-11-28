@@ -304,11 +304,12 @@ defaultNixConfig =
 -- Where the files are
 -- ---------------------------------------------------------------------------
 
--- | The environment that decides which files are read.  The two variables
--- are carried raw, as the bytes 'Nix.Environment.lookupEnvBytes' returns,
--- because upstream reads them differently: an empty @NIX_CONF_DIR@ is
--- unset (@getEnvNonEmpty@), while an empty @NIX_USER_CONF_FILES@ is set
--- and names no files at all.  The directories arrive resolved, since the
+-- | The environment that decides which files are read.  The three
+-- variables are carried raw, as the bytes 'Nix.Environment.lookupEnvBytes'
+-- returns, because upstream reads them differently: an empty
+-- @NIX_CONF_DIR@ is unset (@getEnvNonEmpty@), while an empty
+-- @NIX_USER_CONF_FILES@ is set and names no files at all, and an empty
+-- @NIX_CONFIG_HOME@ is set and names the working directory.  The directories arrive resolved, since the
 -- platform defaults behind them (where the machine-wide config directory
 -- is, what the XDG config home and dirs fall back to) are the caller's to
 -- look up.
@@ -321,6 +322,8 @@ data ConfigLocations = ConfigLocations
     clSystemConfDir :: !(Maybe OsPath),
     -- | @NIX_USER_CONF_FILES@.
     clUserConfFiles :: !(Maybe ByteString),
+    -- | @NIX_CONFIG_HOME@.
+    clNixConfigHome :: !(Maybe ByteString),
     -- | The XDG config home.
     clConfigHome :: !OsPath,
     -- | The XDG config dirs, first entry strongest.
@@ -333,7 +336,12 @@ data ConfigLocations = ConfigLocations
 -- platform's machine-wide directory (no file at all when the platform has
 -- none); then the user files in reverse of the order upstream lists them,
 -- since @loadConfFile@ walks @nixUserConfFiles@ back to front
--- (globals.cc) so that the first listed, the config home, wins.  The system
+-- (globals.cc) so that the first listed, the config home, wins.  The
+-- config home's file is in @NIX_CONFIG_HOME@ itself when that is set,
+-- as upstream 2.36.0's @getConfigDir@ reads it (users.cc), and otherwise
+-- in @nix@ under the XDG config home; an empty @NIX_CONFIG_HOME@ is set,
+-- since upstream reads it with @getEnvOs@, and names @nix.conf@ in the
+-- working directory, as @std::filesystem@ joins an empty path.  The system
 -- directory goes through 'canonicalAbsolutePath', as upstream's @Settings@
 -- constructor runs it through @canonPath@ (globals.cc): a relative one is
 -- refused, and @.@ and @..@ in it collapse, so the file is named canonically
@@ -350,10 +358,11 @@ configFilePaths locations = do
   systemDir <- traverse canonicalAbsolutePath (confDir <|> clSystemConfDir locations)
   userFiles <- case clUserConfFiles locations of
     Just listed -> splitListVar <$> variablePath listed
-    Nothing -> pure (map underXdgDir (clConfigHome locations : clConfigDirs locations))
+    Nothing -> do
+      home <- maybe (pure (clConfigHome locations </> nixConfDirName)) variablePath (clNixConfigHome locations)
+      pure (map (</> nixConfFileName) (home : map (</> nixConfDirName) (clConfigDirs locations)))
   pure (maybeToList ((</> nixConfFileName) <$> systemDir) ++ reverse userFiles)
   where
-    underXdgDir dir = dir </> nixConfDirName </> nixConfFileName
     variablePath bytes = maybe (Left (noHostSpelling bytes)) Right (hostPathFromBytes bytes)
 
 -- | Split a path-list variable on the platform's list separator, dropping
