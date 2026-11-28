@@ -13,7 +13,7 @@ module Nix.Eval.Context
 
     -- * Queries
     contextIsEmpty,
-    firstContextEncoded,
+    firstContextDisplayed,
     inUpstreamOrder,
     encodedElement,
     contextRequest,
@@ -40,7 +40,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval.RealiseContext (ContextRequest (..))
 import Nix.Eval.Types (StringContext (..), StringContextElement (..))
-import Nix.Store.Path (StorePath (spHash, spName))
+import Nix.Store.Path (StorePath (spHash, spName), defaultStoreDir, storePathToText)
 
 -- ---------------------------------------------------------------------------
 -- Construction
@@ -66,15 +66,21 @@ allOutputsContext sp = StringContext (Set.singleton (SCAllOutputs sp))
 contextIsEmpty :: StringContext -> Bool
 contextIsEmpty (StringContext s) = Set.null s
 
--- | The element of a context upstream names first, in the encoding it
--- prints (@NixStringContextElem::to_string@ at 2.24.9): a plain path as
--- its base name, all outputs of a derivation as @=@ and the .drv's, one
--- output as @!output!@ and the .drv's.  Upstream keeps a context in a
--- @std::set@ of a variant ordered plain, all outputs, one output, which
--- is not this type's constructor order, so that order is searched here.
-firstContextEncoded :: StringContext -> Maybe Text
-firstContextEncoded (StringContext elems) =
-  encodedElement . minimumBy (comparing upstreamOrder) <$> NE.nonEmpty (Set.toList elems)
+-- | The element of a context upstream names first, as it displays one
+-- (@NixStringContextElem::display@ at 2.36.0): a plain path as its store
+-- path, all outputs of a derivation as the .drv's store path and
+-- @ (deep)@, and one output as the .drv's store path, @^@ and the
+-- output.  Upstream keeps a context in a @std::set@ of a variant ordered
+-- plain, all outputs, one output, which is not this type's constructor
+-- order, so that order is searched here.
+firstContextDisplayed :: StringContext -> Maybe Text
+firstContextDisplayed (StringContext elems) =
+  displayedElement . minimumBy (comparing upstreamOrder) <$> NE.nonEmpty (Set.toList elems)
+  where
+    displayedElement element = case element of
+      SCPlain sp -> storePathToText defaultStoreDir sp
+      SCAllOutputs sp -> storePathToText defaultStoreDir sp <> " (deep)"
+      SCDrvOutput sp output -> storePathToText defaultStoreDir sp <> "^" <> output
 
 -- | A context's elements in the order upstream keeps them
 -- ('upstreamOrder').

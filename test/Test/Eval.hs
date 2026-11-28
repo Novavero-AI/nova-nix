@@ -4330,10 +4330,10 @@ testDerivationFields = do
       depDrv = "wwk71dy0w17kn5spjd8hbsrk6520xs11-d.drv"
   sequence
     [ fails "a name that is not a string is refused" (drvWith ("name = 1; " <> plain)) "expected a string but found an integer: 1",
-      fails "a name with an output's context names it" (withDep (drvWith ("name = \"x${d}\"; " <> plain))) ("the string 'x" <> depOut <> "' is not allowed to refer to a store path (such as '!out!" <> depDrv <> "')"),
-      fails "a name with a drvPath's context names it" (withDep (drvWith ("name = \"x${d.drvPath}\"; " <> plain))) ("the string 'x/nix/store/" <> depDrv <> "' is not allowed to refer to a store path (such as '=" <> depDrv <> "')"),
-      fails "a plain path comes first among a name's context" (withDep (drvWith ("name = builtins.appendContext \"x${d}\" { \"/nix/store/00000000000000000000000000000000-a\" = { path = true; }; }; " <> plain))) ("the string 'x" <> depOut <> "' is not allowed to refer to a store path (such as '00000000000000000000000000000000-a')"),
-      fails "all outputs come before one among a name's context" (withDep (drvWith ("name = \"x${d}${d.drvPath}\"; " <> plain))) ("the string 'x" <> depOut <> "/nix/store/" <> depDrv <> "' is not allowed to refer to a store path (such as '=" <> depDrv <> "')"),
+      fails "a name with an output's context names it" (withDep (drvWith ("name = \"x${d}\"; " <> plain))) ("the string 'x" <> depOut <> "' is not allowed to refer to a store path (such as '/nix/store/" <> depDrv <> "^out')"),
+      fails "a name with a drvPath's context names it" (withDep (drvWith ("name = \"x${d.drvPath}\"; " <> plain))) ("the string 'x/nix/store/" <> depDrv <> "' is not allowed to refer to a store path (such as '/nix/store/" <> depDrv <> " (deep)')"),
+      fails "a plain path comes first among a name's context" (withDep (drvWith ("name = builtins.appendContext \"x${d}\" { \"/nix/store/00000000000000000000000000000000-a\" = { path = true; }; }; " <> plain))) ("the string 'x" <> depOut <> "' is not allowed to refer to a store path (such as '/nix/store/00000000000000000000000000000000-a')"),
+      fails "all outputs come before one among a name's context" (withDep (drvWith ("name = \"x${d}${d.drvPath}\"; " <> plain))) ("the string 'x" <> depOut <> "/nix/store/" <> depDrv <> "' is not allowed to refer to a store path (such as '/nix/store/" <> depDrv <> " (deep)')"),
       fails "an absent name is getAttr's error" (drvWith plain) "attribute 'name' missing",
       fails "an absent builder is refused" (drvWith "name = \"a\"; system = \"x\";") "required attribute 'builder' missing",
       fails "an empty builder is refused as absent" (drvWith "name = \"a\"; system = \"x\"; builder = \"\";") "required attribute 'builder' missing",
@@ -5311,7 +5311,7 @@ testAttrNameContext = do
         "let c = builtins.appendContext \"a\" { \"/nix/store/00000000000000000000000000000000-a\" = { path = true; }; };"
           <> " p = builtins.unsafeDiscardStringContext c; in "
           <> body
-      refusal = "the string 'a' is not allowed to refer to a store path (such as '00000000000000000000000000000000-a')"
+      refusal = "the string 'a' is not allowed to refer to a store path (such as '/nix/store/00000000000000000000000000000000-a')"
       refused reader body = runTest (reader <> " refuses a name with context") (assertEvalError reader (named body) refusal)
       kept reader body = runTest (reader <> " reads a name without context") (assertEval reader (named body) (VBool True))
   sequence
@@ -5362,7 +5362,7 @@ withPlainStrings text body =
 -- | Upstream's refusal of the string 'withPlainStrings' binds to @c@.
 plainStringRefusal :: Text -> Text
 plainStringRefusal text =
-  "the string '" <> text <> "' is not allowed to refer to a store path (such as '00000000000000000000000000000000-a')"
+  "the string '" <> text <> "' is not allowed to refer to a store path (such as '/nix/store/00000000000000000000000000000000-a')"
 
 -- | Every builtin that reads a plain string reads it as upstream's
 -- @forceStringNoCtx@ does (eval.cc and primops.cc): a string with
@@ -5534,7 +5534,7 @@ testUnsafeGetAttrPos = do
         assertEvalError
           "name context"
           "builtins.unsafeGetAttrPos (builtins.appendContext \"x\" { \"/nix/store/00000000000000000000000000000000-a\" = { path = true; }; }) { }"
-          "the string 'x' is not allowed to refer to a store path (such as '00000000000000000000000000000000-a')",
+          "the string 'x' is not allowed to refer to a store path (such as '/nix/store/00000000000000000000000000000000-a')",
       runTest "the second argument must be a set" $
         assertEvalError "set" "builtins.unsafeGetAttrPos \"a\" 1" "expected a set but found an integer: 1"
     ]
