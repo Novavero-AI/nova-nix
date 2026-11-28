@@ -450,7 +450,9 @@ command name = case name of
           Form "" "Print the packages in a profile"
             :| [Form "--json" "Print a profile's manifest as JSON"],
         commandDescription =
-          "Prints each package in a profile, as `nix profile list` does: its name, in bold, and its store paths, with a blank line between packages, and for a package a flake added its flake attribute and its original and locked flake references. With `--json` it prints the profile's `manifest.json` instead, indented when stdout is a terminal unless `--pretty` or `--no-pretty` says otherwise, the later of them winning. A profile with no manifest holds no packages. The default profile and its link are made when they are missing, and a profile whose current generation is outside the store is refused, as for every profile command.",
+          "Prints each package in a profile, as `nix profile list` does: its name, in bold when stdout takes colour, and its store paths, with a blank line between packages, and for a package a flake added its flake attribute and its original and locked flake references. "
+            <> stylingRule
+            <> " With `--json` it prints the profile's `manifest.json` instead, indented when stdout is a terminal unless `--pretty` or `--no-pretty` says otherwise, the later of them winning. A profile with no manifest holds no packages. The default profile and its link are made when they are missing, and a profile whose current generation is outside the store is refused, as for every profile command.",
         commandExamples =
           Example "List the packages in the default profile." ("profile" :| ["list"]) []
             :| [Example "Print the default profile's manifest, indented." ("profile" :| ["list", "--json", "--pretty"]) []]

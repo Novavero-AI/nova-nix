@@ -145,10 +145,13 @@ testProfileCLI = do
           -- links the binary computes from them on this host, are under the
           -- root.  On Windows a state directory NIX_STATE_HOME does not name
           -- is the Local AppData folder, which no variable moves.
-          runIn given config args = do
+          runIn = runWith []
+          -- A run with variables that name no location beside the
+          -- locations it is given.
+          runWith settings given config args = do
             inside <- locationsUnder given
             if inside
-              then Proc.readCreateProcessWithExitCode (processIn [] given config args) ""
+              then Proc.readCreateProcessWithExitCode (processIn settings given config args) ""
               else pure (ExitFailure 1, "", refusedRun)
           -- A run in the default locations whose stdout is read as bytes,
           -- since a profile's history is not ASCII, with variables beside
@@ -221,6 +224,8 @@ testProfileCLI = do
             then pure Nothing
             else Just <$> Proc.readProcessWithExitCode (T.unpack shell) [helloPath] ""
         listedText <- nn ["profile", "list", "--store", storeArg]
+        listedStyled <- runWith [("FORCE_COLOR", "1")] vars "" ["profile", "list", "--store", storeArg]
+        listedUnstyled <- runWith [("CLICOLOR_FORCE", ""), ("NOCOLOR", "")] vars "" ["profile", "list", "--store", storeArg]
         listedJson <- nn ["profile", "list", "--json", "--store", storeArg]
         prettyJson <- nn ["profile", "list", "--json", "--pretty", "--store", storeArg]
         compactJson <- nn ["profile", "list", "--pretty", "--json", "--no-pretty", "--store", storeArg]
@@ -367,9 +372,13 @@ testProfileCLI = do
                 case ran of
                   Nothing -> Pass
                   Just (code, out, err) -> assertEqual "run" (ExitSuccess, "hello from the profile\n") (code, out) `andThen` assertEqual "stderr" "" err,
-              runTest "profile list prints upstream's lines, the name in bold"
-                $ succeeded listedText
-                $ assertEqual "lines" ["Name:               \ESC[1mhello\ESC[0m", "Store paths:        " <> inStore hello] (let (_, out, _) = listedText in lines (filter (/= '\r') out)),
+              runTest "profile list prints upstream's lines, the name in bold where colour is forced and in neither a pipe nor under NOCOLOR"
+                $ succeeded listedText . succeeded listedStyled . succeeded listedUnstyled
+                $ let printed (_, out, _) = lines (filter (/= '\r') out)
+                      paths = "Store paths:        " <> inStore hello
+                   in assertEqual "a pipe" ["Name:               hello", paths] (printed listedText)
+                        `andThen` assertEqual "forced" ["Name:               \ESC[1mhello\ESC[0m", paths] (printed listedStyled)
+                        `andThen` assertEqual "NOCOLOR" ["Name:               hello", paths] (printed listedUnstyled),
               runTest "profile list --json prints the manifest, paths in the canonical spelling"
                 $ succeeded listedJson
                 $ assertEqual "json" (jsonOf [elementJson "hello" 5 [canonical hello]]) (let (_, out, _) = listedJson in T.strip (T.pack out)),

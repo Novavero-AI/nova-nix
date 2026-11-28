@@ -1842,7 +1842,9 @@ profileListCommand config storeDir selection format = do
   manifest <- readManifest profile >>= either (failError . profileFailureText storeDir) pure
   case format of
     ListJson layout -> printJson layout (manifestJson manifest)
-    ListText -> toStdout (mapM_ TIO.putStrLn (listLines storeDir manifest))
+    ListText -> do
+      styling <- stdoutStyling
+      toStdout (mapM_ TIO.putStrLn (listLines styling storeDir manifest))
 
 -- | Print each generation of a profile and what changed in it from the
 -- one listed before it, as upstream's @profile history@ does.  A
@@ -1967,21 +1969,21 @@ ansiRed = "\ESC[31;1m"
 ansiGreen = "\ESC[32;1m"
 ansiNormal = "\ESC[0m"
 
--- | What @profile list@ prints (@CmdProfileList::run@ in profile.cc): for
--- each element its name in bold, with @(inactive)@ in red after an inactive
--- one's, its flake's lines for one a flake made, and its paths as the store
--- spells them, with a blank line between elements.  Upstream's logger writes
--- the escapes to stdout whatever stdout is (@Logger::writeToStdout@ in
--- logging.cc at 2.35.4).
-listLines :: StoreDir -> Manifest -> [T.Text]
-listLines storeDir (Manifest elements) = intercalate [""] (map elementLines (Map.toAscList elements))
+-- | What @profile list@ prints, as upstream prints it: for each element
+-- its name, in bold, with @(inactive)@, in red, after an inactive one's,
+-- its flake's lines for one a flake made, and its paths as the store spells
+-- them, with a blank line between elements.  The escapes are written only
+-- where stdout takes them ('stdoutStyling'); a name holding an escape of its
+-- own keeps it, where upstream takes every escape out of the line.
+listLines :: Styling -> StoreDir -> Manifest -> [T.Text]
+listLines styling storeDir (Manifest elements) = intercalate [""] (map elementLines (Map.toAscList elements))
   where
     elementLines (name, element) =
-      ("Name:               " <> ansiBold <> name <> ansiNormal <> activity (elementActivity element))
+      ("Name:               " <> style styling ansiBold <> name <> style styling ansiNormal <> activity (elementActivity element))
         : maybe [] sourceLines (elementSource element)
         ++ ["Store paths:        " <> T.unwords (sort [T.pack (storePathToFilePath storeDir path) | path <- Set.toList (elementPaths element)])]
     activity Active = ""
-    activity Inactive = " " <> ansiRed <> "(inactive)" <> ansiNormal
+    activity Inactive = " " <> style styling ansiRed <> "(inactive)" <> style styling ansiNormal
     sourceLines source =
       [ "Flake attribute:    " <> flakeAttribute source,
         "Original flake URL: " <> sourceOriginalUrl source,
