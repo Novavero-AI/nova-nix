@@ -76,7 +76,7 @@ import Data.Word (Word32)
 import Control.Exception (bracket)
 import Data.Bits (testBit, (.|.))
 import Data.Foldable (traverse_)
-import Nix.Store.Access (withValidPathAccess)
+import Nix.Store.Access (ValidNode (..), withValidPathAccess)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
 import Nix.Store.Win32Path (win32FilePath)
@@ -288,19 +288,19 @@ isPlainFile path = do
 
 canonicalizeMetadata path = withValidPathAccess (`canonicalizeNode` path)
 
--- | Make a node canonical, given the step that gives one node a valid
--- path's owner and DACL.  A directory is done after its entries, so
--- nothing done to them comes after its own time is set, and its DACL,
+-- | Make a node canonical, given the step that gives one node of a kind
+-- a valid path's owner and DACL.  A directory is done after its entries,
+-- so nothing done to them comes after its own time is set, and its DACL,
 -- protected, is set after theirs, so none of it is passed to them.
-canonicalizeNode :: (FilePath -> IO ()) -> FilePath -> IO ()
+canonicalizeNode :: (ValidNode -> FilePath -> IO ()) -> FilePath -> IO ()
 canonicalizeNode giveAccess path = do
   node <- classifyWalkNode path
   case node of
-    WalkSymlink -> setStoreTime path *> giveAccess path
+    WalkSymlink -> setStoreTime path *> giveAccess ValidLeaf path
     WalkDirectory -> do
       Dir.listDirectory path >>= traverse_ (canonicalizeNode giveAccess . (path </>))
-      sealNode giveAccess path
-    WalkRegular -> sealNode giveAccess path
+      sealNode (giveAccess ValidDirectory) path
+    WalkRegular -> sealNode (giveAccess ValidLeaf) path
     WalkAbsent -> pure ()
 
 -- | Set a file's or directory's time, give it the read-only attribute,
