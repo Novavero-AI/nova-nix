@@ -20,6 +20,8 @@ readonly KAEM='C:\nix\store\0123456789abcdfghijklmnpqrsvwxyz-kaem\bin\kaem.exe'
 readonly CP='C:\nix\store\0123456789abcdfghijklmnpqrsvwxyz-mescc-tools-extra\bin\cp.exe'
 readonly NOVA='C:\a\_temp\bin\nova-nix.exe'
 readonly CMD='C:\Windows\System32\cmd.exe'
+readonly CONHOST='C:\Windows\System32\conhost.exe'
+readonly CONHOST_COMMAND='\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1'
 
 # event PARENT CHILD COMMAND: a process creation as the Security log
 # renders it.
@@ -45,7 +47,7 @@ expect() {
 }
 
 { event "$NOVA" "$KAEM" "kaem.exe --file build.kaem"; event "$KAEM" "$CP" "cp.exe a b"; } > "$work/events"
-expect 0 "2 processes started, 1 of them by a program in the store, 0 of those from outside it" "a store program that starts store programs passes"
+expect 0 "2 processes started, 1 of them by a program in the store, 0 of those console hosts, 0 from outside the store" "a store program that starts store programs passes"
 
 { event "$KAEM" "$CP" "cp.exe a b"; event "$KAEM" "$CMD" "cmd.exe /c copy a b"; } > "$work/events"
 expect 1 "::error::$KAEM started $CMD, which is not in the store: cmd.exe /c copy a b" "a store program that starts cmd.exe fails, naming both and the command line"
@@ -61,6 +63,15 @@ expect 1 "which is not in the store" "a directory that only begins like the stor
 
 event "$KAEM" "$CMD" 'cmd.exe /c &quot;a &amp; b&quot; &lt;in &gt;out &apos;q&apos;' > "$work/events"
 expect 1 "cmd.exe /c \"a & b\" <in >out 'q'" "the command line is shown with the log's escapes undone"
+
+{ event "$KAEM" "$CP" "cp.exe"; event "$KAEM" "$CONHOST" "$CONHOST_COMMAND"; event "$CP" 'c:\windows\system32\CONHOST.EXE' "$CONHOST_COMMAND"; } > "$work/events"
+expect 0 "3 processes started, 3 of them by a program in the store, 2 of those console hosts, 0 from outside the store" "the console host Windows starts for a console program passes"
+
+event "$KAEM" "$CONHOST" 'conhost.exe --headless --width 80' > "$work/events"
+expect 1 "::error::$KAEM started $CONHOST, which is not in the store: conhost.exe --headless --width 80" "conhost.exe with another command line fails"
+
+event "$KAEM" 'C:\Windows\System32\cmd.exe' "$CONHOST_COMMAND" > "$work/events"
+expect 1 "which is not in the store" "another program with the console host's command line fails"
 
 event "$NOVA" "$KAEM" "kaem.exe" > "$work/events"
 expect 1 "the audit recorded none of the stage's builds" "an audit that holds no process a store program started fails"

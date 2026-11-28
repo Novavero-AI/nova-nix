@@ -16,7 +16,11 @@
 #          being the ones after it.
 #   check  reads the process creations since AUDIT_FIRST_RECORD and fails
 #          on each whose creator's image is in the store and whose own is
-#          not, naming both and its command line.  It fails as well if the
+#          not, naming both and its command line, but for the console host
+#          Windows starts for a console program that has no console:
+#          conhost.exe, which the log names as that program's child, with
+#          the command line CONSOLE_HOST_COMMAND.  It runs no build's code,
+#          and the program does not choose it.  It fails as well if the
 #          log no longer holds every event since then, since a log that
 #          overwrote some cannot say what they were, and if no process a
 #          store program started is among them, since every stage's job
@@ -52,8 +56,14 @@ readonly LOG_BYTES=4294901760
 # The store's directory, with forward slashes: awk reads a backslash in
 # an assigned value as an escape, and the images are compared with their
 # backslashes turned to slashes, and without regard to case, as Windows
-# compares paths.
+# compares paths.  The build directories are under it, in .nova-nix, so a
+# program a build compiled and runs there is in the store too.
 readonly STORE_PREFIX='C:/nix/store/'
+# The console host Windows starts for a console program that has no
+# console, by its image, compared as the store is, and by its whole
+# command line, as the runners' logs show it.
+readonly CONSOLE_HOST='C:/Windows/System32/conhost.exe'
+readonly CONSOLE_HOST_COMMAND='\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1'
 
 fail() {
   echo "::error::$*" >&2
@@ -70,8 +80,10 @@ record_at() {
 # started whose image is outside the store, as an error line, then the
 # counts.  Exits 1 on any, or when no store program started one.
 scan() {
-  awk -v store="$STORE_PREFIX" '
-    BEGIN { RS = "</Event>"; prefix = tolower(store) }
+  # The command line holds backslashes, which an awk -v assignment would
+  # read as escapes, so it reaches awk through the environment.
+  AUDIT_HOST_COMMAND=$CONSOLE_HOST_COMMAND awk -v store="$STORE_PREFIX" -v consoleHost="$CONSOLE_HOST" '
+    BEGIN { RS = "</Event>"; prefix = tolower(store); host = tolower(consoleHost); hostCommand = ENVIRON["AUDIT_HOST_COMMAND"] }
     function field(name,    pattern, text) {
       pattern = "<Data Name=.?" name ".?>[^<]*</Data>"
       if (!match($0, pattern)) return ""
@@ -82,10 +94,13 @@ scan() {
       gsub(/&apos;/, "\047", text); gsub(/&amp;/, "\\&", text)
       return text
     }
-    function inStore(image,    folded) {
-      folded = tolower(image)
-      gsub(/\\/, "/", folded)
-      return index(folded, prefix) == 1
+    function folded(image,    text) {
+      text = tolower(image)
+      gsub(/\\/, "/", text)
+      return text
+    }
+    function inStore(image) {
+      return index(folded(image), prefix) == 1
     }
     /<EventID[ >]/ {
       events++
@@ -94,11 +109,13 @@ scan() {
       if (!inStore(parent)) next
       fromStore++
       if (inStore(child)) next
+      command = field("CommandLine")
+      if (folded(child) == host && command == hostCommand) { consoles++; next }
       outside++
-      print "::error::" parent " started " child ", which is not in the store: " field("CommandLine")
+      print "::error::" parent " started " child ", which is not in the store: " command
     }
     END {
-      print events + 0 " processes started, " fromStore + 0 " of them by a program in the store, " outside + 0 " of those from outside it"
+      print events + 0 " processes started, " fromStore + 0 " of them by a program in the store, " consoles + 0 " of those console hosts, " outside + 0 " from outside the store"
       if (fromStore == 0) {
         print "::error::no process a program in the store started is among them, so the audit recorded none of the stage'"'"'s builds"
         exit 1
