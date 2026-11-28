@@ -135,6 +135,12 @@ foreign import ccall unsafe "nova_test_logon_id"
 foreign import ccall unsafe "nova_test_open_station"
   c_open_station :: CWString -> IO CULong
 
+foreign import ccall unsafe "nova_test_station_dacl"
+  c_station_dacl :: CWString -> Ptr CWString -> IO CULong
+
+foreign import ccall unsafe "nova_test_account_processes"
+  c_account_processes :: CWString -> CWString -> CULong -> Ptr CULong -> IO CULong
+
 foreign import ccall unsafe "nova_test_stdout_value"
   c_stdout_value :: IO CULong
 
@@ -793,23 +799,25 @@ accountCheckList fixture checks one two =
             `andThen` ranOnLogonStation two other
             `andThen` ranOnLogonStation one again
             `andThen` assertEqual "three logons, three stations" (Just 3) (Set.size . Set.fromList <$> stations),
-      runTestM "a running build's window station opens for the build, and not for another slot's" $ do
+      runTestM "a running build's window station opens by name for the build, and for no other slot's build" $ do
         number <- nextRun fixture
         let held = slotBuildDir one </> ("station-" <> show number)
             release = held <> ".release"
         withAsync (runBuilder fixture one id ["station-hold", held, release]) $ \build -> do
           started <- waitUntil (Dir.doesFileExist held)
-          written <- readHeldStation held
-          other <- traverse (\(name, _) -> runBuilder fixture two id ["open-station", BS8.unpack name]) written
+          fields <- readFields held
+          let field name = fields >>= lookup name
+              dacl = maybe "unread" TE.decodeLatin1 (field "dacl")
+          other <- traverse (\name -> runBuilder fixture two id ["open-station", BS8.unpack name]) (field "name")
           BS.writeFile release ""
           finished <- timeout startWaitMicros (wait build)
-          pure $ case (written, other) of
-            (Just (_, own), Just opened) ->
-              assertEqual "opened by its own build" (Just 0) own
+          pure $ case other of
+            Just opened ->
+              assertEqual ("opened by its own build, the station's DACL " <> dacl) (Just "0") (field "open")
                 `andThen` ranAs ExitSuccess opened
-                `andThen` assertEqual ("opened by another slot's build, which answered " <> T.pack (show (attempt opened))) True (maybe False (/= 0) (attempt opened))
+                `andThen` assertEqual ("opened by another slot's build, which answered " <> T.pack (show (attempt opened)) <> ", the station's DACL " <> dacl) True (maybe False (/= 0) (attempt opened))
                 `andThen` assertEqual "the build that held it" (Just (ExitSuccess, "")) (fmap (\run -> (runExit run, runStatus run)) finished)
-            _ -> Fail ("the build wrote no station, started " <> T.pack (show started)),
+            Nothing -> Fail ("the build wrote no station, started " <> T.pack (show started)),
       runTestM "a build's standard output and error are its log, and the helper exits as its builder does" $ do
         run <- runBuilder fixture one id ["echo", "7"]
         pure (ranAs (ExitFailure 7) run `andThen` assertEqual "log" "out\nerr\n" (runLog run)),
@@ -885,22 +893,28 @@ accountCheckList fixture checks one two =
           assertEqual "an image the service alone may read" (ExitFailure 1, Right (Just (Sandbox.StatusRecord Sandbox.WindowsStageExec (fromIntegral accessDenied) Nothing))) (reported refused)
             `andThen` ranAs ExitSuccess ran
             `andThen` assertEqual "the log of the image the slot alone may read" "out\nerr\n" (runLog ran),
-      runTestM "a process a build starts through WMI runs outside its job, and ends with the build, the build log with it" $ do
+      runTestM "a process a build starts through WMI runs outside its job, the service may end every process of the slot's, and the build ends with them, its log with it" $ do
         number <- nextRun fixture
         let marker = slotBuildDir one </> ("escaped-" <> show number)
+            release = marker <> ".release"
             withPowerShell plan = plan {Sandbox.windowsPlanEnvironment = powerShellEnvironment fixture one}
-        finished <- timeout startWaitMicros (runBuilder fixture one withPowerShell ["escape", marker])
-        written <- readEscaped marker
-        case (finished, written) of
-          (Just run, Just (pid, inJob, held)) -> do
-            running <- c_process_running (fromIntegral pid)
-            pure $
-              ranAs ExitSuccess run
-                `andThen` assertEqual "WMI's start" (Just "0") (logged "wmi" run)
-                `andThen` assertEqual "outside the job, holding the build log" (0, 0) (inJob, held)
-                `andThen` assertEqual "running once the build ended" 0 running
-          (Nothing, _) -> pure (Fail "the build, or its log, had not ended within the wait")
-          (Just run, Nothing) -> pure (Fail ("the process started through WMI wrote nothing; log " <> TE.decodeUtf8Lenient (runLog run))),
+        withAsync (runBuilder fixture one withPowerShell ["escape", marker, release]) $ \build -> do
+          appeared <- waitUntilWithin startWaitMicros (Dir.doesFileExist marker)
+          reach <- accountProcesses (slotSid one)
+          BS.writeFile release ""
+          finished <- timeout startWaitMicros (wait build)
+          written <- readEscaped marker
+          case (finished, written) of
+            (Just run, Just (pid, inJob, held)) -> do
+              running <- c_process_running (fromIntegral pid)
+              pure $
+                ranAs ExitSuccess run
+                  `andThen` assertEqual "WMI's start" (Just "0") (logged "wmi" run)
+                  `andThen` assertEqual "outside the job, holding the build log" (0, 0) (inJob, held)
+                  `andThen` assertEqual ("the slot's processes, each its program, ending it, waiting on it: " <> reach) True (all endable (T.splitOn ";" reach))
+                  `andThen` assertEqual "running once the build ended" 0 running
+            (Nothing, _) -> pure (Fail ("the build, or its log, had not ended within the wait; the slot's processes " <> reach))
+            (Just run, Nothing) -> pure (Fail ("the process started through WMI wrote nothing, appeared " <> T.pack (show appeared) <> "; log " <> TE.decodeUtf8Lenient (runLog run))),
       runTestM "a process left running as a slot's account ends when the slot's next build starts" $ do
         pid <- startAs (slotToken two) (unwords (map quoted (builderCommand (fxBuilder fixture) ["wait"])))
         before <- c_process_running pid
@@ -986,14 +1000,37 @@ readPids path = do
     Just [builderPid, started] -> Just (builderPid, started)
     _ -> Nothing
 
--- | The window station a held build wrote it runs on, and what its own
--- open of that station by name answered.
-readHeldStation :: FilePath -> IO (Maybe (BS.ByteString, Maybe CULong))
-readHeldStation path = do
-  written <- readWords path
-  pure $ case written of
-    Just [name, code] -> Just (name, readMaybe (BS8.unpack code))
-    _ -> Nothing
+-- | The lines of a file a builder wrote whole, each a name and a value.
+readFields :: FilePath -> IO (Maybe [(BS.ByteString, BS.ByteString)])
+readFields path = do
+  contents <- try (BS.readFile path)
+  pure $ case contents of
+    Left (_ :: IOException) -> Nothing
+    Right bytes -> traverse field (BS8.lines bytes)
+  where
+    field text = case BS8.words text of
+      [name, value] -> Just (name, value)
+      _ -> Nothing
+
+-- | What the test service may do to each process running as an account,
+-- as @nova_test_account_processes@ lists it.
+accountProcesses :: Sid -> IO Text
+accountProcesses sid =
+  withCWString (T.unpack (sidText sid)) $ \wide -> allocaArray processListChars $ \text -> alloca $ \countOut -> do
+    succeeded "listing an account's processes" =<< c_account_processes wide text (fromIntegral processListChars) countOut
+    T.pack <$> peekCWString text
+
+-- | The room a listing of an account's processes is given.
+processListChars :: Int
+processListChars = 4096
+
+-- | Whether an entry of 'accountProcesses' says the process may be ended;
+-- the empty text after the last entry's semicolon is no entry.
+endable :: Text -> Bool
+endable entry = case T.splitOn ":" entry of
+  [_, terminate, _] -> terminate == "0"
+  [""] -> True
+  _ -> False
 
 -- | What a process a build started through WMI wrote: its ID, whether it
 -- is in a job, and what copying the build log answered.
@@ -1072,7 +1109,8 @@ windowsSandboxBuilder operation = case operation of
   ["station-hold", held, release] -> do
     station <- userObjectName 0
     own <- withCWString (T.unpack station) c_open_station
-    writeWhole held (TE.encodeUtf8 station <> " " <> BS8.pack (show own))
+    dacl <- withCWString (T.unpack station) (wideResult . c_station_dacl)
+    writeWhole held (BS8.unlines [field "name" station, field "open" (T.pack (show own)), field "dacl" dacl])
     released <- waitUntilWithin startWaitMicros (Dir.doesFileExist release)
     unless released exitFailure
   ["open-station", name] -> attemptOn name c_open_station
@@ -1094,7 +1132,7 @@ windowsSandboxBuilder operation = case operation of
   ["list", wildcard] -> attemptOn wildcard c_list
   ["key", path] -> attemptOn path c_open_key
   ["process", pidText] | Just pid <- readMaybe pidText -> c_open_process pid >>= \code -> logLine ("result", T.pack (show code))
-  ["escape", marker] -> escapeThroughWmi marker
+  ["escape", marker, release] -> escapeThroughWmi marker release
   ["escaped", marker, builderText, valueText]
     | Just builderPid <- readMaybe builderText,
       Just value <- readMaybe valueText -> do
@@ -1119,6 +1157,9 @@ windowsSandboxBuilder operation = case operation of
     exitFailure
   where
     attemptOn path call = withCWString path call >>= \code -> logLine ("result", T.pack (show code))
+    -- A line of a name and a value, the value's spaces made dashes so
+    -- that it stays one word.
+    field name value = name <> " " <> TE.encodeUtf8 (T.replace " " "-" value)
 
 -- | Write a line of a name and a value to the build log.
 logLine :: (BS.ByteString, Text) -> IO ()
@@ -1148,9 +1189,10 @@ logonStationName =
 
 -- | Have WMI start this program for the build, as a process that copies
 -- the build log from this one and says in MARKER whether it is in a job,
--- then wait for that, and write what WMI's start answered.
-escapeThroughWmi :: FilePath -> IO ()
-escapeThroughWmi marker = do
+-- then wait for that, write what WMI's start answered, and wait for
+-- RELEASE before ending.
+escapeThroughWmi :: FilePath -> FilePath -> IO ()
+escapeThroughWmi marker release = do
   self <- getExecutablePath
   builderPid <- Proc.getCurrentPid
   value <- c_stdout_value
@@ -1162,7 +1204,8 @@ escapeThroughWmi marker = do
   logLine ("wmi", T.pack (exitNumber code))
   unless (code == ExitSuccess) (putStr err)
   written <- waitUntilWithin startWaitMicros (Dir.doesFileExist marker)
-  unless written exitFailure
+  released <- waitUntilWithin startWaitMicros (Dir.doesFileExist release)
+  unless (written && released) exitFailure
   where
     exitNumber code = case code of
       ExitSuccess -> "0"

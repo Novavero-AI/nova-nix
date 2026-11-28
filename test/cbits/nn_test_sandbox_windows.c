@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <aclapi.h>
 #include <bcrypt.h>
+#include <tlhelp32.h>
 #include <lmaccess.h>
 #include <lmerr.h>
 #include <ntsecapi.h>
@@ -662,6 +663,68 @@ unsigned long nova_test_start_as(void *token, const wchar_t *command, unsigned l
     return error;
 }
 
+/* What this process may do to each process running as the account whose
+ * SID's string SID_TEXT is: entries of its program's name and what opening
+ * it to end it and to wait on it answer, NAME:TERMINATE:SYNCHRONIZE, each
+ * ended by a semicolon, in TEXT, CAPACITY characters; one that does not
+ * fit is left out, and *COUNT gets how many processes there are. */
+unsigned long nova_test_account_processes(const wchar_t *sid_text, wchar_t *text, unsigned long capacity,
+                                          unsigned long *count)
+{
+    PSID sid = NULL;
+    HANDLE snapshot;
+    PROCESSENTRY32W entry;
+    size_t used = 0;
+    BOOL listed;
+    unsigned long error = 0;
+    *count = 0;
+    if (capacity == 0)
+        return ERROR_INSUFFICIENT_BUFFER;
+    text[0] = L'\0';
+    if (!ConvertStringSidToSidW(sid_text, &sid))
+        return GetLastError();
+    snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        error = GetLastError();
+        LocalFree(sid);
+        return error;
+    }
+    entry.dwSize = sizeof entry;
+    for (listed = Process32FirstW(snapshot, &entry); listed; listed = Process32NextW(snapshot, &entry)) {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+        HANDLE token = NULL;
+        union token_user user;
+        DWORD size = 0;
+        if (process == NULL)
+            continue;
+        if (OpenProcessToken(process, TOKEN_QUERY, &token)
+            && GetTokenInformation(token, TokenUser, &user, sizeof user, &size) && EqualSid(user.user.User.Sid, sid)) {
+            HANDLE ending = OpenProcess(PROCESS_TERMINATE, FALSE, entry.th32ProcessID);
+            unsigned long terminate = ending != NULL ? 0 : GetLastError();
+            HANDLE waitable = OpenProcess(SYNCHRONIZE, FALSE, entry.th32ProcessID);
+            unsigned long synchronize = waitable != NULL ? 0 : GetLastError();
+            WCHAR line[MAX_PATH + 32];
+            int length = swprintf(line, sizeof line / sizeof line[0], L"%ls:%lu:%lu;", entry.szExeFile, terminate,
+                                  synchronize);
+            if (length > 0 && used + (size_t)length < capacity) {
+                memcpy(text + used, line, ((size_t)length + 1) * sizeof *text);
+                used += (size_t)length;
+            }
+            (*count)++;
+            if (ending != NULL)
+                CloseHandle(ending);
+            if (waitable != NULL)
+                CloseHandle(waitable);
+        }
+        if (token != NULL)
+            CloseHandle(token);
+        CloseHandle(process);
+    }
+    CloseHandle(snapshot);
+    LocalFree(sid);
+    return 0;
+}
+
 unsigned long nova_test_close_handle(void *handle)
 {
     return CloseHandle(handle) ? 0 : GetLastError();
@@ -763,14 +826,55 @@ unsigned long nova_test_logon_id(unsigned long *high, unsigned long *low)
     return error;
 }
 
-/* Open the window station NAME to read it, and close it. */
+/* Open the window station NAME with whatever access its DACL grants this
+ * process, and close it: a refusal says it grants none. */
 unsigned long nova_test_open_station(const wchar_t *name)
 {
-    HWINSTA station = OpenWindowStationW(name, FALSE, GENERIC_READ);
+    HWINSTA station = OpenWindowStationW(name, FALSE, MAXIMUM_ALLOWED);
     if (station == NULL)
         return GetLastError();
     CloseWindowStation(station);
     return 0;
+}
+
+/* The DACL of STATION, a window station, in SDDL, for LocalFree. */
+static unsigned long station_sddl(HWINSTA station, wchar_t **sddl)
+{
+    SECURITY_INFORMATION wanted = DACL_SECURITY_INFORMATION;
+    PSECURITY_DESCRIPTOR descriptor;
+    DWORD needed = 0;
+    unsigned long error = 0;
+    GetUserObjectSecurity(station, &wanted, NULL, 0, &needed);
+    if (needed == 0)
+        return GetLastError();
+    descriptor = LocalAlloc(LMEM_FIXED, needed);
+    if (descriptor == NULL)
+        return GetLastError();
+    if (!GetUserObjectSecurity(station, &wanted, descriptor, needed, &needed)
+        || !ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION,
+                                                                 sddl, NULL))
+        error = GetLastError();
+    LocalFree(descriptor);
+    return error;
+}
+
+/* The DACL of this process's window station, NAME, in SDDL, for
+ * LocalFree: read through the handle the process was given to it, or,
+ * where that may not read it, through one opened by name to read it. */
+unsigned long nova_test_station_dacl(const wchar_t *name, wchar_t **sddl)
+{
+    HWINSTA opened;
+    unsigned long error;
+    *sddl = NULL;
+    if (station_sddl(GetProcessWindowStation(), sddl) == 0)
+        return 0;
+    *sddl = NULL;
+    opened = OpenWindowStationW(name, FALSE, READ_CONTROL);
+    if (opened == NULL)
+        return GetLastError();
+    error = station_sddl(opened, sddl);
+    CloseWindowStation(opened);
+    return error;
 }
 
 /* The value of this process's standard output handle, as another process
@@ -1064,6 +1168,23 @@ unsigned long nova_test_logon_id(unsigned long *high, unsigned long *low)
 unsigned long nova_test_open_station(const wchar_t *name)
 {
     (void)name;
+    return NOT_ON_WINDOWS;
+}
+
+unsigned long nova_test_station_dacl(const wchar_t *name, wchar_t **sddl)
+{
+    (void)name;
+    *sddl = NULL;
+    return NOT_ON_WINDOWS;
+}
+
+unsigned long nova_test_account_processes(const wchar_t *sid_text, wchar_t *text, unsigned long capacity,
+                                          unsigned long *count)
+{
+    (void)sid_text;
+    if (capacity > 0)
+        text[0] = L'\0';
+    *count = 0;
     return NOT_ON_WINDOWS;
 }
 
