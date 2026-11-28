@@ -4,10 +4,10 @@
  * The core (nova-nix-sandbox.c) is the program as every OS runs it: the
  * command line, the plan read from standard input, and the record a step
  * that fails writes on the status channel.  A backend is the sandbox of
- * one OS (linux.c, darwin.c): it starts the builder there as the plan
- * says, waits for it, ends it when the lifeline closes, and has the helper
- * end as the builder ended, or fail where it cannot see the build out
- * (backend_run).  The executable links the core with the one
+ * one OS (linux.c, darwin.c, windows.c): it starts the builder there as
+ * the plan says, waits for it, ends it when the lifeline closes, and has
+ * the helper end as the builder ended, or fail where it cannot see the
+ * build out (backend_run).  The executable links the core with the one
  * backend for the OS it is built for.  The core reads and writes its
  * channels through the backend, since each OS has its own calls for them;
  * the POSIX backends share theirs (posix.h).
@@ -38,7 +38,8 @@
 
 /* Write the one record a failure reports, "STAGE ERROR INDEX\n", on the
  * status channel: the step, the errno it failed with or 0, and the plan
- * entry or process it concerns. */
+ * entry or process it concerns.  The Windows backend's steps report the
+ * Win32 error code of the call that failed in place of an errno. */
 void status_report(const char *stage, int error, long index);
 
 /* Report a failure and end the process that saw it. */
@@ -68,15 +69,16 @@ int backend_read_input(char *bytes, size_t length);
 void backend_write_status(const char *bytes, size_t length);
 
 /* Run ARGV[0] with the arguments ARGV and the plan's environment, in the
- * sandbox PLAN describes.  Standard input, past the plan, is the
- * lifeline: when it closes, the builder is killed.  A step that fails
- * before the builder starts reports and ends the process.  Otherwise the
- * helper ends as the builder ended: this answers the builder's exit
- * status, or a failure when how it ended cannot be known or, on macOS,
- * when the build's processes cannot all be ended or its output does not
- * end, or does not return when the backend ends the helper by the signal
- * that ended the builder or, on macOS, reports a failure to watch the
- * build log. */
+ * sandbox PLAN describes; on Windows, run the command line the helper was
+ * given past its verb, which ARGV holds as the C runtime decoded it.
+ * Standard input, past the plan, is the lifeline: when it closes, the
+ * builder is killed.  A step that fails before the builder starts reports
+ * and ends the process.  Otherwise the helper ends as the builder ended:
+ * this answers the builder's exit status, or a failure when how it ended
+ * cannot be known or, on macOS, when the build's processes cannot all be
+ * ended or its output does not end, or does not return when the backend
+ * ends the helper by the signal that ended the builder or, on macOS,
+ * reports a failure to watch the build log. */
 int backend_run(const struct plan *plan, char **argv);
 
 /* Check that this system can make the sandbox.  Answers NULL when it can,

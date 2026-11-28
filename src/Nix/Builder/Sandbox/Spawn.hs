@@ -21,10 +21,11 @@
 --
 -- == Where it runs
 --
--- The helper is built for Linux and macOS ('hostSandboxBackend'), and
--- nothing probes or runs it elsewhere.  The chroot code is POSIX, so it
--- runs in the test suite on macOS as well; Windows has no chroot, and
--- there making or sealing one, or looking at a profile's paths, refuses.
+-- The helper is built for Linux, macOS and Windows, and nova-nix probes
+-- and runs it where 'hostSandboxBackend' names a backend, Linux and
+-- macOS.  The chroot code is POSIX, so it runs in the test suite on macOS
+-- as well; Windows has no chroot, and there making or sealing one, or
+-- looking at a profile's paths, refuses.
 --
 -- == Process state
 --

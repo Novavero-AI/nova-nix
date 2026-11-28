@@ -16,7 +16,10 @@
  *   darwin: build-dir and profile, each once and in that order, then any
  *   number of params, each a name and its value;
  *
- * then, for either, any number of environment entries.
+ *   windows: build-dir, token, slot-sid, desktop and memory-cap, each
+ *   once and in that order;
+ *
+ * then, for any of them, any number of environment entries.
  */
 
 #ifndef NOVA_NIX_SANDBOX_PLAN_H
@@ -30,7 +33,8 @@
 /* The backend a plan is for, named as the OS that backend runs on. */
 enum plan_backend {
     PLAN_LINUX,
-    PLAN_DARWIN
+    PLAN_DARWIN,
+    PLAN_WINDOWS
 };
 
 struct bind {
@@ -62,7 +66,18 @@ struct plan {
     const char **parameters;
     size_t parameter_count;
 
-    /* NAME=VALUE entries, NULL-terminated, for the builder's execve. */
+    /* Windows's: the value of the inherited handle to the primary token
+     * of the build slot's account, that account's SID in its S-1-...
+     * form, the window station and desktop to make, as STATION\DESKTOP,
+     * and the most memory, in bytes, each process of the build may
+     * commit. */
+    unsigned long token_handle;
+    const char *slot_sid;
+    const char *desktop;
+    unsigned long long memory_cap;
+
+    /* NAME=VALUE entries, NULL-terminated, for the builder's execve, or
+     * on Windows its environment block. */
     char **environment;
     size_t environment_count;
 };

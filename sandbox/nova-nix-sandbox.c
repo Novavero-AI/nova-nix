@@ -10,15 +10,16 @@
  *     Reads the plan from standard input, sets the sandbox up and runs
  *     PROGRAM there with ARGs and the environment the plan holds.
  *     Standard output is the status channel and standard error the build
- *     log.  On Linux the builder writes its standard output and standard
- *     error to the log itself; on macOS it writes both to a pipe of the
- *     helper's, which the helper copies into the log (darwin.c).  A
- *     step that fails writes one record, "STAGE ERRNO INDEX\n", on the
- *     status channel and the process exits.  A builder that starts leaves
- *     the channel empty, but on macOS for a failure to watch the build
- *     log, and the process exits as the builder did, or fails with the
- *     reason in the build log where it cannot see the build out
- *     (backend_run in backend.h).
+ *     log.  On Linux and Windows the builder writes its standard output
+ *     and standard error to the log itself; on macOS it writes both to a
+ *     pipe of the helper's, which the helper copies into the log
+ *     (darwin.c).  A step that fails writes one record,
+ *     "STAGE ERRNO INDEX\n", on the status channel, its ERRNO a Win32
+ *     error code for a Windows step (backend.h), and the process exits.
+ *     A builder that starts leaves the channel empty, but on macOS for a
+ *     failure to watch the build log, and the process exits as the
+ *     builder did, or fails with the reason in the build log where it
+ *     cannot see the build out (backend_run in backend.h).
  *     Standard input stays open after the plan as a lifeline: when
  *     nova-nix closes it, by ending or dying, the builder is killed.
  *
