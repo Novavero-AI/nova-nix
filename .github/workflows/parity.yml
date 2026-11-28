@@ -20,11 +20,15 @@ on:
   # so nothing reaches Hackage without the drvPath oracle passing there.
   workflow_call:
   # Always report, including documentation-only PRs and the merge queue.
-  # The oracle inputs below are fixed, so upstream churn cannot change the
-  # meaning of this gate between two runs of the same commit.
+  # A draft pull request runs no job until it is marked ready for review,
+  # as in ci.yml (the comment above its ASCII source), whose pull_request
+  # types these are.  The oracle inputs below are fixed, so upstream churn
+  # cannot change the meaning of this gate between two runs of the same
+  # commit.
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
     types: [checks_requested]
 
@@ -45,8 +49,9 @@ jobs:
     name: Nix ${{ matrix.nix }}, nixpkgs ${{ matrix.channel }}
     # A push to main by the merge queue carries the commit its merge group's
     # run tested, here as in ci.yml, so the rows skip it.  A push by anyone
-    # else reaches main untested and runs them.
-    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # else reaches main untested and runs them.  A draft pull request runs
+    # none, as it runs no job of ci.yml's.
+    if: ${{ !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -195,8 +200,10 @@ jobs:
   gate:
     name: Parity
     needs: [parity]
-    # Skipped with the rows on a push by the merge queue.
-    if: ${{ always() && !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') }}
+    # Skipped with the rows on a push by the merge queue and on a draft,
+    # where always() would otherwise run it and fail it on rows that never
+    # ran.
+    if: ${{ always() && !(github.event_name == 'push' && github.actor == 'github-merge-queue[bot]') && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -9,8 +9,10 @@ on:
   push:
     branches: [main]
   # No base-branch filter, as in ci.yml: a stacked pull request bases on
-  # its predecessor, not main, and runs the ladder all the same.
+  # its predecessor, not main, and runs the ladder all the same.  The types
+  # are ci.yml's: a draft runs no job until it is marked ready for review.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   # seed.yml calls it daily and publish.yml for a release.
   workflow_call:
   # A from-seed run on demand, on any branch.
@@ -78,6 +80,10 @@ jobs:
   # ---------------------------------------------------------------------------
   ladder-mode:
     name: Ladder (mode)
+    # A draft pull request runs no job here, as it runs none of ci.yml's
+    # (the comment above its ASCII source), and the jobs that need this one
+    # skip with it.
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     outputs:
       mode: ${{ steps.decide.outputs.mode }}

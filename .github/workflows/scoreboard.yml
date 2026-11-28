@@ -7,8 +7,10 @@ name: Scoreboard
 # over the set that evaluates.  Dispatched with the memory measure, it runs
 # bench.sh's memory suite instead, over a slice of one tree's walk.  A
 # measurement and not a gate: branch protection does not require it, so it
-# runs only when dispatched or when a pull request changes the scoreboard
-# itself, and never in the merge queue.
+# runs only when dispatched or when a pull request that is ready for review
+# changes the scoreboard itself, and never in the merge queue.  The
+# pull_request types are ci.yml's: a draft runs no job until it is marked
+# ready.
 
 on:
   workflow_dispatch:
@@ -29,6 +31,7 @@ on:
         type: string
         default: "2000"
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - .github/workflows/scoreboard.yml
       - profiling/bench.sh
@@ -49,9 +52,13 @@ concurrency:
 jobs:
   # The pairings are parity.yml's matrix rows, read from it, so the two
   # workflows measure the same trees and a bumped row needs no edit here.
-  # The memory suite takes the one row of the channel dispatched.
+  # The memory suite takes the one row of the channel dispatched.  A draft
+  # pull request runs no job, as it runs none of ci.yml's (the comment above
+  # its ASCII source), and the walks, whose matrix is this job's output,
+  # skip with it.
   pairings:
     name: Pairings
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:

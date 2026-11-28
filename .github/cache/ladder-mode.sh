@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Decide how a Seed ladder run's jobs come by the seed ladder, from the
 # event that started the run, its ref, and for a pull request the files it
-# changes.  The merge queue runs no ladder job, Ladder (mode) among them, so
-# this is not asked about it.
+# changes.  The merge queue and a draft pull request run no ladder job,
+# Ladder (mode) among them, so this is not asked about either.
 #
 # Prints one mode:
 #   skip         the ladder jobs do not run: a pull request whose every
