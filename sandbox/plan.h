@@ -16,8 +16,8 @@
  *   darwin: build-dir and profile, each once and in that order, then any
  *   number of params, each a name and its value;
  *
- *   windows: build-dir, token, slot-sid, desktop and memory-cap, each
- *   once and in that order;
+ *   windows: build-dir, token, slot-sid and memory-cap, each once and in
+ *   that order;
  *
  * then, for any of them, any number of environment entries.
  */
@@ -68,12 +68,10 @@ struct plan {
 
     /* Windows's: the value of the inherited handle to the primary token
      * of the build slot's account, that account's SID in its S-1-...
-     * form, the window station and desktop to make, as STATION\DESKTOP,
-     * and the most memory, in bytes, each process of the build may
+     * form, and the most memory, in bytes, each process of the build may
      * commit. */
     unsigned long token_handle;
     const char *slot_sid;
-    const char *desktop;
     unsigned long long memory_cap;
 
     /* NAME=VALUE entries, NULL-terminated, for the builder's execve, or

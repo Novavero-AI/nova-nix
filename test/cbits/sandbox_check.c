@@ -119,8 +119,7 @@ static int render_windows(struct buffer *buffer, const struct plan *plan)
     return append_token(buffer, "backend") && append_token(buffer, "windows") && append_token(buffer, "build-dir")
         && append_token(buffer, plan->build_dir) && append_token(buffer, "token")
         && append_number(buffer, plan->token_handle) && append_token(buffer, "slot-sid")
-        && append_token(buffer, plan->slot_sid) && append_token(buffer, "desktop")
-        && append_token(buffer, plan->desktop) && append_token(buffer, "memory-cap") && append_token(buffer, cap);
+        && append_token(buffer, plan->slot_sid) && append_token(buffer, "memory-cap") && append_token(buffer, cap);
 }
 
 static int render_backend(struct buffer *buffer, const struct plan *plan)

@@ -329,11 +329,11 @@ executable nova-nix
 -- and the builder's exec, where nova-nix itself can run nothing; on
 -- macOS, sandbox/darwin.c, a profile applied in the builder's process
 -- before its exec; both share sandbox/posix.c.  On Windows,
--- sandbox/windows.c starts the builder as a build slot's account, on a
--- window station and desktop of its own, in a job, which takes advapi32's
--- token and security calls and user32's window stations and desktops.
--- The runtime it links is never started.  nova-nix finds it beside
--- itself.
+-- sandbox/windows.c starts the builder as a build slot's account, on the
+-- window station of the slot's logon, in a job, and ends the slot's
+-- processes before and after the build, which takes advapi32's token
+-- calls.  The runtime it links is never started.  nova-nix finds it
+-- beside itself.
 -- ---------------------------------------------------------------------------
 
 executable nova-nix-sandbox
@@ -352,7 +352,6 @@ executable nova-nix-sandbox
     c-sources:      sandbox/windows.c
     extra-libraries:
         advapi32
-        user32
   else
     buildable: False
 
@@ -430,7 +429,8 @@ test-suite nova-nix-test
   -- On Windows the store access tests read a directory's DACL back
   -- through advapi32 (DirDacl), and the sandbox tests make build accounts
   -- through netapi32 and advapi32, their passwords through bcrypt, and a
-  -- window station through user32; elsewhere the store metadata tests
+  -- test service through advapi32, and read and open window stations
+  -- through user32; elsewhere the store metadata tests
   -- read lstat (NodeStatus): a node's group and other bits, and a
   -- symlink's own time.
   if os(windows)

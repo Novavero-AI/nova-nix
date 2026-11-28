@@ -27,10 +27,11 @@
 -- library runs nothing; on macOS (@sandbox\/darwin.c@) the profile,
 -- applied in the builder's process just before its exec.  The helper's
 -- Windows backend (@sandbox\/windows.c@) starts the builder as a build
--- slot's account, whose token it is handed, on a window station and
--- desktop of the build's own, attached to a pseudoconsole, in a job that
--- caps each process's memory, as a t'WindowsPlan' says; 'hostSandboxBackend'
--- names no backend on Windows, where no build runs through the helper.
+-- slot's account, whose token it is handed, on the window station of
+-- that token's logon, attached to a pseudoconsole, in a job that caps
+-- each process's memory, and ends the slot's processes before and after
+-- the build, as a t'WindowsPlan' says; 'hostSandboxBackend' names no
+-- backend on Windows, where no build runs through the helper.
 --
 -- == The protocol
 --
@@ -1303,11 +1304,12 @@ renderDarwinPlan plan =
 
 -- | What the helper does for one build on Windows (@sandbox\/windows.c@):
 -- start the builder as a build slot's account, from the token the
--- process that starts the helper hands it, on a window station and
--- desktop the helper makes for the build, granting the helper's user and
--- the slot's account alone, attached to a pseudoconsole the helper owns,
--- and in a job that caps each process's memory and lets none break away.
--- The builder's command line is the helper's own past its verb.
+-- process that starts the helper hands it, with its image opened as the
+-- slot, on the window station of that token's logon, attached to a
+-- pseudoconsole the helper owns, and in a job that caps each process's
+-- memory and lets none break away, ending every process of the slot's
+-- account before the builder starts and after the build.  The builder's
+-- command line is the helper's own past its verb.
 data WindowsPlan = WindowsPlan
   { -- | The directory the builder starts in.
     windowsPlanBuildDir :: !ByteString,
@@ -1315,13 +1317,9 @@ data WindowsPlan = WindowsPlan
     -- token, which it inherits from the process that starts it.  The
     -- helper takes 1 to 2^31 - 1, the values a handle has.
     windowsPlanToken :: !Word32,
-    -- | The slot's account, whose token that must be, and whom the
-    -- window station and desktop grant.
+    -- | The slot's account, whose token that must be, and whose
+    -- processes the helper ends before and after the build.
     windowsPlanSlot :: !Sid,
-    -- | The window station and desktop the helper makes, as a process's
-    -- start names them, @STATION\\DESKTOP@: neither name empty, nor
-    -- holding a backslash.
-    windowsPlanDesktop :: !ByteString,
     -- | The most memory each process of the build may commit, in bytes,
     -- which the helper takes above 0.
     windowsPlanMemoryCap :: !Word64,
@@ -1332,8 +1330,8 @@ data WindowsPlan = WindowsPlan
   deriving (Eq, Show)
 
 -- | A Windows plan as the helper reads it ('framePlan'): the backend, the
--- build directory, the token's handle, the slot's SID, the window station
--- and desktop and the memory cap, then the builder's environment.
+-- build directory, the token's handle, the slot's SID and the memory
+-- cap, then the builder's environment.
 renderWindowsPlan :: WindowsPlan -> ByteString
 renderWindowsPlan plan =
   framePlan
@@ -1342,7 +1340,6 @@ renderWindowsPlan plan =
           ["build-dir", windowsPlanBuildDir plan],
           ["token", BS8.pack (show (windowsPlanToken plan))],
           ["slot-sid", TE.encodeUtf8 (sidText (windowsPlanSlot plan))],
-          ["desktop", windowsPlanDesktop plan],
           ["memory-cap", BS8.pack (show (windowsPlanMemoryCap plan))]
         ]
         ++ concatMap (\entry -> ["env", entry]) (windowsPlanEnvironment plan)
@@ -1453,8 +1450,11 @@ data WindowsStage
   | WindowsStageSlotSid
   | -- | The token's user is not the plan's slot.
     WindowsStageTokenUser
-  | WindowsStageStation
-  | WindowsStageDesktop
+  | -- | Ending the processes running as the slot's account before the
+    -- builder starts.  The record's index is the process that could not
+    -- be ended, and a sweep that outlasts its wait carries
+    -- @ERROR_TIMEOUT@.
+    WindowsStageSweep
   | -- | Opening NUL, the builder's standard input.
     WindowsStageStdin
   | -- | Copying the build log for the builder to inherit.
@@ -1467,7 +1467,12 @@ data WindowsStage
   | -- | The list of the handles and the pseudoconsole the builder starts
     -- with.
     WindowsStageAttributes
+  | -- | Impersonating the slot, whose access the builder's image is
+    -- opened with.
+    WindowsStageImpersonate
   | WindowsStageExec
+  | -- | Ending the impersonation once the builder is started.
+    WindowsStageRevert
   | -- | Assigning the builder to the build's job.
     WindowsStageAssign
   | -- | Starting the thread that watches the lifeline.
@@ -1483,8 +1488,7 @@ windowsStageName stage = case stage of
   WindowsStageToken -> "token"
   WindowsStageSlotSid -> "slot-sid"
   WindowsStageTokenUser -> "token-user"
-  WindowsStageStation -> "station"
-  WindowsStageDesktop -> "desktop"
+  WindowsStageSweep -> "sweep"
   WindowsStageStdin -> "stdin"
   WindowsStageLog -> "log"
   WindowsStageConsole -> "console"
@@ -1493,7 +1497,9 @@ windowsStageName stage = case stage of
   WindowsStageBuildDir -> "build-dir"
   WindowsStageCommandLine -> "command-line"
   WindowsStageAttributes -> "attributes"
+  WindowsStageImpersonate -> "impersonate"
   WindowsStageExec -> "exec"
+  WindowsStageRevert -> "revert"
   WindowsStageAssign -> "assign"
   WindowsStageLifeline -> "lifeline"
   WindowsStageResume -> "resume"

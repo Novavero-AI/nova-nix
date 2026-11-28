@@ -254,9 +254,10 @@ Neither is built. Each is designed in its issue, and this is the design.
 - **The sandbox** ([#194]). Builds are to run as local build accounts, one
   per build slot, which the service starts through a Windows backend of
   `nova-nix-sandbox`, the helper Linux builds already run through. Each
-  build would get a window station and desktop of its own, a
-  pseudoconsole, and a job with a per-process memory cap that no process
-  can leave. The store directory would let build accounts create entries
+  build would run on the window station of its slot's logon, with a
+  pseudoconsole and a job with a per-process memory cap that no process
+  can leave, and every process of its slot would be ended before and
+  after it. The store directory would let build accounts create entries
   and nothing else, and registering an output would make the service its
   owner and the output read and execute for builds. The issue records
   why restricted, write-restricted and AppContainer tokens are not used.

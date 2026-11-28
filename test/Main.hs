@@ -30,7 +30,7 @@ import Test.Realise (testDepGraph, testRealise)
 import Test.Store (testCaseSensitiveVolumeIO, testExecBit, testFoldingVolumeIO, testGcPure, testHashHelpers, testLinkOrdering, testNarKnownAnswer, testNarNameSafety, testParseStorePath, testPathLocks, testSerialiseIfReadableIO, testStoreAccessIO, testStoreDB, testStoreDelete, testStoreGC, testStoreGCUpstreamManaged, testStoreMetadata, testStoreNameSinks, testStoreNameSinksIO, testStoreOps, testStoreOpsIO, testStorePaths, testStoreWritesUpstreamManaged, testSymlinkWalksIO)
 import Test.Substituter (testNarInfoValidation, testStatedContentAddress, testSubstituter, testSubstituterRetry, testVerifySigs)
 import Test.Trust (testTrust, testTrustScanIO, testTrustWindowsGraphs)
-import Test.WindowsSandbox (testWindowsSandboxIO, windowsSandboxAccounts, windowsSandboxAccountsFlag, windowsSandboxBuilder, windowsSandboxBuilderFlag)
+import Test.WindowsSandbox (testWindowsSandboxIO, windowsSandboxAccounts, windowsSandboxAccountsFlag, windowsSandboxBuilder, windowsSandboxBuilderFlag, windowsSandboxInstall, windowsSandboxInstallFlag, windowsSandboxService, windowsSandboxServiceFlag)
 
 main :: IO ()
 main = do
@@ -51,6 +51,8 @@ main = do
     [flag, source] | flag == namesOnlyChildFlag -> inTestSession (namesOnlyChild source)
     [flag] | flag == arenaCycleChildFlag -> arenaCycleChild
     [flag] | flag == writeCliJsonFlag -> BS.writeFile cliJsonPath Ref.referenceJson
+    flag : rest | flag == windowsSandboxInstallFlag -> windowsSandboxInstall rest
+    flag : rest | flag == windowsSandboxServiceFlag -> windowsSandboxService rest
     flag : rest | flag == windowsSandboxAccountsFlag -> windowsSandboxAccounts rest
     flag : rest | flag == windowsSandboxBuilderFlag -> windowsSandboxBuilder rest
     _ -> withRunTempRoot (inTestSession runSuite)

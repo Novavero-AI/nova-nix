@@ -548,20 +548,20 @@ jobs:
           fi
           exit "$status"
 
-      # The sandbox helper's Windows backend, run as the service that holds
-      # each build slot's token would run it: as SYSTEM, which holds the
-      # privileges to start a process as another account.  A scheduled
-      # task runs the suite's account checks as SYSTEM at normal priority;
-      # they write what they print to a log, printed here, make two
-      # build-slot accounts, run builds as each through the helper, and
-      # remove the accounts, each one's logon right first, however they
-      # end.  The user a build must be kept from is the runner's: its
-      # profile, TEMP, APPDATA and hive, this step's process, a file only
-      # it may read and a file in its profile, both of which the step makes
-      # and removes.  A result of 0 counts only when the log ends with the
-      # checks' count.  Windows PowerShell carries the ScheduledTasks module
-      # itself.
-      - name: The sandbox helper runs builds as build accounts, checked as SYSTEM (Windows)
+      # The sandbox helper's Windows backend, run as the service that logs
+      # each build slot on would run it: as a virtual service account
+      # granted the privileges that start a process as another account.
+      # The suite, run as the runner's administrator, makes two build-slot
+      # accounts and a test service running as its virtual account, starts
+      # the service, which runs the account checks, and prints their log;
+      # it removes the service and the accounts, each one's rights first,
+      # however the checks end.  The user a build must be kept from is the
+      # runner's: its profile, TEMP, APPDATA and hive, this step's process,
+      # a file only it may read and a file in its profile, both of which
+      # the step makes and removes.  The checks' directory is made in the
+      # runner's temporary directory, outside the runner user's profile,
+      # which the service and the slots cannot enter.
+      - name: The sandbox helper runs builds as build accounts, checked as a service (Windows)
         if: runner.os == 'Windows'
         timeout-minutes: 30
         shell: powershell
@@ -571,67 +571,41 @@ jobs:
           $helper = cabal list-bin exe:nova-nix-sandbox
           $bash = 'C:\msys64\usr\bin\bash.exe'
           if (-not (Test-Path -LiteralPath $bash)) { throw "no MSYS2 bash at $bash" }
-          $log = Join-Path $env:RUNNER_TEMP 'windows-sandbox-accounts.log'
           $userOnly = Join-Path $env:TEMP 'nova-nix-sandbox-user-only.txt'
           $profileFile = Join-Path $env:USERPROFILE 'nova-nix-sandbox-profile.txt'
-          $task = 'nova-nix-sandbox-accounts'
-          $flag = '--windows-sandbox-accounts'
           $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-          # LastTaskResult before a task has run.
-          $notRun = 267011
-          # A task's priority, 4 to 6 being the normal class.
-          $normalPriority = 5
-          $limit = New-TimeSpan -Minutes 20
-          $pollSeconds = 5
-          $result = $notRun
           try {
             Set-Content -LiteralPath $userOnly -Value 'the runner user alone may read this'
             icacls $userOnly /inheritance:r /grant:r "*${user}:F" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "icacls failed with $LASTEXITCODE" }
             Set-Content -LiteralPath $profileFile -Value 'a file in the runner user profile'
-            $arguments = "$flag `"$log`" `"$helper`" `"$bash`" $user `"$env:USERPROFILE`" `"$env:TEMP`" " +
-              "`"$env:APPDATA`" $PID `"$userOnly`" `"$profileFile`""
-            $action = New-ScheduledTaskAction -Execute $suite -Argument $arguments
-            $principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-            $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit $limit -Priority $normalPriority
-            Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings | Out-Null
-            try {
-              Start-ScheduledTask -TaskName $task
-              $deadline = (Get-Date) + $limit
-              do {
-                Start-Sleep -Seconds $pollSeconds
-                $state = (Get-ScheduledTask -TaskName $task).State
-                $result = (Get-ScheduledTaskInfo -TaskName $task).LastTaskResult
-              } while (($state -eq 'Running' -or $state -eq 'Queued' -or $result -eq $notRun) -and (Get-Date) -lt $deadline)
-            } finally {
-              if ((Get-ScheduledTask -TaskName $task).State -eq 'Running') { Stop-ScheduledTask -TaskName $task }
-              Unregister-ScheduledTask -TaskName $task -Confirm:$false
-            }
+            & $suite --windows-sandbox-install $env:RUNNER_TEMP $helper $bash $user $env:USERPROFILE $env:TEMP `
+              $env:APPDATA $PID $userOnly $profileFile
+            $result = $LASTEXITCODE
           } finally {
             Remove-Item -LiteralPath $userOnly, $profileFile -Force -ErrorAction SilentlyContinue
           }
-          $lines = @()
-          if (Test-Path -LiteralPath $log) { $lines = @(Get-Content -LiteralPath $log -Encoding UTF8) }
-          $lines
-          "the account checks ended with $result"
-          if (-not ($lines | Select-String -Pattern "^${flag}: [0-9]+/[0-9]+ passed$")) {
-            throw 'the account checks did not finish: their log has no count'
-          }
           exit $result
 
-      # The account checks remove the accounts they make, and their logon
-      # right; this removes any account a run that ended early left, by the
-      # name prefix the checks give them (test/Test/WindowsSandbox.hs), and
-      # leaves such an account's right on its SID, which the discarded
-      # runner takes with it.  Windows PowerShell carries the LocalAccounts
-      # module itself, where PowerShell 7 loads it through a compatibility
-      # session.
-      - name: Remove leftover build accounts (Windows)
+      # The account checks remove the accounts and the test service they
+      # make, and their rights; this removes any a run that ended early
+      # left, by the name prefixes the checks give them
+      # (test/Test/WindowsSandbox.hs), and leaves such an account's or
+      # service's rights on its SID, which the discarded runner takes with
+      # it.  Windows PowerShell carries the LocalAccounts module itself,
+      # where PowerShell 7 loads it through a compatibility session, and
+      # sc.exe deletes a service, for which it has no cmdlet.
+      - name: Remove leftover build accounts and test services (Windows)
         if: always() && runner.os == 'Windows'
         shell: powershell
         run: |
           # Listed in full first, so that removing one does not cut the
           # listing short.
+          @(Get-Service -Name 'nnsandbox*') | ForEach-Object {
+            "removing the leftover service $($_.Name)"
+            if ($_.Status -ne 'Stopped') { Stop-Service -Name $_.Name -Force }
+            sc.exe delete $_.Name
+          }
           @(Get-LocalUser | Where-Object Name -like 'nnslot*') | ForEach-Object {
             "removing the leftover account $($_.Name)"
             Remove-LocalUser -SID $_.SID

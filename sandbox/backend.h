@@ -75,10 +75,10 @@ void backend_write_status(const char *bytes, size_t length);
  * builder is killed.  A step that fails before the builder starts reports
  * and ends the process.  Otherwise the helper ends as the builder ended:
  * this answers the builder's exit status, or a failure when how it ended
- * cannot be known or, on macOS, when the build's processes cannot all be
- * ended or its output does not end, or does not return when the backend
- * ends the helper by the signal that ended the builder or, on macOS,
- * reports a failure to watch the build log. */
+ * cannot be known or, on macOS and Windows, when the build's processes
+ * cannot all be ended or, on macOS, when its output does not end, or does
+ * not return when the backend ends the helper by the signal that ended
+ * the builder or, on macOS, reports a failure to watch the build log. */
 int backend_run(const struct plan *plan, char **argv);
 
 /* Check that this system can make the sandbox.  Answers NULL when it can,
