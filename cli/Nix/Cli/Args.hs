@@ -30,11 +30,13 @@ where
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (listToMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import Nix.Builder.Sandbox (SandboxMode (..))
 import Nix.Develop.Shell (EnvironmentBase (..))
+import Nix.Profile.Generation (Changes (..))
 
 -- | Parsed CLI options.
 data CliOpts = CliOpts
@@ -114,6 +116,17 @@ data Command
     CmdProfileRemove !ProfileSelection !RemoveSelection
   | -- | @profile list@: print what a profile holds.
     CmdProfileList !ProfileSelection !ListFormat
+  | -- | @profile history@: print a profile's generations and what
+    -- changed in each.
+    CmdProfileHistory !ProfileSelection
+  | -- | @profile rollback@: switch a profile to the generation before the
+    -- current one, or to the one @--to@ names, each @--to@ as the command
+    -- line spells it, in order.
+    CmdProfileRollback !ProfileSelection ![String] !Changes
+  | -- | @profile wipe-history@: delete a profile's generations but the
+    -- current one, or with @--older-than@, as the command line spells its
+    -- age, those older than that but the newest of them.
+    CmdProfileWipeHistory !ProfileSelection !(Maybe String) !Changes
   | -- | No command given, or @eval@ given no target.  Usage on stderr,
     -- non-zero: a bare invocation is
     -- a usage error, and a caller testing the exit status must see one.
@@ -250,6 +263,26 @@ data ListOutput = TextOutput | JsonOutput
 
 -- | A selector of @profile remove@ while its line is parsed.
 data Selected = SelectedAll | Selected !RemoveMatcher
+
+-- | A command that changes which generation of a profile is current, or
+-- which generations it has, taking one value flag and @--dry-run@.
+data GenerationCommand
+  = -- | @profile rollback@, whose flag is @--to@.
+    RollsBack
+  | -- | @profile wipe-history@, whose flag is @--older-than@.
+    WipesHistory
+
+-- | The words that select a generation command.
+generationWord :: GenerationCommand -> String
+generationWord kind = case kind of
+  RollsBack -> "profile rollback"
+  WipesHistory -> "profile wipe-history"
+
+-- | The flag a generation command takes a value with.
+generationValueFlag :: GenerationCommand -> String
+generationValueFlag kind = case kind of
+  RollsBack -> "--to"
+  WipesHistory -> "--older-than"
 
 -- | What @develop@ runs in place of an interactive shell, and how it
 -- changes the shell's environment, as the command line gives them, each
@@ -634,12 +667,16 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     goStoreGc _ _ (arg : _) = Left ("unknown store gc argument: " ++ arg)
     -- Sub-parser for profile verbs.
-    goProfile _ [] = Left "profile: expected a subcommand (add, remove, list)"
+    goProfile _ [] = Left ("profile: expected a subcommand (" ++ profileVerbs ++ ")")
     goProfile opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
     goProfile opts ("add" : rest) = goTarget AddsToProfile opts emptyBuildArgs rest
     goProfile opts ("remove" : rest) = goProfileRemove opts DefaultProfile [] [] rest
     goProfile opts ("list" : rest) = goProfileList opts DefaultProfile TextOutput IndentedOnTerminal rest
-    goProfile _ (sub : _) = Left ("unknown profile subcommand: " ++ sub ++ " (expected: add, remove, list)")
+    goProfile opts ("history" : rest) = goProfileHistory opts DefaultProfile rest
+    goProfile opts ("rollback" : rest) = goGenerations RollsBack opts DefaultProfile [] MakeChanges rest
+    goProfile opts ("wipe-history" : rest) = goGenerations WipesHistory opts DefaultProfile [] MakeChanges rest
+    goProfile _ (sub : _) = Left ("unknown profile subcommand: " ++ sub ++ " (expected: " ++ profileVerbs ++ ")")
+    profileVerbs = "add, remove, list, history, rollback, wipe-history"
     -- The flags' matchers come before the arguments', each in the order
     -- given, as upstream runs a flag's handler as it reads the flag and
     -- the arguments' once the line is read.
@@ -677,6 +714,35 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     listFormat output layout = case output of
       TextOutput -> ListText
       JsonOutput -> ListJson layout
+    goProfileHistory opts profile [] = Right opts {optCommand = CmdProfileHistory profile}
+    goProfileHistory opts _ (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
+    goProfileHistory opts profile ("--store" : dir : rest) =
+      goProfileHistory (opts {optStore = Just dir}) profile rest
+    goProfileHistory opts _ ("--profile" : path : rest) =
+      goProfileHistory opts (ProfileAt path) rest
+    goProfileHistory _ _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goProfileHistory _ _ (arg : _) = Left ("unknown profile history argument: " ++ arg)
+    -- The values of the command's flag are kept in order.  Upstream reads
+    -- each --to as its handler meets it, so every one must read, and the
+    -- last wins; --older-than is kept as a string until the command runs,
+    -- so only the last is read.
+    goGenerations kind opts profile values changes [] = Right opts {optCommand = generationCommand kind profile values changes}
+    goGenerations _ opts _ _ _ (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
+    goGenerations kind opts profile values changes ("--store" : dir : rest) =
+      goGenerations kind (opts {optStore = Just dir}) profile values changes rest
+    goGenerations kind opts _ values changes ("--profile" : path : rest) =
+      goGenerations kind opts (ProfileAt path) values changes rest
+    goGenerations kind opts profile values _ ("--dry-run" : rest) =
+      goGenerations kind opts profile values DryRun rest
+    goGenerations kind opts profile values changes (flag : given : rest)
+      | flag == generationValueFlag kind = goGenerations kind opts profile (values ++ [given]) changes rest
+    goGenerations _ _ _ _ _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goGenerations kind _ _ _ _ (arg : _) = Left ("unknown " ++ generationWord kind ++ " argument: " ++ arg)
+    generationCommand kind profile values = case kind of
+      RollsBack -> CmdProfileRollback profile values
+      WipesHistory -> CmdProfileWipeHistory profile (listToMaybe (reverse values))
     -- Upstream's two usage errors, in this parser's words.
     removeSelection selected = case selected of
       [] -> Left "profile remove: no packages specified"
@@ -710,7 +776,7 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     sandboxFlag _ = Nothing
     -- Flags that consume the following argument as their value.
     valueFlags =
-      ["--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--secret-key-file", "--compression", "--profile", "--priority", "--regex"]
+      ["--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--secret-key-file", "--compression", "--profile", "--priority", "--regex", "--to", "--older-than"]
         ++ attrFlags
         ++ outLinkFlags
     -- Attribute selection, under both of upstream's spellings.

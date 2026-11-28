@@ -176,6 +176,7 @@ import qualified Nix.Cli.Args as Cli
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
 import Nix.Derivation (Derivation (..), DerivationOutput (..))
+import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Eval (BuiltinArg (..), EvalPolicy (..), FetchCache (..), FetchGitArgs (..), MonadEval (..), NixValue (..), StringContext (..), StringContextElement (..), Thunk (..), attrSetFromMap, attrSetLookup, attrSetNull, attrSetSize, checkGitRef, checkGitRev, checkGitUrl, decodeFetchCache, deepForce, emptyContext, emptyEnv, encodeFetchCache, eval, evalParsed, evaluated, fetchCacheKey, force, gitInputUrl, gitRemote, listedBuiltins, localFileUrl, mkStr, readThunkValue, runPureEval, typeName, unrestrictedPolicy)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..), envSiteName, setSiteName)
 import Nix.Eval.AttrPath (parseAttrPath, selectAttrPath)
@@ -5549,6 +5550,11 @@ testEnvironmentBytes = do
               assertEqual "lookup" (Right (VInt 42)) <$> evalNixIOWithNixPath testDir "import <mypkg>",
             withEnvBytes "getEnv looks a name up by its bytes" nonUtf8EnvName "hello" $
               expectBytes "name" "hello" <$> evalNixIO testDir "builtins.getEnv (builtins.readFile ./name.bin)",
+            runTestM "a variable set to nothing is set, and one not set is not, as upstream reads them on every platform" $ do
+              let variable = TE.encodeUtf8 testEnvVarName
+              setToNothing <- withEnvVar (T.unpack testEnvVarName) "" (lookupEnvBytes variable)
+              notSet <- lookupEnvBytes variable
+              pure (assertEqual "set to nothing" (EnvValue "") setToNothing `andThen` assertEqual "not set" EnvUnset notSet),
             unpairedSurrogateGetEnv testDir,
             unpairedSurrogateNixPath testDir
           ]

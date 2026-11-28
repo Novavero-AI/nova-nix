@@ -594,6 +594,120 @@
           "usage": "nova-nix profile list --json"
         }
       ]
+    },
+    {
+      "description": "Prints each generation of a profile in order of number, as `nix profile history` does: `Version N (DATE):`, and `Version N (DATE) <- M:` after the first, where `DATE` is the day in UTC the generation was made and `M` the generation listed before it, with `N` in green for the current generation and in bold for the others when stdout takes colour; then a line for each package that differs from generation `M`'s, `NAME: OLD -> NEW`, with the empty-set sign for the versions of a package one of the two lacks, or `No changes.`, and a blank line before the next generation. `NAME` is what `profile remove --regex` matches, and a package's versions are those in its store paths' names, each once and joined by `, `, an epsilon standing for an empty one. Stdout takes colour when it is a terminal and `TERM` is set to something other than `dumb`, or whatever it is when `CLICOLOR_FORCE` or `FORCE_COLOR` is set, and never while `NO_COLOR` or `NOCOLOR` is set, whatever their values. A generation whose store path is gone holds no packages. A generation was made when its link was. The default profile and its link are made when they are missing, and a profile whose current generation is outside the store is refused, as for every profile command.",
+      "examples": [
+        {
+          "arguments": [
+            "profile",
+            "history"
+          ],
+          "command": "nova-nix profile history",
+          "description": "Show what changed in each generation of the default profile.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "profile",
+            "history",
+            "--profile",
+            "./my-profile"
+          ],
+          "command": "nova-nix profile history --profile ./my-profile",
+          "description": "Show the generations of a profile other than the default.",
+          "output": []
+        }
+      ],
+      "name": "nova-nix profile history",
+      "synopsis": [
+        {
+          "summary": "Print each generation of a profile and what changed in it",
+          "usage": "nova-nix profile history"
+        }
+      ]
+    },
+    {
+      "description": "Switches a profile to the newest generation older than its current one, or with `--to N` to generation `N`, as `nix profile rollback` does, and says `switching profile from version CURRENT to N`, `CURRENT` being 0 when the profile has no current generation, and so none older. A generation holds the packages the profile held when it was made, so a rollback brings back what a later change took off, and a change after a rollback makes a generation numbered after the newest. `N` may end in `K`, `M`, `G` or `T`, which multiply it by 1024 once to four times, as upstream reads a number. With `--dry-run` it says where it would switch and switches nothing. A profile's generations are `PROFILE-1-link`, `PROFILE-2-link` and on beside it, and its current one is the one its link names by that bare name, as a switch writes it; a link naming anything else, an absolute path included, names no current generation. The default profile and its link are made when they are missing, and a profile whose current generation is outside the store is refused, as for every profile command. On Windows each link is a symlink, which needs Developer Mode or an elevated shell.",
+      "examples": [
+        {
+          "arguments": [
+            "profile",
+            "rollback"
+          ],
+          "command": "nova-nix profile rollback",
+          "description": "Switch the default profile back to the generation before the current one.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "profile",
+            "rollback",
+            "--to",
+            "2"
+          ],
+          "command": "nova-nix profile rollback --to 2",
+          "description": "Switch the default profile to generation 2.",
+          "output": []
+        }
+      ],
+      "name": "nova-nix profile rollback",
+      "synopsis": [
+        {
+          "summary": "Switch a profile to the generation before the current one",
+          "usage": "nova-nix profile rollback"
+        },
+        {
+          "summary": "Switch a profile to generation N",
+          "usage": "nova-nix profile rollback --to N"
+        }
+      ]
+    },
+    {
+      "description": "Deletes every generation of a profile but its current one, as `nix profile wipe-history` does, saying `removing profile version N` for each, so that none can be rolled back to; the next `store gc` drops their roots and deletes what only they kept. With `--older-than Nd`, `N` a whole number of days from 1, it deletes only the generations made more than `N` days ago, but the newest of them, which the profile held then, and never the current one; one made since then that is numbered below the newest of them is kept, with a warning. A generation was made when its link was. With `--dry-run` it says `would remove profile version N` for each and deletes nothing. A profile with no current generation keeps none for being current. A profile's generations are `PROFILE-1-link`, `PROFILE-2-link` and on beside it, and its current one is the one its link names by that bare name, as a switch writes it; a link naming anything else, an absolute path included, names no current generation. The default profile and its link are made when they are missing, and a profile whose current generation is outside the store is refused, as for every profile command. On Windows each link is a symlink, which needs Developer Mode or an elevated shell.",
+      "examples": [
+        {
+          "arguments": [
+            "profile",
+            "wipe-history"
+          ],
+          "command": "nova-nix profile wipe-history",
+          "description": "Delete every generation of the default profile but the current one.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "profile",
+            "wipe-history",
+            "--older-than",
+            "30d"
+          ],
+          "command": "nova-nix profile wipe-history --older-than 30d",
+          "description": "Delete the generations made more than 30 days ago, keeping the newest of them.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "profile",
+            "wipe-history",
+            "--dry-run"
+          ],
+          "command": "nova-nix profile wipe-history --dry-run",
+          "description": "Say which generations would be deleted, and delete none.",
+          "output": []
+        }
+      ],
+      "name": "nova-nix profile wipe-history",
+      "synopsis": [
+        {
+          "summary": "Delete every generation of a profile but the current one",
+          "usage": "nova-nix profile wipe-history"
+        },
+        {
+          "summary": "Delete the generations of a profile made more than AGE ago, but the newest of them",
+          "usage": "nova-nix profile wipe-history --older-than AGE"
+        }
+      ]
     }
   ],
   "configuration": {
@@ -1281,7 +1395,10 @@
       "commands": [
         "nova-nix profile add",
         "nova-nix profile remove",
-        "nova-nix profile list"
+        "nova-nix profile list",
+        "nova-nix profile history",
+        "nova-nix profile rollback",
+        "nova-nix profile wipe-history"
       ],
       "description": "Work on the profile at `PATH` in place of the default profile",
       "name": "--profile",
@@ -1309,6 +1426,40 @@
       "name": "--regex",
       "spellings": [
         "--regex"
+      ]
+    },
+    {
+      "argument": "N",
+      "commands": [
+        "nova-nix profile rollback"
+      ],
+      "description": "Switch to generation `N` in place of the one before the current",
+      "name": "--to",
+      "spellings": [
+        "--to"
+      ]
+    },
+    {
+      "argument": "AGE",
+      "commands": [
+        "nova-nix profile wipe-history"
+      ],
+      "description": "Delete only the generations older than `AGE`, `N` days written `Nd`, keeping the newest of them",
+      "name": "--older-than",
+      "spellings": [
+        "--older-than"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix profile rollback",
+        "nova-nix profile wipe-history"
+      ],
+      "description": "Say what the command would change, and change nothing",
+      "name": "--dry-run",
+      "spellings": [
+        "--dry-run"
       ]
     },
     {
@@ -1360,7 +1511,10 @@
         "nova-nix store gc",
         "nova-nix profile add",
         "nova-nix profile remove",
-        "nova-nix profile list"
+        "nova-nix profile list",
+        "nova-nix profile history",
+        "nova-nix profile rollback",
+        "nova-nix profile wipe-history"
       ],
       "description": "Use `DIR` as the store (default: the platform store)",
       "name": "--store",

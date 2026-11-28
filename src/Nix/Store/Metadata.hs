@@ -48,6 +48,7 @@ module Nix.Store.Metadata
     isPlainFile,
     writableByOthers,
     foreignOwnedNode,
+    nodeModificationTime,
 
     -- * The canonical form
     NodeKind (..),
@@ -85,9 +86,10 @@ import System.Win32.File
     fILE_SHARE_READ,
     fILE_SHARE_WRITE,
     fILE_WRITE_ATTRIBUTES,
+    gENERIC_READ,
     oPEN_EXISTING,
   )
-import System.Win32.Time (FILETIME (..), setFileTime)
+import System.Win32.Time (FILETIME (..), getFileTime, setFileTime)
 
 #else
 
@@ -258,6 +260,12 @@ writableByOthers :: FilePath -> IO Bool
 -- compare, and finds none.
 foreignOwnedNode :: FilePath -> IO (Maybe FilePath)
 
+-- | A node's own modification time, in whole seconds since the epoch: a
+-- symlink's own rather than its target's, as @lstat@ reads it.  A node
+-- that is not there fails with the 'Control.Exception.IOException'
+-- raised.
+nodeModificationTime :: FilePath -> IO Int64
+
 #if defined(mingw32_HOST_OS)
 
 writableByOthers _ = pure False
@@ -311,13 +319,35 @@ setStoreTime path = do
         (fILE_FLAG_BACKUP_SEMANTICS .|. fileFlagOpenReparsePoint)
         Nothing
 
--- | 'storeModificationTime' as a Windows file time, which counts 100
--- nanosecond ticks from 1601.
+-- | 'storeModificationTime' as a Windows file time.
 storeFileTime :: FILETIME
-storeFileTime = FILETIME (unixEpochTicks + fromIntegral storeModificationTime * ticksPerSecond)
+storeFileTime = FILETIME (fromIntegral (unixEpochTicks + storeModificationTime * ticksPerSecond))
+
+-- The node is opened as 'setStoreTime' opens it, as a symlink itself
+-- rather than its target and with the flag a directory needs, for the
+-- read access GetFileTime asks of a handle.  A time before the epoch
+-- rounds down to its second, as a negative @st_mtime@ does.
+nodeModificationTime path = do
+  target <- win32FilePath path
+  bracket (open target) closeHandle $ \handle -> do
+    (_, _, FILETIME ticks) <- getFileTime handle
+    pure ((fromIntegral ticks - unixEpochTicks) `div` ticksPerSecond)
   where
-    unixEpochTicks = 116444736000000000
-    ticksPerSecond = 10000000
+    open target =
+      createFile
+        target
+        gENERIC_READ
+        (fILE_SHARE_READ .|. fILE_SHARE_WRITE .|. fILE_SHARE_DELETE)
+        Nothing
+        oPEN_EXISTING
+        (fILE_FLAG_BACKUP_SEMANTICS .|. fileFlagOpenReparsePoint)
+        Nothing
+
+-- | The Unix epoch as a Windows file time, which counts 100-nanosecond
+-- ticks from 1601, and the ticks in a second.
+unixEpochTicks, ticksPerSecond :: Int64
+unixEpochTicks = 116444736000000000
+ticksPerSecond = 10000000
 
 -- | @FILE_FLAG_OPEN_REPARSE_POINT@ (winbase.h), which "System.Win32.File"
 -- does not export: open a symlink rather than what it points to.
@@ -333,6 +363,11 @@ isPlainFile path = do
 writableByOthers path = do
   status <- getSymbolicLinkStatus path
   pure (not (isSymbolicLink status) && fileMode status .&. (groupWriteMode .|. otherWriteMode) /= 0)
+
+nodeModificationTime path = do
+  status <- getSymbolicLinkStatus path
+  let CTime seconds = modificationTime status
+  pure seconds
 
 foreignOwnedNode root = do
   user <- getEffectiveUserID
