@@ -62,6 +62,18 @@
 # on a MinGW build host; past that it archives in pieces, which tcc -ar,
 # writing an archive anew each time, cannot.
 #
+# gmp writes its table of each base's digits per bit at build time, with
+# a program it compiles and runs on the build machine, which computes
+# each value with the machine's log and printf, so that the last digit
+# depends on the machine: under the ARM64 leg's x86 emulator, which
+# carries out x87 arithmetic in double precision, gcc46-cxx's program
+# writes other digits for some bases than on x64, and that rung's
+# compilers differ between the legs.  gmp-bases-digits.patch has the
+# program write fixed digits instead, those an x86 processor gives, so
+# the table is the one this rung and gcc46-cxx write on x64 without the
+# patch.  preConfigure applies it once it has unpacked gmp, and gcc46-cxx
+# applies it to the same archive.
+#
 # GCC configures from a build directory beside its source, as its
 # installation guide recommends (INSTALL/configure.html), where nixpkgs
 # configures in the source.  In the source, the top level builds the
@@ -216,6 +228,7 @@ seedStdenv.mkDerivation {
     ;
 
   patches = [ ./fix-tinycc-attribute.patch ];
+  gmpPatch = ./gmp-bases-digits.patch;
 
   buildInputs = [
     mingw-w64-dirent
@@ -225,6 +238,7 @@ seedStdenv.mkDerivation {
   preConfigure = ''
     tar xf "$gmpSrc"
     mv gmp-${gmpVersion} gmp
+    (cd gmp && patch -p1 -i "$gmpPatch")
     tar xf "$mpfrSrc"
     mv mpfr-${mpfrVersion} mpfr
     tar xf "$mpcSrc"
