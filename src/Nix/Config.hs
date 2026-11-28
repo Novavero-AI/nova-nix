@@ -12,8 +12,9 @@
 -- @allowed-impure-host-deps@ and @darwin-log-sandbox-violations@ among
 -- them), what a build that fails leaves (@keep-failed@), where the link to
 -- the default profile is
--- (@use-xdg-base-directories@), and the prompt of a @develop@ shell
--- (@bash-prompt@ and its prefix and suffix).
+-- (@use-xdg-base-directories@), the prompt of a @develop@ shell
+-- (@bash-prompt@ and its prefix and suffix), and which experimental
+-- features are on (@experimental-features@).
 --
 -- == The format
 --
@@ -67,7 +68,7 @@
 --
 -- Sources are folded weakest first, so a later source overrides an earlier
 -- one.  A plain assignment REPLACES the accumulated value; an @extra-@
--- prefixed assignment APPENDS to a list.  An @extra-@ on a Boolean or a
+-- prefixed assignment APPENDS to a list or a set.  An @extra-@ on a Boolean or a
 -- scalar names no setting (upstream appends only to an appendable
 -- setting, so @extra-max-call-depth@ is an unknown name) and is ignored
 -- like any unknown name.  'loadConfig' folds over the built-in default
@@ -147,6 +148,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Word (Word32)
 import Nix.Builder.Sandbox (SandboxMode, parseSandboxMode)
 import Nix.Eval.CallDepth (defaultMaxCallDepth)
+import Nix.ExperimentalFeature (FeatureSet, addFeatures, noFeatures, parseFeatures, replaceFeatures)
 import Nix.HostPath (hostPathFromBytes, hostPathText)
 import System.OsPath (OsChar, OsPath, OsString, (</>))
 import qualified System.OsPath as OP
@@ -224,7 +226,10 @@ data NixConfig = NixConfig
     ncDarwinLogSandboxViolations :: !Bool,
     -- | Upstream's @keep-failed@: a build that fails keeps its directory,
     -- and a check its rebuild of an output that differs.
-    ncKeepFailed :: !Bool
+    ncKeepFailed :: !Bool,
+    -- | Upstream's @experimental-features@, with the warnings its values
+    -- gave, which the caller reports.
+    ncExperimentalFeatures :: !FeatureSet
   }
   deriving (Eq, Show)
 
@@ -285,7 +290,8 @@ defaultNixConfig =
       ncBashPromptSuffix = "",
       ncAllowedImpureHostDeps = PathSetValue KeepsDefault Set.empty,
       ncDarwinLogSandboxViolations = False,
-      ncKeepFailed = False
+      ncKeepFailed = False,
+      ncExperimentalFeatures = noFeatures
     }
 
 -- ---------------------------------------------------------------------------
@@ -676,6 +682,8 @@ applyAssignment config (ConfigAssignment name value) =
     Just (BytesSetting field, _) -> Right (setBytes field value config)
     Just (PathSetSetting field, mode) ->
       Right (setPathSet field (combinePaths mode (getPathSet field config) (Set.fromList (configTokens value))) config)
+    Just (FeaturesSetting, mode) ->
+      Right (config {ncExperimentalFeatures = combineFeatures mode (ncExperimentalFeatures config) (parseFeatures value)})
   where
     combine ReplaceMode _ new = new
     combine AppendMode old new = old ++ new
@@ -685,6 +693,10 @@ applyAssignment config (ConfigAssignment name value) =
     -- configuration.cc at 2.36.0).
     combinePaths ReplaceMode _ new = PathSetValue ReplacesDefault new
     combinePaths AppendMode old new = old {psvPaths = Set.union (psvPaths old) new}
+    -- Upstream's set of features: a plain assignment replaces it and
+    -- @extra-@ adds to it (@appendOrSet@ in configuration.cc at 2.36.0).
+    combineFeatures ReplaceMode = replaceFeatures
+    combineFeatures AppendMode = addFeatures
 
 -- | A list value's tokens as text, split as upstream's @Strings@ setting
 -- splits it, or the refusal of a token that is not UTF-8 (see the module
@@ -707,6 +719,7 @@ resolveName name =
     Just base -> case baseSetting base of
       Just setting@(ListSetting _) -> Just (setting, AppendMode)
       Just setting@(PathSetSetting _) -> Just (setting, AppendMode)
+      Just FeaturesSetting -> Just (FeaturesSetting, AppendMode)
       _ -> Nothing
     Nothing -> case baseSetting name of
       Just setting -> Just (setting, ReplaceMode)
@@ -739,11 +752,12 @@ resolveName name =
       | n == bashPromptKey = Just (BytesSetting BashPromptField)
       | n == bashPromptPrefixKey = Just (BytesSetting BashPromptPrefixField)
       | n == bashPromptSuffixKey = Just (BytesSetting BashPromptSuffixField)
+      | n == experimentalFeaturesKey = Just FeaturesSetting
       | otherwise = Nothing
 
 -- | A setting this layer resolves, by the shape of its value: a list of
 -- text, a Boolean, an unsigned integer, @sandbox@'s mode, a string kept as
--- bytes, or a set of paths.
+-- bytes, a set of paths, or @experimental-features@' set of features.
 data Setting
   = ListSetting !ListField
   | BoolSetting !BoolField
@@ -751,6 +765,7 @@ data Setting
   | ModeSetting
   | BytesSetting !BytesField
   | PathSetSetting !PathSetField
+  | FeaturesSetting
   deriving (Eq, Show)
 
 -- | The settings whose value is a set of paths, kept as bytes.
@@ -952,6 +967,9 @@ bashPromptSuffixKey = "bash-prompt-suffix"
 allowedImpureHostDepsKey, darwinLogSandboxViolationsKey :: ByteString
 allowedImpureHostDepsKey = "allowed-impure-host-deps"
 darwinLogSandboxViolationsKey = "darwin-log-sandbox-violations"
+
+experimentalFeaturesKey :: ByteString
+experimentalFeaturesKey = "experimental-features"
 
 -- | The setting for what a build that fails leaves, which upstream gives no
 -- other name.

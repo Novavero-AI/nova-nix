@@ -149,7 +149,7 @@ import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), 
 import Nix.Eval.Context (contextIsEmpty, encodedElement, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, inUpstreamOrder, plainContext)
 import Nix.Eval.EvalFormals (FormalDefault (..), LambdaName, hasDefault, lambdaNameText)
 import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdateChain, expectInt, expectedFailure, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
-import Nix.Eval.Policy (fileUrlPrefix, isAbsolutePath)
+import Nix.Eval.Policy (fileUrlPrefix, hostPathRules, isAbsolutePath)
 import Nix.Eval.Print (PrintOptions (..), formatXmlFloat, printSymbol, printValue)
 import Nix.Eval.RealiseContext (PendingOrigin (..), contextRefusalMessage, findFileRefusalMessage)
 import Nix.Eval.SourcePos (PosIdx (..), RecordedPos (..), lookupPos, printPos)
@@ -240,7 +240,11 @@ import Nix.Expr.Types
     Expr (..),
     UnaryOp (..),
   )
-import Nix.Hash (FileIngestionMethod (..), base64ToBytes, bytesToHexText, fileIngestionPrefix, hashAlgoBytes, hashPlaceholder, makeFixedOutputPath, parseAnyHash, parseHashAlgo, sha256Digest, sriDigest, unknownHashAlgo)
+import Nix.Fetch.Attrs (AttrValue (..))
+import Nix.Fetch.Input (InputContext (..))
+import Nix.Fetch.Url (Checked, runChecked)
+import Nix.Flake.Ref (flakeRefAttrs, flakeRefFromAttrs, flakeRefToString, parseFlakeRef)
+import Nix.Hash (FileIngestionMethod (..), base64ToBytes, bytesToHexText, fileIngestionPrefix, hashAlgoBytes, hashPlaceholder, makeFixedOutputPath, parseAnyHash, parseHashAlgo, parseNarHash, sha256Digest, unknownHashAlgo)
 import Nix.Json (IntegerRange (..), Json (..), JsonBuilder (..), parseJsonInto, renderJson)
 import Nix.Parser (ParsedSource)
 import Nix.Store.Path (StorePath (spName), StorePathNameError (..), checkStorePathName, defaultStoreDir, defaultStoreDirText, isInStoreText, parseStorePath, parseStorePathBaseName, storePathBaseNameError, storePathNameErrorText, storePathNameReasonText, storePathNameUpstreamText, storePathToText)
@@ -1630,11 +1634,17 @@ builtinDef builtin = shape builtin
       Builtin.Path -> forced1 builtinPath
       Builtin.FilterSource -> onUseFirst builtinFilterSource
       Builtin.FetchMercurial -> forced1 (const (throwEvalError ("unknown builtin '" <> builtinName builtin <> "'")))
+      -- Flake references
+      Builtin.ParseFlakeRef -> forced1 builtinParseFlakeRef
+      Builtin.FlakeRefToString -> forced1 builtinFlakeRefToString
+      Builtin.GetFlake -> forced1 (const (throwEvalError ("unknown builtin '" <> builtinName builtin <> "'")))
 
--- | The builtins @builtins@ lists: every one but @fetchMercurial@, which
--- it leaves out so that a feature test still sees it is missing.
+-- | The builtins @builtins@ lists: every one but @fetchMercurial@ and
+-- @getFlake@, which nova-nix binds under upstream's names but does not
+-- implement, and leaves out so that a feature test still sees them
+-- missing.
 listedBuiltins :: [Builtin]
-listedBuiltins = filter (/= Builtin.FetchMercurial) [minBound .. maxBound]
+listedBuiltins = filter (`notElem` [Builtin.FetchMercurial, Builtin.GetFlake]) [minBound .. maxBound]
 
 -- ---------------------------------------------------------------------------
 -- Builtin dispatch (partial application via accumulated args)
@@ -3737,6 +3747,59 @@ builtinScopedImport scopeArg pathVal = do
     other -> throwEvalError ("builtins.scopedImport: expected a set, got " <> typeName other)
 
 -- ---------------------------------------------------------------------------
+-- Builtin implementations - flake references
+-- ---------------------------------------------------------------------------
+
+-- | Upstream's @builtins.parseFlakeRef@ (flake-primops.cc at 2.36.0): a
+-- flake reference, a string with no context, read as a reference with no
+-- fragment and no base directory, and its attributes as a set.  An
+-- integer attribute past the Nix integer range wraps, as upstream's
+-- @mkInt@ of an unsigned one does.
+builtinParseFlakeRef :: (MonadEval m) => NixValue -> m NixValue
+builtinParseFlakeRef val = do
+  ref <- addErrorTrace "while evaluating the argument passed to builtins.parseFlakeRef" (structuredStringValue RefuseContext val)
+  attrs <- flakeRefStep (\ctx -> flakeRefAttrs <$> parseFlakeRef ctx ref)
+  valuesSet SetParseFlakeRef (Map.map attrValue attrs)
+  where
+    attrValue attr = case attr of
+      AttrString s -> mkStrBytes s
+      AttrInt n -> VInt (fromIntegral n)
+      AttrBool b -> VBool b
+
+-- | Upstream's @builtins.flakeRefToString@: a set's attributes, forced
+-- and checked in the set's order, each an integer that is not negative, a
+-- Boolean or a string whatever its context, read as a flake reference's
+-- attributes and written back as its URL.
+builtinFlakeRefToString :: (MonadEval m) => NixValue -> m NixValue
+builtinFlakeRefToString (VAttrs set) = do
+  attrs <- attrSetFoldM collect Map.empty set
+  mkStrBytes <$> flakeRefStep (\ctx -> flakeRefFromAttrs ctx attrs >>= flakeRefToString ctx)
+  where
+    collect acc name entry = do
+      let attrName = symbolText name
+      value <- force (entryThunk entry)
+      attr <- case value of
+        VInt n
+          | n < 0 -> throwEvalError ("negative value given for flake ref attr " <> attrName <> ": " <> T.pack (show n))
+          | otherwise -> pure (AttrInt (fromIntegral n))
+        VBool b -> pure (AttrBool b)
+        VStr s _ -> pure (AttrString s)
+        other -> throwEvalError ("flake reference attribute sets may only contain integers, Booleans, and strings, but attribute '" <> attrName <> "' is " <> typeName other)
+      pure (Map.insert attrName attr acc)
+builtinFlakeRefToString other =
+  addErrorTrace "while evaluating the argument passed to builtins.flakeRefToString" (expectedFailure "a set" other)
+
+-- | Run a reading of flake references under the session's experimental
+-- features and the host's path rules, giving its warnings as upstream
+-- gives them and failing with its refusal.
+flakeRefStep :: (MonadEval m) => (InputContext -> Checked a) -> m a
+flakeRefStep step = do
+  policy <- evalPolicy
+  let (result, warnings) = runChecked (step (InputContext (epExperimentalFeatures policy) hostPathRules))
+  mapM_ warnMessage warnings
+  either throwEvalError pure result
+
+-- ---------------------------------------------------------------------------
 -- Builtin implementations - network fetchers
 -- ---------------------------------------------------------------------------
 
@@ -5270,27 +5333,6 @@ newHashAllowEmpty expected original
         warnMessage ("found empty hash, assuming '" <> algo <> "-" <> bytesToBase64 zero <> "'")
         pure (algo, zero)
   | otherwise = either throwEvalError pure (parseAnyHash expected original)
-
--- | Parse an SRI hash as upstream's @Hash::parseSRI@ does (hash.cc): the
--- algorithm before the first @-@ and a base64 digest after it.  A hash in
--- any other spelling is refused.
-parseSriHash :: Text -> Either Text (Text, BS.ByteString)
-parseSriHash original = case T.breakOn "-" original of
-  (algo, rest) | Just digest <- T.stripPrefix "-" rest -> (algo,) <$> sriDigest algo digest
-  _ -> Left ("hash '" <> original <> "' is not SRI")
-
--- | A declared @narHash@'s SHA-256 digest, read as upstream's
--- @Input::getNarHash@ reads it (fetchers.cc): an SRI hash, which must be
--- SHA-256, or the empty string, which is a digest whose every byte is zero.
-parseNarHash :: Text -> Either Text BS.ByteString
-parseNarHash declared
-  | T.null declared = Right (BS.replicate sha256DigestSize 0)
-  | otherwise =
-      parseSriHash declared >>= \case
-        ("sha256", digest) -> Right digest
-        _ -> Left "narHash must use SHA-256"
-  where
-    sha256DigestSize = 32
 
 -- | Require a string attribute from an attrset.
 requireStrAttr :: (MonadEval m) => Text -> Text -> AttrSet -> m Text

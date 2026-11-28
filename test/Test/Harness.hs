@@ -1285,7 +1285,10 @@ asciiOsPath = OP.pack . map OP.unsafeFromChar
 -- settings, recorded from its source: every @addConstant@ and @addPrimOp@
 -- in @createBaseEnv@ (src/libexpr/primops.cc) and every @RegisterPrimOp@
 -- in libexpr and libflake not gated on an experimental feature, under the
--- name it registers.  @__importNative@ and @__exec@ need
+-- name it registers, and the three flake builtins @__getFlake@,
+-- @__parseFlakeRef@ and @__flakeRefToString@, which 2.36.0's @nix@ adds to
+-- every evaluator whatever the features (src/libflake/settings.cc).
+-- @__importNative@ and @__exec@ need
 -- @allow-unsafe-native-code-during-evaluation@ and are not here.
 upstreamBaseEnvNames :: Set.Set Text
 upstreamBaseEnvNames =
@@ -1318,6 +1321,7 @@ upstreamBaseEnvNames =
       "__filter",
       "__filterSource",
       "__findFile",
+      "__flakeRefToString",
       "__floor",
       "__foldl'",
       "__fromJSON",
@@ -1327,6 +1331,7 @@ upstreamBaseEnvNames =
       "__getAttr",
       "__getContext",
       "__getEnv",
+      "__getFlake",
       "__groupBy",
       "__hasAttr",
       "__hasContext",
@@ -1352,6 +1357,7 @@ upstreamBaseEnvNames =
       "__nixPath",
       "__nixVersion",
       "__parseDrvName",
+      "__parseFlakeRef",
       "__partition",
       "__path",
       "__pathExists",

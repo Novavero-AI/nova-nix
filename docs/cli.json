@@ -779,6 +779,11 @@
         "name": "trace-import-from-derivation"
       },
       {
+        "description": "Experimental features to turn on, by upstream's names (default: none); a name upstream does not know is dropped with a warning",
+        "flag": "--extra-experimental-features",
+        "name": "experimental-features"
+      },
+      {
         "description": "Whether a build runs in a sandbox: `true`, `relaxed` (a build that is fixed-output or sets `__noChroot` does not) or `false` (default: `true` on Linux, `false` elsewhere)",
         "flag": "--sandbox",
         "name": "sandbox"
@@ -1045,6 +1050,22 @@
       "name": "--no-allow-import-from-derivation",
       "spellings": [
         "--no-allow-import-from-derivation"
+      ]
+    },
+    {
+      "argument": "FEATURES",
+      "commands": [
+        "nova-nix eval",
+        "nova-nix build",
+        "nova-nix develop",
+        "nova-nix print-dev-env",
+        "nova-nix trust",
+        "nova-nix profile add"
+      ],
+      "description": "Turn on the experimental features `FEATURES` names, upstream's names separated by spaces, beside those `experimental-features` turns on: `flakes` lets `builtins.parseFlakeRef` and `builtins.flakeRefToString` read a GitHub, GitLab, sourcehut, path or registry reference",
+      "name": "--extra-experimental-features",
+      "spellings": [
+        "--extra-experimental-features"
       ]
     },
     {

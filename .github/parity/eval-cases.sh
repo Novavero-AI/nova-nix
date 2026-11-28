@@ -717,6 +717,94 @@ if upstreamAtLeast 2.34.0; then
 fi
 echo
 
+# 2.36.0's nix adds getFlake, parseFlakeRef and flakeRefToString to every
+# evaluator whatever the experimental features (configureEvalSettings in
+# libflake's settings.cc), and registers the internal fetchFinalTree with
+# none, so each name is interned as the evaluator starts, ahead of a
+# program's.  Earlier releases register them with flakes on only.  Each row
+# sets experimental-features through NIX_CONFIG, over what the installer's
+# nix.conf turns on.
+if upstreamAtLeast 2.36.0; then
+  echo "== flake references =="
+  noFeatures="experimental-features ="
+  flakes="experimental-features = flakes"
+  withConfig "$noFeatures" check "parseFlakeRef and flakeRefToString are builtins with no feature on" 'let v = [ (builtins ? parseFlakeRef) (builtins ? flakeRefToString) (builtins ? fetchTree) ]; in builtins.deepSeq v v'
+  withConfig "$noFeatures" refusedAtPosition "getFlake's name is interned as the evaluator starts" '({ }: null) { zzz = 1; getFlake = 2; }' "from call site"
+  withConfig "$noFeatures" refusedAtPosition "fetchFinalTree's name is interned as the evaluator starts" '({ }: null) { zzz = 1; fetchFinalTree = 2; }' "from call site"
+  withConfig "$noFeatures" refusedAtPosition "fetchFinalTree's name precedes fetchurl's" '({ }: null) { fetchurl = 1; fetchFinalTree = 2; }' "from call site"
+  withConfig "$noFeatures" refusedAtPosition "the flake primops' names follow fromTOML's" '({ }: null) { getFlake = 1; fromTOML = 2; }' "from call site"
+  withConfig "$noFeatures" refusedAtPosition "parseFlakeRef's name precedes flakeRefToString's" '({ }: null) { flakeRefToString = 1; parseFlakeRef = 2; }' "from call site"
+  withConfig "$noFeatures" refused "a GitHub reference needs flakes" 'builtins.parseFlakeRef "github:NixOS/nixpkgs"'
+  withConfig "$noFeatures" refused "a flake ID needs flakes" 'builtins.parseFlakeRef "nixpkgs"'
+  withConfig "$noFeatures" refused "a path reference needs flakes" 'builtins.parseFlakeRef "/tmp/flake"'
+  withConfig "$noFeatures" refused "GitHub attributes need flakes" 'builtins.flakeRefToString { type = "github"; owner = "NixOS"; repo = "nixpkgs"; }'
+  withConfig "$noFeatures" check "a Git reference needs no feature" 'let v = builtins.parseFlakeRef "git+https://example.org/repo?ref=main"; in builtins.deepSeq v v'
+  withConfig "$noFeatures" check "a tarball reference needs no feature" 'builtins.flakeRefToString (builtins.parseFlakeRef "https://example.org/nixexprs.tar.xz")'
+  rev=2aae6c35c94fcfb415dbe95f408b9ce91ee846ed
+  narHash='sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='
+  for ref in \
+    "nixpkgs" \
+    "nixpkgs/nixos-24.05" \
+    "nixpkgs/nixos-24.05/$rev" \
+    "nixpkgs/branch///$rev///" \
+    "flake:nixpkgs" \
+    "flake:/nixpkgs///branch////" \
+    "flake:nixpkgs/$rev" \
+    "github:NixOS/nixpkgs" \
+    "github:NixOS/nixpkgs/nixos-unstable" \
+    "github:NixOS/nixpkgs/$rev" \
+    "github:NixOS/nixpkgs?ref=nixos-unstable&dir=lib" \
+    "github:NixOS/nixpkgs?rev=$rev&narHash=$narHash" \
+    "github:nixos/nix//master///something/" \
+    "github://////owner%42/////repo%41///branch%43////" \
+    "gitlab:/owner%252Fsubgroup/////repo%41///branch%43////" \
+    "gitlab:veloren/veloren?host=gitlab.example.org" \
+    "sourcehut:~misterio/nix-colors" \
+    "git+https://example.org/repo?ref=main&rev=$rev" \
+    "git+ssh://git@github.com/NixOS/nix?ref=master&shallow=1" \
+    "git+file:///tmp/repo?dir=sub&submodules=1&keep=me" \
+    "git://example.org/repo?ref=branch" \
+    "hg+https://example.org/repo?ref=default&rev=$rev" \
+    "https://example.org/nixexprs.tar.xz" \
+    "https://example.org/nixexprs.tar.xz?narHash=$narHash&lastModified=123&name=x" \
+    "tarball+https://example.org/archive" \
+    "file+https://example.org/notes.txt" \
+    "http://localhost:8181/test/+3d.tar.gz" \
+    "path:/tmp/flake?lastModified=123&rev=$rev" \
+    "path:./relative" \
+    "/tmp/flake/sub?revCount=123" \
+    "/tmp/foo bar/baz?dir=bla space" \
+    "/tmp/flake/"; do
+    withConfig "$flakes" check "parseFlakeRef $ref" "let v = builtins.parseFlakeRef \"$ref\"; in builtins.deepSeq v v"
+    withConfig "$flakes" check "flakeRefToString of parseFlakeRef $ref" "builtins.flakeRefToString (builtins.parseFlakeRef \"$ref\")"
+  done
+  withConfig "$flakes" check "a query parameter with no value is dropped with a warning" 'let v = builtins.parseFlakeRef "github:NixOS/nixpkgs?x&ref=main"; in builtins.deepSeq v v'
+  withConfig "$flakes" check "flakeRefToString of GitHub attributes" 'builtins.flakeRefToString { type = "github"; owner = "NixOS"; repo = "nixpkgs"; ref = "23.05"; dir = "lib"; }'
+  withConfig "$flakes" check "flakeRefToString of a Git path" 'builtins.flakeRefToString { type = "git"; url = "/tmp/repo"; ref = "main"; }'
+  withConfig "$flakes" check "flakeRefToString of an empty NAR hash" 'builtins.flakeRefToString { type = "tarball"; url = "https://example.org/x.tar.gz"; narHash = ""; }'
+  withConfig "$flakes" check "flakeRefToString of a path's attributes as they are" 'builtins.flakeRefToString { type = "path"; path = "/tmp/a"; narHash = ""; revCount = 3; }'
+  withConfig "$flakes" check "flakeRefToString of an upper-case revision" "builtins.flakeRefToString { type = \"indirect\"; id = \"nixpkgs\"; rev = \"2AAE6C35C94FCFB415DBE95F408B9CE91EE846ED\"; }"
+  withConfig "$flakes" refused "a GitHub reference with no repo" 'builtins.parseFlakeRef "github:NixOS"'
+  withConfig "$flakes" refused "a GitHub reference with an unknown parameter" 'builtins.parseFlakeRef "github:a/b?xyzzy=1"'
+  withConfig "$flakes" refused "a GitHub reference with two refs" 'builtins.parseFlakeRef "github:a/b/c?ref=d"'
+  withConfig "$flakes" refused "a GitHub reference with a ref and a revision" "builtins.parseFlakeRef \"github:a/b?ref=x&rev=$rev\""
+  withConfig "$flakes" refused "a relative path" 'builtins.parseFlakeRef "./relative"'
+  withConfig "$flakes" refused "a fragment" 'builtins.parseFlakeRef "nixpkgs#hello"'
+  withConfig "$flakes" refused "a scheme no input has" 'builtins.parseFlakeRef "foo:bar"'
+  withConfig "$flakes" refused "file+git for git+file" 'builtins.parseFlakeRef "file+git:///tmp/repo"'
+  withConfig "$flakes" refused "a path parameter no path input has" 'builtins.parseFlakeRef "path:/a?foo=1"'
+  withConfig "$flakes" refused "a path count that is not a number" 'builtins.parseFlakeRef "path:/a?revCount=x"'
+  withConfig "$flakes" refused "a flake ID with too many segments" 'builtins.parseFlakeRef "flake:nixpkgs/a/b/c"'
+  withConfig "$flakes" refused "an ID that is not a flake ID" 'builtins.parseFlakeRef "flake:1abc"'
+  withConfig "$flakes" refused "an attribute the scheme does not allow" 'builtins.flakeRefToString { type = "github"; owner = "a"; repo = "b"; foo = "c"; }'
+  withConfig "$flakes" refused "attributes with no type" 'builtins.flakeRefToString { owner = "a"; }'
+  withConfig "$flakes" refused "a type no scheme has" 'builtins.flakeRefToString { type = "unknown"; x = 1; }'
+  withConfig "$flakes" refused "a revision that is not a string" 'builtins.flakeRefToString { type = "github"; owner = "a"; repo = "b"; rev = 1; }'
+  withConfig "$flakes" refused "a negative attribute" 'builtins.flakeRefToString { type = "path"; path = "/a"; revCount = -1; }'
+  withConfig "$flakes" refused "an attribute that is a list" 'builtins.flakeRefToString { type = "path"; path = [ ]; }'
+  echo
+fi
+
 echo "== Nova's mirror interface preserves fixed-output identity =="
 for caseName in legacy sha256 sri order invalidUrls invalidHashes escapedUrl unicodeUrl; do
   check "fetchurl $caseName" "(import ./fetchurl-cases.nix).$caseName"

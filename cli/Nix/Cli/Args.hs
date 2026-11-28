@@ -84,6 +84,9 @@ data CliOpts = CliOpts
     -- | @--sandbox@, @--no-sandbox@ or @--relaxed-sandbox@, the last given:
     -- upstream's @sandbox@ on this run.
     optSandbox :: !(Maybe SandboxMode),
+    -- | Each @--extra-experimental-features@ value, in order: features
+    -- turned on for this run beside those the configuration turns on.
+    optExtraExperimentalFeatures :: ![String],
     optCommand :: !Command
   }
   deriving (Eq, Show)
@@ -414,12 +417,14 @@ emptyPushArgs = PushArgs Nothing Nothing Nothing Nothing False []
 -- silent drop: an unknown or misspelled flag fails the parse, so nothing
 -- after it (a requested @--substituter@, say) is quietly discarded.
 parseArgs :: [String] -> Either String CliOpts
-parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] False False False False False False False False Nothing CmdUsage)
+parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] False False False False False False False False Nothing [] CmdUsage)
   where
     go opts [] = Right opts
     go opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
     go opts ("--nix-path" : val : rest) =
       go (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
+    go opts (flag : features : rest)
+      | flag == extraFeaturesFlag = go (withFeatures features opts) rest
     go opts (flag : name : value : rest)
       | Just arg <- autoArg flag value = go (withAutoArg name arg opts) rest
     go opts ("--strict" : rest) =
@@ -470,6 +475,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     goEval opts ("--aterm" : rest) = goEval (opts {optAterm = True}) rest
     goEval opts ("--nix-path" : val : rest) =
       goEval (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) rest
+    goEval opts (flag : features : rest)
+      | flag == extraFeaturesFlag = goEval (withFeatures features opts) rest
     goEval opts (flag : name : value : rest)
       | Just arg <- autoArg flag value = goEval (withAutoArg name arg opts) rest
     -- Accepted here as well as at the top level, like build and push:
@@ -524,6 +531,8 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       goTarget kind (opts {optTrustedKey = Just key}) targetArgs rest
     goTarget kind opts targetArgs ("--nix-path" : val : rest) =
       goTarget kind (opts {optNixPaths = optNixPaths opts ++ [T.pack val]}) targetArgs rest
+    goTarget kind opts targetArgs (flag : features : rest)
+      | flag == extraFeaturesFlag = goTarget kind (withFeatures features opts) targetArgs rest
     goTarget kind opts targetArgs (flag : name : value : rest)
       | Just arg <- autoArg flag value = goTarget kind (withAutoArg name arg opts) targetArgs rest
     goTarget kind opts targetArgs ("--exec-wrapper" : spec : rest)
@@ -776,11 +785,15 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     sandboxFlag _ = Nothing
     -- Flags that consume the following argument as their value.
     valueFlags =
-      ["--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--secret-key-file", "--compression", "--profile", "--priority", "--regex", "--to", "--older-than"]
+      [extraFeaturesFlag, "--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--secret-key-file", "--compression", "--profile", "--priority", "--regex", "--to", "--older-than"]
         ++ attrFlags
         ++ outLinkFlags
     -- Attribute selection, under both of upstream's spellings.
     attrFlags = ["-A", "--attr"]
+    -- Upstream's setting flag for experimental features, which adds its
+    -- value to the configured ones.
+    extraFeaturesFlag = "--extra-experimental-features"
+    withFeatures features opts = opts {optExtraExperimentalFeatures = optExtraExperimentalFeatures opts ++ [features]}
     -- The result link, under both of nix-build's spellings.
     outLinkFlags = ["-o", "--out-link"]
     -- No result link, under both of nix-build's spellings.

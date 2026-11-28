@@ -1,9 +1,10 @@
 -- | The evaluation policy: upstream's @restrict-eval@ and @pure-eval@
 -- settings, the @allowed-uris@ list, and the pure decisions they drive,
 -- plus the @trace-verbose@ setting, which decides what
--- @builtins.traceVerbose@ does, and @allow-import-from-derivation@ and
+-- @builtins.traceVerbose@ does, @allow-import-from-derivation@ and
 -- @trace-import-from-derivation@, which decide whether a path reader may
--- build what its argument's context names.
+-- build what its argument's context names, and @experimental-features@,
+-- which decides what a flake reference may name.
 --
 -- Upstream gates evaluation in two layers.  Under either setting the root
 -- filesystem is wrapped in an accessor that admits a path when it lies
@@ -65,6 +66,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval.CanonPath (canonPathValue)
+import Nix.ExperimentalFeature (FeatureSet, noFeatures)
 import Nix.Store.Path (StoreDir, defaultStoreDirText, qualifyPathText)
 import qualified System.Info
 
@@ -95,7 +97,10 @@ data EvalPolicy = EvalPolicy
     epTraceVerbose :: !Bool,
     -- | Whether a path reader may build or substitute what its argument's
     -- context names.
-    epImportFromDerivation :: !ImportFromDerivation
+    epImportFromDerivation :: !ImportFromDerivation,
+    -- | Upstream's @experimental-features@: what reading a flake
+    -- reference or a fetcher input may need.
+    epExperimentalFeatures :: !FeatureSet
   }
   deriving (Eq, Show)
 
@@ -115,10 +120,18 @@ data ImportFromDerivation
     TraceImportFromDerivation
   deriving (Eq, Show)
 
--- | Upstream's default: every confinement off, nothing listed, and an
--- import from derivation allowed and not traced.
+-- | Upstream's default: every confinement off, nothing listed, an import
+-- from derivation allowed and not traced, and no experimental feature.
 unrestrictedPolicy :: EvalPolicy
-unrestrictedPolicy = EvalPolicy {epRestrictEval = False, epPureEval = False, epAllowedUris = [], epTraceVerbose = False, epImportFromDerivation = AllowImportFromDerivation}
+unrestrictedPolicy =
+  EvalPolicy
+    { epRestrictEval = False,
+      epPureEval = False,
+      epAllowedUris = [],
+      epTraceVerbose = False,
+      epImportFromDerivation = AllowImportFromDerivation,
+      epExperimentalFeatures = noFeatures
+    }
 
 -- | Whether filesystem access goes through the allow list: upstream wraps
 -- the root filesystem when either setting is on.
