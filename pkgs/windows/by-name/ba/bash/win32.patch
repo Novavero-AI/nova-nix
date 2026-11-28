@@ -65,7 +65,7 @@
  #if defined (ALIAS)
  #  include "alias.h"
  #endif
-@@ -5767,7 +5796,108 @@
+@@ -5767,7 +5796,109 @@
  #  define NOTFOUND_HOOK "command_not_found_handle"
  #endif
  
@@ -145,11 +145,12 @@
 +    }
 +  else
 +    {
++      /* The vector borrows the words' strings, which WORDS still owns. */
 +      args = strvec_from_word_list (words, 0, 0, (int *)NULL);
 +      spawn_exclude = fds_to_close;
 +      result = shell_execve (command, args, export_env);
 +      spawn_exclude = (struct fd_bitmap *)NULL;
-+      strvec_dispose (args);
++      free (args);
 +    }
 +
 +  if (saved_undo_list)
@@ -174,7 +175,7 @@
  execute_disk_command (WORD_LIST *words, REDIRECT *redirects, char *command_line,
  		      int pipe_in, int pipe_out, int async,
  		      struct fd_bitmap *fds_to_close, int cmdflags)
-@@ -5822,6 +5952,20 @@
+@@ -5822,6 +5953,20 @@
    else if (command == 0 && notfound_str == 0)	/* make sure */
      init_notfound_str ();
  
@@ -195,7 +196,7 @@
    /* We have to make the child before we check for the non-existence
       of COMMAND, since we want the error messages to be redirected. */
    /* If we can get away without forking and there are no pipes to deal with,
-@@ -5928,7 +6072,14 @@
+@@ -5928,7 +6073,14 @@
  	 leave it there, in the same format that the user used to
  	 type it in. */
        args = strvec_from_word_list (words, 0, 0, (int *)NULL);
@@ -210,7 +211,7 @@
      }
    else
      {
-@@ -6023,6 +6174,30 @@
+@@ -6023,6 +6175,30 @@
        size_increment = 2;
      }
  
@@ -241,7 +242,7 @@
    larry = strvec_len (args) + size_increment;
    args = strvec_resize (args, larry + 1);
  
-@@ -6041,6 +6216,7 @@
+@@ -6041,6 +6217,7 @@
    args[larry] = (char *)NULL;
  
    return (shell_execve (execname, args, env));
@@ -249,7 +250,7 @@
  }
  #undef STRINGCHAR
  #undef WHITECHAR
-@@ -6130,7 +6306,11 @@
+@@ -6130,7 +6307,11 @@
    size_t larray;
  
    SETOSTYPE (0);		/* Some systems use for USG/POSIX semantics */
@@ -262,7 +263,7 @@
    i = errno;			/* error from execve() */
    CHECK_TERMSIG;
    SETOSTYPE (1);
-@@ -6235,6 +6415,26 @@
+@@ -6235,6 +6416,26 @@
  
    /* We have committed to attempting to execute the contents of this file
       as shell commands. */
