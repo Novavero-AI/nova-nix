@@ -966,10 +966,6 @@ jobs:
             }
           }
 
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
-
       # Every source pkgs/windows fetches, from the public cache where it
       # holds it, so the builds below fetch none.
       - name: Take the sources from the public cache
@@ -1427,10 +1423,6 @@ jobs:
         with:
           name: stage0-nova-nix
           path: ${{ runner.temp }}
-
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
       # Every source pkgs/windows fetches, from the public cache where it
       # holds it, so the builds below fetch none.  They name no substituter
