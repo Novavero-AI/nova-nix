@@ -146,7 +146,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
-import Data.Char (ord)
+import Data.Char (isAsciiLower, isAsciiUpper, ord)
 import Data.Foldable (toList, traverse_)
 import Data.Functor ((<&>))
 import Data.Functor.Identity (Identity (..))
@@ -214,6 +214,7 @@ import Nix.Expr.Types
 import Nix.Hash (FileIngestionMethod (..), makeFixedOutputPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.Parser (parseNix, parseNixWithScope, parsedExpr)
+import qualified Nix.Profile.Manifest as Manifest
 import qualified Nix.Realise as Realise
 import Nix.Store (Store (..), closeStore, isValid, materializeEvalSources, openStore, registrationFor)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), pathCaseHack, probeCaseSensitivity, processCaseHack, volumeCaseHack)
@@ -3976,8 +3977,83 @@ testBatch4 = do
       runTest "parseDrvName no version" $
         assertEval "parseDrv-nover" "(builtins.parseDrvName \"hello\").version" (mkStr ""),
       runTest "parseDrvName type error" $
-        assertEvalFail "parseDrv-err" "builtins.parseDrvName 42"
+        assertEvalFail "parseDrv-err" "builtins.parseDrvName 42",
+      runTest "parseDrvName splits at the first dash a non-letter follows, a letter being ASCII" $
+        foldr
+          ( \(input, name, version) rest ->
+              assertEval
+                input
+                ("builtins.parseDrvName " <> quoted input <> " == { name = " <> quoted name <> "; version = " <> quoted version <> "; }")
+                (VBool True)
+                `andThen` rest
+          )
+          Pass
+          [ ("foo-.1", "foo", ".1"),
+            ("foo--1", "foo", "-1"),
+            ("foo-_1", "foo", "_1"),
+            ("foo-bar-1.0", "foo-bar", "1.0"),
+            ("foo-Bar", "foo-Bar", ""),
+            ("foo-\233", "foo", "\233"),
+            ("nix-0.12pre12876", "nix", "0.12pre12876"),
+            ("foo-", "foo-", ""),
+            ("-", "-", ""),
+            ("-1", "", "1"),
+            ("", "", "")
+          ],
+      runTestM "parseDrvName rejoins to its input, splitting at no earlier dash than the first a non-letter follows" $
+        propertyResult (QC.forAll genDrvNameInput parseDrvNameLaws),
+      runTestM "a profile names an element by the name parseDrvName gives its path's name" $
+        propertyResult $
+          QC.forAll genDrvNameInput $ \input ->
+            fmap fst (parsedDrvName input) QC.=== Right (TE.encodeUtf8 (Manifest.drvNameName input))
     ]
+  where
+    quoted text = "\"" <> text <> "\""
+
+-- | Run a property quietly, its report as the failure.
+propertyResult :: (QC.Testable prop) => prop -> IO TestResult
+propertyResult prop = do
+  result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} prop
+  pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+
+-- | Derivation-name-like text over what a split reads: letters of both
+-- cases, digits, separators, dashes weighted to appear often, and a
+-- character outside ASCII, which is no letter.  Nothing a Nix string
+-- literal needs escaped.
+genDrvNameInput :: QC.Gen Text
+genDrvNameInput = T.pack <$> QC.listOf (QC.frequency [(3, pure '-'), (6, QC.elements "abZ019._+ \233")])
+
+-- | The name and version @builtins.parseDrvName@ gives a string.
+parsedDrvName :: Text -> Either Text (BS.ByteString, BS.ByteString)
+parsedDrvName input = (,) <$> part "name" <*> part "version"
+  where
+    part field = case evalNix ("(builtins.parseDrvName \"" <> input <> "\")." <> field) of
+      Right (VStr bytes _) -> Right bytes
+      Right other -> Left ("not a string: " <> T.pack (show other))
+      Left err -> Left err
+
+-- | The laws that pin upstream's split: the parts rejoin to the input
+-- around one dash, or the name is the whole input and the version
+-- empty; no dash in the name splits it; the version starts with no
+-- letter; and a name split off does not end with a dash, which would
+-- have split it there instead.
+parseDrvNameLaws :: Text -> QC.Property
+parseDrvNameLaws input = case parsedDrvName input of
+  Left err -> QC.counterexample (T.unpack err) False
+  Right (name, version) ->
+    QC.counterexample (show (name, version)) $
+      (if BS.null version then name == bytes else name <> "-" <> version == bytes)
+        && null (splitDashes name)
+        && maybe True (not . isAsciiLetter . fst) (BS8.uncons version)
+        && (BS.null version || not ("-" `BS.isSuffixOf` name))
+  where
+    bytes = TE.encodeUtf8 input
+    splitDashes text =
+      [ at
+      | (at, ('-', next)) <- zip [0 :: Int ..] (BS8.zip text (BS.drop 1 text)),
+        not (isAsciiLetter next)
+      ]
+    isAsciiLetter c = isAsciiLower c || isAsciiUpper c
 
 -- ---------------------------------------------------------------------------
 -- Tests: Batch 5 - Serialization + hashing

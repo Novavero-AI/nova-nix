@@ -116,6 +116,7 @@ library
     Nix.DependencyGraph
     Nix.Derivation
     Nix.Derivation.StructuredAttrs
+    Nix.DrvName
     Nix.Develop.Capture
     Nix.Develop.Environment
     Nix.Develop.Shell
