@@ -40,6 +40,11 @@ name: Ladder
 # configure tested is there and not in the job's log.  Mes's builds run
 # no configure.
 #
+# Each stage's job turns on Windows' audit of process creation before it
+# builds anything, and fails after its builds and checks if a program from
+# the store started one from outside it, such as the host's cmd.exe
+# (.github/bootstrap/process-audit.sh).
+#
 # With publish set, each stage publishes what it holds to the public cache
 # once its checks pass, with that token.  GitHub refuses a job that
 # references the environment from any other ref, so a job names it only
@@ -110,6 +115,19 @@ jobs:
       name: ${{ inputs.publish && 'cache' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Windows' audit of process creation, on before the stage builds
+      # anything, for the check after its builds that no program from the
+      # store started one from outside it (.github/bootstrap/process-audit.sh
+      # says how).  A check that cannot fail is a run that tests nothing and
+      # stays green, so the audit's decisions are run against their cases
+      # first.
+      - name: Audit process creation
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/bootstrap/process-audit-cases.sh
+          bash .github/bootstrap/process-audit.sh start
 
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -285,6 +303,13 @@ jobs:
         shell: pwsh
         run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
 
+      # No program from the store started one from outside it, by the
+      # audit of every process the stage's builds and checks started
+      # (.github/bootstrap/process-audit.sh).
+      - name: No build started a program from outside the store
+        shell: bash
+        run: bash .github/bootstrap/process-audit.sh check
+
       # The handoff for the stage after this one.  Its NARs are compressed
       # already, so the zip stores them as they are.  Kept a day: a re-run
       # of a failed stage within it finds the handoff, and after it the run
@@ -338,6 +363,19 @@ jobs:
       name: ${{ inputs.publish && 'cache' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Windows' audit of process creation, on before the stage builds
+      # anything, for the check after its builds that no program from the
+      # store started one from outside it (.github/bootstrap/process-audit.sh
+      # says how).  A check that cannot fail is a run that tests nothing and
+      # stays green, so the audit's decisions are run against their cases
+      # first.
+      - name: Audit process creation
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/bootstrap/process-audit-cases.sh
+          bash .github/bootstrap/process-audit.sh start
 
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -969,6 +1007,13 @@ jobs:
         shell: pwsh
         run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
 
+      # No program from the store started one from outside it, by the
+      # audit of every process the stage's builds and checks started
+      # (.github/bootstrap/process-audit.sh).
+      - name: No build started a program from outside the store
+        shell: bash
+        run: bash .github/bootstrap/process-audit.sh check
+
       # The handoff for the stage after this one.  Its NARs are compressed
       # already, so the zip stores them as they are.  Kept a day: a re-run
       # of a failed stage within it finds the handoff, and after it the run
@@ -1032,6 +1077,19 @@ jobs:
       name: ${{ inputs.publish && 'cache' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Windows' audit of process creation, on before the stage builds
+      # anything, for the check after its builds that no program from the
+      # store started one from outside it (.github/bootstrap/process-audit.sh
+      # says how).  A check that cannot fail is a run that tests nothing and
+      # stays green, so the audit's decisions are run against their cases
+      # first.
+      - name: Audit process creation
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/bootstrap/process-audit-cases.sh
+          bash .github/bootstrap/process-audit.sh start
 
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -1266,6 +1324,13 @@ jobs:
         shell: pwsh
         run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
 
+      # No program from the store started one from outside it, by the
+      # audit of every process the stage's builds and checks started
+      # (.github/bootstrap/process-audit.sh).
+      - name: No build started a program from outside the store
+        shell: bash
+        run: bash .github/bootstrap/process-audit.sh check
+
       # The handoff for the stage after this one.  Its NARs are compressed
       # already, so the zip stores them as they are.  Kept a day: a re-run
       # of a failed stage within it finds the handoff, and after it the run
@@ -1325,6 +1390,19 @@ jobs:
       name: ${{ inputs.publish && 'cache' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Windows' audit of process creation, on before the stage builds
+      # anything, for the check after its builds that no program from the
+      # store started one from outside it (.github/bootstrap/process-audit.sh
+      # says how).  A check that cannot fail is a run that tests nothing and
+      # stays green, so the audit's decisions are run against their cases
+      # first.
+      - name: Audit process creation
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/bootstrap/process-audit-cases.sh
+          bash .github/bootstrap/process-audit.sh start
 
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -1472,6 +1550,13 @@ jobs:
         shell: pwsh
         run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
 
+      # No program from the store started one from outside it, by the
+      # audit of every process the stage's builds and checks started
+      # (.github/bootstrap/process-audit.sh).
+      - name: No build started a program from outside the store
+        shell: bash
+        run: bash .github/bootstrap/process-audit.sh check
+
       # The handoff for the stage after this one.  Its NARs are compressed
       # already, so the zip stores them as they are.  Kept a day: a re-run
       # of a failed stage within it finds the handoff, and after it the run
@@ -1536,6 +1621,19 @@ jobs:
       name: ${{ inputs.publish && 'cache' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Windows' audit of process creation, on before the stage builds
+      # anything, for the check after its builds that no program from the
+      # store started one from outside it (.github/bootstrap/process-audit.sh
+      # says how).  A check that cannot fail is a run that tests nothing and
+      # stays green, so the audit's decisions are run against their cases
+      # first.
+      - name: Audit process creation
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/bootstrap/process-audit-cases.sh
+          bash .github/bootstrap/process-audit.sh start
 
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -1736,6 +1834,13 @@ jobs:
         shell: pwsh
         run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
 
+      # No program from the store started one from outside it, by the
+      # audit of every process the stage's builds and checks started
+      # (.github/bootstrap/process-audit.sh).
+      - name: No build started a program from outside the store
+        shell: bash
+        run: bash .github/bootstrap/process-audit.sh check
+
       # The handoff for the stage after this one.  Its NARs are compressed
       # already, so the zip stores them as they are.  Kept a day: a re-run
       # of a failed stage within it finds the handoff, and after it the run
@@ -1797,6 +1902,19 @@ jobs:
       name: ${{ inputs.publish && 'cache' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Windows' audit of process creation, on before the stage builds
+      # anything, for the check after its builds that no program from the
+      # store started one from outside it (.github/bootstrap/process-audit.sh
+      # says how).  A check that cannot fail is a run that tests nothing and
+      # stays green, so the audit's decisions are run against their cases
+      # first.
+      - name: Audit process creation
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/bootstrap/process-audit-cases.sh
+          bash .github/bootstrap/process-audit.sh start
 
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -1953,6 +2071,13 @@ jobs:
         shell: pwsh
         run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
 
+      # No program from the store started one from outside it, by the
+      # audit of every process the stage's builds and checks started
+      # (.github/bootstrap/process-audit.sh).
+      - name: No build started a program from outside the store
+        shell: bash
+        run: bash .github/bootstrap/process-audit.sh check
+
       # The handoff for the stage after this one.  Its NARs are compressed
       # already, so the zip stores them as they are.  Kept a day: a re-run
       # of a failed stage within it finds the handoff, and after it the run
@@ -2023,6 +2148,19 @@ jobs:
       name: ${{ inputs.publish && 'cache' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Windows' audit of process creation, on before the stage builds
+      # anything, for the check after its builds that no program from the
+      # store started one from outside it (.github/bootstrap/process-audit.sh
+      # says how).  A check that cannot fail is a run that tests nothing and
+      # stays green, so the audit's decisions are run against their cases
+      # first.
+      - name: Audit process creation
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/bootstrap/process-audit-cases.sh
+          bash .github/bootstrap/process-audit.sh start
 
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -2246,6 +2384,13 @@ jobs:
         shell: pwsh
         run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
 
+      # No program from the store started one from outside it, by the
+      # audit of every process the stage's builds and checks started
+      # (.github/bootstrap/process-audit.sh).
+      - name: No build started a program from outside the store
+        shell: bash
+        run: bash .github/bootstrap/process-audit.sh check
+
       # The handoff for the stage after this one.  Its NARs are compressed
       # already, so the zip stores them as they are.  Kept a day: a re-run
       # of a failed stage within it finds the handoff, and after it the run
@@ -2308,6 +2453,19 @@ jobs:
       name: ${{ inputs.publish && 'cache' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Windows' audit of process creation, on before the stage builds
+      # anything, for the check after its builds that no program from the
+      # store started one from outside it (.github/bootstrap/process-audit.sh
+      # says how).  A check that cannot fail is a run that tests nothing and
+      # stays green, so the audit's decisions are run against their cases
+      # first.
+      - name: Audit process creation
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/bootstrap/process-audit-cases.sh
+          bash .github/bootstrap/process-audit.sh start
 
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -2443,6 +2601,13 @@ jobs:
         shell: pwsh
         run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
 
+      # No program from the store started one from outside it, by the
+      # audit of every process the stage's builds and checks started
+      # (.github/bootstrap/process-audit.sh).
+      - name: No build started a program from outside the store
+        shell: bash
+        run: bash .github/bootstrap/process-audit.sh check
+
       # The handoff for the stage after this one.  Its NARs are compressed
       # already, so the zip stores them as they are.  Kept a day: a re-run
       # of a failed stage within it finds the handoff, and after it the run
@@ -2509,6 +2674,19 @@ jobs:
       name: ${{ inputs.publish && 'cache' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Windows' audit of process creation, on before the stage builds
+      # anything, for the check after its builds that no program from the
+      # store started one from outside it (.github/bootstrap/process-audit.sh
+      # says how).  A check that cannot fail is a run that tests nothing and
+      # stays green, so the audit's decisions are run against their cases
+      # first.
+      - name: Audit process creation
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/bootstrap/process-audit-cases.sh
+          bash .github/bootstrap/process-audit.sh start
 
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -2689,6 +2867,13 @@ jobs:
         shell: pwsh
         run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
 
+      # No program from the store started one from outside it, by the
+      # audit of every process the stage's builds and checks started
+      # (.github/bootstrap/process-audit.sh).
+      - name: No build started a program from outside the store
+        shell: bash
+        run: bash .github/bootstrap/process-audit.sh check
+
       # The handoff for the stage after this one.  Its NARs are compressed
       # already, so the zip stores them as they are.  Kept a day: a re-run
       # of a failed stage within it finds the handoff, and after it the run
@@ -2757,6 +2942,19 @@ jobs:
       name: ${{ inputs.publish && 'cache' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Windows' audit of process creation, on before the stage builds
+      # anything, for the check after its builds that no program from the
+      # store started one from outside it (.github/bootstrap/process-audit.sh
+      # says how).  A check that cannot fail is a run that tests nothing and
+      # stays green, so the audit's decisions are run against their cases
+      # first.
+      - name: Audit process creation
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/bootstrap/process-audit-cases.sh
+          bash .github/bootstrap/process-audit.sh start
 
       - name: Download nova-nix
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -3014,6 +3212,13 @@ jobs:
         if: ${{ !cancelled() }}
         shell: pwsh
         run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # No program from the store started one from outside it, by the
+      # audit of every process the stage's builds and checks started
+      # (.github/bootstrap/process-audit.sh).
+      - name: No build started a program from outside the store
+        shell: bash
+        run: bash .github/bootstrap/process-audit.sh check
 
       # What this job built and its checks ran on (.github/cache/publish.sh).
       - name: Publish the stage to the public cache
