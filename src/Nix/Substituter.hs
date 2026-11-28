@@ -168,7 +168,7 @@ import Nix.Hash (FileIngestionMethod (..), ModuloHash, moduloHashFinalize, modul
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, fetchStatusFailure, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Logger (Logger (..), logWarning)
 import Nix.Realise (Fallback (..), Offer (..))
-import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), UpstreamHazard (..), abortNarUnpack, acquirePathLock, canonicalizeMetadata, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, sinkNarStream, unpackNarEntry, upstreamManagedRefusal, volumeCaseHack)
+import Nix.Store (ArchiveEnd (..), CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), UpstreamHazard (..), abortNarUnpack, acquirePathLock, canonicalizeMetadata, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, sinkNarStream, unpackNarEntry, upstreamManagedRefusal, volumeCaseHack)
 import Nix.Store.DB (PathRegistration (..), Ultimate (..))
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir, StorePath (spHash, spName), parseStorePathBaseName, storePathHashLen, storePathToFilePath, storePathToText)
@@ -1156,21 +1156,24 @@ materializeNarFromSource store sp narInfo declaredDigest refs deriver source =
 
 -- | Drive the decompressed chunk source through incremental hashing,
 -- the streaming NAR parser, and the store's streaming unpack sink,
--- returning the verified NAR byte count.  The hash context folds over
--- exactly the bytes the parser consumes, so the digest is of the NAR
--- the tree was built from.  The sensitivity is the destination
--- volume's, 'stCaseSensitivity' when the destination is a store path.
+-- returning the verified NAR byte count.  The archive ends at its root
+-- node's close and the source after it is left unread, as upstream's
+-- import of a substituted NAR stops reading there.  The hash context
+-- and the count fold over exactly the bytes the parser consumes, so
+-- NarHash and NarSize are held to the archive the tree was built from,
+-- as upstream holds them.  The sensitivity is the destination volume's,
+-- 'stCaseSensitivity' when the destination is a store path.
 consumeNarStream :: CaseSensitivity -> FilePath -> NarInfo.NarInfo -> Hash.NixHash -> IO BS.ByteString -> IO (Either AttemptFailure Int)
 consumeNarStream sensitivity destPath narInfo declaredDigest narSource = do
   sink <- newNarUnpackSink sensitivity destPath
-  streamed <- sinkNarStream sink narSource
+  streamed <- sinkNarStream AtRootClose sink narSource
   case streamed of
     Left failure -> pure (Left (narStreamFailure failure))
     Right (digest, narBytes)
       | toInteger narBytes /= NarInfo.niNarSize narInfo -> do
           abortNarUnpack sink
-          -- The grammar completed, so the transfer was whole: a size
-          -- that still disagrees is the narinfo misdeclaring.
+          -- The archive completed, so it arrived whole: a size that
+          -- still disagrees is the narinfo misdeclaring.
           pure
             ( Left
                 ( FatalFailure
@@ -1183,8 +1186,8 @@ consumeNarStream sensitivity destPath narInfo declaredDigest narSource = do
             )
       | digest /= declaredDigest -> do
           abortNarUnpack sink
-          -- Size matched, so the transfer completed; wrong bytes are
-          -- deterministic corruption, not a hiccup.
+          -- Size matched, so the archive arrived whole; wrong bytes
+          -- are deterministic corruption, not a hiccup.
           pure
             ( Left
                 ( FatalFailure

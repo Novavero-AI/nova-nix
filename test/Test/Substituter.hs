@@ -31,7 +31,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), currentPlatform)
 import Nix.Hash (moduloHashFinalize, moduloHashInit, moduloHashUpdate, rawHashWithAlgo)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), defaultFetchRetryPolicy, ioRetryEffects)
 import qualified Nix.Realise as Realise
-import Nix.Store (Store (..), caseHackDiskNames, closeStore, onDiskNameKey, openStore, releasePathLock, tryAcquirePathLock, unpackNarEntry, writeDrv)
+import Nix.Store (ArchiveEnd (..), Store (..), caseHackDiskNames, closeStore, newNarUnpackSink, onDiskNameKey, openStore, releasePathLock, sinkNarStream, tryAcquirePathLock, unpackNarEntry, writeDrv)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathRegistration (..), Ultimate (..))
 import qualified Nix.Store.ExecBit as ExecBit
@@ -50,7 +50,7 @@ import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermis
 import qualified System.Directory as Dir
 import System.FilePath ((</>))
 import qualified System.Info as SI
-import Test.Harness (TestResult (..), andThen, assertEqual, assertLeft, canonicalAs, chunkReader, forceRemoveIfExists, narRequest, offeredSubstitute, offeredThenFetched, posixOnlyEntries, quotedAsCxx, runTest, runTestM, servedPaths, sigTestKeyText, sigTestWrongKeyText, testLogger)
+import Test.Harness (TestResult (..), andThen, assertEqual, assertLeft, canonicalAs, chunkReader, forceRemoveIfExists, narInfoRequest, narRequest, offeredSubstitute, offeredThenFetched, posixOnlyEntries, quotedAsCxx, runTest, runTestM, servedPaths, sigTestKeyText, sigTestWrongKeyText, signedTestNarInfo, testLogger)
 import qualified Test.QuickCheck as QC
 
 -- ---------------------------------------------------------------------------
@@ -355,6 +355,56 @@ testSubstituter = do
             ]
         forceRemoveIfExists tmpDir
         pure (foldr andThen Pass results),
+      -- Streamed to its root node's close, the archive's digest and size
+      -- are of the archive alone, whatever follows it and wherever the
+      -- chunks fall, since the input after that close is left unread.
+      runTestM "a NAR streamed to its root's close is hashed and counted alone, whatever follows it" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpDir = tmpBase </> "nova-nix-test-stream-root-close"
+            expected = Right (CHash.hashBytes streamTestNar, BS.length streamTestNar)
+            genTrailing = BS.pack <$> QC.listOf QC.arbitrary
+            streamedWith (trailing, chunkLen) = QC.ioProperty $ do
+              forceRemoveIfExists tmpDir
+              createDirectoryIfMissing True tmpDir
+              sink <- newNarUnpackSink tmpSensitivity (tmpDir </> "out")
+              source <- chunkReader (streamChunks chunkLen (streamTestNar <> trailing))
+              streamed <- sinkNarStream AtRootClose sink source
+              pure (streamed QC.=== expected)
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll ((,) <$> genTrailing <*> QC.choose (1, BS.length streamTestNar)) streamedWith
+        forceRemoveIfExists tmpDir
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      -- Upstream's import of a substituted NAR stops reading at the root
+      -- node's close and holds NarHash and NarSize to the bytes read to
+      -- there, so a cache's NAR followed by bytes the archive does not
+      -- hold substitutes as the archive alone.
+      runTestM "a cache's NAR followed by extra bytes substitutes as the archive, under its NarHash and NarSize" $ do
+        tmpBase <- getTemporaryDirectory
+        let sp = StorePath (T.replicate 32 "g") "trailing"
+            contents = "the archive\n"
+            nar = NAR.serialise (NAR.NarRegular False contents)
+            root = tmpBase </> "nova-nix-test-subst-trailing"
+        case signedTestNarInfo sp [] "nar/trailing.nar" nar of
+          Left err -> pure (Fail (T.pack err))
+          Right (publicKey, narInfo) -> do
+            let served = Map.fromList [(narInfoRequest sp, TE.encodeUtf8 narInfo), ("/nar/trailing.nar", nar <> "bytes after the archive")]
+                route target _ = Send (maybe (httpResponse "404 Not Found" "") (httpResponse "200 OK") (Map.lookup target served))
+            withHttpServer route $ \base _ _ ->
+              bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
+                bracket (openStore testLogger (StoreDir root)) closeStore $ \store -> do
+                  result <- offeredThenFetched defaultFetchRetryPolicy (ioRetryEffects testLogger) store [Subst.CacheConfig base [publicKey] 40] sp
+                  case result of
+                    Subst.SubstSuccess reg lock -> do
+                      releasePathLock lock
+                      onDisk <- BS.readFile (storePathToFilePath (stDir store) sp)
+                      pure
+                        ( assertEqual
+                            "NarHash, NarSize and the file"
+                            (CHash.formatNixHash (CHash.hashBytes nar), BS.length nar, contents)
+                            (prNarHash reg, prNarSize reg, onDisk)
+                        )
+                    other -> pure (Fail ("expected the archive substituted, got: " <> T.pack (show other))),
       -- A narinfo lying about NarSize in either direction is refused
       -- at NarDone - the grammar completed, so the mismatch is the
       -- narinfo misdeclaring, and fatal.
