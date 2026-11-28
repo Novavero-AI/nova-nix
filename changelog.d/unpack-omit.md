@@ -1,0 +1,2 @@
+- **`builtin:unpack` leaves out the archive members its derivation's `omit` names, each by its path from the archive's root.** stage0-pe32's tree is unpacked before any tool exists, so the builtin is what removes the file there. A path that no archive in `srcs` holds fails the build, as does one that leaves the archive or names its root.
+- **Library API:** `Nix.Builder.Unpack.envOmit` is new.
