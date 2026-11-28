@@ -7,9 +7,10 @@ name: Seed
 # request and a push to main take the rungs the public cache holds from it
 # on the x64 leg alone, so this is the run that fails when the chain no
 # longer builds from the seed, under a builder change or a newer runner
-# image, and the one that runs the ladder on ARM64.  GitHub sends a
-# scheduled run's notifications to whoever last changed its cron line.  A
-# from-seed run on demand is seed-ladder.yml dispatched, on any branch.
+# image, the one that runs the ladder on ARM64, and the one that compares
+# each rung's NAR hash across the legs.  GitHub sends a scheduled run's
+# notifications to whoever last changed its cron line.  A from-seed run on
+# demand is seed-ladder.yml dispatched, on any branch.
 #
 # Its own workflow rather than a schedule in ci.yml or seed-ladder.yml:
 # GitHub disables a public repository's scheduled workflows after 60 days

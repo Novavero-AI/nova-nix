@@ -62,7 +62,9 @@ jobs:
   #                and on main any that a push whose run was cancelled while
   #                it waited never published.
   #   seed         the daily run seed.yml calls, a dispatched run and a
-  #                release.  Both legs build every rung from the seed.
+  #                release.  Both legs build every rung from the seed,
+  #                and Ladder (NAR hashes) compares each rung's NAR hash
+  #                across them.
   #
   # A push to main publishes what its x64 leg holds, the rungs it built and
   # the ones it took from the cache: a rung's store path, and so what the
@@ -249,3 +251,48 @@ jobs:
       cache-public-key: ${{ needs.ladder-mode.outputs.cache-public-key }}
     secrets:
       NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+
+  # ---------------------------------------------------------------------------
+  # Ladder (NAR hashes): the NAR hash of every rung on each leg, compared,
+  # in seed mode, where both legs build every rung from the seed.  A rung's
+  # store path is the same on both, since its derivation is, and its NAR
+  # hash is the same only if its build wrote the same bytes: a rung whose
+  # output depends on the machine, the user or the time fails here, named
+  # with each leg's hash.  Both legs build in the same directory, under the
+  # store's .nova-nix\builds, so a rung that records where it was built
+  # matches all the same.  Each stage's job records its rungs
+  # (.github/cache/rung-hashes.sh), and this job compares the records
+  # (.github/cache/compare-rung-hashes.sh).  It runs when a leg failed too,
+  # comparing the stages both legs reached, and fails, naming each stage a
+  # leg did not record.
+  # ---------------------------------------------------------------------------
+  ladder-hashes:
+    name: Ladder (NAR hashes)
+    needs: [ladder-mode, ladder]
+    if: ${{ !cancelled() && needs.ladder-mode.outputs.mode == 'seed' && needs.ladder.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # A comparison that passes a rung it should fail is a check that stays
+      # green and tests nothing, so the rules are checked against their
+      # cases before they compare anything.
+      - name: The comparison decides its cases
+        run: bash .github/cache/compare-rung-hashes-cases.sh
+
+      - name: Download the legs' records
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rung-hashes-*
+          path: ${{ runner.temp }}/rung-hashes
+          merge-multiple: true
+
+      # The legs are the Ladder job's matrix, each named by its runner image,
+      # as each stage's record names it.
+      - name: Compare the legs' NAR hashes
+        env:
+          LEGS: ${{ join(fromJSON(needs.ladder-mode.outputs.legs).*.os, ' ') }}
+        run: |
+          set -euo pipefail
+          read -ra legs <<< "$LEGS"
+          bash .github/cache/compare-rung-hashes.sh "$RUNNER_TEMP/rung-hashes" "${legs[@]}"
