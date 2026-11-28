@@ -132,6 +132,12 @@ data Command
     -- current one, or with @--older-than@, as the command line spells its
     -- age, those older than that but the newest of them.
     CmdProfileWipeHistory !ProfileSelection !(Maybe String) !Changes
+  | -- | @key generate-secret@: print a new secret key with the name
+    -- @--key-name@ gives, as the command line spells it.
+    CmdKeyGenerateSecret !String
+  | -- | @key convert-secret-to-public@: print the public key of the
+    -- secret key on standard input.
+    CmdKeyConvertSecretToPublic
   | -- | No command given, or @eval@ given no target.  Usage on stderr,
     -- non-zero: a bare invocation is
     -- a usage error, and a caller testing the exit status must see one.
@@ -476,6 +482,7 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     go opts ("push" : rest) = goPush opts emptyPushArgs rest
     go opts ("store" : rest) = goStore opts rest
     go opts ("profile" : rest) = goProfile opts rest
+    go opts ("key" : rest) = goKey opts rest
     go _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     go _ (flag : _)
@@ -739,6 +746,28 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     goProfileList _ _ _ _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     goProfileList _ _ _ _ (arg : _) = Left ("unknown profile list argument: " ++ arg)
+    -- Sub-parser for key verbs.  The last --key-name given is the name,
+    -- as upstream's flag handler sets it each time it is read.  --store is
+    -- taken and unused, as upstream's key commands take it, a setting
+    -- every command accepts.
+    goKey _ [] = Left "key: expected a subcommand (generate-secret, convert-secret-to-public)"
+    goKey opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
+    goKey opts ("generate-secret" : rest) = goKeyGenerate opts Nothing rest
+    goKey opts ("convert-secret-to-public" : rest) = goKeyConvert opts rest
+    goKey _ (sub : _) = Left ("unknown key subcommand: " ++ sub ++ " (expected: generate-secret, convert-secret-to-public)")
+    goKeyGenerate opts keyName [] = maybe (Left "key generate-secret: required argument '--key-name' is missing") (\name -> Right opts {optCommand = CmdKeyGenerateSecret name}) keyName
+    goKeyGenerate opts _ (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
+    goKeyGenerate opts _ ("--key-name" : name : rest) = goKeyGenerate opts (Just name) rest
+    goKeyGenerate opts keyName ("--store" : dir : rest) = goKeyGenerate (opts {optStore = Just dir}) keyName rest
+    goKeyGenerate _ _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goKeyGenerate _ _ (arg : _) = Left ("unknown key generate-secret argument: " ++ arg)
+    goKeyConvert opts [] = Right opts {optCommand = CmdKeyConvertSecretToPublic}
+    goKeyConvert opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
+    goKeyConvert opts ("--store" : dir : rest) = goKeyConvert (opts {optStore = Just dir}) rest
+    goKeyConvert _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goKeyConvert _ (arg : _) = Left ("unknown key convert-secret-to-public argument: " ++ arg)
     listFormat output layout = case output of
       TextOutput -> ListText
       JsonOutput -> ListJson layout
@@ -804,7 +833,7 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     sandboxFlag _ = Nothing
     -- Flags that consume the following argument as their value.
     valueFlags =
-      [extraFeaturesFlag, "--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--secret-key-file", "--compression", "--profile", "--priority", "--regex", "--to", "--older-than"]
+      [extraFeaturesFlag, "--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--secret-key-file", "--compression", "--profile", "--priority", "--regex", "--to", "--older-than", "--key-name"]
         ++ attrFlags
         ++ outLinkFlags
     -- Attribute selection, under both of upstream's spellings.

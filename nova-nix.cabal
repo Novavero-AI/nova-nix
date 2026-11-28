@@ -157,6 +157,7 @@ library
     Nix.Hash
     Nix.Http
     Nix.Json
+    Nix.Key
     Nix.Logger
 
   autogen-modules:  Paths_nova_nix
@@ -390,6 +391,7 @@ test-suite nova-nix-test
     Test.Exceptions
     Test.Fetch
     Test.Harness
+    Test.Key
     Test.Parser
     Test.Pkgs
     Test.Push

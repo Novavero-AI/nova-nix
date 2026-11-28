@@ -104,6 +104,8 @@ data CommandName
   | ProfileHistoryCommand
   | ProfileRollbackCommand
   | ProfileWipeHistoryCommand
+  | KeyGenerateSecretCommand
+  | KeyConvertSecretToPublicCommand
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | What the reference says about a command, or about the global form.
@@ -175,6 +177,8 @@ commandWords name = case name of
   ProfileHistoryCommand -> ["profile", "history"]
   ProfileRollbackCommand -> ["profile", "rollback"]
   ProfileWipeHistoryCommand -> ["profile", "wipe-history"]
+  KeyGenerateSecretCommand -> ["key", "generate-secret"]
+  KeyConvertSecretToPublicCommand -> ["key", "convert-secret-to-public"]
 
 -- | A command as it is invoked, @nova-nix store gc@.
 commandInvocation :: CommandName -> Text
@@ -372,7 +376,7 @@ command name = case name of
           Form "--cache URL PATH..." "Push store paths (and their closures) to a binary cache"
             :| [Form "--cache URL --all" "Push every valid path except derivations, and their closures"],
         commandDescription =
-          "Copies the closure of each `PATH`, or with `--all` every valid path except derivations, to the binary cache at `URL`. A `PATH` is a store path, in full or as its base name; a derivation is refused, since a binary cache serves outputs. Paths the cache already holds are skipped, and every NAR is in place before any narinfo announces it. An `http://` or `https://` `URL` is a nova-cache server, which signs what it receives, and a narinfo is read back to check that the server signed it. A `file://` `URL` names a directory, which gets the layout upstream's `nix copy --to file://` writes, so that any web server can serve it and a substituter can read it through the same `URL`: `nix-cache-info`, a narinfo for each path, signed with the secret key in `--secret-key-file`, and the NARs under `nar/`. The key file is one `nix-store --generate-binary-cache-key` writes, and a substituter of the cache trusts its public key. It prints how many paths it pushed and how many the cache already held.",
+          "Copies the closure of each `PATH`, or with `--all` every valid path except derivations, to the binary cache at `URL`. A `PATH` is a store path, in full or as its base name; a derivation is refused, since a binary cache serves outputs. Paths the cache already holds are skipped, and every NAR is in place before any narinfo announces it. An `http://` or `https://` `URL` is a nova-cache server, which signs what it receives, and a narinfo is read back to check that the server signed it. A `file://` `URL` names a directory, which gets the layout upstream's `nix copy --to file://` writes, so that any web server can serve it and a substituter can read it through the same `URL`: `nix-cache-info`, a narinfo for each path, signed with the secret key in `--secret-key-file`, and the NARs under `nar/`. The key file is one `key generate-secret` writes, or upstream's `nix key generate-secret` or `nix-store --generate-binary-cache-key`, and a substituter of the cache trusts the public key `key convert-secret-to-public` prints for it. It prints how many paths it pushed and how many the cache already held.",
         commandExamples =
           Example
             "Push every path in the store except derivations, compressed with zstd, to a cache that takes the API key in `cache-api-key`."
@@ -498,6 +502,22 @@ command name = case name of
                  Example "Say which generations would be deleted, and delete none." ("profile" :| ["wipe-history", "--dry-run"]) []
                ]
       }
+  KeyGenerateSecretCommand ->
+    CommandEntry
+      { commandForms = Form "--key-name NAME" "Print a new secret key for signing store paths" :| [],
+        commandDescription =
+          "Generates an Ed25519 secret key named `NAME` and prints it on stdout with no line feed after it, as `nix key generate-secret` does: `NAME`, a colon, and the base64 of the key's 64 bytes, the seed it was made from and then that seed's public key. `push --secret-key-file` signs a `file://` cache with such a key, and `key convert-secret-to-public` prints the public key a substituter of the cache trusts. Any `NAME` is taken; the cache's host and the key's number, as in `cache.example.org-1`, is the convention, and a substituter finds the key that checks a signature by the name the signature carries.",
+        commandExamples =
+          Example "Print a new secret key for a cache at cache.example.org." ("key" :| ["generate-secret", "--key-name", "cache.example.org-1"]) [] :| []
+      }
+  KeyConvertSecretToPublicCommand ->
+    CommandEntry
+      { commandForms = Form "" "Print the public key of the secret key read from stdin" :| [],
+        commandDescription =
+          "Reads a secret key from stdin, all of it as it is, and prints its public key with no line feed after it, as `nix key convert-secret-to-public` does: the key's name, a colon, and the base64 of the key's last 32 bytes. The base64 is read as upstream reads it, up to its first `=` and skipping line feeds, so what follows the padding of a 64-byte key, such as a line feed, is not read; any other character outside base64 before it, a carriage return or a space among them, a key with no name or no bytes, and a key that is not 64 bytes are refused in upstream's words.",
+        commandExamples =
+          Example "Print the public key of a secret key piped to stdin." ("key" :| ["convert-secret-to-public"]) [] :| []
+      }
 
 -- | What a profile is and where it is, as the descriptions of the
 -- commands that change one say.
@@ -587,6 +607,7 @@ data FlagName
   | SecretKeyFileFlag
   | CompressionFlag
   | PrintRootsFlag
+  | KeyNameFlag
   | ProfileFlag
   | PriorityFlag
   | RegexFlag
@@ -736,6 +757,8 @@ flag name = case name of
     long "compression" (Just "KIND") ("Artifact packaging (" <> pushCompressionValues <> "; default none)") pushOnly
   PrintRootsFlag ->
     long "print-roots" Nothing "List the roots as `LINK -> PATH` and delete nothing" (CommandFlag (StoreGcCommand :| []))
+  KeyNameFlag ->
+    long "key-name" (Just "NAME") "The name of the new key, such as `cache.example.org-1` (required)" (CommandFlag (KeyGenerateSecretCommand :| []))
   ProfileFlag ->
     long "profile" (Just "PATH") "Work on the profile at `PATH` in place of the default profile" (CommandFlag (ProfileAddCommand :| [ProfileRemoveCommand, ProfileListCommand, ProfileHistoryCommand, ProfileRollbackCommand, ProfileWipeHistoryCommand]))
   PriorityFlag ->
@@ -755,7 +778,7 @@ flag name = case name of
   NoPrettyFlag ->
     long "no-pretty" Nothing "With `--json`, print the JSON on one line, as when stdout is not a terminal" jsonCommands
   StoreFlag ->
-    long "store" (Just "DIR") "Use `DIR` as the store (default: the platform store)" (CommandFlag (EvalCommand :| [BuildCommand, DevelopCommand, PrintDevEnvCommand, TrustCommand, PushCommand, StoreDeleteCommand, StoreGcCommand, ProfileAddCommand, ProfileRemoveCommand, ProfileListCommand, ProfileHistoryCommand, ProfileRollbackCommand, ProfileWipeHistoryCommand]))
+    long "store" (Just "DIR") "Use `DIR` as the store (default: the platform store)" (CommandFlag (EvalCommand :| [BuildCommand, DevelopCommand, PrintDevEnvCommand, TrustCommand, PushCommand, StoreDeleteCommand, StoreGcCommand, ProfileAddCommand, ProfileRemoveCommand, ProfileListCommand, ProfileHistoryCommand, ProfileRollbackCommand, ProfileWipeHistoryCommand, KeyGenerateSecretCommand, KeyConvertSecretToPublicCommand]))
   HelpFlag ->
     long "help" Nothing "Print the commands, flags and settings, and exit" GlobalFlag
   VersionFlag ->

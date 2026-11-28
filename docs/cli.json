@@ -384,7 +384,7 @@
       ]
     },
     {
-      "description": "Copies the closure of each `PATH`, or with `--all` every valid path except derivations, to the binary cache at `URL`. A `PATH` is a store path, in full or as its base name; a derivation is refused, since a binary cache serves outputs. Paths the cache already holds are skipped, and every NAR is in place before any narinfo announces it. An `http://` or `https://` `URL` is a nova-cache server, which signs what it receives, and a narinfo is read back to check that the server signed it. A `file://` `URL` names a directory, which gets the layout upstream's `nix copy --to file://` writes, so that any web server can serve it and a substituter can read it through the same `URL`: `nix-cache-info`, a narinfo for each path, signed with the secret key in `--secret-key-file`, and the NARs under `nar/`. The key file is one `nix-store --generate-binary-cache-key` writes, and a substituter of the cache trusts its public key. It prints how many paths it pushed and how many the cache already held.",
+      "description": "Copies the closure of each `PATH`, or with `--all` every valid path except derivations, to the binary cache at `URL`. A `PATH` is a store path, in full or as its base name; a derivation is refused, since a binary cache serves outputs. Paths the cache already holds are skipped, and every NAR is in place before any narinfo announces it. An `http://` or `https://` `URL` is a nova-cache server, which signs what it receives, and a narinfo is read back to check that the server signed it. A `file://` `URL` names a directory, which gets the layout upstream's `nix copy --to file://` writes, so that any web server can serve it and a substituter can read it through the same `URL`: `nix-cache-info`, a narinfo for each path, signed with the secret key in `--secret-key-file`, and the NARs under `nar/`. The key file is one `key generate-secret` writes, or upstream's `nix key generate-secret` or `nix-store --generate-binary-cache-key`, and a substituter of the cache trusts the public key `key convert-secret-to-public` prints for it. It prints how many paths it pushed and how many the cache already held.",
       "examples": [
         {
           "arguments": [
@@ -721,6 +721,50 @@
         {
           "summary": "Delete the generations of a profile made more than AGE ago, but the newest of them",
           "usage": "nova-nix profile wipe-history --older-than AGE"
+        }
+      ]
+    },
+    {
+      "description": "Generates an Ed25519 secret key named `NAME` and prints it on stdout with no line feed after it, as `nix key generate-secret` does: `NAME`, a colon, and the base64 of the key's 64 bytes, the seed it was made from and then that seed's public key. `push --secret-key-file` signs a `file://` cache with such a key, and `key convert-secret-to-public` prints the public key a substituter of the cache trusts. Any `NAME` is taken; the cache's host and the key's number, as in `cache.example.org-1`, is the convention, and a substituter finds the key that checks a signature by the name the signature carries.",
+      "examples": [
+        {
+          "arguments": [
+            "key",
+            "generate-secret",
+            "--key-name",
+            "cache.example.org-1"
+          ],
+          "command": "nova-nix key generate-secret --key-name cache.example.org-1",
+          "description": "Print a new secret key for a cache at cache.example.org.",
+          "output": []
+        }
+      ],
+      "name": "nova-nix key generate-secret",
+      "synopsis": [
+        {
+          "summary": "Print a new secret key for signing store paths",
+          "usage": "nova-nix key generate-secret --key-name NAME"
+        }
+      ]
+    },
+    {
+      "description": "Reads a secret key from stdin, all of it as it is, and prints its public key with no line feed after it, as `nix key convert-secret-to-public` does: the key's name, a colon, and the base64 of the key's last 32 bytes. The base64 is read as upstream reads it, up to its first `=` and skipping line feeds, so what follows the padding of a 64-byte key, such as a line feed, is not read; any other character outside base64 before it, a carriage return or a space among them, a key with no name or no bytes, and a key that is not 64 bytes are refused in upstream's words.",
+      "examples": [
+        {
+          "arguments": [
+            "key",
+            "convert-secret-to-public"
+          ],
+          "command": "nova-nix key convert-secret-to-public",
+          "description": "Print the public key of a secret key piped to stdin.",
+          "output": []
+        }
+      ],
+      "name": "nova-nix key convert-secret-to-public",
+      "synopsis": [
+        {
+          "summary": "Print the public key of the secret key read from stdin",
+          "usage": "nova-nix key convert-secret-to-public"
         }
       ]
     }
@@ -1432,6 +1476,17 @@
       ]
     },
     {
+      "argument": "NAME",
+      "commands": [
+        "nova-nix key generate-secret"
+      ],
+      "description": "The name of the new key, such as `cache.example.org-1` (required)",
+      "name": "--key-name",
+      "spellings": [
+        "--key-name"
+      ]
+    },
+    {
       "argument": "PATH",
       "commands": [
         "nova-nix profile add",
@@ -1558,7 +1613,9 @@
         "nova-nix profile list",
         "nova-nix profile history",
         "nova-nix profile rollback",
-        "nova-nix profile wipe-history"
+        "nova-nix profile wipe-history",
+        "nova-nix key generate-secret",
+        "nova-nix key convert-secret-to-public"
       ],
       "description": "Use `DIR` as the store (default: the platform store)",
       "name": "--store",

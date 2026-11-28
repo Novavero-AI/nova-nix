@@ -72,6 +72,7 @@ import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.HostPath (hostPathFromBytes, hostPathText)
 import Nix.Http (defaultFetchRetryPolicy)
 import Nix.Json (Json, renderJson)
+import Nix.Key (generateSecretKey, keyRefusalMessage, parseSecretKey, renderPublicKey, renderSecretKey)
 import Nix.Logger (Logger, escapeFilterFor, handleLogger, logWarning)
 import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Profile.Generation (Change (..), Changes (..), DatedGeneration (..), Generation (..), GenerationNumber (..), ProfileFailure (..), ProfileLinkPlace (..), RollbackTarget (..), WipeScope (..), absolutePath, checkProfileStore, currentEpochSeconds, cutoffBefore, findGenerations, generationDate, parseOlderThan, readGenerationNumber, readManifest, readProfileEnvironment, resolveDefaultProfile, switchGeneration, updateProfile, wipeHistory)
@@ -94,7 +95,7 @@ import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
 import qualified System.File.OsPath as OsFile
 import System.FilePath (takeDirectory, takeFileName, (</>))
-import System.IO (BufferMode (..), hIsTerminalDevice, hPutStrLn, hSetBinaryMode, hSetBuffering, hSetEncoding, stderr, stdout, utf8)
+import System.IO (BufferMode (..), hFlush, hIsTerminalDevice, hPutStrLn, hSetBinaryMode, hSetBuffering, hSetEncoding, stderr, stdin, stdout, utf8)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError, isUserError)
 import qualified System.Info
 import System.Mem (performMajorGC)
@@ -226,6 +227,8 @@ main = do
     CmdProfileHistory selection -> profileHistoryCommand config storeDir selection
     CmdProfileRollback selection to changes -> profileRollbackCommand config storeDir selection to changes
     CmdProfileWipeHistory selection olderThan changes -> profileWipeHistoryCommand config storeDir selection olderThan changes
+    CmdKeyGenerateSecret keyName -> keyGenerateSecretCommand keyName
+    CmdKeyConvertSecretToPublic -> keyConvertSecretToPublicCommand
     CmdUsage -> mapM_ (TIO.hPutStrLn stderr) helpLines >> exitFailure
     CmdHelp -> toStdout (mapM_ TIO.putStrLn helpLines)
     CmdVersion -> toStdout (putStrLn versionLine)
@@ -1876,6 +1879,33 @@ removalMatcher storeDir removal = case removal of
 -- | A command-line argument's text, refused when it is not UTF-8.
 argumentText :: T.Text -> String -> IO T.Text
 argumentText what arg = commandLineBytes what arg >>= either (const (failError (what <> " is not valid UTF-8"))) pure . TE.decodeUtf8'
+
+-- | Print a new secret key with the given name, and no line feed after it,
+-- as @nix key generate-secret@ prints one ("Nix.Key").
+keyGenerateSecretCommand :: String -> IO ()
+keyGenerateSecretCommand keyName = do
+  name <- commandLineBytes "--key-name" keyName
+  secretKey <- generateSecretKey name
+  printBytes (renderSecretKey secretKey)
+
+-- | Read a secret key from stdin, every byte as it arrives, and print its
+-- public key with no line feed after it, as @nix key
+-- convert-secret-to-public@ does.  A key that does not read is refused in
+-- upstream's words, with status 1.
+keyConvertSecretToPublicCommand :: IO ()
+keyConvertSecretToPublicCommand = do
+  hSetBinaryMode stdin True
+  spelled <- BS.hGetContents stdin
+  case parseSecretKey spelled of
+    Left refusal -> do
+      BS.hPut stderr (keyRefusalMessage refusal <> "\n")
+      exitWith (ExitFailure 1)
+    Right secretKey -> printBytes (renderPublicKey secretKey)
+
+-- | Write bytes to stdout as they are, flushed here, so a reader that went
+-- away ends the command quietly ('toStdout') rather than at exit.
+printBytes :: BS.ByteString -> IO ()
+printBytes bytes = toStdout (BS.hPut stdout bytes >> hFlush stdout)
 
 -- | Print what a profile holds: upstream's lines, or with @--json@ its
 -- manifest, as 'printJson' prints it.

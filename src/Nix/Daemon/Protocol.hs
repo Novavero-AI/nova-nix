@@ -181,7 +181,6 @@ import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder)
-import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -193,11 +192,11 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word32, Word64, Word8)
 import Nix.Daemon.Wire (Decoder, getBool, getBytes, getCount, getInt64, getList, getWord32, getWord64, getWord8, malformed, putBool, putBytes, putList, putNum)
-import Nix.Hash (FileIngestionMethod (..), base64ToBytes, bytesToHexText, digestByLength, hashAlgoBytes, parseAnyHash, parseHashAlgo)
+import Nix.Hash (FileIngestionMethod (..), bytesToHexText, digestByLength, hashAlgoBytes, parseAnyHash, parseHashAlgo)
 import Nix.Json (Json (..), expectJson, jsonText, parseJson, renderJson)
+import Nix.Key (colonBase64Message, parseColonBase64, renderColonBase64)
 import Nix.Store.Path (StoreDir (..), StorePath, checkStorePathName, parseStorePathBaseName, spName, storePathBaseNameError, storePathBasename, storePathHashLen, storePathNameUpstreamText, storePathToText)
 import qualified NovaCache.Base32 as Nix32
-import qualified NovaCache.Base64 as B64
 import Numeric (showHex)
 
 -- ---------------------------------------------------------------------------
@@ -563,23 +562,11 @@ signatureFromParts name bytes
   | BS.null name || BS.elem colon name || BS.null bytes = Nothing
   | otherwise = Just (Signature name bytes)
 
--- | A signature from its spelling, as upstream's @Signature::parse@ reads
--- it (local-keys.cc at 2.35.4): the name before the first colon, and the
--- base64 after it, neither empty.
+-- | A signature from its spelling, as upstream reads one
+-- ('parseColonBase64'): the name before the first colon, and the base64
+-- after it, neither empty.
 parseSignature :: ByteString -> Either Text Signature
-parseSignature spelled = case BS.break (== colon) spelled of
-  (name, rest)
-    | not (BS.null name),
-      Just encoded <- grammarText <$> BS.stripPrefix ":" rest ->
-        case base64ToBytes encoded of
-          Just bytes | not (BS.null bytes) -> Right (Signature name bytes)
-          Just _ -> Left corrupt
-          Nothing -> Left (maybe corrupt badCharacter (T.find (not . isBase64Char) (T.takeWhile (/= '=') encoded)))
-  _ -> Left corrupt
-  where
-    corrupt = "signature is corrupt"
-    badCharacter c = "invalid character in Base64 string: '" <> T.singleton c <> "'"
-    isBase64Char c = isAsciiUpper c || isAsciiLower c || isDigit c || c == '+' || c == '/' || c == '\n'
+parseSignature = either (Left . colonBase64Message "signature") (Right . uncurry Signature) . parseColonBase64
 
 -- | The byte that ends a signature's key name.
 colon :: Word8
@@ -587,7 +574,7 @@ colon = 0x3a
 
 -- | A signature as upstream spells it, its bytes in padded base64.
 renderSignature :: Signature -> ByteString
-renderSignature (Signature name bytes) = name <> ":" <> TE.encodeUtf8 (B64.encode bytes)
+renderSignature (Signature name bytes) = renderColonBase64 name bytes
 
 -- | A set of signatures.
 getSignatureSet :: Decoder (Set Signature)

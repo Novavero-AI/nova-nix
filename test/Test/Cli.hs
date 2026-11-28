@@ -7,6 +7,7 @@ module Test.Cli
     testExecWrapperCLI,
     testUncaughtIOFailureCLI,
     testClosedStdoutCLI,
+    testKeyCLI,
     testImportFromDerivationCLI,
     testCheckCLI,
     testDevelopCLI,
@@ -35,7 +36,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (isAsciiLower, isAsciiUpper)
-import Data.Foldable (toList)
+import Data.Foldable (toList, traverse_)
 import Data.Functor.Identity (Identity (..))
 import Data.List (findIndex, inits, intercalate, isInfixOf, isPrefixOf, isSuffixOf, nub, sort, stripPrefix)
 import Data.List.NonEmpty (NonEmpty (..))
@@ -77,7 +78,7 @@ import qualified System.Directory as Dir
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath (searchPathSeparator, takeDirectory, takeFileName, (</>))
-import System.IO (hClose)
+import System.IO (hClose, hSetBinaryMode)
 import System.IO.Error (ioeGetErrorString)
 import qualified System.Info as SI
 import qualified System.OsPath as OP
@@ -1019,6 +1020,73 @@ testClosedStdoutCLI = do
           left <- filterM (Dir.doesPathExist . (store </>)) doomed
           pure (assertEqual "status, stderr and what is left" (ExitSuccess, ["finding garbage collector roots..."], []) (code, err, left))
       ]
+
+-- | @key generate-secret@ and @key convert-secret-to-public@ through the
+-- binary: the bytes each writes, with no line feed after them, the
+-- generated key's public key as nova-cache derives it from the seed,
+-- upstream's documented pair, and the refusals with their status.
+testKeyCLI :: IO [Bool]
+testKeyCLI = do
+  putStrLn "cli/key"
+  tmpBase <- getTemporaryDirectory
+  ambient <- getEnvironment
+  let root = tmpBase </> "nova-nix-test-cli-key"
+      isolatedEnv =
+        ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n")
+          : ("NIX_CONF_DIR", root </> "system")
+          : ("XDG_CONFIG_HOME", root </> "config")
+          : ("XDG_CONFIG_DIRS", root </> "config-dirs")
+          : filter (\(key, _) -> key `notElem` ["NIX_CONFIG", "NIX_CONF_DIR", "NIX_USER_CONF_FILES", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS"]) ambient
+      upstreamSecret = "cache.example.org-0:E7lAO+MsPwTFfPXsdPtW8GKui/5ho4KQHVcAGnX+Tti1V4dUxoVoqLyWJ4YESuZJwQ67GVIksDt47og+tPVUZw=="
+  bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $ do
+    -- Built, if it is not, with the ambient environment cabal needs, then
+    -- run by its path, so stdin and stdout reach it as bytes.
+    _ <- Proc.readCreateProcessWithExitCode (Proc.proc "cabal" ["run", "-v0", "exe:nova-nix", "--", "--version"]) ""
+    (_, listed, _) <- Proc.readCreateProcessWithExitCode (Proc.proc "cabal" ["list-bin", "-v0", "exe:nova-nix"]) ""
+    let exe = fromMaybe "nova-nix" (listToMaybe (reverse (filter (not . null) (lines (filter (/= '\r') listed)))))
+        run = runWithBytes exe isolatedEnv
+    generated@(_, secret, _) <- run ["key", "generate-secret", "--key-name", "cache.example.org-1"] ""
+    converted <- run ["key", "convert-secret-to-public"] secret
+    upstream <- run ["key", "convert-secret-to-public"] (upstreamSecret <> "\n")
+    corrupt <- run ["key", "convert-secret-to-public"] "no-colon"
+    short <- run ["key", "convert-secret-to-public"] "k:AAAA"
+    nameless <- run ["key", "generate-secret"] ""
+    let derived = either (const Nothing) (Just . TE.encodeUtf8 . Signing.renderPublicKey) (Signing.parseSecretKey (TE.decodeLatin1 secret) >>= Signing.toPublicKey)
+    sequence
+      [ runTest "generate-secret prints the name, a colon and 88 characters of base64, with no line feed" $
+          assertEqual "status, length after the name, stderr" (ExitSuccess, Just 88, "") (fst3 generated, BS.length <$> BS.stripPrefix "cache.example.org-1:" secret, thd3 generated),
+        runTest "convert-secret-to-public prints the generated key's public key, the one its seed gives, with no line feed" $
+          assertEqual "status, stdout, stderr" (ExitSuccess, derived, "") (fst3 converted, Just (snd3 converted), thd3 converted),
+        runTest "convert-secret-to-public prints for upstream's example key, echoed, the public key upstream's documentation prints" $
+          assertEqual "status and stdout" (ExitSuccess, "cache.example.org-0:tVeHVMaFaKi8lieGBErmScEOuxlSJLA7eO6IPrT1VGc=") (fst3 upstream, snd3 upstream),
+        runTest "a key that does not read fails with status 1 and upstream's report, and one of the wrong size with upstream's line" $
+          assertEqual
+            "status, stdout, stderr"
+            [ (ExitFailure 1, "", "error:\n       " <> TE.encodeUtf8 (T.singleton '\x2026') <> " while decoding key named ''\n\n       error: key is corrupt\n"),
+              (ExitFailure 1, "", "error: secret key is not valid\n")
+            ]
+            [corrupt, short],
+        runTest "generate-secret without --key-name is refused in upstream's words" $
+          assertEqual "status and stderr" (ExitFailure 1, "key generate-secret: required argument '--key-name' is missing\n") (fst3 nameless, BS8.filter (/= '\r') (thd3 nameless))
+      ]
+  where
+    fst3 (code, _, _) = code
+    snd3 (_, out, _) = out
+    thd3 (_, _, err) = err
+
+-- | Run a program with bytes on its stdin: its status and the bytes it
+-- wrote to stdout and stderr.
+runWithBytes :: FilePath -> [(String, String)] -> [String] -> BS.ByteString -> IO (ExitCode, BS.ByteString, BS.ByteString)
+runWithBytes exe environment args input =
+  Proc.withCreateProcess
+    (Proc.proc exe args) {Proc.env = Just environment, Proc.std_in = Proc.CreatePipe, Proc.std_out = Proc.CreatePipe, Proc.std_err = Proc.CreatePipe}
+    $ \inPipe outPipe errPipe process -> do
+      mapM_ (`hSetBinaryMode` True) (catMaybes [inPipe, outPipe, errPipe])
+      traverse_ (\toChild -> BS.hPut toChild input >> hClose toChild) inPipe
+      out <- maybe (pure BS.empty) BS.hGetContents outPipe
+      err <- maybe (pure BS.empty) BS.hGetContents errPipe
+      code <- Proc.waitForProcess process
+      pure (code, out, err)
 
 -- ---------------------------------------------------------------------------
 -- Tests: realising a string's context
@@ -2621,6 +2689,8 @@ cliOperands name flagName = case name of
   Ref.ProfileHistoryCommand -> []
   Ref.ProfileRollbackCommand -> []
   Ref.ProfileWipeHistoryCommand -> []
+  Ref.KeyGenerateSecretCommand -> concat [["--key-name", "value"] | flagName /= Ref.KeyNameFlag]
+  Ref.KeyConvertSecretToPublicCommand -> []
   where
     expression = concat [["--expr", "1"] | flagName /= Ref.ExprFlag]
 
@@ -2641,6 +2711,8 @@ cliSelects name parsed = case (name, parsed) of
   (Ref.ProfileHistoryCommand, Cli.CmdProfileHistory {}) -> True
   (Ref.ProfileRollbackCommand, Cli.CmdProfileRollback {}) -> True
   (Ref.ProfileWipeHistoryCommand, Cli.CmdProfileWipeHistory {}) -> True
+  (Ref.KeyGenerateSecretCommand, Cli.CmdKeyGenerateSecret _) -> True
+  (Ref.KeyConvertSecretToPublicCommand, Cli.CmdKeyConvertSecretToPublic) -> True
   _ -> False
 
 -- | One word read back as a POSIX shell reads it, for what
