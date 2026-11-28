@@ -62,6 +62,7 @@ module Nix.Store.Access
     -- * The Windows access control list
     Sid,
     sidFromText,
+    sidText,
     accessSddl,
   )
 where
@@ -243,6 +244,10 @@ sidFromText text = do
     -- top 16 of 48 bits are not all zero.
     wideAuthority digits =
       T.length digits == wideAuthorityDigits && T.all isHexDigit digits && T.any (/= '0') (T.take wideHighDigits digits)
+
+-- | A SID's string form, as 'sidFromText' took it.
+sidText :: Sid -> Text
+sidText (Sid text) = text
 
 -- | Whether text is a decimal below the limit, spelled with no sign,
 -- space or leading zero.

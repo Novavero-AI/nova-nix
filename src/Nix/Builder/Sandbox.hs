@@ -25,7 +25,12 @@
 -- (@sandbox\/linux.c@) the namespaces, the mounts and the root, between
 -- the namespaces' creation and the builder's exec, where the process
 -- library runs nothing; on macOS (@sandbox\/darwin.c@) the profile,
--- applied in the builder's process just before its exec.
+-- applied in the builder's process just before its exec.  The helper's
+-- Windows backend (@sandbox\/windows.c@) starts the builder as a build
+-- slot's account, whose token it is handed, on a window station and
+-- desktop of the build's own, attached to a pseudoconsole, in a job that
+-- caps each process's memory, as a t'WindowsPlan' says; 'hostSandboxBackend'
+-- names no backend on Windows, where no build runs through the helper.
 --
 -- == The protocol
 --
@@ -103,6 +108,10 @@ module Nix.Builder.Sandbox
     darwinParameters,
     renderDarwinPlan,
 
+    -- * The Windows plan
+    WindowsPlan (..),
+    renderWindowsPlan,
+
     -- * The chroot
     SkeletonEntry (..),
     chrootSkeleton,
@@ -114,6 +123,8 @@ module Nix.Builder.Sandbox
     setupStageName,
     DarwinStage (..),
     darwinStageName,
+    WindowsStage (..),
+    windowsStageName,
     ProbeStage (..),
     probeStageName,
     StatusRecord (..),
@@ -143,11 +154,12 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Foreign.C.Error (Errno (..), eNOENT, eNOTDIR, ePERM, errnoToIOError)
 import GHC.IO.Exception (IOException (ioe_description))
 import Nix.Derivation (Derivation, fixedOutput)
 import Nix.Realise (derivationAttrs, derivationBoolAttr, derivationStringAttr, derivationStringsAttr)
+import Nix.Store.Access (Sid, sidText)
 import Nix.Store.Path (StorePath, defaultStoreDir, storePathToText)
 import System.Exit (ExitCode)
 import qualified System.Info
@@ -1286,6 +1298,57 @@ renderDarwinPlan plan =
     )
 
 -- ---------------------------------------------------------------------------
+-- The Windows plan
+-- ---------------------------------------------------------------------------
+
+-- | What the helper does for one build on Windows (@sandbox\/windows.c@):
+-- start the builder as a build slot's account, from the token the
+-- process that starts the helper hands it, on a window station and
+-- desktop the helper makes for the build, granting the helper's user and
+-- the slot's account alone, attached to a pseudoconsole the helper owns,
+-- and in a job that caps each process's memory and lets none break away.
+-- The builder's command line is the helper's own past its verb.
+data WindowsPlan = WindowsPlan
+  { -- | The directory the builder starts in.
+    windowsPlanBuildDir :: !ByteString,
+    -- | The value of the helper's handle to the slot account's primary
+    -- token, which it inherits from the process that starts it.  The
+    -- helper takes 1 to 2^31 - 1, the values a handle has.
+    windowsPlanToken :: !Word32,
+    -- | The slot's account, whose token that must be, and whom the
+    -- window station and desktop grant.
+    windowsPlanSlot :: !Sid,
+    -- | The window station and desktop the helper makes, as a process's
+    -- start names them, @STATION\\DESKTOP@: neither name empty, nor
+    -- holding a backslash.
+    windowsPlanDesktop :: !ByteString,
+    -- | The most memory each process of the build may commit, in bytes,
+    -- which the helper takes above 0.
+    windowsPlanMemoryCap :: !Word64,
+    -- | The builder's environment, as @NAME=VALUE@ entries, which the
+    -- helper takes as UTF-8, and none of them empty.
+    windowsPlanEnvironment :: ![ByteString]
+  }
+  deriving (Eq, Show)
+
+-- | A Windows plan as the helper reads it ('framePlan'): the backend, the
+-- build directory, the token's handle, the slot's SID, the window station
+-- and desktop and the memory cap, then the builder's environment.
+renderWindowsPlan :: WindowsPlan -> ByteString
+renderWindowsPlan plan =
+  framePlan
+    ( concat
+        [ ["backend", "windows"],
+          ["build-dir", windowsPlanBuildDir plan],
+          ["token", BS8.pack (show (windowsPlanToken plan))],
+          ["slot-sid", TE.encodeUtf8 (sidText (windowsPlanSlot plan))],
+          ["desktop", windowsPlanDesktop plan],
+          ["memory-cap", BS8.pack (show (windowsPlanMemoryCap plan))]
+        ]
+        ++ concatMap (\entry -> ["env", entry]) (windowsPlanEnvironment plan)
+    )
+
+-- ---------------------------------------------------------------------------
 -- What the helper reports
 -- ---------------------------------------------------------------------------
 
@@ -1377,6 +1440,64 @@ setupStageName stage = case stage of
   StageNoNewPrivs -> "no-new-privs"
   StageExec -> "exec"
 
+-- | A step of @nova-nix-sandbox run@ that can fail on Windows, whose
+-- record carries the Win32 error code of the call that failed, but for
+-- the plan's, which carries an errno value as on every OS.
+data WindowsStage
+  = WindowsStagePlan
+  | -- | Enabling the privileges that start a process as another account.
+    WindowsStagePrivileges
+  | -- | The plan's token: a handle this process holds, to a primary
+    -- token.
+    WindowsStageToken
+  | WindowsStageSlotSid
+  | -- | The token's user is not the plan's slot.
+    WindowsStageTokenUser
+  | WindowsStageStation
+  | WindowsStageDesktop
+  | -- | Opening NUL, the builder's standard input.
+    WindowsStageStdin
+  | -- | Copying the build log for the builder to inherit.
+    WindowsStageLog
+  | WindowsStageConsole
+  | WindowsStageJob
+  | WindowsStageEnvironment
+  | WindowsStageBuildDir
+  | WindowsStageCommandLine
+  | -- | The list of the handles and the pseudoconsole the builder starts
+    -- with.
+    WindowsStageAttributes
+  | WindowsStageExec
+  | -- | Assigning the builder to the build's job.
+    WindowsStageAssign
+  | -- | Starting the thread that watches the lifeline.
+    WindowsStageLifeline
+  | WindowsStageResume
+  deriving (Eq, Show, Enum, Bounded)
+
+-- | The token the helper writes for a Windows stage.
+windowsStageName :: WindowsStage -> ByteString
+windowsStageName stage = case stage of
+  WindowsStagePlan -> "plan"
+  WindowsStagePrivileges -> "privileges"
+  WindowsStageToken -> "token"
+  WindowsStageSlotSid -> "slot-sid"
+  WindowsStageTokenUser -> "token-user"
+  WindowsStageStation -> "station"
+  WindowsStageDesktop -> "desktop"
+  WindowsStageStdin -> "stdin"
+  WindowsStageLog -> "log"
+  WindowsStageConsole -> "console"
+  WindowsStageJob -> "job"
+  WindowsStageEnvironment -> "environment"
+  WindowsStageBuildDir -> "build-dir"
+  WindowsStageCommandLine -> "command-line"
+  WindowsStageAttributes -> "attributes"
+  WindowsStageExec -> "exec"
+  WindowsStageAssign -> "assign"
+  WindowsStageLifeline -> "lifeline"
+  WindowsStageResume -> "resume"
+
 -- | A check of @nova-nix-sandbox probe@ that can fail.
 data ProbeStage
   = ProbeSigchld
@@ -1389,6 +1510,9 @@ data ProbeStage
   | ProbeProcRemount
   | -- | macOS's sandbox refused the probe's profile.
     ProbeSandbox
+  | -- | The privileges that start a process as another account could
+    -- not be enabled, on Windows.
+    ProbePrivileges
   deriving (Eq, Show, Enum, Bounded)
 
 -- | The token the helper writes for a probe check.
@@ -1403,6 +1527,7 @@ probeStageName stage = case stage of
   ProbeMountns -> "mountns"
   ProbeProcRemount -> "proc-remount"
   ProbeSandbox -> "sandbox"
+  ProbePrivileges -> "privileges"
 
 -- | The helper's report of a step that failed: the step, the @errno@ it
 -- failed with (0 for none), and the plan entry or process it concerns.
@@ -1478,6 +1603,7 @@ unavailabilityCause cause = case cause of
     ProbeMountns -> "mount namespaces do not work on this system" <> errnoSuffix (recordErrno record)
     ProbeProcRemount -> "PID namespaces do not work on this system: cannot remount /proc"
     ProbeSandbox -> "macOS's sandbox refuses a profile from nova-nix's process, as it refuses one from a process already in a sandbox"
+    ProbePrivileges -> "the sandbox helper cannot enable SeAssignPrimaryTokenPrivilege and SeIncreaseQuotaPrivilege, which start a build as a build account"
 
 -- | Upstream's refusal of a sandboxed build on a system without the
 -- namespaces, with @sandbox-fallback@ off (@tryLocalBuild@ in LDG,

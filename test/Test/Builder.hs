@@ -49,6 +49,13 @@ module Test.Builder
     testWantedOutputsIO,
     testBuilder,
     testFlatOutputFormIO,
+
+    -- * What the Windows sandbox tests share
+    sandboxHelperVar,
+    processWaitMicros,
+    startWaitMicros,
+    waitUntil,
+    waitUntilWithin,
   )
 where
 
@@ -84,7 +91,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Tuple (swap)
-import Data.Word (Word64, Word8)
+import Data.Word (Word32, Word64, Word8)
 import Foreign.C.Error (Errno (..), eACCES, eAGAIN, eINVAL, eIO, eMFILE, eNOENT, eNOTDIR, getErrno)
 import Foreign.C.String (withCString)
 import Foreign.C.Types (CChar, CInt (..), CLong (..), CSize (..))
@@ -120,6 +127,7 @@ import Nix.Profile.Tree (BuildEnvFailure (..), Built (..), EntryKind (..), Listi
 import Nix.Push (PushCompression (..), preparePath, storePathBasename)
 import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, canonicalizeMetadata, closeStore, collectGarbage, freshCopyPath, gcRootsDir, isValid, openStore, pathLockFilePath, releasePathLock, replaceWithCopy, rewriteRegularFile, tryAcquirePathLock, waitingForLockMessage, writeDrv)
+import qualified Nix.Store.Access as Access
 import Nix.Store.CaseSensitive (volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), metaDirName, queryDeriver, queryPathInfo, queryReferences, registerPaths)
 import qualified Nix.Store.ExecBit as ExecBit
@@ -1033,6 +1041,71 @@ testSandboxPure = do
               `andThen` assertEqual "the report, unread" "the sandbox helper cannot read the builder's report of its setup: Input/output error" (message Sandbox.DarwinStageRelay (errno eIO))
               `andThen` assertEqual "a Linux stage" (Sandbox.SetupIncomplete "the sandbox helper wrote a status that cannot be read: 'hostname 1 -1\n'") (outcome (Right ()) (ExitFailure 1) "hostname 1 -1\n")
               `andThen` assertEqual "builder" (Sandbox.BuilderRan (ExitFailure 3)) (outcome (Right ()) (ExitFailure 3) ""),
+      runTest "a Windows plan renders as the helper reads it: the backend, the build directory, the token, the slot, the desktop and the memory cap, then entries" $
+        case Access.sidFromText "S-1-5-21-1-2-3-1001" of
+          Nothing -> Fail "the slot's SID does not read as one"
+          Just slot ->
+            let plan = Sandbox.WindowsPlan "C:\\b" 404 slot "nn-1\\build" 268435456 ["PATH=C:\\Windows"]
+                body =
+                  BS.concat
+                    [ "7:backend\NUL7:windows\NUL9:build-dir\NUL4:C:\\b\NUL",
+                      "5:token\NUL3:404\NUL8:slot-sid\NUL19:S-1-5-21-1-2-3-1001\NUL",
+                      "7:desktop\NUL10:nn-1\\build\NUL10:memory-cap\NUL9:268435456\NUL",
+                      "3:env\NUL15:PATH=C:\\Windows\NUL"
+                    ]
+             in assertEqual "bytes" ("nova-nix-sandbox-plan 4\n" <> BS8.pack (show (BS.length body)) <> "\n" <> body) (Sandbox.renderWindowsPlan plan),
+      runTestM "the helper's parser reads a rendered Windows plan back into exactly its fields, and refuses one it cannot use" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.checkCoverage $
+              QC.forAll genWindowsPlan $ \plan ->
+                let usable = windowsPlanUsable plan
+                 in QC.cover 30 usable "the helper can use it" $
+                      QC.cover 5 (not usable) "the helper cannot use it" $
+                        QC.ioProperty $ do
+                          let tokens = BS.drop 1 (BS8.dropWhile (/= '\n') (BS.drop (BS.length Sandbox.planVersionLine) (Sandbox.renderWindowsPlan plan)))
+                          echoed <- helperPlanEcho tokens
+                          pure (echoed QC.=== if usable then Right tokens else Left invalidPlan)
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      runTestM "the helper's parser takes a Windows plan's keys once and in order, then entries, and nothing else" $ do
+        let framed = BS.concat . map planToken
+            singletons = ["backend", "windows", "build-dir", "C:\\b", "token", "404", "slot-sid", "S-1-5-18", "desktop", "s\\d", "memory-cap", "1"]
+            whole = singletons ++ ["env", "a=b"]
+            withValue key value = go singletons
+              where
+                go (name : old : rest)
+                  | name == key = name : value : rest
+                  | otherwise = name : old : go rest
+                go other = other
+            refusals =
+              [ take 10 singletons,
+                singletons ++ ["bind", "/t", "/s", "r"],
+                singletons ++ ["param", "_A", "1"],
+                singletons ++ ["env", "a=b", "memory-cap", "1"],
+                ["backend", "windows", "token", "404", "build-dir", "C:\\b", "slot-sid", "S-1-5-18", "desktop", "s\\d", "memory-cap", "1"],
+                withValue "build-dir" "b",
+                withValue "build-dir" "/b",
+                withValue "token" "0",
+                withValue "token" "2147483648",
+                withValue "slot-sid" "SY",
+                withValue "desktop" "sd",
+                withValue "desktop" "\\d",
+                withValue "desktop" "s\\",
+                withValue "desktop" "s\\d\\e",
+                withValue "memory-cap" "0"
+              ]
+            acceptances = [whole, withValue "build-dir" "\\\\server\\share", withValue "build-dir" "c:/b"]
+        accepted <- traverse (helperPlanEcho . framed) acceptances
+        refused <- traverse (helperPlanEcho . framed) refusals
+        pure $
+          assertEqual "accepted" (map (Right . framed) acceptances) accepted
+            `andThen` assertEqual "refused" (map (const (Left invalidPlan)) refusals) refused,
+      runTest "the Windows helper's records parse, each stage under a name of its own, and the probe's check of the privileges is one of its checks" $
+        let names = map Sandbox.windowsStageName [minBound .. maxBound]
+         in foldr andThen Pass [assertEqual (TE.decodeLatin1 (Sandbox.windowsStageName stage)) (Right (Just (Sandbox.StatusRecord stage 1300 Nothing))) (Sandbox.parseStatus Sandbox.windowsStageName (Sandbox.windowsStageName stage <> " 1300 -1\n")) | stage <- [minBound .. maxBound]]
+              `andThen` assertEqual "distinct names" (length names) (Set.size (Set.fromList names))
+              `andThen` assertEqual "the probe's" (Right (Just (Sandbox.StatusRecord Sandbox.ProbePrivileges 1300 Nothing))) (Sandbox.parseStatus Sandbox.probeStageName "privileges 1300 -1\n")
+              `andThen` assertEqual "a Linux stage" (Left "the sandbox helper wrote a status that cannot be read: 'pivot 1 -1\n'") (Sandbox.parseStatus Sandbox.windowsStageName "pivot 1 -1\n"),
       runTest "on macOS a sandbox that cannot be made fails the build in upstream's words, whatever sandbox-fallback says, which Linux heeds" $
         let refused = Sandbox.ProbeFailed (Sandbox.StatusRecord Sandbox.ProbeSandbox 0 Nothing)
             darwin = Just Sandbox.DarwinBackend
@@ -1189,6 +1262,55 @@ darwinPlanUsable plan =
   all (BS.notElem 0) (Sandbox.darwinPlanBuildDir plan : Sandbox.darwinPlanProfile plan : concat [[name, value] | (name, value) <- Sandbox.darwinPlanParameters plan] ++ Sandbox.darwinPlanEnvironment plan)
     && "/" `BS.isPrefixOf` Sandbox.darwinPlanBuildDir plan
     && not (any (BS.null . fst) (Sandbox.darwinPlanParameters plan))
+
+-- | A Windows plan with any bytes in its byte fields, most often bytes the
+-- helper can use, and now and then a token or a memory cap it refuses.
+genWindowsPlan :: QC.Gen Sandbox.WindowsPlan
+genWindowsPlan =
+  Sandbox.WindowsPlan
+    <$> QC.frequency [(12, ("C:\\" <>) <$> usable), (1, genPlanBytes)]
+    <*> QC.frequency [(12, QC.choose (1, handleValueMax)), (1, QC.elements [0, handleValueMax + 1, maxBound])]
+    <*> QC.suchThatMap genSidText Access.sidFromText
+    <*> QC.frequency [(12, (\station desktop -> station <> "\\" <> desktop) <$> name <*> name), (1, genPlanBytes)]
+    <*> QC.frequency [(12, QC.choose (1, maxBound)), (1, pure 0)]
+    <*> few (QC.frequency [(12, usable), (1, genPlanBytes)])
+  where
+    few gen = QC.choose (0, 3) >>= \count -> QC.vectorOf count gen
+    usable = BS.filter (/= 0) <$> genPlanBytes
+    -- A window station's or desktop's name: not empty, and no NUL or
+    -- backslash in it.
+    name = ("n" <>) . BS.filter (`notElem` [0, backslash]) <$> genPlanBytes
+    backslash = 92
+    genSidText = do
+      subauthorities <- QC.choose (1, 15) >>= \count -> QC.vectorOf count (QC.choose (0, 4294967295 :: Integer))
+      authority <- QC.elements [1, 5 :: Integer]
+      pure (T.intercalate "-" ("S-1" : map (T.pack . show) (authority : subauthorities)))
+
+-- | The largest value of a handle the helper takes, the largest an int
+-- holds.
+handleValueMax :: Word32
+handleValueMax = 2147483647
+
+-- | Whether the helper can use a Windows plan: no field holds a NUL, its
+-- build directory is absolute, its token a value a handle has, its
+-- desktop a window station's name and a desktop's, and its memory cap
+-- above 0.
+windowsPlanUsable :: Sandbox.WindowsPlan -> Bool
+windowsPlanUsable plan =
+  all (BS.notElem 0) (Sandbox.windowsPlanBuildDir plan : Sandbox.windowsPlanDesktop plan : Sandbox.windowsPlanEnvironment plan)
+    && windowsAbsolute (Sandbox.windowsPlanBuildDir plan)
+    && Sandbox.windowsPlanToken plan >= 1
+    && Sandbox.windowsPlanToken plan <= handleValueMax
+    && stationAndDesktop (Sandbox.windowsPlanDesktop plan)
+    && Sandbox.windowsPlanMemoryCap plan > 0
+  where
+    windowsAbsolute path = case BS8.unpack (BS.take 3 path) of
+      [letter, ':', separator] -> isAsciiLetter letter && separator `elem` ['\\', '/']
+      _ -> "\\\\" `BS.isPrefixOf` path
+    isAsciiLetter letter = letter `elem` (['A' .. 'Z'] ++ ['a' .. 'z'])
+    stationAndDesktop text = case BS8.split '\\' text of
+      [station, desktop] -> not (BS.null station) && not (BS.null desktop)
+      _ -> False
 
 -- | A plan's inputs with nothing in them but a root and a build directory.
 sandboxPlanInputs :: Sandbox.PlanInputs
