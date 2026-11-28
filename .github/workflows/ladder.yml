@@ -3207,6 +3207,16 @@ jobs:
           "$greeter/bin/greeter.exe" | prints greeter.exe "Hello from libgreet, a dependency built from source by nova-nix!"
           exit "$status"
 
+      # --all is every valid path but the derivations: the sources, the rungs
+      # and the checks' outputs.  push skips what the handoff already holds.
+      - name: Hand the store to the Bash stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
+            --compression zstd --all
+
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server
         if: ${{ !cancelled() }}
@@ -3228,6 +3238,20 @@ jobs:
           NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
         run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
+      # The handoff for the stage after this one.  Its NARs are compressed
+      # already, so the zip stores them as they are.  Kept a day: a re-run
+      # of a failed stage within it finds the handoff, and after it the run
+      # is re-run whole.
+      - name: Upload the handoff
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: handoff-stdenv-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
       # The config.log files of a build that failed, from the directory it
       # kept: configure writes each test's commands and what they printed
       # there, and only its verdicts to the job's log.  A job that failed
@@ -3241,6 +3265,182 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: config-logs-stdenv-${{ inputs.os }}
+          path: C:\nix\store\.nova-nix\builds\**\config.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Bash: GNU Bash 5.3 built by the package set's stdenv, which runs here
+  # with no fork: test/data/bash.nix's checks have it run a script of
+  # functions, arrays and namerefs under inherit_errexit, and a program and
+  # a #! script found on a PATH of drive-letter directories joined with
+  # `:', and compare what it wrote with test/data/bash-checks-answer.txt.
+  #
+  # The timeout is twice an estimate of this stage on the ARM64 leg, which
+  # no run has measured yet: bash's build is some three times the size of
+  # GNU sed's, which the Stdenv stage builds in under a minute on x64, and
+  # the ARM64 leg takes three times as long.
+  # ---------------------------------------------------------------------------
+  bash-windows:
+    name: Bash
+    needs: [stdenv-windows]
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 40
+    environment:
+      name: ${{ inputs.publish && 'cache' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Windows' audit of process creation, on before the stage builds
+      # anything, for the check after its builds that no program from the
+      # store started one from outside it (.github/bootstrap/process-audit.sh
+      # says how).  A check that cannot fail is a run that tests nothing and
+      # stays green, so the audit's decisions are run against their cases
+      # first.
+      - name: Audit process creation
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/bootstrap/process-audit-cases.sh
+          bash .github/bootstrap/process-audit.sh start
+
+      - name: Download nova-nix
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-nova-nix
+          path: ${{ runner.temp }}
+
+      - name: Download the handoff server
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ladder-handoff-server
+          path: ${{ runner.temp }}/handoff-server
+
+      - name: Download the Stdenv stage's handoff
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: handoff-stdenv-${{ inputs.os }}
+          path: ${{ runner.temp }}/handoff
+
+      # The keep-failed setting, which -K turns on, for every build below
+      # (the Stdenv job says why it is set here).
+      - name: Keep a failed build's directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData\nix" | Out-Null
+          Set-Content -Path "$env:ProgramData\nix\nix.conf" -Value 'keep-failed = true'
+
+      - name: Serve the handoff
+        shell: bash
+        run: bash .github/cache/handoff-serve.sh "$RUNNER_TEMP/handoff-server/bin/nova-cache-server.exe" "$RUNNER_TEMP/handoff"
+
+      # The handoff for every step below: what a stage before this one
+      # built, the sources among it, comes from there.
+      - name: Name the handoff as a substituter
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY"
+
+      # The Stdenv stage's rungs, from the handoff, which holds them all
+      # (the Stdenv job says why this fails on a rung it builds).
+      - name: Take the Stdenv stage's rungs from the handoff
+        shell: bash
+        run: CACHE_URL=$HANDOFF_URL bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" stdenv fail
+
+      # Substitute mode names the public cache after the handoff, so that
+      # only what no stage before this one built comes from it.
+      - name: Name the handoff and the public cache as substituters
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/name-substituters.sh "$HANDOFF_URL" "$HANDOFF_PUBLIC_KEY" "$CACHE_URL" "$CACHE_PUBLIC_KEY"
+
+      # This stage's rung, downloaded where the public cache holds it and
+      # built where the change alters it.
+      - name: Take the unchanged rungs from the public cache
+        if: inputs.mode == 'substitute'
+        shell: bash
+        run: bash .github/cache/substitute-rungs.sh "$RUNNER_TEMP/bin/nova-nix.exe" bash build
+
+      - name: Build bash
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A bash
+          echo "== bash built in $((SECONDS - start)) s"
+
+      # The first line of --version, with the carriage return a console
+      # program's line may end with removed.
+      - name: bash prints its version
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/default.nix -A bash | tail -n 1); then
+            echo "::error::bash did not build"
+            exit 1
+          fi
+          code=0
+          version=$("$(cygpath -u "$out")/bin/bash.exe" --version) || code=$?
+          version=${version%%$'\n'*}
+          version=${version%$'\r'}
+          case $version in
+            'GNU bash, version 5.3.20(1)-release '*) echo "ok    bash --version prints $version" ;;
+            *)
+              echo "::error::bash --version exited $code and printed $version"
+              exit 1
+              ;;
+          esac
+
+      # test/data/bash.nix's checks: bash as a build's builder, running
+      # test/data/bash-checks/checks.sh, which writes a line for each thing
+      # it checks; the lines are compared with
+      # test/data/bash-checks-answer.txt.
+      - name: bash runs functions, arrays and namerefs, and programs and scripts on a drive-letter PATH
+        shell: bash
+        run: |
+          set -uo pipefail
+          expected=test/data/bash-checks-answer.txt
+          if ! out=$("$RUNNER_TEMP/bin/nova-nix.exe" build test/data/bash.nix -A checks | tail -n 1); then
+            echo "::error::checks did not build"
+            exit 1
+          fi
+          lines=$(cygpath -u "$out")
+          if cmp "$expected" "$lines"; then
+            echo "ok    checks wrote the lines of $expected"
+          else
+            echo "::error::checks' lines differ from $expected:"
+            diff "$expected" "$lines"
+            exit 1
+          fi
+
+      # A job whose handoff never served has no server to stop.
+      - name: Stop the handoff server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: if ($env:HANDOFF_SERVER_PID) { Stop-Process -Id $env:HANDOFF_SERVER_PID }
+
+      # No program from the store started one from outside it, by the
+      # audit of every process the stage's builds and checks started
+      # (.github/bootstrap/process-audit.sh).
+      - name: No build started a program from outside the store
+        shell: bash
+        run: bash .github/bootstrap/process-audit.sh check
+
+      # What this job built and its checks ran on (.github/cache/publish.sh).
+      - name: Publish the stage to the public cache
+        if: inputs.publish
+        shell: bash
+        env:
+          NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
+        run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+      # A failed build's config.log files (the Stdenv job says why).
+      - name: Upload a failed build's config.log files
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: config-logs-bash-${{ inputs.os }}
           path: C:\nix\store\.nova-nix\builds\**\config.log
           include-hidden-files: true
           if-no-files-found: ignore

@@ -1,0 +1,581 @@
+--- a/builtins/exec.def
++++ b/builtins/exec.def
+@@ -230,6 +230,13 @@
+ 
+   exit_value = shell_execve (command, args, env);
+   opt = errno;
++#if defined (_WIN32)
++  /* shell_execve started the program as a new process: the shell waits
++     for it and exits with its status, as the program would have exited in
++     the shell's place. */
++  if (spawned_program_status (&exit_value))
++    exit (exit_value);
++#endif
+ 
+   if (cleanenv == 0)
+     adjust_shell_level (1);
+--- a/builtins/psize.c
++++ b/builtins/psize.c
+@@ -70,6 +70,10 @@
+     {
+       int n;
+       n = write (1, buf, 128);
++      /* Where the system raises no SIGPIPE, the write that fails ends the
++	 count, as the comment above says. */
++      if (n < 0)
++	sigpipe (SIGPIPE);
+       nw += n;
+     }
+   return (0);
+--- a/execute_cmd.c
++++ b/execute_cmd.c
+@@ -94,6 +94,35 @@
+ 
+ #include "input.h"
+ 
++#if defined (_WIN32)
++/* Windows has no fork or execve.  A program the shell runs is started as
++   a new process (win32/proc.c), from the shell itself, which makes the
++   program's redirections its own while it starts it (spawn_disk_command).
++   EXECVE stands where execve does: on Windows it starts the program and
++   returns 0, and spawned_pid holds the process for the caller to wait for
++   or record.  spawn_exclude marks the descriptors the program must not
++   get, those a forked child would have closed. */
++static pid_t spawned_pid = NO_PID;
++static struct fd_bitmap *spawn_exclude;
++
++static int
++win32_execve (char *path, char **args, char **env)
++{
++  pid_t pid;
++
++  pid = w32_spawnve (path, args, env,
++		     spawn_exclude ? (unsigned char *)spawn_exclude->bitmap : 0,
++		     spawn_exclude ? spawn_exclude->size : 0);
++  if (pid < 0)
++    return -1;
++  spawned_pid = pid;
++  return 0;
++}
++#  define EXECVE(path, args, env)	win32_execve (path, args, env)
++#else
++#  define EXECVE(path, args, env)	execve (path, args, env)
++#endif
++
+ #if defined (ALIAS)
+ #  include "alias.h"
+ #endif
+@@ -5767,7 +5796,108 @@
+ #  define NOTFOUND_HOOK "command_not_found_handle"
+ #endif
+ 
++#if defined (_WIN32)
++/* If shell_execve started a program, wait for it, put its status as $?
++   reports it in *STATUSP and return 1; return 0 if it started none.  This
++   is how the shell stands in for a program it would have exec'd. */
++int
++spawned_program_status (int *statusp)
++{
++  pid_t pid;
++  int status;
++
++  if (spawned_pid == NO_PID)
++    return 0;
++  pid = spawned_pid;
++  spawned_pid = NO_PID;
++  if (waitpid (pid, &status, 0) < 0)
++    {
++      *statusp = EXECUTION_FAILURE;
++      return 1;
++    }
++  *statusp = WIFSIGNALED (status) ? 128 + WTERMSIG (status) : WEXITSTATUS (status);
++  return 1;
++}
++
++/* Run COMMAND, the file the search for PATHNAME found, or 0 if it found
++   none, as a forked child would run it: with REDIRECTS, and without the
++   descriptors in FDS_TO_CLOSE.  The shell makes the redirections its own
++   while it starts the program, and undoes them after.  Returns
++   EXECUTION_SUCCESS with the program recorded as the last child made, or
++   the status a child that never ran the program would have exited with.
++   A simple command in a pipeline or the background forks before it gets
++   here (execute_simple_command), so no pipe or asynchronous command
++   reaches it. */
+ static int
++spawn_disk_command (char *command, char *pathname, WORD_LIST *words,
++		    REDIRECT *redirects, struct fd_bitmap *fds_to_close)
++{
++  REDIRECT *saved_undo_list;
++  char **args;
++  int result;
++
++  start_pipeline ();
++
++  /* As make_child does: a program reading the script's input reads on
++     from where the shell is. */
++  if (default_buffered_input != -1)
++    sync_buffered_stream (default_buffered_input);
++
++  if (redirects && do_redirections (redirects, RX_ACTIVE|RX_UNDOABLE) != 0)
++    {
++      undo_partial_redirects ();
++      dispose_exec_redirects ();
++      last_made_pid = NO_PID;
++      return (EXECUTION_FAILURE);
++    }
++
++  saved_undo_list = redirection_undo_list;
++  redirection_undo_list = (REDIRECT *)NULL;
++  dispose_exec_redirects ();
++  if (saved_undo_list)
++    {
++      begin_unwind_frame ("spawn-redirects");
++      add_unwind_protect (uw_cleanup_redirects, (char *)saved_undo_list);
++    }
++
++  if (command == 0)
++    {
++      char *printable;
++
++      printable = printable_filename (pathname, 0);
++      internal_error ("%s: %s", printable, notfound_str);
++      if (printable != pathname)
++	free (printable);
++      result = EX_NOTFOUND;	/* Posix.2 says the exit status is 127 */
++    }
++  else
++    {
++      args = strvec_from_word_list (words, 0, 0, (int *)NULL);
++      spawn_exclude = fds_to_close;
++      result = shell_execve (command, args, export_env);
++      spawn_exclude = (struct fd_bitmap *)NULL;
++      strvec_dispose (args);
++    }
++
++  if (saved_undo_list)
++    {
++      redirection_undo_list = saved_undo_list;
++      discard_unwind_frame ("spawn-redirects");
++    }
++  undo_partial_redirects ();
++
++  if (spawned_pid != NO_PID)
++    {
++      register_child (spawned_pid, 0);
++      spawned_pid = NO_PID;
++      return (EXECUTION_SUCCESS);
++    }
++  last_made_pid = NO_PID;
++  return (result);
++}
++#endif /* _WIN32 */
++
++static int
+ execute_disk_command (WORD_LIST *words, REDIRECT *redirects, char *command_line,
+ 		      int pipe_in, int pipe_out, int async,
+ 		      struct fd_bitmap *fds_to_close, int cmdflags)
+@@ -5822,6 +5952,20 @@
+   else if (command == 0 && notfound_str == 0)	/* make sure */
+     init_notfound_str ();
+ 
++#if defined (_WIN32)
++  /* Without fork, a program, and the message that a command was not found,
++     come from the shell itself (spawn_disk_command).  A command not found
++     that a shell function handles still needs a copy of the shell. */
++  if (nofork == 0 && pipe_in == NO_PIPE && pipe_out == NO_PIPE && async == 0 &&
++      (command || find_function (NOTFOUND_HOOK) == 0))
++    {
++      result = spawn_disk_command (command, pathname, words, redirects,
++				   fds_to_close);
++      FREE (command);
++      return (result);
++    }
++#endif
++
+   /* We have to make the child before we check for the non-existence
+      of COMMAND, since we want the error messages to be redirected. */
+   /* If we can get away without forking and there are no pipes to deal with,
+@@ -5928,7 +6072,14 @@
+ 	 leave it there, in the same format that the user used to
+ 	 type it in. */
+       args = strvec_from_word_list (words, 0, 0, (int *)NULL);
++#if defined (_WIN32)
++      /* The shell exits with the status of the program it stands in for. */
++      result = shell_execve (command, args, export_env);
++      spawned_program_status (&result);
++      exit (result);
++#else
+       exit (shell_execve (command, args, export_env));
++#endif
+     }
+   else
+     {
+@@ -6023,6 +6174,30 @@
+       size_increment = 2;
+     }
+ 
++#if defined (_WIN32)
++  /* The shell goes on after starting the interpreter, and its caller keeps
++     ARGS, so the interpreter's arguments are a vector of their own. */
++  {
++    char **nargs;
++    int n, j, r;
++
++    n = strvec_len (args);
++    nargs = strvec_create (n + size_increment + 1);
++    j = 0;
++    nargs[j++] = execname;
++    if (firstarg)
++      nargs[j++] = firstarg;
++    nargs[j++] = command;
++    for (i = 1; i < n; i++)
++      nargs[j++] = args[i];
++    nargs[j] = (char *)NULL;
++    r = shell_execve (execname, nargs, env);
++    free (nargs);
++    FREE (firstarg);
++    free (execname);
++    return (r);
++  }
++#else
+   larry = strvec_len (args) + size_increment;
+   args = strvec_resize (args, larry + 1);
+ 
+@@ -6041,6 +6216,7 @@
+   args[larry] = (char *)NULL;
+ 
+   return (shell_execve (execname, args, env));
++#endif
+ }
+ #undef STRINGCHAR
+ #undef WHITECHAR
+@@ -6130,7 +6306,11 @@
+   size_t larray;
+ 
+   SETOSTYPE (0);		/* Some systems use for USG/POSIX semantics */
+-  execve (command, args, env);
++#if defined (_WIN32)
++  spawned_pid = NO_PID;
++#endif
++  if (EXECVE (command, args, env) == 0)
++    return (EXECUTION_SUCCESS);	/* Windows: started as a new process */
+   i = errno;			/* error from execve() */
+   CHECK_TERMSIG;
+   SETOSTYPE (1);
+@@ -6235,6 +6415,26 @@
+ 
+   /* We have committed to attempting to execute the contents of this file
+      as shell commands. */
++
++#if defined (_WIN32)
++  /* There is no copy of this shell to run the file in, so a new one runs
++     it, as `bash FILE ARGS' would. */
++  {
++    char **nargs;
++    int n, r;
++
++    n = strvec_len (args);
++    nargs = strvec_create (n + 2);
++    nargs[0] = shell_name;
++    nargs[1] = command;
++    for (i = 1; i < n; i++)
++      nargs[i + 1] = args[i];
++    nargs[n + 1] = (char *)NULL;
++    r = shell_execve (w32_executable_path (), nargs, env);
++    free (nargs);
++    return (r);
++  }
++#endif
+ 
+   reset_parser ();
+   initialize_subshell ();
+--- a/execute_cmd.h
++++ b/execute_cmd.h
+@@ -77,6 +77,9 @@
+ extern int execute_command (COMMAND *);
+ extern int execute_command_internal (COMMAND *, int, int, int, struct fd_bitmap *);
+ extern int shell_execve (char *, char **, char **);
++#if defined (_WIN32)
++extern int spawned_program_status (int *);
++#endif
+ extern void setup_async_signals (void);
+ extern void async_redirect_stdin (void);
+ 
+--- a/findcmd.c
++++ b/findcmd.c
+@@ -323,7 +323,11 @@
+ {
+   char *path;
+ 
++#if defined (_WIN32)
++  path = extract_path_unit (path_list, path_index_pointer);
++#else
+   path = extract_colon_unit (path_list, path_index_pointer);
++#endif
+ 
+   if (path == 0)
+     return (path);
+--- a/general.c
++++ b/general.c
+@@ -863,7 +863,7 @@
+ int
+ absolute_program (const char *string)
+ {
+-#ifndef __MSYS__
++#if !defined (__MSYS__) && !defined (_WIN32)
+   return ((char *)mbschr (string, '/') != (char *)NULL);
+ #else
+   return ((char *)mbschr (string, '/') != (char *)NULL ||
+@@ -1095,6 +1095,50 @@
+ 
+   return (value);
+ }
++
++#if defined (_WIN32)
++/* extract_colon_unit for a list of directories that may begin with drive
++   letters: a unit ends at `;', or at `:' unless that `:' ends a drive
++   letter at the unit's start, as busybox-w32 splits PATH. */
++char *
++extract_path_unit (char *string, int *p_index)
++{
++  int i, start, len;
++  char *value;
++
++  if (string == 0)
++    return (string);
++
++  len = strlen (string);
++  if (*p_index >= len)
++    return ((char *)NULL);
++
++  i = *p_index;
++
++  if (i && (string[i] == ':' || string[i] == ';'))
++    i++;
++
++  start = i;
++  if (ISALPHA ((unsigned char)string[i]) && string[i + 1] == ':')
++    i += 2;
++  for (; string[i] && string[i] != ':' && string[i] != ';'; i++)
++    ;
++
++  *p_index = i;
++
++  if (i == start)
++    {
++      if (string[i])
++	(*p_index)++;
++      value = (char *)xmalloc (1);
++      value[0] = '\0';
++    }
++  else
++    value = substring (string, start, i);
++
++  return (value);
++}
++#endif /* _WIN32 */
+ 
+ /* **************************************************************** */
+ /*								    */
+--- a/general.h
++++ b/general.h
+@@ -262,22 +262,22 @@
+ /* Some useful definitions for Unix pathnames.  Argument convention:
+    x == string, c == character */
+ 
+-#if !defined (__CYGWIN__)
++#if !defined (__CYGWIN__) && !defined (_WIN32)
+ #  define ABSPATH(x)	((x)[0] == '/')
+ #  define RELPATH(x)	((x)[0] != '/')
+-#else /* __CYGWIN__ */
++#else /* __CYGWIN__ || _WIN32 */
+ #  define ABSPATH(x)	(((x)[0] && ISALPHA((unsigned char)(x)[0]) && (x)[1] == ':') || ISDIRSEP((x)[0]))
+ #  define RELPATH(x)	(ABSPATH(x) == 0)
+-#endif /* __CYGWIN__ */
++#endif /* __CYGWIN__ || _WIN32 */
+ 
+ #define ROOTEDPATH(x)	(ABSPATH(x))
+ 
+ #define DIRSEP	'/'
+-#if !defined (__CYGWIN__)
++#if !defined (__CYGWIN__) && !defined (_WIN32)
+ #  define ISDIRSEP(c)	((c) == '/')
+ #else
+ #  define ISDIRSEP(c)	((c) == '/' || (c) == '\\')
+-#endif /* __CYGWIN__ */
++#endif /* __CYGWIN__ || _WIN32 */
+ #define PATHSEP(c)	(ISDIRSEP(c) || (c) == 0)
+ 
+ #define DOT_OR_DOTDOT(s)	(s[0] == '.' && (s[1] == 0 || (s[1] == '.' && s[2] == 0)))
+@@ -352,6 +352,9 @@
+ extern char *printable_filename (char *, int);
+ 
+ extern char *extract_colon_unit (char *, int *);
++#if defined (_WIN32)
++extern char *extract_path_unit (char *, int *);
++#endif
+ 
+ extern void tilde_initialize (void);
+ extern char *bash_tilde_find_word (const char *, int, size_t *);
+--- a/jobs.h
++++ b/jobs.h
+@@ -295,6 +295,7 @@
+ extern void list_running_jobs (int);
+ 
+ extern pid_t make_child (char *, int);
++extern void register_child (pid_t, int);
+ 
+ extern int get_tty_state (void);
+ extern int set_tty_state (void);
+--- a/lib/malloc/malloc.c
++++ b/lib/malloc/malloc.c
+@@ -84,6 +84,7 @@
+ #  include <strings.h>
+ #endif
+ #include <errno.h>
++#include <stdint.h>
+ #include <stdio.h>
+ 
+ #if !defined (botch)
+@@ -706,15 +707,15 @@
+   mp = (union mhead *) sbrk (sbrk_amt);
+ 
+   /* Totally out of memory. */
+-  if ((long)mp == -1)
++  if ((intptr_t)mp == -1)
+     goto morecore_done;
+ 
+   memtop += sbrk_amt;
+ 
+   /* shouldn't happen, but just in case -- require 8- or 16-byte alignment */
+-  if ((long)mp & MALIGN_MASK)
++  if ((intptr_t)mp & MALIGN_MASK)
+     {
+-      mp = (union mhead *) (((long)mp + MALIGN_MASK) & ~MALIGN_MASK);
++      mp = (union mhead *) (((intptr_t)mp + MALIGN_MASK) & ~MALIGN_MASK);
+       nblks--;
+     }
+ 
+@@ -758,7 +759,7 @@
+      much as we can.  Once we figure out how much to advance the break
+      pointer, go ahead and do it. */
+   memtop = curbrk = sbrk (0);
+-  sbrk_needed = pagesz - ((long)curbrk & (pagesz - 1));	/* sbrk(0) % pagesz */
++  sbrk_needed = pagesz - ((intptr_t)curbrk & (pagesz - 1));	/* sbrk(0) % pagesz */
+   if (sbrk_needed < 0)
+     sbrk_needed += pagesz;
+ 
+@@ -770,7 +771,7 @@
+       _mstats.tsbrk += sbrk_needed;
+ #endif
+       curbrk = sbrk (sbrk_needed);
+-      if ((long)curbrk == -1)
++      if ((intptr_t)curbrk == -1)
+ 	return -1;
+       memtop += sbrk_needed;
+ 
+@@ -1283,10 +1284,10 @@
+   if (ptr == 0)
+     return 0;
+   /* If entire block has the desired alignment, just accept it.  */
+-  if (((long) ptr & (alignment - 1)) == 0)
++  if (((intptr_t) ptr & (alignment - 1)) == 0)
+     return ptr;
+   /* Otherwise, get address of byte in the block that has that alignment.  */
+-  aligned = (char *) (((long) ptr + alignment - 1) & (~alignment + 1));
++  aligned = (char *) (((intptr_t) ptr + alignment - 1) & (~alignment + 1));
+ 
+   /* Store a suitable indication of how to free the block,
+      so that free can find the true beginning of it.  */
+--- a/lib/sh/netopen.c
++++ b/lib/sh/netopen.c
+@@ -326,6 +326,10 @@
+ 
+ #else /* !HAVE_NETWORK */
+ 
++#include <sys/types.h>
++#include <bashintl.h>
++#include <shell.h>
++
+ int
+ netopen (char *path)
+ {
+--- a/lib/sh/random.c
++++ b/lib/sh/random.c
+@@ -30,6 +30,7 @@
+ #  include <unistd.h>
+ #endif
+ #include "filecntl.h"
++#include "posixtime.h"
+ 
+ #include <stdio.h>
+ #include "bashansi.h"
+--- a/lib/sh/winsize.c
++++ b/lib/sh/winsize.c
+@@ -54,6 +54,7 @@
+ #endif /* !STRUCT_WINSIZE_IN_TERMIOS && !STRUCT_WINSIZE_IN_SYS_IOCTL */
+ 
+ #include <stdio.h>
++#include <errno.h>
+ 
+ /* Return the fd from which we are actually getting input. */
+ #define input_tty() (shell_tty != -1) ? shell_tty : fileno (stderr)
+--- a/nojobs.c
++++ b/nojobs.c
+@@ -556,17 +556,21 @@
+       default_tty_job_signals ();
+     }
+   else
+-    {
+-      /* In the parent. */
++    register_child (pid, flags);	/* In the parent. */
++  return (pid);
++}
+ 
+-      last_made_pid = pid;
++/* Record PID, a child the shell started, as the last child made, and the
++   last asynchronous one if FLAGS has FORK_ASYNC, to be waited for. */
++void
++register_child (pid_t pid, int flags)
++{
++  last_made_pid = pid;
+ 
+-      if (async_p)
+-	last_asynchronous_pid = pid;
++  if (flags & FORK_ASYNC)
++    last_asynchronous_pid = pid;
+ 
+-      add_pid (pid, async_p);
+-    }
+-  return (pid);
++  add_pid (pid, flags & FORK_ASYNC);
+ }
+ 
+ void
+--- a/pathexp.c
++++ b/pathexp.c
+@@ -868,7 +868,11 @@
+           ret[i].st.mtime = get_stat_mtime (&st);
+           ret[i].st.atime = get_stat_atime (&st);
+           ret[i].st.ctime = get_stat_ctime (&st);
++#if defined (HAVE_STRUCT_STAT_ST_BLOCKS)
+           ret[i].st.blocks = st.st_blocks;
++#else
++          ret[i].st.blocks = 0;
++#endif
+         }
+     }
+ 
+--- a/shell.c
++++ b/shell.c
+@@ -396,6 +396,10 @@
+   USE_VAR(saverst);
+ #endif
+ 
++#if defined (_WIN32)
++  w32_init ();
++#endif
++
+   /* Catch early SIGINTs. */
+   code = setjmp_nosigs (top_level);
+   if (code)

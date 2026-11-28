@@ -1,0 +1,16 @@
+function and local -n: after
+array: 3 elements, the second beta
+associative array: sky blue, grass green, 2 keys
+shopt: inherit_errexit is on
+probe exited 3
+probe read [plain]
+probe read [two words]
+probe read [a "quote"]
+probe read [back\slash\]
+probe read []
+probe cat copied [first]
+probe cat copied [second]
+/dev/null took probe's output
+greet printed: hello from a script
+greet exited 4
+no-such-command exited 127

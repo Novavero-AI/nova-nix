@@ -25,6 +25,7 @@ module Test.Pkgs
     testBinutilsNativeX8664Windows,
     testGccNativeX8664Windows,
     testStdenvWindows,
+    testBashWindows,
     testWindowsSources,
     testWindowsRungs,
     testWorkflowSpellings,
@@ -1105,7 +1106,7 @@ testChecksForbidSubstitutes = do
     ]
   where
     checkFiles :: [Text]
-    checkFiles = ["binutils.nix", "binutils-native-x86_64.nix", "binutils-x86_64.nix", "busybox.nix", "gcc-core.nix", "gcc-core-x86_64.nix", "gcc-latest.nix", "gcc-native-x86_64.nix", "gcc-x86_64.nix", "gcc10.nix", "gcc46.nix", "gcc46-cxx.nix", "gnumake.nix", "mes.nix", "mingw-w64-latest.nix", "mingw-w64-x86_64.nix", "run-command.nix", "seed-stdenv.nix", "stdenv.nix", "tinycc.nix"]
+    checkFiles = ["bash.nix", "binutils.nix", "binutils-native-x86_64.nix", "binutils-x86_64.nix", "busybox.nix", "gcc-core.nix", "gcc-core-x86_64.nix", "gcc-latest.nix", "gcc-native-x86_64.nix", "gcc-x86_64.nix", "gcc10.nix", "gcc46.nix", "gcc46-cxx.nix", "gnumake.nix", "mes.nix", "mingw-w64-latest.nix", "mingw-w64-x86_64.nix", "run-command.nix", "seed-stdenv.nix", "stdenv.nix", "tinycc.nix"]
 
 -- | @pkgs/windows@'s seed stdenv, read back as the build driver reads it:
 -- what the stdenv and GNU Hello built with it, @test\/data\/seed-stdenv.nix@'s
@@ -3609,6 +3610,138 @@ testStdenvWindows = do
     addedNames :: [Text]
     addedNames = archives ++ ["gcc-wrapper-16.2.0", "hello", "stdenv-flags", "sed", "zlib", "libgreet", "zdemo", "greeter"]
 
+-- | @pkgs\/windows@' bash, read back as the build driver reads it: what
+-- it and @test\/data\/bash.nix@'s checks add to the closure of the
+-- package set's stdenv.  The leaves it adds are bash's tarball and GNU's
+-- twenty official patches, each fetched fixed-output.  A derivation runs
+-- busybox's awk over the patches with @context-to-unified.awk@, and bash
+-- applies its output, one patch for each in order, then @win32.patch@.
+-- bash is configured without job control, line editing, history,
+-- translations or network redirections, with its own malloc and the
+-- cache answers the port gives configure.  The checks run bash itself as
+-- the builder, with probe, which the stdenv builds, and a #! script whose
+-- interpreter is bash.
+testBashWindows :: IO [Bool]
+testBashWindows = do
+  putStrLn "pkgs/bash"
+  cwd <- Dir.getCurrentDirectory
+  storeDir <- evalNixIOStoreDir
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  let source =
+        T.concat
+          [ "let pkgs = import ",
+            nixQuotedPath (cwd </> "pkgs" </> "windows"),
+            "; checks = import ",
+            nixQuotedPath (cwd </> "test" </> "data" </> "bash.nix"),
+            "; in builtins.concatStringsSep \" \" [ ",
+            T.unwords [path <> ".drvPath" | path <- roots],
+            " ]"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right parsed -> runEvalIO st $ do
+      value <- evalParsed (pure (evalBaseEnv st)) parsed
+      case value of
+        VStr bytes _ -> do
+          let rootOf = Map.fromList (zip roots (T.words (bytesText bytes)))
+          stdenv <- sessionClosure (maybeToList (Map.lookup stdenvRoot rootOf))
+          full <- sessionClosure (Map.elems rootOf)
+          pure (rootOf, stdenv, full)
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  case outcome of
+    Left err -> sequence [runTest instantiates (Fail err)]
+    Right (rootOf, stdenv, full) -> do
+      let added = Map.elems (Map.difference full stdenv)
+          nameOf drv = maybe "" bytesText (Map.lookup "name" (drvEnv drv))
+          variableOf name drv = maybe "" bytesText (Map.lookup name (drvEnv drv))
+          wordsOf name = maybe [] (T.words . variableOf name)
+          isFetch drv = drvBuilder drv == "builtin:fetchurl"
+          isFixedOutput drv = not (all (T.null . doHash) (drvOutputs drv))
+          addedLeaves = filter (Map.null . drvInputDrvs) added
+          derivationAt root = Map.lookup root rootOf >>= (`Map.lookup` full)
+          named name = listToMaybe [drv | drv <- added, nameOf drv == name]
+          outputOf drv = maybe "<no output>" (storePathToText defaultStoreDir . doPath) (listToMaybe (drvOutputs drv))
+          bash = derivationAt bashRoot
+          unified = named "bash-5.3-patches"
+          checks = derivationAt checksRoot
+          scripts = derivationAt scriptsRoot
+          fetchedPatches = [drv | n <- patchNumbers, drv <- maybeToList (named ("bash53-" <> n))]
+          inputSourceNames drv = map spName (drvInputSrcs drv)
+      sequence
+        [ runTest instantiates $
+            assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
+          runTest "the leaves it adds are bash's tarball and GNU's official patches, each fetched fixed-output" $
+            assertEqual
+              "leaves added"
+              (sort ("bash-5.3.tar.gz" : map ("bash53-" <>) patchNumbers), True)
+              (sort (map nameOf addedLeaves), all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
+          runTest "busybox's awk writes each official patch, in order, as a unified diff" $
+            assertEqual
+              "the patches it reads and the converter"
+              (Just (map outputOf fetchedPatches, ["context-to-unified.awk"]))
+              (unified <&> \drv -> (wordsOf "patches" (Just drv), filter (== "context-to-unified.awk") (inputSourceNames drv))),
+          runTest "bash applies the unified official patches in order, then win32.patch" $
+            assertEqual
+              "patches"
+              ([outputOf u <> "/bash53-" <> n <> ".patch" | u <- maybeToList unified, n <- patchNumbers], Just "win32.patch")
+              ( take (length patchNumbers) (wordsOf "patches" bash),
+                listToMaybe (drop (length patchNumbers) (wordsOf "patches" bash)) >>= fmap spName . parseStorePath defaultStoreDir
+              ),
+          runTest "bash is configured as a builder's shell, with the port's cache answers" $
+            assertEqual "configureFlags" configureFlags (wordsOf "configureFlags" bash),
+          runTest "the checks run bash itself as the builder, with probe and the #! script, whose interpreter is bash" $
+            assertEqual
+              "the builder, the script, probe's and scripts' outputs, and the interpreter"
+              ( Just (maybe "" outputOf bash <> "/bin/bash.exe"),
+                ["checks.sh"],
+                fmap outputOf (named "bash-probe"),
+                fmap outputOf scripts,
+                Just (maybe "" outputOf bash <> "/bin/bash")
+              )
+              ( bytesText . drvBuilder <$> checks,
+                [name | drv <- maybeToList checks, path <- drvArgs drv, Just sp <- [parseStorePath defaultStoreDir (bytesText path)], let name = spName sp, name == "checks.sh"],
+                variableOf "probe" <$> checks,
+                variableOf "scripts" <$> checks,
+                variableOf "interpreter" <$> scripts
+              )
+        ]
+  where
+    instantiates :: Text
+    instantiates = "bash and its checks instantiate, adding twenty-six to the stdenv's closure"
+    stdenvRoot :: Text
+    stdenvRoot = "pkgs.stdenv.cc"
+    bashRoot :: Text
+    bashRoot = "pkgs.bash"
+    checksRoot :: Text
+    checksRoot = "checks.checks"
+    scriptsRoot :: Text
+    scriptsRoot = "checks.scripts"
+    roots :: [Text]
+    roots = [stdenvRoot, bashRoot, checksRoot, scriptsRoot]
+    patchNumbers :: [Text]
+    patchNumbers = [T.justifyRight 3 '0' (T.pack (show n)) | n <- [1 :: Int .. 20]]
+    addedNames :: [Text]
+    addedNames =
+      ["bash-5.3p20", "bash-5.3-patches", "bash-5.3.tar.gz", "bash-probe", "bash-scripts", "bash-checks"]
+        ++ map ("bash53-" <>) patchNumbers
+    configureFlags :: [Text]
+    configureFlags =
+      [ "--disable-job-control",
+        "--disable-readline",
+        "--disable-history",
+        "--disable-nls",
+        "--disable-net-redirections",
+        "--without-curses",
+        "--with-bash-malloc",
+        "bash_cv_dev_fd=standard",
+        "bash_cv_dev_stdin=present",
+        "bash_cv_getcwd_malloc=yes",
+        "bash_cv_getenv_redef=no",
+        "ac_cv_func_strdup=no",
+        "ac_cv_func_wcsdup=no"
+      ]
+
 -- | @pkgs\/windows\/sources.nix@ against the package set whose sources it
 -- lists: the fetches in the closure of every derivation in the set are the
 -- list's, each fixed-output and listed once.  A package that fetches a
@@ -3813,12 +3946,13 @@ testWindowsRungs = do
         ("x86_64", "x86_64-windows"),
         ("gcc-x86_64", "gcc-x86_64-windows"),
         ("native-x86_64", "native-x86_64-windows"),
-        ("stdenv", "stdenv-windows")
+        ("stdenv", "stdenv-windows"),
+        ("bash", "bash-windows")
       ]
     -- The rung each stage ends on, so that a workflow read as building
     -- nothing does not pass against an empty list.
     knownRungs :: [(Text, Text)]
-    knownRungs = [("mes", "mes.libc"), ("tinycc", "seedStdenv.applets"), ("gcc46", "gcc46"), ("gcc46-cxx", "gcc46-cxx"), ("gcc10", "mingw-w64-crt-latest"), ("gcc-latest", "gcc-latest"), ("x86_64", "mingw-w64-crt-x86_64"), ("gcc-x86_64", "gcc-x86_64"), ("native-x86_64", "gcc-native-x86_64"), ("stdenv", "stdenv.cc")]
+    knownRungs = [("mes", "mes.libc"), ("tinycc", "seedStdenv.applets"), ("gcc46", "gcc46"), ("gcc46-cxx", "gcc46-cxx"), ("gcc10", "mingw-w64-crt-latest"), ("gcc-latest", "gcc-latest"), ("x86_64", "mingw-w64-crt-x86_64"), ("gcc-x86_64", "gcc-x86_64"), ("native-x86_64", "gcc-native-x86_64"), ("stdenv", "stdenv.cc"), ("bash", "bash")]
     -- What ends a stage's rungs in the string the expression returns: no
     -- attribute path is spelled so.
     stageEnd :: Text

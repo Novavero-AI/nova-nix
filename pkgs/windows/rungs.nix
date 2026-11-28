@@ -101,4 +101,7 @@
   # The package set's stdenv: its compiler and linker wrappers on that
   # toolchain, the Stdenv stage.
   stdenv = [ "stdenv.cc" ];
+
+  # GNU Bash, built by that stdenv, the Bash stage.
+  bash = [ "bash" ];
 }

@@ -26,7 +26,7 @@ import Test.Exceptions (testInterruptsPropagate)
 import Test.Fetch (testExperimentalFeatures, testFetchUrls, testFlakeRefBuiltins, testFlakeRefs)
 import Test.Harness (evalChild, evalChildFlag, inTestSession)
 import Test.Parser (testCurPos, testExprTypes, testLexer, testLineEndings, testParserErrors, testParserExprs, testParserIntegration, testSourceBytes, testSourceBytesIO, testStaticGlobalsSync, testStringAttrKeys, testUndefinedVariables, testUndefinedVariablesIO)
-import Test.Pkgs (testBinutilsNativeX8664Windows, testBinutilsWindows, testBinutilsX8664Windows, testBusyboxWindows, testChecksForbidSubstitutes, testGcc10Windows, testGcc46CxxWindows, testGcc46Windows, testGccCoreWindows, testGccCoreX8664Windows, testGccLatestWindows, testGccNativeX8664Windows, testGccX8664Windows, testGnumakeWindows, testMesWindows, testMingwW64CrtX8664Windows, testMingwW64LatestWindows, testPkgsFetchurl, testSeedStdenvWindows, testStage0Pe32Chain, testStdenvWindows, testTinyccWindows, testWindowsRungs, testWindowsSources, testWorkflowSpellings)
+import Test.Pkgs (testBashWindows, testBinutilsNativeX8664Windows, testBinutilsWindows, testBinutilsX8664Windows, testBusyboxWindows, testChecksForbidSubstitutes, testGcc10Windows, testGcc46CxxWindows, testGcc46Windows, testGccCoreWindows, testGccCoreX8664Windows, testGccLatestWindows, testGccNativeX8664Windows, testGccX8664Windows, testGnumakeWindows, testMesWindows, testMingwW64CrtX8664Windows, testMingwW64LatestWindows, testPkgsFetchurl, testSeedStdenvWindows, testStage0Pe32Chain, testStdenvWindows, testTinyccWindows, testWindowsRungs, testWindowsSources, testWorkflowSpellings)
 import Test.Push (testPushClosureIO, testPushDirectory, testPushMultipart, testPushPure)
 import Test.Realise (testDepGraph, testRealise)
 import Test.Store (testCaseSensitiveVolumeIO, testExecBit, testFoldingVolumeIO, testGcPure, testHashHelpers, testLinkOrdering, testNarKnownAnswer, testNarNameSafety, testParseStorePath, testPathInfo, testPathLocks, testSerialiseIfReadableIO, testStoreAccessIO, testStoreDB, testStoreDelete, testStoreGC, testStoreGCUpstreamManaged, testStoreImports, testStoreMetadata, testStoreNameSinks, testStoreNameSinksIO, testStoreOps, testStoreOpsIO, testStorePaths, testStoreWritesUpstreamManaged, testSymlinkWalksIO)
@@ -142,6 +142,7 @@ runSuite = do
           testBinutilsNativeX8664Windows,
           testGccNativeX8664Windows,
           testStdenvWindows,
+          testBashWindows,
           testChecksForbidSubstitutes,
           testWindowsSources,
           testWindowsRungs,
