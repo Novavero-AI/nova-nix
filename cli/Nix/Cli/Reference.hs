@@ -104,6 +104,7 @@ data CommandName
   | ProfileHistoryCommand
   | ProfileRollbackCommand
   | ProfileWipeHistoryCommand
+  | DaemonCommand
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | What the reference says about a command, or about the global form.
@@ -175,6 +176,7 @@ commandWords name = case name of
   ProfileHistoryCommand -> ["profile", "history"]
   ProfileRollbackCommand -> ["profile", "rollback"]
   ProfileWipeHistoryCommand -> ["profile", "wipe-history"]
+  DaemonCommand -> ["daemon"]
 
 -- | A command as it is invoked, @nova-nix store gc@.
 commandInvocation :: CommandName -> Text
@@ -206,7 +208,7 @@ globalForm =
   CommandEntry
     { commandForms = Form "COMMAND [FLAG...]" "Run one command, with the flags it takes" :| [],
       commandDescription =
-        "nova-nix evaluates Nix expressions, builds derivations, starts shells with a derivation's build environment, reports what a derivation's closure relies on, pushes store paths to a binary cache, keeps profiles of packages and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` has another status, 104, for an output that differs, and `develop`, once its shell has started, exits with the shell's.",
+        "nova-nix evaluates Nix expressions, builds derivations, starts shells with a derivation's build environment, reports what a derivation's closure relies on, pushes store paths to a binary cache, keeps profiles of packages, maintains its store and serves it to other users' Nix clients, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` has another status, 104, for an output that differs, and `develop`, once its shell has started, exits with the shell's.",
       commandExamples =
         Example "Print the release this binary was built from." ("--version" :| []) []
           :| [Example "Print the commands, flags and settings." ("--help" :| []) []]
@@ -498,6 +500,15 @@ command name = case name of
                  Example "Say which generations would be deleted, and delete none." ("profile" :| ["wipe-history", "--dry-run"]) []
                ]
       }
+  DaemonCommand ->
+    CommandEntry
+      { commandForms = Form "" "Serve the store to other users' Nix clients over a Unix socket, until stopped" :| [],
+        commandDescription =
+          "Serves the store, as `nix daemon` does, to clients that speak upstream Nix's worker protocol, such as upstream's `nix` given `--store daemon`, on a Unix socket at `$NIX_DAEMON_SOCKET_PATH`, else `daemon-socket/socket` in `$NIX_STATE_DIR`, else `/nix/var/nix/daemon-socket/socket`, or where `--socket-path` puts it. The socket is writable by every user, so the directory it is in decides who reaches it. A client is trusted when `trusted-users` names it, may connect when it is trusted or `allowed-users` names it, and may not when its group is `build-users-group`; each names users, groups as `@GROUP`, or everyone as `*`. A client the daemon does not trust may not repair, has its settings limited as upstream's daemon limits them, and is shown roots without what holds them. The daemon holds the store open while it runs, so a collection waits for it to stop, and serves each connection on its own. It answers queries of the store: which paths are valid, their info, referrers and derivers, a derivation's outputs, the roots, and a path's NAR, and it keeps temporary and indirect roots; a client asking it to build, substitute, add paths or collect garbage is told it does not yet. nova-nix's own commands open the store themselves. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused. It runs on Linux and macOS.",
+        commandExamples =
+          Example "Serve the platform store, as root, to every user's clients." ("daemon" :| []) []
+            :| [Example "Serve a store under `/srv`, on a socket beside it, trusting no client." ("daemon" :| ["--store", "/srv/nix/store", "--socket-path", "/srv/nix/daemon-socket/socket", "--force-untrusted"]) []]
+      }
 
 -- | What a profile is and where it is, as the descriptions of the
 -- commands that change one say.
@@ -596,6 +607,10 @@ data FlagName
   | JsonFlag
   | PrettyFlag
   | NoPrettyFlag
+  | ForceTrustedFlag
+  | ForceUntrustedFlag
+  | DefaultTrustFlag
+  | SocketPathFlag
   | StoreFlag
   | HelpFlag
   | VersionFlag
@@ -754,8 +769,16 @@ flag name = case name of
     long "pretty" Nothing "With `--json`, indent the JSON, as when stdout is a terminal" jsonCommands
   NoPrettyFlag ->
     long "no-pretty" Nothing "With `--json`, print the JSON on one line, as when stdout is not a terminal" jsonCommands
+  ForceTrustedFlag ->
+    long "force-trusted" Nothing "Trust every client, without asking who it is" daemonOnly
+  ForceUntrustedFlag ->
+    long "force-untrusted" Nothing "Trust no client, without asking who it is" daemonOnly
+  DefaultTrustFlag ->
+    long "default-trust" Nothing "Admit and trust each client as `trusted-users` and `allowed-users` say (the default)" daemonOnly
+  SocketPathFlag ->
+    long "socket-path" (Just "PATH") "Listen on the socket at `PATH`, in place of `$NIX_DAEMON_SOCKET_PATH` and the default" daemonOnly
   StoreFlag ->
-    long "store" (Just "DIR") "Use `DIR` as the store (default: the platform store)" (CommandFlag (EvalCommand :| [BuildCommand, DevelopCommand, PrintDevEnvCommand, TrustCommand, PushCommand, StoreDeleteCommand, StoreGcCommand, ProfileAddCommand, ProfileRemoveCommand, ProfileListCommand, ProfileHistoryCommand, ProfileRollbackCommand, ProfileWipeHistoryCommand]))
+    long "store" (Just "DIR") "Use `DIR` as the store (default: the platform store)" (CommandFlag (EvalCommand :| [BuildCommand, DevelopCommand, PrintDevEnvCommand, TrustCommand, PushCommand, StoreDeleteCommand, StoreGcCommand, ProfileAddCommand, ProfileRemoveCommand, ProfileListCommand, ProfileHistoryCommand, ProfileRollbackCommand, ProfileWipeHistoryCommand, DaemonCommand]))
   HelpFlag ->
     long "help" Nothing "Print the commands, flags and settings, and exit" GlobalFlag
   VersionFlag ->
@@ -769,6 +792,7 @@ flag name = case name of
     buildOnly = CommandFlag (BuildCommand :| [])
     pushOnly = CommandFlag (PushCommand :| [])
     developOnly = CommandFlag (DevelopCommand :| [])
+    daemonOnly = CommandFlag (DaemonCommand :| [])
     -- The commands that print JSON with --json.
     jsonCommands = CommandFlag (PrintDevEnvCommand :| [TrustCommand, ProfileListCommand])
     -- The commands that select an attribute of what they evaluate, and
@@ -831,12 +855,15 @@ configuration =
                Setting "allowed-impure-host-deps" "Host paths at or beneath which a derivation's `__impureHostDeps` may name one for a sandboxed build on macOS (default on macOS: `/System/Library`, `/usr/lib`, `/dev` and `/bin/sh`)" Nothing,
                Setting "darwin-log-sandbox-violations" "Send what a sandboxed build's profile refuses on macOS to the system log" Nothing,
                Setting "require-drop-supplementary-groups" "Fail a sandboxed build when the user's supplementary groups cannot be dropped (default: on for root)" Nothing,
-               Setting "build-users-group" "The group whose members builds run as, one build to a member at a time, when nova-nix runs as root on Linux or macOS; with it empty a build runs as the user nova-nix runs as (default: `nixbld` for root, empty otherwise)" Nothing,
+               Setting "build-users-group" "The group whose members builds run as, one build to a member at a time, when nova-nix runs as root on Linux or macOS, and whose members may not connect to the daemon; with it empty a build runs as the user nova-nix runs as (default: `nixbld` for root, empty otherwise)" Nothing,
                Setting "use-xdg-base-directories" "Link the default profile from `profile` in the state directory in place of `~/.nix-profile` (default `false`)" Nothing,
                Setting "ssl-cert-file" "The CA bundle a sandboxed fixed-output build sees (default: `$NIX_SSL_CERT_FILE`, `$SSL_CERT_FILE`, or the first that exists of `/etc/ssl/certs/ca-certificates.crt` and `etc/ssl/certs/ca-bundle.crt` under `/nix/var/nix/profiles/default`)" Nothing,
                Setting "bash-prompt" "The prompt (`PS1`) of an interactive `develop` shell, in place of the user's" Nothing,
                Setting "bash-prompt-prefix" "Text put before the prompt of an interactive `develop` shell" Nothing,
-               Setting "bash-prompt-suffix" "Text put after the prompt of an interactive `develop` shell" Nothing
+               Setting "bash-prompt-suffix" "Text put after the prompt of an interactive `develop` shell" Nothing,
+               Setting "trusted-users" "The users the daemon trusts, each a name, `@GROUP` for a group's members, or `*` for everyone (default `root`)" Nothing,
+               Setting "allowed-users" "The users who may connect to the daemon, named as `trusted-users` names them; a trusted user always may (default `*`)" Nothing,
+               Setting "trusted-substituters" "Substituters a client the daemon does not trust may ask it for, besides those it uses" Nothing
              ],
       configDescription =
         "`nix.conf` is read in upstream's order: `$NIX_CONF_DIR/nix.conf`, where `NIX_CONF_DIR` defaults to "

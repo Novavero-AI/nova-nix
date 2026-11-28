@@ -155,8 +155,11 @@ nova-nix another directory with `--store`. A build in a store other than
 `/nix/store` or `C:\nix\store` writes that store's directory into its output,
 so the output differs from upstream's at the same store path.
 
-Each `nova-nix` process opens the store itself, with no daemon, so whoever
-builds needs write access to the store directory.
+Each `nova-nix` command opens the store itself, so whoever builds needs write
+access to the store directory. On Linux and macOS, `nova-nix daemon` serves the
+store to other users' clients over a Unix socket, as `nix daemon` does, in
+upstream Nix's protocol: it answers their queries of the store and keeps their
+roots, and does not yet build, substitute or add paths for them.
 
 **Linux.** The store is `/nix/store`, which nova-nix creates when `/nix` is
 yours. The installer gives you `/nix`; by hand:
@@ -341,7 +344,7 @@ Hello, world!
 ## Status
 
 Not implemented yet, and on the [roadmap]: flakes, `nix-shell`, `nix develop`
-on Windows, and a daemon for a multi-user store. On Linux a build runs in a
+on Windows, and building through `nova-nix daemon` for a multi-user store. On Linux a build runs in a
 sandbox, as upstream's does, where it sees only its inputs and, unless it is
 fixed-output, no network; a builder that is a host program such as `/bin/sh`
 needs `sandbox-paths` to bind it, as a release archive binds its own shell.

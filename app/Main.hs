@@ -11,7 +11,7 @@
 module Main (main) where
 
 import Control.Applicative ((<|>))
-import Control.Exception (AsyncException (UserInterrupt), bracket, bracketOnError, displayException, handle, handleJust, try)
+import Control.Exception (AsyncException (UserInterrupt), bracket, bracketOnError, displayException, finally, handle, handleJust, try)
 import Control.Monad (filterM, foldM_, mfilter, void, when, (>=>))
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Data.Bifunctor (first)
@@ -48,6 +48,10 @@ import Nix.Cli.Args (AutoArg (..), CliOpts (..), Command (..), DevEnvFormat (..)
 import Nix.Cli.Reference (Host (..), SystemConfDirSource (..), currentHost, helpLines, renderIndentedJson, systemConfDirSource)
 import Nix.Config (DefaultUse (..), NixConfig (..), PathSetValue (..))
 import qualified Nix.Config as Config
+import Nix.Daemon.Connection (ServerConfig (..))
+import Nix.Daemon.Listen (DaemonOptions (..), TrustOverride, authSettingsFor, closeListener, daemonSocketPath, daemonUnavailable, openListener, serveListener)
+import Nix.Daemon.LocalStore (newServedStore, serveLocal)
+import Nix.Daemon.Protocol (Verbosity (..), Version (..), featureRealisationWithPath, latestVersionNumber)
 import Nix.DependencyGraph (DepNode (..), buildDepGraph)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), DrvFile, drvFileATerm, drvFileDerivation, drvFilePath, fromATerm)
 import Nix.Develop.Capture (CaptureFailure, OutputObject (..), captureDerivation, captureFailureMessage, environmentOutput, getEnvScriptContents, getEnvScriptName, getEnvScriptPath, noEnvironmentMessage)
@@ -226,6 +230,7 @@ main = do
     CmdProfileHistory selection -> profileHistoryCommand config storeDir selection
     CmdProfileRollback selection to changes -> profileRollbackCommand config storeDir selection to changes
     CmdProfileWipeHistory selection olderThan changes -> profileWipeHistoryCommand config storeDir selection olderThan changes
+    CmdDaemon trust socketPath -> daemonCommand config storeDir trust socketPath
     CmdUsage -> mapM_ (TIO.hPutStrLn stderr) helpLines >> exitFailure
     CmdHelp -> toStdout (mapM_ TIO.putStrLn helpLines)
     CmdVersion -> toStdout (putStrLn versionLine)
@@ -1606,6 +1611,41 @@ storeGcCommand storeDir printRoots = do
       results <- collectGarbage store Set.empty
       closeStore store
       either (failWith . ("store gc: " <>)) (toStdout . TIO.putStrLn . gcSummaryLine) results
+
+-- ---------------------------------------------------------------------------
+-- The daemon
+-- ---------------------------------------------------------------------------
+
+-- | Serve the store over the daemon's socket until the process is
+-- stopped, holding it open all the while.  A store upstream Nix's
+-- database also manages is refused first, since the daemon serves the
+-- store in upstream's daemon's place.
+daemonCommand :: NixConfig -> StoreDir -> TrustOverride -> Maybe String -> IO ()
+daemonCommand config storeDir trust socketPathArg = do
+  mapM_ (failWith . ("daemon: " <>)) daemonUnavailable
+  upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("daemon: " <>))
+  socketPath <- maybe daemonSocketPath socketPathBytes socketPathArg
+  auth <- authSettingsFor config
+  logger <- cliLogger
+  bracket (openStore logger storeDir) closeStore $ \store -> do
+    served <- newServedStore store
+    let server =
+          ServerConfig
+            { scStoreDir = stDir store,
+              scVersion = Version latestVersionNumber (Set.singleton featureRealisationWithPath),
+              scNixVersion = BC.pack versionLine,
+              scVerbosity = daemonVerbosity,
+              scConfig = config
+            }
+    listener <- openListener socketPath >>= either (failWith . ("daemon: " <>)) pure
+    serveListener logger (DaemonOptions trust auth (serveLocal served server)) listener `finally` closeListener listener
+  where
+    socketPathBytes arg = argumentBytes arg >>= maybe (failWith ("daemon: the socket path '" <> T.pack arg <> "' has no spelling as bytes")) pure
+
+-- | How much the daemon tells a client that has not set its own
+-- verbosity: upstream's default, the info level.
+daemonVerbosity :: Verbosity
+daemonVerbosity = Verbosity 3
 
 -- ---------------------------------------------------------------------------
 -- Profile commands

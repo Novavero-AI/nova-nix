@@ -125,10 +125,7 @@ data ServerConfig = ServerConfig
     -- | How much a client is told until it sets its own verbosity.
     scVerbosity :: !Verbosity,
     -- | The daemon's settings, which each connection starts from.
-    scConfig :: !NixConfig,
-    -- | The substituters a client the daemon does not trust may use,
-    -- besides those the daemon uses.
-    scTrustedSubstituters :: ![Text]
+    scConfig :: !NixConfig
   }
 
 -- | Why a connection ended.
@@ -246,7 +243,7 @@ perform :: (Monad m) => Env m -> Request -> Conn m OpEnd
 perform env = \case
   SetOptions client -> do
     settings <- gets sessSettings
-    let (updated, warnings) = applyClientSettings (envTrust env) (scTrustedSubstituters config) client settings
+    let (updated, warnings) = applyClientSettings (envTrust env) client settings
     modify' (\session -> session {sessSettings = updated})
     traverse_ (warn (connVerbosity updated)) warnings
     finish mempty

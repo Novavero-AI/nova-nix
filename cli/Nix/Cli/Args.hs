@@ -36,6 +36,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import Nix.Builder.Sandbox (SandboxMode (..))
+import Nix.Daemon.Listen (TrustOverride (..))
 import Nix.Develop.Shell (EnvironmentBase (..))
 import Nix.Profile.Generation (Changes (..))
 
@@ -132,6 +133,10 @@ data Command
     -- current one, or with @--older-than@, as the command line spells its
     -- age, those older than that but the newest of them.
     CmdProfileWipeHistory !ProfileSelection !(Maybe String) !Changes
+  | -- | @daemon@: serve the store to clients over a socket, trusting them
+    -- as the override says, at the socket path given, as the command line
+    -- spells it, or the default one.
+    CmdDaemon !TrustOverride !(Maybe String)
   | -- | No command given, or @eval@ given no target.  Usage on stderr,
     -- non-zero: a bare invocation is
     -- a usage error, and a caller testing the exit status must see one.
@@ -476,6 +481,7 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     go opts ("push" : rest) = goPush opts emptyPushArgs rest
     go opts ("store" : rest) = goStore opts rest
     go opts ("profile" : rest) = goProfile opts rest
+    go opts ("daemon" : rest) = goDaemon opts DefaultTrust Nothing rest
     go _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     go _ (flag : _)
@@ -694,6 +700,19 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     goStoreGc _ _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     goStoreGc _ _ (arg : _) = Left ("unknown store gc argument: " ++ arg)
+    -- Sub-parser for daemon: a later trust flag replaces an earlier one, as
+    -- upstream's handlers assign it.
+    goDaemon opts trust socketPath [] = Right opts {optCommand = CmdDaemon trust socketPath}
+    goDaemon opts _ _ (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
+    goDaemon opts trust socketPath ("--store" : dir : rest) =
+      goDaemon (opts {optStore = Just dir}) trust socketPath rest
+    goDaemon opts trust _ ("--socket-path" : path : rest) = goDaemon opts trust (Just path) rest
+    goDaemon opts _ socketPath ("--force-trusted" : rest) = goDaemon opts ForceTrusted socketPath rest
+    goDaemon opts _ socketPath ("--force-untrusted" : rest) = goDaemon opts ForceUntrusted socketPath rest
+    goDaemon opts _ socketPath ("--default-trust" : rest) = goDaemon opts DefaultTrust socketPath rest
+    goDaemon _ _ _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goDaemon _ _ _ (arg : _) = Left ("unknown daemon argument: " ++ arg)
     -- Sub-parser for profile verbs.
     goProfile _ [] = Left ("profile: expected a subcommand (" ++ profileVerbs ++ ")")
     goProfile opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
@@ -804,7 +823,7 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     sandboxFlag _ = Nothing
     -- Flags that consume the following argument as their value.
     valueFlags =
-      [extraFeaturesFlag, "--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--secret-key-file", "--compression", "--profile", "--priority", "--regex", "--to", "--older-than"]
+      [extraFeaturesFlag, "--nix-path", "--store", "--substituter", "--trusted-key", "--exec-wrapper", "--expr", "--cache", "--key-file", "--secret-key-file", "--compression", "--profile", "--priority", "--regex", "--to", "--older-than", "--socket-path"]
         ++ attrFlags
         ++ outLinkFlags
     -- Attribute selection, under both of upstream's spellings.
