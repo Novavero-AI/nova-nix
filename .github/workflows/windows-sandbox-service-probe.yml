@@ -12,7 +12,11 @@ name: Windows sandbox service probe
 # outside its job and what that process holds, and what a slot's build
 # reaches of the network with no rule, under WFP filters on the slot's and
 # its group's SIDs, under a Windows Firewall rule, and under a filter the
-# service adds itself.  The probe judges nothing.  Its last step removes
+# service adds itself, and with loopback to another account's listener
+# blocked too; and whether the service can end a slot's processes after a
+# build.  On this branch nova-nix-sandbox also takes a plan naming no
+# window station, which starts the builder on the one the system picks
+# for the slot's logon session.  The probe judges nothing.  Its last step removes
 # the service, its rights, the accounts, their rights and group, the task
 # a build made and the firewall rule, by name, on every path; the probe's
 # layout is under the runner's temporary directory.
@@ -105,6 +109,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           & $env:PROBE_EXE wfp $env:PROBE_ROOT group
+          exit $LASTEXITCODE
+
+      - name: Network, WFP filters on the slot's SID that also block loopback to another account
+        if: ${{ !cancelled() }}
+        run: |
+          & $env:PROBE_EXE wfp $env:PROBE_ROOT loopback
           exit $LASTEXITCODE
 
       # The rule names the slot by an SDDL, as New-NetFirewallRule's

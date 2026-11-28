@@ -208,7 +208,9 @@ static int parse_windows_singletons(struct tokens *cursor, struct plan *plan)
     if (!read_value(cursor, "slot-sid", &value) || strncmp(value, SID_PREFIX, sizeof SID_PREFIX - 1) != 0)
         return 0;
     plan->slot_sid = value;
-    if (!read_value(cursor, "desktop", &value) || !station_and_desktop(value))
+    /* On this probe branch an empty desktop asks for no window station of
+     * the helper's: the system picks the token's logon session's. */
+    if (!read_value(cursor, "desktop", &value) || !(value[0] == '\0' || station_and_desktop(value)))
         return 0;
     plan->desktop = value;
     return read_value(cursor, "memory-cap", &value) && parse_size(value, &plan->memory_cap) && plan->memory_cap > 0;

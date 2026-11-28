@@ -26,10 +26,19 @@
  *   - what a slot's build reaches of the network: TCP to an address and
  *     to a name, a name's resolution, UDP to a DNS server, and loopback,
  *     its own and the service's; with no rule, under a Windows Filtering
- *     Platform filter on the slot's SID and on its group's, under a
- *     Windows Firewall rule for the slot, and under a filter the service
- *     adds itself in a dynamic session, with what each costs to add and
- *     remove.
+ *     Platform filter on the slot's SID and on its group's, with loopback
+ *     to another account's listener blocked too, under a Windows Firewall
+ *     rule for the slot, and under a filter the service adds itself in a
+ *     dynamic session, with what each costs to add and remove;
+ *   - whether the service, having given a slot's token a default DACL
+ *     that grants it, can end the slot's processes after a build, as
+ *     upstream ends its build user's, a process WMI started among them.
+ *
+ * On this branch nova-nix-sandbox also takes a plan whose desktop is
+ * empty, which makes no window station and starts the builder with
+ * lpDesktop empty, on the one the system picks for the token's logon
+ * session; builds through the helper use that once the named one is
+ * refused.
  *
  * Each measurement is a line "MEASURE label: what was seen"; the probe
  * judges nothing, and exits nonzero only when it cannot set its
@@ -42,8 +51,9 @@
  *                                configuration
  *   probe phase ROOT PHASE       start the service for PHASE (main, net,
  *                                wfp-self) and print its log
- *   probe wfp ROOT TARGET        add WFP block filters for TARGET (slot or
- *                                group) in a dynamic session of this
+ *   probe wfp ROOT TARGET        add WFP block filters for TARGET (slot,
+ *                                group, or loopback, the slot's with
+ *                                loopback to others) in a dynamic session of this
  *                                process's, run the service's net phase
  *                                under them, then close the session
  *   probe wfp-self ROOT          grant the service the WFP rights to add
@@ -78,6 +88,7 @@
 #include <ntsecapi.h>
 #include <sddl.h>
 #include <aclapi.h>
+#include <tlhelp32.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -135,6 +146,7 @@ static const GUID layer_accept_v4 = {0xe1cd9fe7, 0xf4b5, 0x4273, {0x96, 0xc0, 0x
 static const GUID layer_accept_v6 = {0xa3b42c97, 0x9f04, 0x4672, {0xb8, 0x7e, 0xce, 0xe9, 0xc4, 0x83, 0x25, 0x7f}};
 static const GUID condition_user_id = {0xaf043a0a, 0xb34d, 0x4f86, {0x97, 0x9c, 0xc9, 0x03, 0x71, 0xaf, 0x6e, 0x66}};
 static const GUID condition_flags = {0x632ce23b, 0x5167, 0x435c, {0x86, 0xd7, 0xe9, 0x03, 0x68, 0x4a, 0xa8, 0x0c}};
+static const GUID condition_remote_user_id = {0xf63073b7, 0x0189, 0x4ab0, {0x95, 0xa4, 0x61, 0x23, 0xcb, 0xfa, 0xb8, 0x62}};
 static const GUID sublayer_universal = {0xeebecc03, 0xced4, 0x4380, {0x81, 0x9a, 0x27, 0x34, 0x39, 0x7b, 0x2b, 0x74}};
 #define SESSION_FLAG_DYNAMIC 0x00000001
 #define ACTRL_ADD 0x00000001
@@ -996,6 +1008,63 @@ static DWORD add_block_filters(HANDLE engine, const WCHAR *sid, const char *labe
     return failed;
 }
 
+/* Add, in ENGINE, a filter at each ALE connect layer that blocks what a
+ * process whose token holds SID connects to over loopback when the other
+ * end's account is not that SID: loopback to another account's listener,
+ * where the build's own stays open. */
+static DWORD add_loopback_filters(HANDLE engine, const WCHAR *sid)
+{
+    PSECURITY_DESCRIPTOR local = NULL;
+    PSECURITY_DESCRIPTOR remote = NULL;
+    FWP_BYTE_BLOB local_blob;
+    FWP_BYTE_BLOB remote_blob;
+    FWPM_FILTER_CONDITION0 conditions[3];
+    DWORD failed = 0;
+    int i;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(join(L"D:(A;;CC;;;", sid, L")", END), SDDL_REVISION_1,
+                                                              &local, NULL)
+        || !ConvertStringSecurityDescriptorToSecurityDescriptorW(join(L"D:(D;;CC;;;", sid, L")(A;;CC;;;WD)", END),
+                                                                 SDDL_REVISION_1, &remote, NULL))
+        return GetLastError();
+    local_blob.size = GetSecurityDescriptorLength(local);
+    local_blob.data = (UINT8 *)local;
+    remote_blob.size = GetSecurityDescriptorLength(remote);
+    remote_blob.data = (UINT8 *)remote;
+    memset(conditions, 0, sizeof conditions);
+    conditions[0].fieldKey = condition_user_id;
+    conditions[0].matchType = FWP_MATCH_EQUAL;
+    conditions[0].conditionValue.type = FWP_SECURITY_DESCRIPTOR_TYPE;
+    conditions[0].conditionValue.sd = &local_blob;
+    conditions[1].fieldKey = condition_flags;
+    conditions[1].matchType = FWP_MATCH_FLAGS_ALL_SET;
+    conditions[1].conditionValue.type = FWP_UINT32;
+    conditions[1].conditionValue.uint32 = FWP_CONDITION_FLAG_IS_LOOPBACK;
+    conditions[2].fieldKey = condition_remote_user_id;
+    conditions[2].matchType = FWP_MATCH_EQUAL;
+    conditions[2].conditionValue.type = FWP_SECURITY_DESCRIPTOR_TYPE;
+    conditions[2].conditionValue.sd = &remote_blob;
+    for (i = 0; i < 2; i++) {
+        FWPM_FILTER0 filter;
+        UINT64 id = 0;
+        DWORD error;
+        memset(&filter, 0, sizeof filter);
+        filter.displayData.name = L"nnprobe loopback block";
+        filter.layerKey = *block_layers[i];
+        filter.action.type = FWP_ACTION_BLOCK;
+        filter.weight.type = FWP_EMPTY;
+        filter.numFilterConditions = 3;
+        filter.filterCondition = conditions;
+        error = FwpmFilterAdd0(engine, &filter, NULL, &id);
+        say("MEASURE wfp-loopback filter %s, loopback to another account: %s", block_layer_names[i],
+            error == 0 ? "added" : error_text(error));
+        if (error != 0)
+            failed = error;
+    }
+    LocalFree(local);
+    LocalFree(remote);
+    return failed;
+}
+
 /* FwpmSubLayerSetSecurityInfoByKey0, which mingw-w64's fwpmu.h does not
  * declare, looked up in fwpuclnt by name. */
 typedef DWORD(WINAPI *set_sublayer_security_call)(HANDLE, const GUID *, SECURITY_INFORMATION, const SID *, const SID *,
@@ -1134,6 +1203,8 @@ static int wfp_command(const WCHAR *root, const WCHAR *target)
         return 1;
     }
     sid = config_value(config, wcscmp(target, L"group") == 0 ? "group-sid" : "slot1-sid");
+    /* The loopback target blocks the slot as the slot target does, and
+     * loopback to other accounts' listeners besides. */
     started = now_counter();
     engine = open_dynamic_engine(&error);
     say("MEASURE wfp-%s administrator's dynamic session: %s, %.2f ms", utf8(target),
@@ -1145,6 +1216,8 @@ static int wfp_command(const WCHAR *root, const WCHAR *target)
     error = add_block_filters(engine, widen(sid), wcscmp(target, L"group") == 0 ? "wfp-group" : "wfp-slot");
     say("MEASURE wfp-%s filters for %s: %s, %.2f ms in all", utf8(target), sid, error == 0 ? "added" : error_text(error),
         elapsed_ms(started));
+    if (wcscmp(target, L"loopback") == 0)
+        add_loopback_filters(engine, widen(sid));
     phase_command(root, L"net");
     started = now_counter();
     error = FwpmEngineClose0(engine);
@@ -1272,6 +1345,11 @@ struct service_context {
     WCHAR *station_name;
     struct user32 user32;
     int have_user32;
+    /* Whether the helper's plans name no window station, so the system
+     * picks the slot's logon session's, and whether a build through the
+     * helper is followed by a sweep of its slot's processes. */
+    int helper_system_desktop;
+    int sweep_after;
 };
 
 /* A pipe's reader, gathering what comes until the pipe ends. */
@@ -1416,6 +1494,51 @@ static const char *const *builder_environment(const struct slot *slot, size_t *c
     return entries;
 }
 
+/* End every process running as SLOT's account, as upstream ends every
+ * process of its build user once a build is over, saying what each step
+ * of that came to for each. */
+static void sweep_slot(struct service_context *c, const struct slot *slot)
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W entry;
+    int found = 0;
+    (void)c;
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        say("MEASURE sweep snapshot: %s", error_text(GetLastError()));
+        return;
+    }
+    entry.dwSize = sizeof entry;
+    if (Process32FirstW(snapshot, &entry))
+        do {
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+            HANDLE token = NULL;
+            union {
+                TOKEN_USER user;
+                BYTE bytes[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+            } user;
+            DWORD size = 0;
+            if (process == NULL)
+                continue;
+            if (OpenProcessToken(process, TOKEN_QUERY, &token)
+                && GetTokenInformation(token, TokenUser, &user, sizeof user, &size)
+                && EqualSid(user.user.User.Sid, slot->sid_binary)) {
+                HANDLE ending = OpenProcess(PROCESS_TERMINATE, FALSE, entry.th32ProcessID);
+                found++;
+                say("MEASURE sweep %s process %lu (%s): %s", slot->name, (unsigned long)entry.th32ProcessID,
+                    utf8(entry.szExeFile),
+                    ending == NULL ? error_text(GetLastError())
+                                   : (TerminateProcess(ending, 1) ? "ended by the service" : error_text(GetLastError())));
+                if (ending != NULL)
+                    CloseHandle(ending);
+            }
+            if (token != NULL)
+                CloseHandle(token);
+            CloseHandle(process);
+        } while (Process32NextW(snapshot, &entry));
+    CloseHandle(snapshot);
+    say("MEASURE sweep %s: %d of its processes found running after its build", slot->name, found);
+}
+
 /* Run a build through nova-nix-sandbox: COMMAND, the builder's command
  * line, in SLOT, on a window station named for the run.  The helper gets
  * the slot's token inherited, and the plan, the lifeline, the status pipe
@@ -1449,7 +1572,10 @@ static void through_helper(struct service_context *c, const struct slot *slot, c
     memset(result, 0, sizeof *result);
     result->log_end_ms = -1;
     c->runs++;
-    snprintf(desktop, sizeof desktop, "nnprobe-%lu-%u\\build", (unsigned long)GetCurrentProcessId(), c->runs);
+    if (c->helper_system_desktop)
+        desktop[0] = '\0';
+    else
+        snprintf(desktop, sizeof desktop, "nnprobe-%lu-%u\\build", (unsigned long)GetCurrentProcessId(), c->runs);
     plan = render_plan(slot, desktop, environment, entries, &plan_length);
     inheritable.nLength = sizeof inheritable;
     inheritable.lpSecurityDescriptor = NULL;
@@ -1504,8 +1630,10 @@ static void through_helper(struct service_context *c, const struct slot *slot, c
             TerminateProcess(process.hProcess, 1);
         WaitForSingleObject(process.hProcess, INFINITE);
     }
-    ended = GetTickCount64();
     GetExitCodeProcess(process.hProcess, &result->exit_code);
+    if (c->sweep_after)
+        sweep_slot(c, slot);
+    ended = GetTickCount64();
     if (WaitForSingleObject(log_reader.thread, LOG_END_WAIT_MS) == WAIT_OBJECT_0)
         result->log_end_ms = (long)(GetTickCount64() - ended);
     WaitForSingleObject(status_reader.thread, LOG_END_WAIT_MS);
@@ -1776,6 +1904,23 @@ static int log_slots_on(struct service_context *c)
             continue;
         }
         say("MEASURE service LogonUserW %s (batch): logged on", s->name);
+        {
+            /* The default DACL the design's service gives a slot's token:
+             * SYSTEM, the service and the slot. */
+            PSECURITY_DESCRIPTOR descriptor = NULL;
+            BOOL present = FALSE;
+            BOOL defaulted = FALSE;
+            TOKEN_DEFAULT_DACL dacl;
+            WCHAR *sddl = join(L"D:(A;;GA;;;SY)(A;;GA;;;", sid_text(c->own_sid), L")(A;;GA;;;", widen(s->sid), L")", END);
+            dacl.DefaultDacl = NULL;
+            if (ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &descriptor, NULL)
+                && GetSecurityDescriptorDacl(descriptor, &present, &dacl.DefaultDacl, &defaulted))
+                say("MEASURE service sets %s's token default DACL to SYSTEM, the service and the slot: %s", s->name,
+                    SetTokenInformation(s->token, TokenDefaultDacl, &dacl, sizeof dacl) ? "set"
+                                                                                         : error_text(GetLastError()));
+            if (descriptor != NULL)
+                LocalFree(descriptor);
+        }
     }
     return all;
 }
@@ -1972,7 +2117,8 @@ static void net_build(struct service_context *c, const char *label)
     SOCKET listener = loopback_listener(&port);
     char *label_copy = take(strlen(label) + 1);
     strcpy(label_copy, label);
-    direct_build(c, &c->slots[0], child_command(c->probe, join(L"net ", decimal(port), END)), DESKTOP_SYSTEM, &b);
+    c->helper_system_desktop = 1;
+    through_helper(c, &c->slots[0], child_command(c->probe, join(L"net ", decimal(port), END)), &b);
     say_build(label_copy, &b);
     if (listener != INVALID_SOCKET)
         closesocket(listener);
@@ -2018,7 +2164,13 @@ static void main_phase(struct service_context *c)
     through_helper(c, &c->slots[0], child_command(c->probe, L"identity"), &b);
     say_build("helper start slot1 identity", &b);
     helper_runs = b.start_error == 0 && strstr(b.log, "identity user") != NULL;
-    say("MEASURE helper starts a builder for the service: %s", helper_runs ? "yes" : "no");
+    say("MEASURE helper, making a named window station, starts a builder for the service: %s", helper_runs ? "yes" : "no");
+    c->helper_system_desktop = 1;
+    through_helper(c, &c->slots[0], child_command(c->probe, L"identity"), &b);
+    say_build("helper start slot1 identity, its plan naming no window station", &b);
+    helper_runs = b.start_error == 0 && strstr(b.log, "identity user") != NULL;
+    say("MEASURE helper, its plan naming no window station, starts a builder for the service: %s",
+        helper_runs ? "yes" : "no");
 
     for (i = DESKTOP_SYSTEM; i <= DESKTOP_INHERIT; i++) {
         char label[160];
@@ -2052,19 +2204,24 @@ static void main_phase(struct service_context *c)
     image_labels[2] = "image only the slot may read";
     for (i = 0; i < 3; i++) {
         char label[160];
-        snprintf(label, sizeof label, "direct start, %s", image_labels[i]);
-        direct_build(c, &c->slots[0], child_command(images[i], L"identity"), DESKTOP_SYSTEM, &b);
+        snprintf(label, sizeof label, "helper start, %s", image_labels[i]);
+        through_helper(c, &c->slots[0], child_command(images[i], L"identity"), &b);
         say_build(label, &b);
     }
 
     {
         static const WCHAR *const ways[] = {L"escape-task", L"escape-wmi", L"escape-hkcu"};
         for (i = 0; i < 3; i++) {
-            char label[64];
-            snprintf(label, sizeof label, "direct build %s", utf8(ways[i]));
-            direct_build(c, &c->slots[0], child_command(c->probe, ways[i]), DESKTOP_SYSTEM, &b);
+            char label[96];
+            /* The WMI escape is followed by the service's sweep of the
+             * slot's processes, and its log's end is timed after that. */
+            c->sweep_after = wcscmp(ways[i], L"escape-wmi") == 0;
+            snprintf(label, sizeof label, "helper build %s%s", utf8(ways[i]),
+                     c->sweep_after ? ", then the service's sweep" : "");
+            through_helper(c, &c->slots[0], child_command(c->probe, ways[i]), &b);
             say_build(label, &b);
             record_escape(c, utf8(ways[i]), b.log);
+            c->sweep_after = 0;
         }
     }
 
@@ -2483,7 +2640,7 @@ static void child_escaped(const WCHAR *marker, const WCHAR *builder_pid, const W
     BOOL in_job = FALSE;
     HANDLE builder = OpenProcess(PROCESS_DUP_HANDLE, FALSE, (DWORD)wcstoul(builder_pid, NULL, 10));
     HANDLE copy = NULL;
-    char text[512];
+    char text[2048];
     char dup_text[256];
     DWORD session = 0;
     IsProcessInJob(GetCurrentProcess(), NULL, &in_job);
@@ -2495,8 +2652,21 @@ static void child_escaped(const WCHAR *marker, const WCHAR *builder_pid, const W
         snprintf(dup_text, sizeof dup_text, "duplicating its log handle failed, %s", error_text(GetLastError()));
     else
         snprintf(dup_text, sizeof dup_text, "holds a copy of the builder's log handle");
-    snprintf(text, sizeof text, "escaped pid %lu\nescaped in a job %s\nescaped session %lu\nescaped %s\n",
-             (unsigned long)GetCurrentProcessId(), in_job ? "yes" : "no", (unsigned long)session, dup_text);
+    {
+        DWORD needed = 0;
+        PSECURITY_DESCRIPTOR descriptor;
+        char *dacl_text = "unreadable";
+        GetKernelObjectSecurity(GetCurrentProcess(), DACL_SECURITY_INFORMATION, NULL, 0, &needed);
+        if (needed > 0) {
+            descriptor = take(needed);
+            if (GetKernelObjectSecurity(GetCurrentProcess(), DACL_SECURITY_INFORMATION, descriptor, needed, &needed))
+                dacl_text = descriptor_text(descriptor, DACL_SECURITY_INFORMATION);
+        }
+        snprintf(text, sizeof text,
+                 "escaped pid %lu\nescaped in a job %s\nescaped session %lu\nescaped %s\nescaped process DACL %s\n",
+                 (unsigned long)GetCurrentProcessId(), in_job ? "yes" : "no", (unsigned long)session, dup_text,
+                 dacl_text);
+    }
     write_file_whole(marker, text);
     Sleep(ESCAPED_HOLD_MS);
     if (copy != NULL)

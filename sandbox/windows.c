@@ -378,6 +378,15 @@ static void make_user_objects(const struct plan *plan, PSID helper, PSID slot, s
     DWORD error = 0;
 
     made->name = widened(plan->desktop, "station", NO_INDEX);
+    /* On this probe branch an empty desktop makes no window station: the
+     * builder starts with lpDesktop empty, on the system's for its
+     * token's logon session. */
+    made->station = NULL;
+    made->desktop = NULL;
+    if (plan->desktop[0] == '\0') {
+        *acl = NULL;
+        return;
+    }
     station_name = widened(plan->desktop, "station", NO_INDEX);
     desktop_name = wcschr(station_name, L'\\');
     *desktop_name++ = L'\0';
@@ -411,8 +420,10 @@ static void make_user_objects(const struct plan *plan, PSID helper, PSID slot, s
  * which follows. */
 static void close_user_objects(struct user_objects *made)
 {
-    CloseDesktop(made->desktop);
-    CloseWindowStation(made->station);
+    if (made->desktop != NULL)
+        CloseDesktop(made->desktop);
+    if (made->station != NULL)
+        CloseWindowStation(made->station);
     free(made->name);
 }
 
