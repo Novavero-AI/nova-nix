@@ -872,7 +872,7 @@ narSpecFileVector =
 -- 'Subst.SubstError' with its message.
 offeredThenFetched :: FetchRetryPolicy -> RetryEffects IO -> Store -> [Subst.CacheConfig] -> StorePath -> IO Subst.SubstResult
 offeredThenFetched policy effects store caches sp = do
-  offer <- evalStateT (Subst.queryReferencesWith testLogger policy effects Realise.NoFallback caches sp) Subst.emptyNarInfoMemo
+  offer <- evalStateT (Subst.queryReferencesWith testLogger policy effects Realise.NoFallback caches sp) Subst.emptyCacheMemo
   case offer of
     Realise.Offered substitute _ -> Subst.fetchSubstituteWith policy effects store substitute
     Realise.NotOffered -> pure Subst.SubstNotFound

@@ -369,7 +369,7 @@
       ]
     },
     {
-      "description": "Copies the closure of each `PATH`, or with `--all` every valid path except derivations, to the binary cache at `URL`. A `PATH` is a store path, in full or as its base name; a derivation is refused, since a binary cache serves outputs. Paths the cache already holds are skipped, and every NAR is in place before any narinfo announces it. An `http://` or `https://` `URL` is a nova-cache server, which signs what it receives, and a narinfo is read back to check that the server signed it. A `file://` `URL` names a directory, which gets the layout upstream's `nix copy --to file://` writes, so that any web server can serve it: `nix-cache-info`, a narinfo for each path, signed with the secret key in `--secret-key-file`, and the NARs under `nar/`. The key file is one `nix-store --generate-binary-cache-key` writes, and a substituter of the cache trusts its public key. It prints how many paths it pushed and how many the cache already held.",
+      "description": "Copies the closure of each `PATH`, or with `--all` every valid path except derivations, to the binary cache at `URL`. A `PATH` is a store path, in full or as its base name; a derivation is refused, since a binary cache serves outputs. Paths the cache already holds are skipped, and every NAR is in place before any narinfo announces it. An `http://` or `https://` `URL` is a nova-cache server, which signs what it receives, and a narinfo is read back to check that the server signed it. A `file://` `URL` names a directory, which gets the layout upstream's `nix copy --to file://` writes, so that any web server can serve it and a substituter can read it through the same `URL`: `nix-cache-info`, a narinfo for each path, signed with the secret key in `--secret-key-file`, and the NARs under `nar/`. The key file is one `nix-store --generate-binary-cache-key` writes, and a substituter of the cache trusts its public key. It prints how many paths it pushed and how many the cache already held.",
       "examples": [
         {
           "arguments": [
@@ -714,7 +714,7 @@
     "description": "`nix.conf` is read in upstream's order: `$NIX_CONF_DIR/nix.conf`, where `NIX_CONF_DIR` defaults to `/etc/nix`, or `%ProgramData%\\nix` on Windows; the XDG `nix/nix.conf` files or `$NIX_USER_CONF_FILES`; then `$NIX_CONFIG`. A later source replaces an earlier one's value, an `extra-` prefix on a list setting adds to it instead, and a flag adds to whatever they configure: an entry to a list, or a Boolean moved from its default, which a flag cannot move back.",
     "settings": [
       {
-        "description": "Binary caches a build substitutes from",
+        "description": "Binary caches a build substitutes from, each the `http://` or `https://` URL of one a server serves or the `file://` URL of a directory, such as one `push` writes (`file:///D:/cache` on Windows), which is asked at the `Priority` its `nix-cache-info` states, `0` when it states none",
         "flag": "--substituter",
         "name": "substituters"
       },
