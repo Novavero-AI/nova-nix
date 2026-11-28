@@ -56,7 +56,7 @@ module Nix.Eval.IO
   )
 where
 
-import Control.Exception (Exception, IOException, SomeAsyncException, SomeException, bracket, bracket_, catch, catchJust, displayException, fromException, onException, throwIO, try, tryJust)
+import Control.Exception (Exception, IOException, SomeAsyncException, SomeException, bracket, bracket_, catch, catchJust, displayException, fromException, onException, throwIO, toException, try, tryJust)
 import Control.Monad (mfilter, unless, void, when)
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Control.Monad.IO.Class (liftIO)
@@ -958,18 +958,17 @@ instance MonadEval EvalIO where
 
   addSourceNar name narBytes =
     case NAR.deserialise narBytes of
-      -- The bytes come from NAR.serialise of a tree this process just
-      -- walked, so they fail to parse only when the tree holds a name or
-      -- a link target past the format's limits: the walk archives one,
-      -- as upstream's dump does, and the parser refuses it, as
-      -- upstream's parse of that dump does.  On Windows a name of 255
-      -- UTF-16 units can pass 255 bytes of UTF-8.
-      Left err -> throwEvalError ("builtins.path: internal NAR round-trip error: " <> T.pack err)
+      -- The bytes are the NAR of a tree the filter walk just built, so
+      -- they fail to parse only when the tree holds what a filesystem can
+      -- hold and the parser refuses, such as a name past the length the
+      -- parser holds names to: on Windows a name of 255 UTF-16 units can
+      -- pass 255 bytes of UTF-8.  Upstream's restore of its own dump
+      -- refuses such an archive in its parser's words, and the refusal
+      -- here is the parser's too.
+      Left err -> throwEvalError (T.pack err)
       Right entry -> do
         sp <- storePathOrThrow (makeFixedOutputPath name "sha256" NarIngestion (sha256Digest narBytes))
         let destPath = canonicalStorePathText sp
-        -- Raised here rather than inside 'wrapIO', which would render
-        -- the refusal through an exception's own text ("user error (...)").
         writtenFor Computed $ do
           destFilePath <- evalFilePath sp
           wrapIO (unpackToStoreVerified destFilePath entry (sha256Digest narBytes)) >>= either throwEvalError pure
@@ -1232,14 +1231,11 @@ addMade ops = do
       outcome <- wrapIO (try (soAddEvalObjects ops objects))
       recordAdded st objects outcome
     recordAdded st objects outcome = case outcome of
-      Left (failure :: IOException) -> pure (Left (RealisationFailed (T.pack (ioFailureText failure))))
+      Left (failure :: IOException) -> pure (Left (RealisationFailed (exceptionText (toException failure))))
       Right (Left reason) -> pure (Left (RealisationFailed reason))
       Right (Right ()) -> do
         let paths = map canonicalStorePathText (Map.keys (eoSources objects)) <> Map.keys (eoStoreWrites objects) <> Map.keys (eoDerivations objects)
         Right () <$ EvalIO (liftIO (modifyIORef' (esAdded st) (<> Set.fromList paths)))
-    ioFailureText failure
-      | isUserError failure = ioeGetErrorString failure
-      | otherwise = displayException failure
 
 -- | Under a restricting policy, make readable every path in the closures
 -- of a realisation's outputs, as upstream's @allowClosure@ does
@@ -1639,22 +1635,36 @@ wrapIO action = EvalIO $ liftIO $ do
       | Just (_ :: SomeAsyncException) <- fromException err -> throwIO err
       | Just abortErr <- fromException err -> throwIO (abortErr :: NixAbortError)
       | Just nixErr <- fromException err -> throwIO (nixErr :: NixEvalError)
-      | otherwise -> throwIO (NixEvalError ErrorUncatchable (untracedFailure (T.pack (displayException err))))
+      | otherwise -> throwIO (NixEvalError ErrorUncatchable (untracedFailure (exceptionText err)))
+
+-- | An exception as the user reads it.  A 'userError' is a refusal the
+-- code raised in its own words (a tree the walk refuses to archive, a
+-- path the store refuses to register), so it is its message alone,
+-- which 'displayException' would wrap in @user error (...)@.
+exceptionText :: SomeException -> Text
+exceptionText err = case fromException err of
+  Just ioErr | isUserError ioErr -> T.pack (ioeGetErrorString ioErr)
+  _ -> T.pack (displayException err)
 
 -- | 'wrapIO' for an access to a source path: an 'IOException' becomes
 -- the message upstream gives that access ('sourceErrorMessage'), naming
--- the path as given.
+-- the path as given.  A 'userError' is no failed access but a refusal in
+-- its own words, such as the walk's of an entry a NAR cannot hold, so it
+-- reaches 'wrapIO' as it was raised.
 sourceIO :: SourceAccess -> Text -> IO a -> EvalIO a
 sourceIO access path = sourceIOWith access (pure path)
 
 -- | 'sourceIO' with the path to name computed once the access has failed,
 -- so a successful read pays nothing for it.
 sourceIOWith :: SourceAccess -> IO Text -> IO a -> EvalIO a
-sourceIOWith access shownPath action =
-  wrapIO $
-    action `catch` \(err :: IOException) -> do
-      shown <- shownPath
-      throwIO (NixEvalError ErrorUncatchable (untracedFailure (sourceErrorMessage access shown err)))
+sourceIOWith access shownPath action = wrapIO (action `catch` reworded)
+  where
+    reworded :: IOException -> IO b
+    reworded err
+      | isUserError err = throwIO err
+      | otherwise = do
+          shown <- shownPath
+          throwIO (NixEvalError ErrorUncatchable (untracedFailure (sourceErrorMessage access shown err)))
 
 -- | A path with its symlinks resolved, as upstream names one it reached
 -- through realisePath (readFile, hashFile and readDir resolve fully),
@@ -1703,7 +1713,7 @@ runEvalIOTraced st (EvalIO action) = do
       | Just (_ :: SomeAsyncException) <- fromException err -> throwIO err
       | Just (NixEvalError _ failure) <- fromException err -> pure (Left failure)
       | Just (NixAbortError failure) <- fromException err -> pure (Left failure)
-      | otherwise -> pure (Left (untracedFailure (T.pack (displayException err))))
+      | otherwise -> pure (Left (untracedFailure (exceptionText err)))
 
 -- ---------------------------------------------------------------------------
 -- Store copy helpers
