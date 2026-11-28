@@ -184,7 +184,9 @@ In that case, give those commands a store in your home directory,
 that only you, SYSTEM and Administrators can change it, and nova-nix creates a
 store directory with the same permissions. A `C:\nix` that nova-nix creates
 itself grants other users nothing; the installer accepts it and gives it its
-own permissions.
+own permissions. nova-nix refuses a store when the store directory, or a
+directory on the way to it below the drive root, is owned by another account or
+lets one change it, and the error names the directory to move aside.
 Turn on Developer Mode (Settings, For developers): nova-nix makes native
 symlinks, inside store paths and for the `result` link a build makes, and
 Windows allows them only in Developer Mode or an elevated shell. Without

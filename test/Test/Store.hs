@@ -32,21 +32,21 @@ where
 
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Exception (IOException, SomeException, bracket, bracket_, evaluate, finally, throwIO, try)
-import Control.Monad (filterM, forM, when)
-import Data.Bits (xor, (.&.))
+import Control.Monad (filterM, forM, join, when)
+import Data.Bits (complement, popCount, shiftR, xor, (.&.), (.|.))
 import qualified Data.ByteString as BS
 import Data.Char (isDigit)
 import Data.Either (isLeft, isRight)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isPrefixOf, nub, sort)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust, isNothing, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
-import Data.Word (Word32, Word8)
+import Data.Word (Word16, Word32, Word8)
 import qualified Database.SQLite.Simple as SQL
 import DirDacl (Dacl (..), DaclEntry (..), directoryDacl, processUserSid)
 import GHC.IO.Exception (IOErrorType (..), IOException (..))
@@ -63,13 +63,13 @@ import Nix.Http (defaultFetchRetryPolicy, ioRetryEffects)
 import Nix.Push (computeClosure)
 import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv)
-import Nix.Store.Access (DirAccess (..), accessSddl, sidFromText)
+import Nix.Store.Access (AclEntry (..), DirAccess (..), DirSecurity (..), Distrust (..), accessSddl, descriptorDistrust, distrustMessage, parseSecurityDescriptor, securityDistrust, sidFromText, storeDirectories)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (MetadataChange (..), NodeKind (..), NodeMetadata (..), Ownership (..), canonicalPermissions, executablePermissions, metadataChanges, readOnlyPermissions, storeModificationTime)
-import Nix.Store.Ops (EvalObjects (..), StoreOps (..), StoreQueries (..), withLocalStore, withOpenedOnFirstUse)
+import Nix.Store.Ops (EvalObjects (..), StoreOps (..), StoreQueries (..), localQueries, withLocalStore, withOpenedOnFirstUse)
 import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, qualifyPathText, storePathHashLen, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import Nix.Store.Path.Internal (StorePath (..))
 import Nix.Store.Upstream (UpstreamHazard (..), upstreamManagedRefusal)
@@ -82,15 +82,17 @@ import qualified NovaCache.Signing as Signing
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
 import System.Environment (lookupEnv)
+import System.Exit (ExitCode (..))
 import qualified System.FileLock as FileLock
 import System.FilePath (dropDrive, joinPath, pathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
-import System.IO.Error (ioeGetErrorString, ioeGetFileName, isAlreadyExistsError)
+import System.IO.Error (ioeGetErrorString, ioeGetFileName, isAlreadyExistsError, isUserError)
 import qualified System.Info as SI
 import qualified System.OsPath as OP
 import qualified System.Process as Proc
 import System.Timeout (timeout)
 import Test.Harness (TestResult (..), andThen, assertEqual, assertEvalErrorIO, bytesText, canonicalAs, chunkReader, deleteNamed, evalAndBuild, evalNix, evalNixIOIn, evalNixIOStore, findTestShell, forceRemoveIfExists, genDrvName, genFixturePath, mkTestBuildDrv, narInfoRequest, narSpecFileVector, narSpecVector, offeredThenFetched, parseErrorTag, posixOnlyEntries, quotedAsCxx, removeIfExists, runTest, runTestM, servedPaths, sigTestKeyText, simpleTestDrv, symlinksAvailable, testDrvPath, testEvalState, testLogger, walkWatchdogMicros, withTempStore)
 import qualified Test.QuickCheck as QC
+import Text.Read (readMaybe)
 
 -- ---------------------------------------------------------------------------
 -- Tests: Store paths (existing)
@@ -1335,13 +1337,19 @@ testParseStorePath = do
 -- Tests: Push (pure narinfo construction + closure computation)
 -- ---------------------------------------------------------------------------
 
--- | Who a directory the store creates is open to ("Nix.Store.Access").
--- The SDDL each is created with on Windows is checked on every
--- platform.  On Windows a new store's directories, the parents made for
--- them and a build directory are read back through the API: protected,
--- with nothing inherited, and granting what install-nova-nix grants on
--- @C:\\nix@, that less Users' entry, or the user alone, so no entry names
--- Authenticated Users or Everyone.
+-- | Who a directory the store creates is open to, and when one already
+-- there may hold a store or lead to one ("Nix.Store.Access").  The SDDL
+-- each is created with on Windows is checked on every platform, and so
+-- are the directories a store's open checks, install-nova-nix's rule
+-- over an owner and DACL, the security descriptor that rule reads, and
+-- the refusal's words.  On Windows a new store's directories, the
+-- parents made for them and a build directory are read back through the
+-- API: protected, with nothing inherited, and granting what
+-- install-nova-nix grants on @C:\\nix@, that less Users' entry, or the
+-- user alone, so no entry names Authenticated Users or Everyone.  A
+-- store nova-nix made opens again, and one whose parent another account
+-- owns, or whose parent's DACL lets another account change it, is
+-- refused naming that parent.
 testStoreAccessIO :: IO [Bool]
 testStoreAccessIO = do
   putStrLn "store/access"
@@ -1413,6 +1421,149 @@ testStoreAccessIO = do
         | otherwise = runTestM name $ do
             user <- processUserSid
             maybe (pure (Fail "no user SID was read")) check user
+      otherUser = "S-1-5-21-1-2-3-1002"
+      administrators = "S-1-5-32-544"
+      users = "S-1-5-32-545"
+      authenticatedUsers = "S-1-5-11"
+      creatorOwner = "S-1-3-0"
+      everyone = "S-1-1-0"
+      localService = "S-1-5-19"
+      -- Modify, FILE_GENERIC_READ | FILE_GENERIC_WRITE |
+      -- FILE_GENERIC_EXECUTE | DELETE, which a client edition's drive
+      -- root passes down to Authenticated Users.
+      modify = 0x1301BF
+      -- GENERIC_READ | GENERIC_EXECUTE, which C:\Users passes down to
+      -- Everyone.
+      genericReadExecute = 0xA0000000
+      -- Each right that lets an account change a directory, by its
+      -- winnt.h name.
+      changingRights =
+        [ ("FILE_WRITE_DATA", 0x2),
+          ("FILE_APPEND_DATA", 0x4),
+          ("FILE_WRITE_EA", 0x10),
+          ("FILE_DELETE_CHILD", 0x40),
+          ("FILE_WRITE_ATTRIBUTES", 0x100),
+          ("DELETE", 0x10000),
+          ("WRITE_DAC", 0x40000),
+          ("WRITE_OWNER", 0x80000),
+          ("GENERIC_ALL", 0x10000000),
+          ("GENERIC_WRITE", 0x40000000)
+        ]
+      allowing rights sid = AllowEntry rights <$> sidFromText sid
+      installerEntries = [allowing fullControl someUser, allowing fullControl localSystem, allowing fullControl administrators, allowing readAndExecute users]
+      -- The decision for someUser over an owner and a DACL, their SIDs
+      -- given as text, which is Nothing when one is not a SID.
+      decision owner entries = do
+        user <- sidFromText someUser
+        security <- DirSecurity <$> traverse sidFromText owner <*> traverse sequenceA entries
+        pure (securityDistrust user security)
+      decides label owner entries expected =
+        runTest label (fromMaybe (Fail "a SID in the case is not one") (assertEqual label <$> expected <*> decision owner entries))
+      accepted = Just Nothing
+      refusedAs reason = Just <$> reason
+      writableBy sid = refusedAs (WritableBy <$> sidFromText sid)
+      -- A SID, a DACL and a self-relative security descriptor laid out
+      -- as MS-DTYP gives them.  An entry is its type, flags and size,
+      -- then its access mask and SID where its type puts them.
+      le16 :: Word16 -> BS.ByteString
+      le16 value = BS.pack [fromIntegral value, fromIntegral (value `shiftR` 8)]
+      le32 :: Word32 -> BS.ByteString
+      le32 value = BS.pack [fromIntegral (value `shiftR` shift) | shift <- [0, 8, 16, 24]]
+      sidBytes text = do
+        rest <- T.stripPrefix "S-1-" text
+        (authority, subauthorities) <- case T.splitOn "-" rest of
+          first : more -> Just (first, more)
+          [] -> Nothing
+        value <- readMaybe (T.unpack authority) :: Maybe Integer
+        subs <- traverse (readMaybe . T.unpack) subauthorities
+        pure (BS.pack (1 : fromIntegral (length subs) : [fromIntegral (value `shiftR` shift) | shift <- [40, 32 .. 0]]) <> foldMap le32 subs)
+      entryOf kind flags body = BS.pack [kind, flags] <> le16 (fromIntegral (4 + BS.length body)) <> body
+      common kind flags mask sid trailing = entryOf kind flags (le32 mask <> sid <> trailing)
+      compound flags mask sid = entryOf 0x4 flags (le32 mask <> le16 1 <> le16 0 <> sid)
+      object kind flags mask objectFlags sid = entryOf kind flags (le32 mask <> le32 objectFlags <> BS.replicate (16 * popCount objectFlags) 0xAB <> sid)
+      aclOf entries = BS.pack [2, 0] <> le16 (fromIntegral (8 + sum (map BS.length entries))) <> le16 (fromIntegral (length entries)) <> le16 0 <> mconcat entries
+      -- The DACL is Nothing for a descriptor that says it has none, Just
+      -- Nothing for a null one, and otherwise the DACL's bytes.
+      descriptorOf owner dacl =
+        let ownerBytes = fromMaybe BS.empty owner
+            daclBytes = fromMaybe BS.empty (join dacl)
+            offsetOf part at = if BS.null part then 0 else at
+         in BS.pack [1, 0]
+              <> le16 (0x8000 .|. maybe 0 (const 0x4) dacl)
+              <> le32 (offsetOf ownerBytes 20)
+              <> le32 0
+              <> le32 0
+              <> le32 (offsetOf daclBytes (20 + fromIntegral (BS.length ownerBytes)))
+              <> ownerBytes
+              <> daclBytes
+      -- SIDs spelled byte by byte, apart from sidBytes.
+      systemBytes = BS.pack [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]
+      administratorsBytes = BS.pack [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 0x02, 0, 0]
+      authenticatedBytes = BS.pack [1, 1, 0, 0, 0, 0, 0, 5, 11, 0, 0, 0]
+      creatorOwnerBytes = BS.pack [1, 1, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0]
+      userBytes = BS.pack [1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0xE9, 0x03, 0, 0]
+      -- Owned by Administrators, with a DACL of one entry, full control
+      -- for SYSTEM passed down (OICI), spelled byte by byte.
+      fixture =
+        BS.pack
+          ( [1, 0, 0x04, 0x80, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 0, 0]
+              <> [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 0x02, 0, 0]
+              <> [2, 0, 28, 0, 1, 0, 0, 0]
+              <> [0, 0x03, 20, 0, 0xFF, 0x01, 0x1F, 0, 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]
+          )
+      setByte index value bytes = BS.take index bytes <> BS.singleton value <> BS.drop (index + 1) bytes
+      ownedByUser dacl = descriptorOf (Just userBytes) (Just (Just (aclOf dacl)))
+      -- The kinds of entry each layout holds, spelled apart from the
+      -- library's tables.
+      commonKinds = [0x0, 0x1, 0x2, 0x3, 0x9, 0xA, 0xD, 0xE]
+      objectKinds = [0x5, 0x6, 0x7, 0x8, 0xB, 0xC, 0xF, 0x10]
+      allowKinds = [0x0, 0x4, 0x5, 0x9, 0xB]
+      -- An entry's bytes and what it is read as, for a generated type,
+      -- flags, mask, object flags and SID.
+      encodedEntry (kind, flags, mask, objectFlags, sidText) = do
+        sid <- sidBytes sidText
+        named <- sidFromText sidText
+        let meaning
+              | kind `elem` allowKinds = AllowEntry mask named
+              | kind `elem` (0x4 : commonKinds <> objectKinds) = OtherEntry
+              | otherwise = UnknownEntry kind
+            bytes
+              | kind == 0x4 = compound flags mask sid
+              | kind `elem` objectKinds = object kind flags mask objectFlags sid
+              | otherwise = common kind flags mask sid BS.empty
+        pure (bytes, meaning)
+      genEntry = (,,,,) <$> QC.choose (0, 0x14) <*> QC.arbitrary <*> QC.arbitrary <*> QC.choose (0, 3) <*> genSid
+      genDacl = QC.oneof [pure Nothing, pure (Just Nothing), Just . Just <$> QC.resize 6 (QC.listOf genEntry)]
+      -- A generated descriptor's bytes and what they are read as.
+      encodedDescriptor (ownerText, daclSpec) = do
+        owner <- traverse sidBytes ownerText
+        ownerSid <- traverse sidFromText ownerText
+        entries <- traverse (traverse (traverse encodedEntry)) daclSpec
+        let dacl = fmap (fmap (aclOf . map fst)) entries
+        pure (descriptorOf owner dacl, DirSecurity ownerSid (fmap (map snd) =<< entries))
+      -- Open the store again, and expect it refused for the directory,
+      -- for the reason given.
+      refusedFor root dir reason = do
+        store <- unStoreDir <$> canonicalStoreDir (StoreDir root)
+        outcome <- try (openStore testLogger (StoreDir root) >>= closeStore)
+        pure $ case (reason, outcome) of
+          (Nothing, _) -> Fail "the reason names no SID"
+          (Just why, Left err)
+            | isUserError err -> assertEqual "the refusal" (distrustMessage dir store why) (ioeGetErrorString err)
+            | otherwise -> Fail ("expected a refusal, got: " <> T.pack (show (err :: IOException)))
+          (Just _, Right ()) -> Fail "the store was opened"
+      -- icacls changes a DACL or an owner, as another account's tools
+      -- would; its exit code says whether it could.
+      icacls args = do
+        (code, out, err) <- Proc.readProcessWithExitCode "icacls" args ""
+        pure (code, out <> err)
+      -- nova-nix makes the store, and icacls changes its parent.
+      madeThenChanged label args = do
+        let root = scratch label </> "nix" </> "store"
+        openStore testLogger (StoreDir root) >>= closeStore
+        parent <- takeDirectory . unStoreDir <$> canonicalStoreDir (StoreDir root)
+        (code, said) <- icacls (parent : args)
+        pure (root, parent, code, said)
   sequence
     [ runTest "a store directory's DACL is protected, with full control for the user, SYSTEM and Administrators and read and execute for Users, each passed down" $
         assertEqual
@@ -1528,7 +1679,227 @@ testStoreAccessIO = do
           after <- directoryDacl root
           pure $
             assertEqual "protected before the open" (Just False) (daclProtected <$> before)
-              `andThen` assertEqual "the DACL after the open" before after
+              `andThen` assertEqual "the DACL after the open" before after,
+      runTest "the directories a store's open checks are those below its volume root, outermost first, the store's and its state directory's made with StoreAccess and the others with ParentAccess" $
+        assertEqual
+          "the default store"
+          [("C:\\nix", ParentAccess), ("C:\\nix\\store", StoreAccess), ("C:\\nix\\store\\.nova-nix", StoreAccess)]
+          (storeDirectories "C:\\nix\\store\\.nova-nix")
+          `andThen` assertEqual
+            "a store further down"
+            [("D:\\a", ParentAccess), ("D:\\a\\_temp", ParentAccess), ("D:\\a\\_temp\\store", StoreAccess), ("D:\\a\\_temp\\store\\.nova-nix", StoreAccess)]
+            (storeDirectories "D:\\a\\_temp\\store\\.nova-nix")
+          `andThen` assertEqual "a store at a drive root" [("E:\\.nova-nix", StoreAccess)] (storeDirectories "E:\\.nova-nix")
+          `andThen` assertEqual
+            "a trailing separator"
+            [("C:\\nix", ParentAccess), ("C:\\nix\\store", StoreAccess), ("C:\\nix\\store\\.nova-nix", StoreAccess)]
+            (storeDirectories "C:\\nix\\store\\.nova-nix\\"),
+      decides "install-nova-nix's DACL, on a directory the user owns, is trusted with a store" (Just someUser) (Just installerEntries) accepted,
+      decides "a directory Administrators own, as one an elevated shell makes is, is trusted" (Just administrators) (Just installerEntries) accepted,
+      decides "a directory SYSTEM owns is trusted" (Just localSystem) (Just installerEntries) accepted,
+      decides "a directory another account owns is refused, naming its owner" (Just otherUser) (Just installerEntries) (refusedAs (OwnedBy . Just <$> sidFromText otherUser)),
+      decides "a directory with no owner is refused" Nothing (Just installerEntries) (refusedAs (Just (OwnedBy Nothing))),
+      decides "a directory with no DACL, or a null one, is refused" (Just someUser) Nothing (refusedAs (Just NoDacl)),
+      decides "an empty DACL, which grants no account anything, is trusted" (Just someUser) (Just []) accepted,
+      decides
+        "the DACL a client edition's drive root passes down is refused for its modify for Authenticated Users"
+        (Just someUser)
+        (Just [allowing fullControl administrators, allowing fullControl localSystem, allowing readAndExecute users, allowing modify authenticatedUsers])
+        (writableBy authenticatedUsers),
+      decides
+        "the DACL a server edition's drive root passes down is refused for its first grant to Users, to add a subdirectory"
+        (Just administrators)
+        (Just [allowing fullControl localSystem, allowing fullControl administrators, allowing readAndExecute users, allowing 0x4 users, allowing 0x2 users, allowing 0x10000000 creatorOwner])
+        (writableBy users),
+      decides
+        "read and execute for Users and Everyone, and the generic read and execute C:\\Users passes down, change nothing and are trusted"
+        (Just someUser)
+        (Just (installerEntries <> [allowing readAndExecute everyone, allowing genericReadExecute everyone]))
+        accepted,
+      decides "a deny, audit or alarm entry, whatever it names, is trusted" (Just someUser) (Just (Just OtherEntry : installerEntries)) accepted,
+      decides "an entry of a type nova-nix cannot read is refused" (Just someUser) (Just (installerEntries <> [Just (UnknownEntry 0x11)])) (refusedAs (Just UnreadableEntry)),
+      decides
+        "of two entries another account could change the directory through, the first is named"
+        (Just someUser)
+        (Just [allowing 0x40 authenticatedUsers, allowing fullControl users])
+        (writableBy authenticatedUsers),
+      runTest "each right that changes a directory, granted alone to another account, is refused, and every other right together is trusted" $
+        foldr
+          (\(name, rights) rest -> assertEqual name (writableBy authenticatedUsers) (decision (Just someUser) (Just [allowing rights authenticatedUsers])) `andThen` rest)
+          Pass
+          changingRights
+          `andThen` assertEqual
+            "every other right"
+            accepted
+            (decision (Just someUser) (Just [allowing (complement (foldr ((.|.) . snd) 0 changingRights)) authenticatedUsers])),
+      runTest "one SID is trusted whatever the case of its wide authority's hexadecimal digits" $
+        fromMaybe (Fail "not a SID") $ do
+          user <- sidFromText "S-1-0x123456789abc-1"
+          spelled <- sidFromText "S-1-0x123456789ABC-1"
+          pure (assertEqual "the decision" Nothing (securityDistrust user (DirSecurity (Just spelled) (Just [AllowEntry fullControl spelled])))),
+      -- What nova-nix creates a directory with, read back from the SDDL
+      -- it writes.
+      runTestM "a directory nova-nix creates, owned by the user, is trusted with a store, for every user and access" $
+        let readBack user sddl = do
+              entries <- sddlEntries sddl
+              DirSecurity (Just user) . Just <$> traverse allowEntryOf entries
+            allowEntryOf fields = case fields of
+              ["A", "OICI", rights, "", "", trustee] -> AllowEntry <$> readMaybe (T.unpack rights) <*> sidFromText trustee
+              _ -> Nothing
+         in property $
+              QC.forAll genSid $ \text -> case sidFromText text of
+                Nothing -> QC.counterexample ("refused " <> T.unpack text) False
+                Just user ->
+                  QC.conjoin
+                    [ QC.counterexample (show access) (fmap (securityDistrust user) (readBack user (accessSddl user access)) QC.=== Just Nothing)
+                    | access <- [StoreAccess, ParentAccess, OwnerAccess]
+                    ],
+      runTest "a security descriptor is read as MS-DTYP lays it out" $
+        fromMaybe (Fail "not a SID") $ do
+          owner <- sidFromText administrators
+          system <- sidFromText localSystem
+          pure $
+            assertEqual "the fixture" (Just (DirSecurity (Just owner) (Just [AllowEntry fullControl system]))) (parseSecurityDescriptor fixture)
+              `andThen` assertEqual "the fixture as built" fixture (descriptorOf (Just administratorsBytes) (Just (Just (aclOf [common 0x0 0x03 fullControl systemBytes BS.empty])))),
+      runTest "an inherit-only entry granting another account a change is refused" $
+        fromMaybe (Fail "not a SID") $ do
+          user <- sidFromText someUser
+          grantee <- sidFromText creatorOwner
+          -- OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE
+          pure (assertEqual "the decision" (Just (WritableBy grantee)) (descriptorDistrust user (ownedByUser [common 0x0 0x0B 0x10000000 creatorOwnerBytes BS.empty]))),
+      runTest "a null DACL, a descriptor that says it has no DACL, and one with no owner are refused" $
+        fromMaybe (Fail "not a SID") $ do
+          user <- sidFromText someUser
+          pure $
+            assertEqual "a null DACL" (Just NoDacl) (descriptorDistrust user (descriptorOf (Just userBytes) (Just Nothing)))
+              `andThen` assertEqual "no DACL" (Just NoDacl) (descriptorDistrust user (descriptorOf (Just userBytes) Nothing))
+              `andThen` assertEqual "no owner" (Just (OwnedBy Nothing)) (descriptorDistrust user (descriptorOf Nothing (Just (Just (aclOf []))))),
+      runTest "an allow entry of every kind is read, past a callback's data and an object entry's GUIDs" $
+        fromMaybe (Fail "not a SID") $ do
+          user <- sidFromText someUser
+          grantee <- sidFromText authenticatedUsers
+          pure $
+            assertEqual
+              "the entries"
+              (Just (DirSecurity (Just user) (Just (replicate 5 (AllowEntry 0x2 grantee)))))
+              ( parseSecurityDescriptor
+                  ( ownedByUser
+                      [ common 0x0 0x0 0x2 authenticatedBytes BS.empty,
+                        common 0x9 0x0 0x2 authenticatedBytes "callback data",
+                        compound 0x0 0x2 authenticatedBytes,
+                        object 0x5 0x0 0x2 3 authenticatedBytes,
+                        object 0xB 0x0 0x2 1 authenticatedBytes
+                      ]
+                  )
+              ),
+      runTest "a deny, audit or alarm entry of every kind grants nothing, and an entry of a later type, such as a mandatory label, is unreadable" $
+        fromMaybe (Fail "not a SID") $ do
+          user <- sidFromText someUser
+          let granting kind
+                | kind `elem` objectKinds = object kind 0x0 0xFFFFFFFF 2 authenticatedBytes
+                | otherwise = common kind 0x0 0xFFFFFFFF authenticatedBytes BS.empty
+              restricting = [0x1, 0x2, 0x3, 0xA, 0xD, 0xE, 0x6, 0x7, 0x8, 0xC, 0xF, 0x10]
+          pure $
+            assertEqual "the entries" (Just (DirSecurity (Just user) (Just (map (const OtherEntry) restricting)))) (parseSecurityDescriptor (ownedByUser (map granting restricting)))
+              `andThen` assertEqual "a mandatory label" (Just UnreadableEntry) (descriptorDistrust user (ownedByUser [common 0x11 0x0 0x1 authenticatedBytes BS.empty])),
+      runTest "bytes that are not a security descriptor are refused as unreadable" $
+        fromMaybe (Fail "not a SID") $ do
+          user <- sidFromText someUser
+          let malformed =
+                [ ("empty", BS.empty),
+                  ("a header cut short", BS.take 19 fixture),
+                  ("another revision", setByte 0 2 fixture),
+                  ("not self-relative", setByte 3 0x00 fixture),
+                  ("an owner past the end", setByte 4 200 fixture),
+                  ("an ACL past the end", setByte 38 60 fixture),
+                  ("an entry past its ACL", setByte 46 40 fixture),
+                  ("an entry smaller than its header", setByte 46 2 fixture),
+                  ("more entries than the ACL holds", setByte 40 2 fixture),
+                  ("a SID of another revision", setByte 20 2 fixture),
+                  ("a SID of sixteen subauthorities", descriptorOf (Just (BS.pack [1, 16, 0, 0, 0, 0, 0, 5] <> foldMap le32 (replicate 16 1))) Nothing)
+                ]
+          pure (foldr (\(name, bytes) rest -> assertEqual name (Just UnreadableDescriptor) (descriptorDistrust user bytes) `andThen` rest) Pass malformed),
+      runTestM "a descriptor is read back as it was laid out, and no part of it cut short is read" $
+        property $
+          QC.forAll ((,) <$> QC.oneof [pure Nothing, Just <$> genSid] <*> genDacl) $ \spec -> case encodedDescriptor spec of
+            Nothing -> QC.counterexample "a generated SID does not encode" False
+            Just (bytes, expected) ->
+              parseSecurityDescriptor bytes QC.=== Just expected
+                QC..&&. QC.conjoin [QC.counterexample ("cut to " <> show size) (parseSecurityDescriptor (BS.take size bytes) QC.=== Nothing) | size <- [0 .. BS.length bytes - 1]],
+      runTest "a refusal names the directory, what is wrong with it and the store, and says to move the directory aside" $
+        fromMaybe (Fail "not a SID") $ do
+          owner <- sidFromText otherUser
+          grantee <- sidFromText authenticatedUsers
+          let refusal = distrustMessage "C:\\nix" "C:\\nix\\store"
+              advice = ", so the store in C:\\nix\\store cannot be trusted; move C:\\nix aside and let nova-nix or install-nova-nix create it"
+          pure $
+            assertEqual "another owner" ("C:\\nix belongs to S-1-5-21-1-2-3-1002, not to you, SYSTEM or Administrators" <> advice) (refusal (OwnedBy (Just owner)))
+              `andThen` assertEqual "no owner" ("C:\\nix belongs to no one, not to you, SYSTEM or Administrators" <> advice) (refusal (OwnedBy Nothing))
+              `andThen` assertEqual "no DACL" ("C:\\nix has no DACL, which lets every account change it" <> advice) (refusal NoDacl)
+              `andThen` assertEqual "an unreadable entry" ("C:\\nix carries an access entry of a kind nova-nix cannot read" <> advice) (refusal UnreadableEntry)
+              `andThen` assertEqual "a grant" ("C:\\nix lets S-1-5-11 change it" <> advice) (refusal (WritableBy grantee))
+              `andThen` assertEqual "an unreadable descriptor" ("C:\\nix has a security descriptor nova-nix cannot read" <> advice) (refusal UnreadableDescriptor),
+      -- The first open checks every directory above the store's parents
+      -- in the temporary directory, which nova-nix did not make; the
+      -- second checks those it made.
+      onWindows "a store nova-nix made, and the parents it made for it, are trusted when it is opened again" $ \_ ->
+        fresh "reopened" $ do
+          let root = scratch "reopened" </> "nix" </> "store"
+          openStore testLogger (StoreDir root) >>= closeStore
+          outcome <- try (openStore testLogger (StoreDir root) >>= closeStore)
+          pure (either (\err -> Fail ("the second open failed: " <> T.pack (show (err :: IOException)))) (const Pass) outcome),
+      -- LOCAL SERVICE stands for another user: giving a directory away
+      -- takes the restore privilege an elevated shell holds.
+      onWindows "a store whose parent another account owns is refused, naming the parent and its owner" $ \_ ->
+        fresh "owned" $ do
+          (root, parent, code, said) <- madeThenChanged "owned" ["/setowner", "*" <> T.unpack localService]
+          case code of
+            ExitFailure _ -> Pass <$ putStrLn ("  SKIP  giving a directory another owner needs an elevated shell: " <> said)
+            ExitSuccess -> refusedFor root parent (OwnedBy . Just <$> sidFromText localService),
+      onWindows "a store whose parent lets Authenticated Users change it is refused, by the read-only queries too, naming the parent and them" $ \_ ->
+        fresh "granted" $ do
+          (root, parent, code, said) <- madeThenChanged "granted" ["/grant", "*" <> T.unpack authenticatedUsers <> ":(OI)(CI)(M)"]
+          case code of
+            ExitFailure _ -> pure (Fail ("icacls could not grant the right: " <> T.pack said))
+            ExitSuccess -> do
+              opened <- refusedFor root parent (WritableBy <$> sidFromText authenticatedUsers)
+              store <- unStoreDir <$> canonicalStoreDir (StoreDir root)
+              queried <- try (sqValidPaths (localQueries (StoreDir root)) Set.empty)
+              pure $
+                opened `andThen` case (queried, sidFromText authenticatedUsers) of
+                  (Left err, Just grantee)
+                    | isUserError err -> assertEqual "the read-only refusal" (distrustMessage parent store (WritableBy grantee)) (ioeGetErrorString err)
+                  (outcome, _) -> Fail ("expected the read-only queries refused, got: " <> T.pack (show (outcome :: Either IOException (Set.Set StorePath)))),
+      -- Upstream's database beside the store makes the store's tree
+      -- answer a read-only query in place of nova-nix's database.
+      onWindows "a store upstream's database also manages, whose parent lets Authenticated Users change it, is refused before its tree answers a query" $ \_ ->
+        fresh "upstream" $ do
+          (root, parent, code, said) <- madeThenChanged "upstream" ["/grant", "*" <> T.unpack authenticatedUsers <> ":(OI)(CI)(M)"]
+          let upstreamDatabase = parent </> "var" </> "nix" </> "db" </> "db.sqlite"
+          createDirectoryIfMissing True (takeDirectory upstreamDatabase)
+          BS.writeFile upstreamDatabase BS.empty
+          store <- unStoreDir <$> canonicalStoreDir (StoreDir root)
+          queried <- try (sqValidPaths (localQueries (StoreDir root)) Set.empty)
+          pure $ case (code, queried, sidFromText authenticatedUsers) of
+            (ExitFailure _, _, _) -> Fail ("icacls could not grant the right: " <> T.pack said)
+            (ExitSuccess, Left err, Just grantee)
+              | isUserError err -> assertEqual "the refusal" (distrustMessage parent store (WritableBy grantee)) (ioeGetErrorString err)
+            (ExitSuccess, outcome, _) -> Fail ("expected the query refused, got: " <> T.pack (show (outcome :: Either IOException (Set.Set StorePath)))),
+      onWindows "a store whose parent passes down full control for CREATOR OWNER, an inherit-only entry, is refused" $ \_ ->
+        fresh "inherit-only" $ do
+          (root, parent, code, said) <- madeThenChanged "inherit-only" ["/grant", "*" <> T.unpack creatorOwner <> ":(OI)(CI)(IO)(F)"]
+          case code of
+            ExitFailure _ -> pure (Fail ("icacls could not grant the right: " <> T.pack said))
+            ExitSuccess -> refusedFor root parent (WritableBy <$> sidFromText creatorOwner),
+      onWindows "a store whose parent grants Users read and execute and denies Guests a write is trusted" $ \_ ->
+        fresh "read-only" $ do
+          (root, parent, granted, said) <- madeThenChanged "read-only" ["/grant", "*" <> T.unpack users <> ":(OI)(CI)(RX)"]
+          (denied, deniedSaid) <- icacls [parent, "/deny", "*S-1-5-32-546:(W)"]
+          case (granted, denied) of
+            (ExitSuccess, ExitSuccess) -> do
+              outcome <- try (openStore testLogger (StoreDir root) >>= closeStore)
+              pure (either (\err -> Fail ("the open failed: " <> T.pack (show (err :: IOException)))) (const Pass) outcome)
+            _ -> pure (Fail ("icacls could not change the DACL: " <> T.pack (said <> deniedSaid)))
     ]
 
 -- ---------------------------------------------------------------------------

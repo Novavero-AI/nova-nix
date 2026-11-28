@@ -100,7 +100,9 @@ canonicalStoreDir (StoreDir dir) = StoreDir . T.unpack . canonPath . T.pack <$> 
 -- once the lease is held releases what was taken before it, the database
 -- and the lease, so a failed open holds nothing that a later collection
 -- would wait on.  The line goes to the logger given, which the handle
--- keeps for its operations ('stLogger').
+-- keeps for its operations ('stLogger').  On Windows a store another
+-- account could change is refused before the lease is taken, by
+-- 'createStoreDirectories'.
 openStore :: Logger -> StoreDir -> IO Store
 openStore logger rawDir = do
   dir <- canonicalStoreDir rawDir

@@ -50,6 +50,7 @@ import Data.Text (Text)
 import Nix.Builder (BuildConfig (..), BuildStop (..), SubstitutionAccess (..), buildRequests, checkStored, realiseWithoutWriting)
 import Nix.Logger (Logger)
 import Nix.Store (Store (..), StoreDB, UpstreamHazard (..), addOutLinkRoot, addSourceTree, canonicalStoreDir, closeStore, closeStoreDB, dbFileName, isValidPath, materializeEvalSources, materializeEvalStoreWrites, metaDirName, openStore, openStoreDBReadOnly, queryReferences, storeTablesExist, upstreamManagedRefusal, writeDrvClosure)
+import Nix.Store.Access (checkStateDirectory)
 import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode, parseStorePath, storePathToFilePath)
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
 import qualified NovaCache.NAR as NAR
@@ -184,14 +185,18 @@ localQueries rawDir = queriesOf rawDir inDatabase
 -- database through the given action, given the directory's canonical
 -- spelling, which answers the value it is given when there is no database
 -- to ask.  In a store upstream Nix's database also manages the database
--- is never opened (the module header says why).
+-- is never opened (the module header says why), and the store's tree
+-- answers instead, once the directories on the way to it pass the check
+-- a database's open makes first ('checkStateDirectory').
 queriesOf :: StoreDir -> (forall a. StoreDir -> a -> (StoreDB -> IO a) -> IO a) -> StoreQueries IO
 queriesOf rawDir withDatabase =
   StoreQueries
     { sqValidPaths = \paths ->
         asked $ \dir upstreamManaged ->
           if upstreamManaged
-            then Set.fromList <$> filterM (onDisk dir) (Set.toList paths)
+            then do
+              checkStateDirectory (unStoreDir dir </> metaDirName)
+              Set.fromList <$> filterM (onDisk dir) (Set.toList paths)
             else withDatabase dir Set.empty (\db -> Set.fromList <$> filterM (isValidPath db) (Set.toList paths)),
       sqReferences = \path ->
         asked $ \dir upstreamManaged ->
