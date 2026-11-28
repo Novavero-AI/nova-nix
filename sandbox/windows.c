@@ -1,28 +1,34 @@
 /*
  * nova-nix-sandbox's Windows backend (backend.h): runs the builder as the
- * build slot's account whose primary token the helper is given, on a
- * window station and desktop of the build's own, attached to a
+ * build slot's account whose primary token the helper is given, on the
+ * window station Windows makes for that token's logon, attached to a
  * pseudoconsole the helper owns, in a job that caps each process's memory
- * and lets none of them break away.
+ * and lets none of them break away, and ends every process running as the
+ * slot's account before the builder starts and after the build.
  *
- * The helper runs as the service that holds each slot's token, which
- * hands it one slot's token as a handle it inherits and names in the
- * plan, with the slot's SID.  The token must be a primary token whose
- * user is that SID; the helper keeps it from every process it starts but
- * the builder, which runs as it.  Starting a process under another
- * logon's token takes SeAssignPrimaryTokenPrivilege and
- * SeIncreaseQuotaPrivilege, which the helper enables in its own token
- * first, and which the probe checks it can enable.
+ * The helper runs as the service that logs each slot on, which hands it
+ * the slot's token as a handle it inherits and names in the plan, with the
+ * slot's SID.  The token must be a primary token whose user is that SID;
+ * the helper keeps it from every process it starts but the builder, which
+ * runs as it.  Starting a process under another logon's token takes
+ * SeAssignPrimaryTokenPrivilege and SeIncreaseQuotaPrivilege, which the
+ * helper enables in its own token first, and which the probe checks it can
+ * enable.
  *
- * A process the service starts would start on the service's window
- * station and desktop, which the slot's account cannot open, and a
- * process that cannot open its window station and desktop fails to
- * start.  So the helper makes a window station and a desktop for the
- * build, named as the plan says, whose DACLs grant its own user and the
- * slot's account all access and nobody else.  A window station of that
- * name that already exists is refused, not opened, since whoever made it
- * chose its DACL.  Both go with their last handle, which the helper
- * closes once the build has ended.
+ * The builder starts with an empty window station and desktop name, which
+ * puts it on the window station Windows makes for its token's logon
+ * session and that station's default desktop: a station of that logon
+ * alone.  The helper makes none, since a service running as a virtual
+ * account may not name a window station, and the service's own is not the
+ * slot's to open.
+ *
+ * CreateProcessAsUserW opens the builder's image with the access of the
+ * thread that calls it, not of the token it starts the builder with.  So
+ * the helper calls it impersonating the slot, and reverts after, so that
+ * a derivation cannot have the slot run an image only the service may
+ * read.  The impersonation takes no privilege, as the slot's token comes
+ * from a logon the service made with the slot's password, in the logon
+ * session the helper runs in.
  *
  * A process started with a console of its own, as libiberty starts gcc's
  * subprograms when gcc has none, fails to start under a build account's
@@ -36,17 +42,33 @@
  * standard input is NUL; those two handles are all it inherits.
  *
  * The builder starts suspended, is assigned to the build's job and is
- * then resumed, so no process of the build runs outside the job.  The
- * job kills its processes when its last handle closes, the helper's, so
- * the build ends with the helper however the helper ends.  It caps the
- * memory each process may commit, ends a process at an unhandled
- * exception at once, and grants no breakaway, so no process in it can
- * break away from it.  It nests in any job the helper is in, the process
- * library's among them.  The helper waits until the job holds no
- * process, as nova-nix waits for an unsandboxed build's job, and exits
- * with the builder's exit code.  Standard input, past the plan, is the
- * lifeline: a thread of the helper's reads it, and when it ends
- * terminates the job.
+ * then resumed, so no process it starts runs outside the job.  The job
+ * kills its processes when its last handle closes, the helper's, so the
+ * build ends with the helper however the helper ends.  It caps the memory
+ * each process may commit, ends a process at an unhandled exception at
+ * once, and grants no breakaway, so no process in it can break away from
+ * it.  It nests in any job the helper is in, the process library's among
+ * them.  The helper waits until the job holds no process, as nova-nix
+ * waits for an unsandboxed build's job, and exits with the builder's exit
+ * code.  Standard input, past the plan, is the lifeline: a thread of the
+ * helper's reads it, and when it ends terminates the job.
+ *
+ * A build can still have a process started for it outside the job, as
+ * WMI's Win32_Process.Create starts one, which then outlives the build,
+ * holding what it copied from the build, the build log among them.  So,
+ * as upstream ends every process of its build user before a build and
+ * after it, the helper ends every process running as the slot's account
+ * before the builder starts and once the job holds no process.  A listing
+ * of the processes misses one started after it, so the helper lists them
+ * again until a listing finds none of the slot's still running.  It can
+ * end a process whose DACL grants it, as the DACL of every process the
+ * slot starts does that keeps the default DACL the service gives the
+ * slot's token; a process given a security descriptor that grants it
+ * nothing is beyond the reach of any account without
+ * SeDebugPrivilege, the helper's included.  A sweep that fails before the
+ * build is reported on the status channel; one that fails after it is
+ * said in the build log and fails the build, as a process of the build
+ * may be left running.
  *
  * The status channel is the helper's standard output, which no process
  * of the build inherits, so a builder that starts leaves it empty.  A
@@ -76,15 +98,10 @@
 
 #include <windows.h>
 #include <sddl.h>
+#include <tlhelp32.h>
 
 #include "backend.h"
 #include "plan.h"
-
-/* CreateWindowStationW's flag that refuses a window station that already
- * exists, which older MinGW headers lack; the value is fixed ABI. */
-#ifndef CWF_CREATE_ONLY
-#define CWF_CREATE_ONLY 0x00000001
-#endif
 
 /* The exit code the build's processes are ended with when the lifeline
  * ends or the helper cannot watch them: the process library's, which
@@ -103,6 +120,13 @@
 /* The attributes the builder starts with: its handle list and its
  * pseudoconsole. */
 #define START_ATTRIBUTE_COUNT 2
+
+/* How long a sweep of the slot's processes may take, in all, to end those
+ * it finds and come to a listing that finds none still running. */
+#define SWEEP_WAIT_SECONDS 10
+
+/* The Win32 error a sweep that outlasts its wait is reported with. */
+#define SWEEP_TIMEOUT_ERROR ERROR_TIMEOUT
 
 /* The memory cap is a SIZE_T in the job's limits; on every Windows this
  * backend builds for, a SIZE_T holds any cap a plan names. */
@@ -134,14 +158,32 @@ struct console {
     HANDLE drain;
 };
 
-/* The build's window station and desktop, and the name a process's start
- * gives them by, STATION\DESKTOP. */
-struct user_objects {
-    HWINSTA station;
-    HDESK desktop;
-    WCHAR *name;
+/* How a sweep of the slot's processes ended. */
+enum sweep_outcome {
+    /* A listing found none of the slot's processes still running. */
+    SWEEP_DONE,
+    /* The processes could not be listed. */
+    SWEEP_UNLISTED,
+    /* A process running as the slot's account could not be ended. */
+    SWEEP_UNENDED,
+    /* Listings still found the slot's processes running
+     * SWEEP_WAIT_SECONDS after the sweep began. */
+    SWEEP_LINGERING
 };
 
+/* What a sweep came to: how it ended, the Win32 error behind
+ * SWEEP_UNLISTED or SWEEP_UNENDED, and the process the latter concerns. */
+struct sweep {
+    enum sweep_outcome outcome;
+    DWORD error;
+    DWORD pid;
+};
+
+/* The window station and desktop name the builder starts with: an empty
+ * one, which starts it on the window station of its token's logon, on that
+ * station's default desktop.  CreateProcessAsUserW takes the name as a
+ * string it may write to. */
+static WCHAR logon_desktop[] = L"";
 /* ------------------------------------------------------------------------
  * The channels
  * ------------------------------------------------------------------------ */
@@ -275,9 +317,9 @@ static WCHAR *builder_command_line(void)
  * The tokens
  * ------------------------------------------------------------------------ */
 
-/* Enable each of the start privileges in TOKEN, this process's.  Answers
- * 0, or the Win32 error of the step that failed: ERROR_NOT_ALL_ASSIGNED
- * for a privilege the token does not hold. */
+/* Enable each of the start privileges in TOKEN.  Answers 0, or the
+ * Win32 error of the step that failed: ERROR_NOT_ALL_ASSIGNED for a
+ * privilege the token does not hold. */
 static DWORD enable_privileges(HANDLE token)
 {
     size_t i;
@@ -299,20 +341,17 @@ static DWORD enable_privileges(HANDLE token)
     return 0;
 }
 
-/* The user of this process's token, the service's, with the start
- * privileges enabled in that token.  Fails the process at privileges. */
-static void ready_own_token(union token_user *user)
+/* Enable each of the start privileges in this process's own token, the
+ * service's.  Answers as enable_privileges does. */
+static DWORD enable_own_privileges(void)
 {
     HANDLE own = NULL;
-    DWORD size = 0;
     DWORD error;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &own))
-        status_fail("privileges", (int)GetLastError(), NO_INDEX);
-    if ((error = enable_privileges(own)) != 0)
-        status_fail("privileges", (int)error, NO_INDEX);
-    if (!GetTokenInformation(own, TokenUser, user, sizeof *user, &size))
-        status_fail("privileges", (int)GetLastError(), NO_INDEX);
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &own))
+        return GetLastError();
+    error = enable_privileges(own);
     CloseHandle(own);
+    return error;
 }
 
 /* The slot's token the plan names, kept from every process this one
@@ -344,76 +383,167 @@ static HANDLE slot_token(const struct plan *plan, PSID *slot)
 }
 
 /* ------------------------------------------------------------------------
- * The window station and desktop
+ * The slot's processes
  * ------------------------------------------------------------------------ */
 
-/* The DACL of the build's window station and desktop, in a buffer of its
- * own: all access for HELPER, this process's user, and for SLOT, and no
- * other entry.  Generic rights, which each object maps to its own as it
- * is made. */
-static PACL grant_both(PSID helper, PSID slot)
+/* Whether PROCESS, open to query, runs as SLOT.  A process whose token
+ * this one may not query counts as another account's: it is not one this
+ * process could end. */
+static int runs_as(HANDLE process, PSID slot)
 {
-    DWORD entry = (DWORD)(sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD));
-    DWORD size = (DWORD)sizeof(ACL) + entry + GetLengthSid(helper) + entry + GetLengthSid(slot);
-    PACL acl = malloc(size);
-    if (acl == NULL)
-        status_fail("station", ERROR_NOT_ENOUGH_MEMORY, NO_INDEX);
-    if (!InitializeAcl(acl, size, ACL_REVISION) || !AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, helper)
-        || !AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, slot))
-        status_fail("station", (int)GetLastError(), NO_INDEX);
-    return acl;
+    HANDLE token = NULL;
+    union token_user user;
+    DWORD size = 0;
+    int same;
+    if (!OpenProcessToken(process, TOKEN_QUERY, &token))
+        return 0;
+    same = GetTokenInformation(token, TokenUser, &user, sizeof user, &size) && EqualSid(user.user.User.Sid, slot);
+    CloseHandle(token);
+    return same;
 }
 
-/* Make the build's window station and desktop, named by the plan, which
- * grant only HELPER and SLOT.  A desktop is made on the calling process's
- * window station, so this process moves to the build's for the call and
- * back after it. */
-static void make_user_objects(const struct plan *plan, PSID helper, PSID slot, struct user_objects *made, PACL *acl)
+/* End the process PID, which runs as the slot's account and which the
+ * handle the caller holds keeps from giving its ID to another, and wait
+ * until DEADLINE for it to end.  Answers 1 when it was running, 0 when it
+ * had already ended, or -1 with *SWEEP saying why it could not be ended or
+ * did not end in time. */
+static int end_process(DWORD pid, ULONGLONG deadline, struct sweep *sweep)
 {
-    SECURITY_DESCRIPTOR descriptor;
-    SECURITY_ATTRIBUTES attributes;
-    WCHAR *station_name;
-    WCHAR *desktop_name;
-    HWINSTA previous;
-    DWORD error = 0;
-
-    made->name = widened(plan->desktop, "station", NO_INDEX);
-    station_name = widened(plan->desktop, "station", NO_INDEX);
-    desktop_name = wcschr(station_name, L'\\');
-    *desktop_name++ = L'\0';
-
-    *acl = grant_both(helper, slot);
-    if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION)
-        || !SetSecurityDescriptorDacl(&descriptor, TRUE, *acl, FALSE))
-        status_fail("station", (int)GetLastError(), NO_INDEX);
-    attributes.nLength = sizeof attributes;
-    attributes.lpSecurityDescriptor = &descriptor;
-    attributes.bInheritHandle = FALSE;
-
-    made->station = CreateWindowStationW(station_name, CWF_CREATE_ONLY, WINSTA_ALL_ACCESS | READ_CONTROL, &attributes);
-    if (made->station == NULL)
-        status_fail("station", (int)GetLastError(), NO_INDEX);
-    previous = GetProcessWindowStation();
-    if (previous == NULL || !SetProcessWindowStation(made->station))
-        status_fail("desktop", (int)GetLastError(), NO_INDEX);
-    made->desktop = CreateDesktopW(desktop_name, NULL, NULL, 0, GENERIC_ALL, &attributes);
-    if (made->desktop == NULL)
-        error = GetLastError();
-    if (!SetProcessWindowStation(previous) && error == 0)
-        error = GetLastError();
-    if (error != 0)
-        status_fail("desktop", (int)error, NO_INDEX);
-    free(station_name);
+    HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+    ULONGLONG now;
+    DWORD waited;
+    int answer = 1;
+    if (process == NULL) {
+        sweep->outcome = SWEEP_UNENDED;
+        sweep->error = GetLastError();
+        sweep->pid = pid;
+        return -1;
+    }
+    /* A process that has already ended needs no ending. */
+    if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0) {
+        CloseHandle(process);
+        return 0;
+    }
+    /* TerminateProcess refuses a process that has ended, as this one may
+     * have since the check above. */
+    if (!TerminateProcess(process, ENDED_BUILD_EXIT_CODE)) {
+        DWORD error = GetLastError();
+        if (WaitForSingleObject(process, 0) != WAIT_OBJECT_0) {
+            sweep->outcome = SWEEP_UNENDED;
+            sweep->error = error;
+            sweep->pid = pid;
+            CloseHandle(process);
+            return -1;
+        }
+    }
+    now = GetTickCount64();
+    waited = WaitForSingleObject(process, now < deadline ? (DWORD)(deadline - now) : 0);
+    if (waited == WAIT_TIMEOUT) {
+        sweep->outcome = SWEEP_LINGERING;
+        answer = -1;
+    } else if (waited != WAIT_OBJECT_0) {
+        sweep->outcome = SWEEP_UNENDED;
+        sweep->error = GetLastError();
+        sweep->pid = pid;
+        answer = -1;
+    }
+    CloseHandle(process);
+    return answer;
 }
 
-/* Close the build's window station and desktop, which go with their last
- * handle.  A close that fails leaves its object to this process's end,
- * which follows. */
-static void close_user_objects(struct user_objects *made)
+/* List the processes and end each that runs as SLOT, waiting until
+ * DEADLINE for each to end.  Answers how many were running, or -1 with
+ * *SWEEP saying why the pass failed. */
+static long sweep_pass(PSID slot, ULONGLONG deadline, struct sweep *sweep)
 {
-    CloseDesktop(made->desktop);
-    CloseWindowStation(made->station);
-    free(made->name);
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W entry;
+    long running = 0;
+    BOOL listed;
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        sweep->outcome = SWEEP_UNLISTED;
+        sweep->error = GetLastError();
+        return -1;
+    }
+    entry.dwSize = sizeof entry;
+    for (listed = Process32FirstW(snapshot, &entry); listed; listed = Process32NextW(snapshot, &entry)) {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+        int ended;
+        if (process == NULL)
+            continue;
+        ended = runs_as(process, slot) ? end_process(entry.th32ProcessID, deadline, sweep) : 0;
+        CloseHandle(process);
+        if (ended < 0) {
+            CloseHandle(snapshot);
+            return -1;
+        }
+        running += ended;
+    }
+    if (GetLastError() != ERROR_NO_MORE_FILES) {
+        sweep->outcome = SWEEP_UNLISTED;
+        sweep->error = GetLastError();
+        CloseHandle(snapshot);
+        return -1;
+    }
+    CloseHandle(snapshot);
+    return running;
+}
+
+/* End every process running as SLOT: list them and end each, until a
+ * listing finds none still running, for up to SWEEP_WAIT_SECONDS. */
+static struct sweep sweep_slot(PSID slot)
+{
+    struct sweep sweep;
+    ULONGLONG deadline = GetTickCount64() + SWEEP_WAIT_SECONDS * 1000ULL;
+    sweep.outcome = SWEEP_DONE;
+    sweep.error = 0;
+    sweep.pid = 0;
+    for (;;) {
+        long running = sweep_pass(slot, deadline, &sweep);
+        if (running <= 0)
+            return sweep;
+        if (GetTickCount64() >= deadline) {
+            sweep.outcome = SWEEP_LINGERING;
+            return sweep;
+        }
+    }
+}
+
+/* End every process running as SLOT before the builder starts, reporting
+ * a sweep that fails on the status channel. */
+static void sweep_before_build(PSID slot)
+{
+    struct sweep sweep = sweep_slot(slot);
+    if (sweep.outcome == SWEEP_UNLISTED)
+        status_fail("sweep", (int)sweep.error, NO_INDEX);
+    if (sweep.outcome == SWEEP_UNENDED)
+        status_fail("sweep", (int)sweep.error, (long)sweep.pid);
+    if (sweep.outcome == SWEEP_LINGERING)
+        status_fail("sweep", SWEEP_TIMEOUT_ERROR, NO_INDEX);
+}
+
+/* End every process running as SLOT once the build has ended.  Answers
+ * whether none is left, saying in the build log why one may be. */
+static int sweep_after_build(PSID slot)
+{
+    struct sweep sweep = sweep_slot(slot);
+    switch (sweep.outcome) {
+    case SWEEP_DONE:
+        return 1;
+    case SWEEP_UNLISTED:
+        fprintf(stderr, "nova-nix-sandbox: cannot list the processes running as the build's account: Win32 error %lu\n",
+                (unsigned long)sweep.error);
+        return 0;
+    case SWEEP_UNENDED:
+        fprintf(stderr, "nova-nix-sandbox: cannot end process %lu, which runs as the build's account: Win32 error %lu\n",
+                (unsigned long)sweep.pid, (unsigned long)sweep.error);
+        return 0;
+    case SWEEP_LINGERING:
+        fprintf(stderr, "nova-nix-sandbox: processes were still running as the build's account %d seconds after it ended\n",
+                SWEEP_WAIT_SECONDS);
+        return 0;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------------
@@ -590,13 +720,38 @@ static void builder_handles(HANDLE *nul, HANDLE *log)
         status_fail("log", (int)GetLastError(), NO_INDEX);
 }
 
+/* Start the builder suspended, as SLOT's TOKEN, impersonating the slot
+ * for the call so that the builder's image is opened with the slot's
+ * access, and revert after it, on every path.  A start that fails, or a
+ * revert that does, fails this process. */
+static PROCESS_INFORMATION start_builder(HANDLE token, WCHAR *command, WCHAR *environment, const WCHAR *build_dir,
+                                         STARTUPINFOEXW *startup)
+{
+    PROCESS_INFORMATION process;
+    BOOL started;
+    DWORD error;
+    memset(&process, 0, sizeof process);
+    if (!ImpersonateLoggedOnUser(token))
+        status_fail("impersonate", (int)GetLastError(), NO_INDEX);
+    started = CreateProcessAsUserW(token, NULL, command, NULL, NULL, TRUE,
+                                   CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                                   environment, build_dir, &startup->StartupInfo, &process);
+    error = started ? 0 : GetLastError();
+    if (!RevertToSelf()) {
+        DWORD revert_error = GetLastError();
+        if (started)
+            TerminateProcess(process.hProcess, ENDED_BUILD_EXIT_CODE);
+        status_fail("revert", (int)revert_error, NO_INDEX);
+    }
+    if (!started)
+        status_fail("exec", (int)error, NO_INDEX);
+    return process;
+}
+
 int backend_run(const struct plan *plan, char **argv)
 {
-    union token_user helper;
     PSID slot = NULL;
     HANDLE token;
-    struct user_objects objects;
-    PACL acl = NULL;
     struct console console;
     HANDLE job = NULL;
     HANDLE port = NULL;
@@ -616,9 +771,10 @@ int backend_run(const struct plan *plan, char **argv)
      * argv holds in the system's code page. */
     (void)argv;
 
-    ready_own_token(&helper);
+    if ((error = enable_own_privileges()) != 0)
+        status_fail("privileges", (int)error, NO_INDEX);
     token = slot_token(plan, &slot);
-    make_user_objects(plan, helper.user.User.Sid, slot, &objects, &acl);
+    sweep_before_build(slot);
     make_console(&console);
     make_job(plan, &job, &port);
     builder_handles(&inherited[0], &inherited[1]);
@@ -628,18 +784,14 @@ int backend_run(const struct plan *plan, char **argv)
     attributes = start_attributes(inherited, sizeof inherited / sizeof inherited[0], console.console);
 
     memset(&startup, 0, sizeof startup);
-    memset(&process, 0, sizeof process);
     startup.StartupInfo.cb = sizeof startup;
-    startup.StartupInfo.lpDesktop = objects.name;
+    startup.StartupInfo.lpDesktop = logon_desktop;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdInput = inherited[0];
     startup.StartupInfo.hStdOutput = inherited[1];
     startup.StartupInfo.hStdError = inherited[1];
     startup.lpAttributeList = attributes;
-    if (!CreateProcessAsUserW(token, NULL, command, NULL, NULL, TRUE,
-                              CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
-                              environment, build_dir, &startup.StartupInfo, &process))
-        status_fail("exec", (int)GetLastError(), NO_INDEX);
+    process = start_builder(token, command, environment, build_dir, &startup);
     if (!AssignProcessToJobObject(job, process.hProcess)) {
         error = GetLastError();
         TerminateProcess(process.hProcess, ENDED_BUILD_EXIT_CODE);
@@ -680,9 +832,9 @@ int backend_run(const struct plan *plan, char **argv)
         status = (int)code;
     }
     CloseHandle(process.hProcess);
+    if (!sweep_after_build(slot))
+        status = EXIT_FAILURE;
     close_console(&console);
-    close_user_objects(&objects);
-    free(acl);
     LocalFree(slot);
     return status;
 }
@@ -693,14 +845,7 @@ int backend_run(const struct plan *plan, char **argv)
 
 const char *backend_probe(int *error)
 {
-    HANDLE own = NULL;
-    DWORD failed;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &own)) {
-        *error = (int)GetLastError();
-        return "privileges";
-    }
-    failed = enable_privileges(own);
-    CloseHandle(own);
+    DWORD failed = enable_own_privileges();
     *error = (int)failed;
     return failed != 0 ? "privileges" : NULL;
 }

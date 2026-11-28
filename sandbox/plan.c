@@ -119,15 +119,6 @@ static int windows_absolute(const char *text)
     return text[0] == '\\' && text[1] == '\\';
 }
 
-/* Whether TEXT names a window station and a desktop on it, as a process's
- * start takes them: STATION\DESKTOP, neither empty, since neither name
- * may hold a backslash. */
-static int station_and_desktop(const char *text)
-{
-    const char *separator = strchr(text, '\\');
-    return separator != NULL && separator != text && separator[1] != '\0' && strchr(separator + 1, '\\') == NULL;
-}
-
 /* A bind's flags: "-" for none, else letters r (read-only), o (optional)
  * and c (resolve the source's symlinks first). */
 static int parse_bind_flags(const char *text, struct bind *bind)
@@ -208,9 +199,6 @@ static int parse_windows_singletons(struct tokens *cursor, struct plan *plan)
     if (!read_value(cursor, "slot-sid", &value) || strncmp(value, SID_PREFIX, sizeof SID_PREFIX - 1) != 0)
         return 0;
     plan->slot_sid = value;
-    if (!read_value(cursor, "desktop", &value) || !station_and_desktop(value))
-        return 0;
-    plan->desktop = value;
     return read_value(cursor, "memory-cap", &value) && parse_size(value, &plan->memory_cap) && plan->memory_cap > 0;
 }
 
