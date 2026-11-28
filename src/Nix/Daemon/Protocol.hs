@@ -31,6 +31,7 @@ module Nix.Daemon.Protocol
     latestVersionNumber,
     minimumVersionNumber,
     featureRealisationWithPath,
+    featureDeleteDeadSpecificReferrers,
     getVersionNumber,
     putVersionNumber,
     getFeatures,
@@ -79,6 +80,7 @@ module Nix.Daemon.Protocol
     caAlgo,
     caDigest,
     parseContentAddress,
+    parseContentAddressMethod,
     renderContentAddress,
     getContentAddress,
     putContentAddress,
@@ -148,6 +150,7 @@ module Nix.Daemon.Protocol
     Field (..),
     Activity (..),
     DaemonError (..),
+    defaultExitStatus,
     StderrMessage (..),
     getStderrMessage,
     putStderrMessage,
@@ -172,7 +175,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word32, Word64, Word8)
 import Nix.Daemon.Wire (Decoder, getBool, getBytes, getCount, getInt64, getList, getWord32, getWord64, getWord8, malformed, putBool, putBytes, putList, putNum)
-import Nix.Hash (FileIngestionMethod (..), base64ToBytes, bytesToHexText, digestByLength, hashAlgoBytes, parseAnyHash)
+import Nix.Hash (FileIngestionMethod (..), base64ToBytes, bytesToHexText, digestByLength, hashAlgoBytes, parseAnyHash, parseHashAlgo)
 import Nix.Json (Json (..), expectJson, jsonText, parseJson, renderJson)
 import Nix.Store.Path (StoreDir (..), StorePath, checkStorePathName, parseStorePathBaseName, spName, storePathBaseNameError, storePathBasename, storePathHashLen, storePathNameUpstreamText, storePathToText)
 import qualified NovaCache.Base32 as Nix32
@@ -222,6 +225,12 @@ minimumVersionNumber = VersionNumber 1 18
 -- older JSON form.
 featureRealisationWithPath :: Feature
 featureRealisationWithPath = Feature "realisation-with-path-not-hash"
+
+-- | A collection's paths sent as a set with a flag that takes their
+-- referrers too.  Without it, a collection's paths are a bare set, and a
+-- collection of the dead limited to some paths cannot be asked for.
+featureDeleteDeadSpecificReferrers :: Feature
+featureDeleteDeadSpecificReferrers = Feature "delete-dead-specific-referrers"
 
 -- | Whether a version's number is at least the given one.
 atLeast :: Version -> VersionNumber -> Bool
@@ -611,7 +620,25 @@ contentAddressFromParts method algo digest
 -- unprefixed spelling but SRI.  The @git:@ method needs upstream's
 -- @git-hashing@ experimental feature, which nova-nix does not have.
 parseContentAddress :: Text -> Either Text ContentAddress
-parseContentAddress spelled = case T.breakOn ":" spelled of
+parseContentAddress spelled = do
+  (method, algo, digest) <- contentAddressPrefix spelled
+  ContentAddress method algo <$> digestByLength algo digest
+
+-- | The method and the algorithm an upload names for the path it makes
+-- (@text:sha256@, @fixed:r:sha256@), as upstream reads them: the spelling
+-- of a content address up to its digest, read with a colon after it, so
+-- a refusal quotes that colon.  What follows the algorithm is ignored, as
+-- upstream ignores it.
+parseContentAddressMethod :: ByteString -> Either Text (ContentAddressMethod, Text)
+parseContentAddressMethod spelled = do
+  (method, algo, _) <- contentAddressPrefix (grammarText spelled <> ":")
+  (method, algo) <$ parseHashAlgo algo
+
+-- | A content address's method and algorithm, and the text after the
+-- algorithm's colon, as upstream reads them, its refusals quoting the
+-- whole of what it was given.
+contentAddressPrefix :: Text -> Either Text (ContentAddressMethod, Text, Text)
+contentAddressPrefix spelled = case T.breakOn ":" spelled of
   (prefix, rest)
     | Just afterPrefix <- T.stripPrefix ":" rest -> case prefix of
         "text" -> hashed TextMethod afterPrefix
@@ -624,7 +651,7 @@ parseContentAddress spelled = case T.breakOn ":" spelled of
   where
     hashed method afterMethod = case T.breakOn ":" afterMethod of
       (algo, rest)
-        | Just digest <- T.stripPrefix ":" rest -> ContentAddress method algo <$> digestByLength algo digest
+        | Just afterAlgo <- T.stripPrefix ":" rest -> Right (method, algo, afterAlgo)
       _ -> Left ("content address hash must be in form '<algo>:<hash>', but found: " <> spelled)
 
 -- | A content address as upstream renders it: the method, the algorithm

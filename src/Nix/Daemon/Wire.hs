@@ -89,8 +89,10 @@ data Decoding a
   | -- | More input is needed: the next chunk, or 'Nothing' at the end of
     -- the input.
     NeedInput (Maybe ByteString -> Decoding a)
-  | -- | The input holds no value.
-    DecodeFailed !DecodeError
+  | -- | The input holds no value: why, and the input after the bytes the
+    -- refused read took, where upstream's source is left when its read
+    -- throws.
+    DecodeFailed !DecodeError !ByteString
 
 -- | Begin decoding, before any input has arrived.
 startDecoding :: Decoder a -> Decoding a
@@ -100,25 +102,24 @@ startDecoding (Decoder reader) = fromBinary (Get.runGetIncremental (runExceptT r
     -- calls 'fail', and every refusal is the 'Left' of 'Malformed'.
     fromBinary step = case step of
       Get.Done rest _ (Right value) -> Decoded value rest
-      Get.Done _ _ (Left message) -> DecodeFailed (Malformed message)
-      Get.Fail {} -> DecodeFailed InputEnded
+      Get.Done rest _ (Left message) -> DecodeFailed (Malformed message) rest
+      Get.Fail rest _ _ -> DecodeFailed InputEnded rest
       Get.Partial more -> NeedInput (fromBinary . more)
 
 -- | Hand a decode the next chunk of input, or 'Nothing' at its end.  A
--- decode that is over keeps a chunk after its value as input that followed
--- it.
+-- decode that is over keeps a chunk as input that followed it.
 feedInput :: Maybe ByteString -> Decoding a -> Decoding a
 feedInput chunk decoding = case decoding of
   NeedInput more -> more chunk
   Decoded value rest -> Decoded value (maybe rest (rest <>) chunk)
-  failed@(DecodeFailed _) -> failed
+  DecodeFailed err rest -> DecodeFailed err (maybe rest (rest <>) chunk)
 
 -- | Decode a value from input that is all there is, giving the value and
 -- the bytes after it.
 runDecoder :: Decoder a -> ByteString -> Either DecodeError (a, ByteString)
 runDecoder reader input = case feedInput Nothing (feedInput (Just input) (startDecoding reader)) of
   Decoded value rest -> Right (value, rest)
-  DecodeFailed err -> Left err
+  DecodeFailed err _ -> Left err
   -- A decode told that its input ended never asks for more.
   NeedInput _ -> Left InputEnded
 
