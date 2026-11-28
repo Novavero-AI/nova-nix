@@ -31,6 +31,12 @@
 -- contain, such as a program on the host; builders in its input sources;
 -- the builtins nova-nix runs itself; and the input sources.  Nothing here
 -- says whether any of it is safe.
+--
+-- A file of prebuilt code whose bytes are those of a fixed-output input
+-- the closure runs as a builder, a copy of a seed in a source archive
+-- say, is named as that input: it is code the closure already relies on,
+-- not more of it.  The report is lines ('renderTrustReport') or one JSON
+-- document of the same facts ('trustReportJson').
 module Nix.Trust
   ( -- * Prebuilt code
     CodeKind (..),
@@ -57,6 +63,8 @@ module Nix.Trust
     TrustReport (..),
     trustReport,
     renderTrustReport,
+    trustReportJson,
+    trustReportJsonVersion,
   )
 where
 
@@ -78,6 +86,7 @@ import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word32, Word8)
 import Nix.DependencyGraph (DepGraph (..), DepNode (..), transitiveDeps)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), fixedOutput)
+import Nix.Json (Json (..))
 import Nix.Store.Path (StorePath (spName), defaultStoreDir, defaultStoreDirText, parseStorePathBaseName, storePathToText)
 
 -- ---------------------------------------------------------------------------
@@ -346,7 +355,10 @@ data CodePlace
 -- | A file of prebuilt code a scan found.
 data FoundCode = FoundCode
   { fcKind :: !CodeKind,
-    fcPlace :: !CodePlace
+    fcPlace :: !CodePlace,
+    -- | The SHA-256 of the file's bytes, in lowercase base-16: the hash a
+    -- fixed-output derivation of the same bytes states, hashed flat.
+    fcSha256 :: !Text
   }
   deriving (Eq, Ord, Show)
 
@@ -566,7 +578,11 @@ data TrustReport = TrustReport
     -- | The input sources: store paths the closure's derivations take
     -- that none of them builds, such as files evaluation copies from the
     -- expression's tree.
-    trSources :: !(Set StorePath)
+    trSources :: !(Set StorePath),
+    -- | The outputs of the fixed-output inputs run as builders that are
+    -- one file hashed flat with SHA-256, by that hash: a file of prebuilt
+    -- code with the same SHA-256 is one of them, by its bytes.
+    trBuilderBytes :: !(Map Text [StorePath])
   }
   deriving (Eq, Show)
 
@@ -579,13 +595,23 @@ data TrustReport = TrustReport
 trustReport :: Map StorePath ContentFacts -> DepGraph -> StorePath -> TrustReport
 trustReport facts graph root =
   TrustReport
-    { trInputs = sortOn (\input -> (spName (inputOutput input), inputOutput input)) (map inputFor (Map.toList (walkFixed walk))),
+    { trInputs = inputs,
       trOutsideBuilders = tally [drvBuilder drv | (drv, OutsideUse) <- uses],
       trSourceBuilders = tally [drvBuilder drv | (drv, SourceUse) <- uses],
       trBuiltinBuilders = tally [drvBuilder drv | (drv, BuiltinUse) <- uses],
-      trSources = sources
+      trSources = sources,
+      trBuilderBytes =
+        Map.fromListWith
+          (flip (++))
+          [ (doHash out, [doPath out])
+          | input <- inputs,
+            inputClass input == RunAsBuilder,
+            Just (_, out) <- [Map.lookup (inputDrvPath input) (walkFixed walk)],
+            doHashAlgo out == flatSha256
+          ]
     }
   where
+    inputs = sortOn (\input -> (spName (inputOutput input), inputOutput input)) (map inputFor (Map.toList (walkFixed walk)))
     walk = walkClosure graph root
     closureDrvs = map dnDerivation (Map.elems (walkNodes walk))
     sources = Set.fromList (concatMap drvInputSrcs closureDrvs)
@@ -658,9 +684,135 @@ renderTrustReport report =
     runLines lead builders = [lead <> derivations count <> ": " <> displayBytes builder | (builder, count) <- Map.toList builders]
     scanLines NotInStore = ["not read: the store does not hold it"]
     scanLines (Scanned facts) = map codeLine (cfCode facts) ++ map unreadLine (cfUnread facts)
-    codeLine code = codeKindName (fcKind code) <> ": " <> placeText (fcPlace code)
+    codeLine code = codeKindName (fcKind code) <> ": " <> placeText (fcPlace code) <> copyText code
+    copyText code = case copiesOf report code of
+      [] -> ""
+      copies -> ", the bytes of " <> T.intercalate " and " (map (storePathToText defaultStoreDir) copies)
     unreadLine unread = "not read: " <> maybe "" (<> ": ") (ufFile unread) <> ufReason unread
     indented = ("  " <>)
+
+-- | The hash algorithm field of a fixed output that is one file hashed
+-- with SHA-256: flat, with no method before the algorithm.
+flatSha256 :: Text
+flatSha256 = "sha256"
+
+-- | The outputs of the fixed-output inputs run as builders whose bytes a
+-- file of prebuilt code is, by its SHA-256.  A fetched file is its own
+-- input, whose hash the report already gives with the others it equals,
+-- so only a file inside a fetched output is named a copy.
+copiesOf :: TrustReport -> FoundCode -> [StorePath]
+copiesOf report code = case fcPlace code of
+  FetchedFile -> []
+  _ -> Map.findWithDefault [] (fcSha256 code) (trBuilderBytes report)
+
+-- ---------------------------------------------------------------------------
+-- The report as JSON
+-- ---------------------------------------------------------------------------
+
+-- | The version of the JSON form, which a change to its fields that a
+-- reader of an earlier one would misread raises.
+trustReportJsonVersion :: Integer
+trustReportJsonVersion = 1
+
+-- | The report as one JSON document, the facts the lines give and the
+-- input sources themselves where the lines count them.  Store paths are
+-- full paths, keys are camelCase as upstream's JSON output spells its own,
+-- and each collection of inputs or builders is an object keyed by its
+-- path, members in name order:
+--
+-- > { "version": 1,
+-- >   "fixedOutputInputs": { OUTPUT: INPUT, ... },
+-- >   "buildersOutsideClosure": { BUILDER: COUNT, ... },
+-- >   "buildersInInputSources": { BUILDER: COUNT, ... },
+-- >   "builtinBuilders": { BUILDER: COUNT, ... },
+-- >   "inputSources": [ PATH, ... ] }
+--
+-- An INPUT is its @drvPath@, its @class@ (@runAsBuilder@,
+-- @holdsPrebuiltCode@, @notFullyRead@ or @holdsNoPrebuiltCode@), the
+-- builtin that fetches it as @fetchedBy@ or the builder that makes it as
+-- @builtBy@, @sameHash@, @builderOf@ and @inTreeOfBuilderOf@ (each builder
+-- with how many derivations it builds), @inStore@, @prebuiltCode@ and
+-- @notRead@.  A @prebuiltCode@ entry is its @kind@, its @file@ in a fetched
+-- tree or null for the fetched file, its @member@ in an archive or null,
+-- its @sha256@, and @sameBytesAs@, the outputs of the inputs run as
+-- builders it is a copy of.  A @notRead@ entry is its @file@ and its
+-- @reason@.  A builder that is not UTF-8 is shown with replacement
+-- characters, as the lines show it.
+trustReportJson :: TrustReport -> Json
+trustReportJson report =
+  object
+    [ ("version", JsonInt trustReportJsonVersion),
+      ("fixedOutputInputs", JsonObject (Map.fromList [(pathText (inputOutput input), inputJson input) | input <- trInputs report])),
+      ("buildersOutsideClosure", builderCounts (trOutsideBuilders report)),
+      ("buildersInInputSources", builderCounts (trSourceBuilders report)),
+      ("builtinBuilders", builderCounts (trBuiltinBuilders report)),
+      ("inputSources", JsonArray (map (JsonString . pathText) (Set.toList (trSources report))))
+    ]
+  where
+    object = JsonObject . Map.fromList
+    pathText = storePathToText defaultStoreDir
+    paths = JsonArray . map (JsonString . pathText)
+    builderCounts builders = JsonObject (Map.fromList [(displayBytes builder, JsonInt (toInteger count)) | (builder, count) <- Map.toList builders])
+    nullable = maybe JsonNull JsonString
+    inputJson input =
+      object
+        ( [ ("drvPath", JsonString (pathText (inputDrvPath input))),
+            ("class", JsonString (classKey (inputClass input))),
+            provenance (inputProvenance input),
+            ("sameHash", paths (inputSameHash input)),
+            ("builderOf", builderCounts (inputBuilders input)),
+            ("inTreeOfBuilderOf", builderCounts (inputTreeBuilders input))
+          ]
+            ++ scanned (inputScan input)
+        )
+    provenance (FetchedBy builder) = ("fetchedBy", JsonString (displayBytes builder))
+    provenance (BuiltBy builder) = ("builtBy", JsonString (displayBytes builder))
+    scanned NotInStore = [("inStore", JsonBool False), ("prebuiltCode", JsonArray []), ("notRead", JsonArray [])]
+    scanned (Scanned facts) =
+      [ ("inStore", JsonBool True),
+        ("prebuiltCode", JsonArray (map codeJson (cfCode facts))),
+        ("notRead", JsonArray (map unreadJson (cfUnread facts)))
+      ]
+    codeJson code =
+      let (file, member) = placeFields (fcPlace code)
+       in object
+            [ ("kind", JsonString (codeKindKey (fcKind code))),
+              ("file", nullable file),
+              ("member", nullable member),
+              ("sha256", JsonString (fcSha256 code)),
+              ("sameBytesAs", paths (copiesOf report code))
+            ]
+    unreadJson unread = object [("file", nullable (ufFile unread)), ("reason", JsonString (ufReason unread))]
+
+-- | Where a file of prebuilt code is as JSON gives it: its path in a
+-- fetched tree, or none for the fetched file, and its path in an archive,
+-- or none for a file that is not in one.
+placeFields :: CodePlace -> (Maybe Text, Maybe Text)
+placeFields place = case place of
+  FetchedFile -> (Nothing, Nothing)
+  TreeFile path -> (Just path, Nothing)
+  ArchiveMember member -> (Nothing, Just member)
+  TreeArchiveMember archive member -> (Just archive, Just member)
+
+-- | How JSON names a class.
+classKey :: InputClass -> Text
+classKey inputClassValue = case inputClassValue of
+  RunAsBuilder -> "runAsBuilder"
+  HoldsPrebuiltCode -> "holdsPrebuiltCode"
+  NotFullyRead -> "notFullyRead"
+  HoldsNoPrebuiltCode -> "holdsNoPrebuiltCode"
+
+-- | How JSON names a kind of prebuilt code.
+codeKindKey :: CodeKind -> Text
+codeKindKey kind = case kind of
+  PeImage -> "peImage"
+  ElfImage -> "elfImage"
+  ElfObject -> "elfObject"
+  ElfOther -> "elf"
+  MachO -> "machO"
+  MachOUniversal -> "machOUniversal"
+  CoffObject -> "coffObject"
+  ArArchive -> "arArchive"
 
 -- | Where a file of prebuilt code is, as the report says it.
 placeText :: CodePlace -> Text

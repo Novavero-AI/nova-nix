@@ -8402,7 +8402,7 @@ testTargetArgs = do
       runTest "an argument in angle brackets is a search path lookup, as upstream's lookupFileArg reads one" $
         assertEqual "build" (Right (Cli.CmdBuild (Cli.TargetSearchPath "nixpkgs") (Just "hello") (Cli.OutLinkAt "result"))) (parsed ["build", "<nixpkgs>", "-A", "hello"])
           `andThen` assertEqual "eval" (Right (Cli.CmdEval (Cli.TargetSearchPath "nixpkgs/lib"))) (parsed ["eval", "<nixpkgs/lib>"])
-          `andThen` assertEqual "trust" (Right (Cli.CmdTrust (Cli.TargetSearchPath "x") Nothing)) (parsed ["trust", "<x>"])
+          `andThen` assertEqual "trust" (Right (Cli.CmdTrust (Cli.TargetSearchPath "x") Nothing Cli.TrustLines Cli.IndentedOnTerminal)) (parsed ["trust", "<x>"])
           `andThen` assertEqual "two characters" (Right (Cli.CmdEval (Cli.TargetFile "<>"))) (parsed ["eval", "<>"])
           `andThen` assertEqual "unclosed" (Right (Cli.CmdEval (Cli.TargetFile "<x"))) (parsed ["eval", "<x"])
           `andThen` assertEqual "a path" (Right (Cli.CmdEval (Cli.TargetFile "./dir"))) (parsed ["eval", "./dir"]),
