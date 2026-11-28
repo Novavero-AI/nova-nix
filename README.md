@@ -8,7 +8,7 @@ nova-nix is an implementation of [Nix](https://nixos.org) for Windows, macOS
 and Linux. It evaluates Nix expressions, builds derivations into a Nix store
 and downloads from binary caches. Its commands are its own: `nova-nix eval`
 and `nova-nix build` take the place of `nix-instantiate --eval` and
-`nix-build`.
+`nix-build`, and `nova-nix profile` that of `nix profile`.
 
 - **Upstream's derivations.** On each nixpkgs tree [the scoreboard][scoreboard]
   walks, every package `nix-env -qa` lists for x86_64-linux that upstream Nix
@@ -339,20 +339,18 @@ Hello, world!
 ## Status
 
 Not implemented yet, and on the [roadmap]: flakes, `nix-shell`, `nix develop`
-on Windows, profiles (`nix-env`, `nix profile`; run a program from its store
-path or the `result` link a build makes instead), and a daemon for a
-multi-user store. On Linux a build runs in a sandbox, as upstream's does, where
-it sees only its inputs and, unless it is fixed-output, no network; a builder
-that is a host program such as `/bin/sh` needs `sandbox-paths` to bind it, as a
-release archive binds its own shell. Ubuntu lets the sandbox in only under an
-AppArmor profile for `nova-nix-sandbox`, and without one a build runs
-unsandboxed after a warning. On macOS `sandbox = true` runs a build under a
-profile of macOS's sandbox, off by default as upstream's is, where it reads
-only its inputs and the paths `sandbox-paths` names and, unless it is
-fixed-output, reaches no network. As root a sandboxed build is refused, since
-nova-nix has no build users yet. Builds on Windows, and on macOS by default,
-are not sandboxed: a builder there can read and write outside its build
-directory and reach the network.
+on Windows, and a daemon for a multi-user store. On Linux a build runs in a
+sandbox, as upstream's does, where it sees only its inputs and, unless it is
+fixed-output, no network; a builder that is a host program such as `/bin/sh`
+needs `sandbox-paths` to bind it, as a release archive binds its own shell.
+Ubuntu lets the sandbox in only under an AppArmor profile for
+`nova-nix-sandbox`, and without one a build runs unsandboxed after a warning.
+On macOS `sandbox = true` runs a build under a profile of macOS's sandbox, off
+by default as upstream's is, where it reads only its inputs and the paths
+`sandbox-paths` names and, unless it is fixed-output, reaches no network. As
+root a sandboxed build is refused, since nova-nix has no build users yet.
+Builds on Windows, and on macOS by default, are not sandboxed: a builder there
+can read and write outside its build directory and reach the network.
 
 A target is a file, a directory or a `<NAME>` the search path finds, not a
 URL, and `build` builds one derivation, where `nix-build` builds each one in a

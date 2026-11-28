@@ -8,7 +8,8 @@
 -- each element's paths in store-path order, in the canonical
 -- @\/nix\/store@ spelling.  An element a flake made keeps the fields it
 -- was read with, where upstream parses its flake references and renders
--- them again.
+-- them again.  What changed from one manifest to the next is what a
+-- profile's history shows of each generation.
 --
 -- Everything here is pure: reading the file, building the tree and
 -- making the generation are "Nix.Profile.Generation"'s.
@@ -49,6 +50,12 @@ module Nix.Profile.Manifest
     ConflictSide (..),
     Conflict (..),
     attributeConflict,
+
+    -- * Between generations
+    ElementChange (..),
+    manifestChanges,
+    changeLine,
+    elementVersions,
   )
 where
 
@@ -60,6 +67,7 @@ import Data.Char (isAsciiLower, isAsciiUpper)
 import Data.Foldable (toList)
 import Data.Int (Int32)
 import Data.List.NonEmpty (NonEmpty)
+import qualified Data.Map.Merge.Strict as Merge
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -315,14 +323,21 @@ outputsSpelled spec = maybe ["*"] (\names -> [name | OutputName name <- Set.toAs
 -- constructor in names.cc splits one; the whole name when there is no
 -- such dash.
 drvNameName :: Text -> Text
-drvNameName name = go 0 name
+drvNameName = fst . splitDrvName
+
+-- | A derivation name split at the first dash something other than a
+-- letter follows, into the name before it and the version after it, as
+-- upstream splits one; the whole name and an empty version when there is
+-- no such dash.
+splitDrvName :: Text -> (Text, Text)
+splitDrvName name = go 0 name
   where
     go !taken rest = case T.uncons rest of
-      Nothing -> name
+      Nothing -> (name, "")
       Just ('-', after)
         | Just (next, _) <- T.uncons after,
           not (isAsciiLetter next) ->
-            T.take taken name
+            (T.take taken name, after)
       Just (_, after) -> go (taken + 1) after
     isAsciiLetter c = isAsciiLower c || isAsciiUpper c
 
@@ -479,3 +494,62 @@ attributeConflict storeDir resolvedDir (Manifest elements) fileA fileB priority 
     under path file = any (\dir -> spelledIn dir path `T.isPrefixOf` hostPathText file) [storeDir, resolvedDir]
     installables element = Set.map (spelledIn storeDir) (elementPaths element)
     spelledIn dir = T.pack . storePathToFilePath dir
+
+-- ---------------------------------------------------------------------------
+-- Between generations
+-- ---------------------------------------------------------------------------
+
+-- | How an element differs from one generation's manifest to the next,
+-- by its name in both.
+data ElementChange
+  = -- | One only the later manifest holds: its identifier and versions.
+    ElementAdded !Text !Text
+  | -- | One only the earlier manifest holds: its identifier and versions.
+    ElementRemoved !Text !Text
+  | -- | One both hold at different versions: its identifier in the earlier,
+    -- and its versions in each.
+    ElementUpgraded !Text !Text !Text
+  deriving (Eq, Show)
+
+-- | What changed from one manifest to the next, element by element in
+-- name order, as a profile's history shows it: an element only one of
+-- them holds is added or removed, and one both hold has changed when its
+-- versions ('elementVersions') differ, whatever else about it did.
+manifestChanges :: Manifest -> Manifest -> [ElementChange]
+manifestChanges (Manifest earlier) (Manifest later) =
+  Map.elems (Merge.merge (Merge.mapMissing (const removed)) (Merge.mapMissing (const added)) (Merge.zipWithMaybeMatched (const upgraded)) earlier later)
+  where
+    removed element = ElementRemoved (elementIdentifier element) (elementVersions element)
+    added element = ElementAdded (elementIdentifier element) (elementVersions element)
+    upgraded before after
+      | elementVersions before == elementVersions after = Nothing
+      | otherwise = Just (ElementUpgraded (elementIdentifier before) (elementVersions before) (elementVersions after))
+
+-- | A change as a profile's history prints it, with the empty-set sign
+-- for the versions of an element that is not there.
+changeLine :: ElementChange -> Text
+changeLine change = case change of
+  ElementAdded identifier versions -> identifier <> ": " <> emptySetSign <> " -> " <> versions
+  ElementRemoved identifier versions -> identifier <> ": " <> versions <> " -> " <> emptySetSign
+  ElementUpgraded identifier before after -> identifier <> ": " <> before <> " -> " <> after
+
+-- | An element's versions, as a profile's history shows them: the version
+-- part of each of its paths' names, each once, an empty one shown as an
+-- epsilon, in byte order and joined by a comma and a space, or the
+-- empty-set sign for an element with no paths.
+elementVersions :: Element -> Text
+elementVersions element
+  | Set.null versions = emptySetSign
+  | otherwise = T.intercalate ", " (Set.toAscList (Set.map shown versions))
+  where
+    versions = Set.map (snd . splitDrvName . spName) (elementPaths element)
+    shown version
+      | T.null version = emptyVersionSign
+      | otherwise = version
+
+-- | What a profile's history shows for no versions at all, U+2205 EMPTY
+-- SET, and for an empty version, U+03B5 GREEK SMALL LETTER EPSILON, as
+-- upstream shows them.
+emptySetSign, emptyVersionSign :: Text
+emptySetSign = "\x2205"
+emptyVersionSign = "\x03B5"

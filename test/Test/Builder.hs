@@ -4455,6 +4455,20 @@ genManifest = manifestOf <$> QC.resize 4 (QC.listOf ((,) <$> genElementName <*> 
         <*> QC.elements ["packages.x86_64-linux.hello", "hello"]
         <*> QC.elements [Nothing, Just Proto.AllOutputs, Proto.namedOutputs (Set.fromList [Proto.OutputName "out", Proto.OutputName "dev"])]
 
+-- | A profile's generations in order of number, distinct, each made at a
+-- moment among a few, with a current generation that is one of them, one
+-- that is not listed, or none, and a cutoff among those moments.
+genDatedListing :: QC.Gen ([Gen.DatedGeneration], Maybe Gen.GenerationNumber, Gen.EpochSeconds)
+genDatedListing = do
+  gaps <- QC.resize 8 (QC.listOf (QC.chooseInt (1, 3)))
+  let numbers = drop 1 (scanl (+) 0 gaps)
+  times <- traverse (const (QC.chooseInt (0, 20))) numbers
+  current <- QC.oneof [pure Nothing, Just <$> QC.elements (0 : numbers)]
+  cutoff <- QC.chooseInt (0, 21)
+  let entry n t = Gen.DatedGeneration (Gen.Generation (numbered n) (asciiOsPath ("profile-" <> show n <> "-link"))) (Gen.EpochSeconds (fromIntegral t))
+      numbered = Gen.GenerationNumber . fromIntegral
+  pure (zipWith entry numbers times, numbered <$> current, Gen.EpochSeconds (fromIntegral cutoff))
+
 -- | The manifest: upstream's names, its version 3 bytes, the versions it
 -- reads, and what selects its elements.
 testProfileManifest :: IO [Bool]
@@ -4599,7 +4613,33 @@ testProfileManifest = do
               `andThen` assertEqual
                 "a file in a directory the tree expanded, under the store resolved through its links"
                 (Just (Manifest.Conflict (Manifest.ConflictSide resolvedA "hello" (spelled hello)) (Manifest.ConflictSide fileB "other" (spelled other)) 5))
-                (Manifest.attributeConflict storeDir resolvedDir manifest resolvedA fileB 5)
+                (Manifest.attributeConflict storeDir resolvedDir manifest resolvedA fileB 5),
+      runTest "an element's versions are its paths' version parts, each once, in byte order, an empty one an epsilon and none the empty-set sign" $
+        let bare = profileFixture 'g' "tool"
+         in assertEqual "two" "2.12.1, 2.12.1-man" (Manifest.elementVersions (manifestElement [helloMan, hello]))
+              `andThen` assertEqual "each once" "2.12.1" (Manifest.elementVersions (manifestElement [hello, profileFixture 'h' "hello-2.12.1"]))
+              `andThen` assertEqual "an empty version" "\x03B5" (Manifest.elementVersions (manifestElement [bare]))
+              `andThen` assertEqual "after every other" "2.12.1, \x03B5" (Manifest.elementVersions (manifestElement [bare, hello]))
+              `andThen` assertEqual "no paths" "\x2205" (Manifest.elementVersions (manifestElement [])),
+      runTest "a history line names each element added, removed or at other versions, in name order, by its earlier identifier, as upstream's does" $
+        let helloTwo = profileFixture 'f' "hello-2.0"
+            bare = profileFixture 'g' "tool"
+            renamed = profileFixture 'i' "renamed-3"
+            earlier = manifestOf [("hello", manifestElement [hello]), ("tool", manifestElement [bare]), ("world", manifestElement [world]), ("x", manifestElement [helloTwo])]
+            later = manifestOf [("hello", manifestElement [helloTwo, helloMan]), ("tool", manifestElement [bare]), ("x", manifestElement [renamed]), ("zeta", manifestElement [bare])]
+         in assertEqual
+              "lines"
+              ["hello: 2.12.1 -> 2.0, 2.12.1-man", "world: 1.0 -> \x2205", "hello: 2.0 -> 3", "tool: \x2205 -> \x03B5"]
+              (map Manifest.changeLine (Manifest.manifestChanges earlier later))
+              `andThen` assertEqual "no changes" [] (Manifest.manifestChanges earlier earlier),
+      runTestM "a manifest has no changes from itself, and from or to an empty one each element is added or removed, in name order" $
+        propertyHolds $
+          QC.forAll genManifest $ \manifest ->
+            let elements = Map.elems (Manifest.manifestElements manifest)
+                described element = (Manifest.elementIdentifier element, Manifest.elementVersions element)
+             in Manifest.manifestChanges manifest manifest QC.=== []
+                  QC..&&. Manifest.manifestChanges Manifest.emptyManifest manifest QC.=== map (uncurry Manifest.ElementAdded . described) elements
+                  QC..&&. Manifest.manifestChanges manifest Manifest.emptyManifest QC.=== map (uncurry Manifest.ElementRemoved . described) elements
     ]
 
 -- | Generations and where profiles are: names, numbering, the location
@@ -4675,8 +4715,107 @@ testProfileGenerations = do
          in assertEqual "slashed" "C:/nix/store/a/bin" (Gen.narLinkTarget Gen.SlashedTargets "C:\\nix\\store\\a\\bin")
               `andThen` assertEqual "bytes" "a\\b" (Gen.narLinkTarget Gen.TargetBytes "a\\b")
               `andThen` assertEqual "a Windows generation" (Right (NAR.serialise windowsNar)) (NAR.serialise <$> Gen.generationNar Gen.SlashedTargets windowsTree "{}")
-              `andThen` assertEqual "this host" (if SI.os == "mingw32" then Gen.SlashedTargets else Gen.TargetBytes) Gen.hostNarTargets
+              `andThen` assertEqual "this host" (if SI.os == "mingw32" then Gen.SlashedTargets else Gen.TargetBytes) Gen.hostNarTargets,
+      runTest "profile history, rollback and wipe-history take their flags, every --to kept in order and the last --older-than" $
+        let parsed args = fmap Cli.optCommand (Cli.parseArgs ("profile" : args))
+         in assertEqual "history" (Right (Cli.CmdProfileHistory (Cli.ProfileAt "p"))) (parsed ["history", "--profile", "p"])
+              `andThen` assertEqual "rollback" (Right (Cli.CmdProfileRollback Cli.DefaultProfile [] Gen.MakeChanges)) (parsed ["rollback"])
+              `andThen` assertEqual "every --to, and --dry-run" (Right (Cli.CmdProfileRollback Cli.DefaultProfile ["2", "3"] Gen.DryRun)) (parsed ["rollback", "--to", "2", "--dry-run", "--to", "3"])
+              `andThen` assertEqual "the last --older-than" (Right (Cli.CmdProfileWipeHistory Cli.DefaultProfile (Just "14d") Gen.MakeChanges)) (parsed ["wipe-history", "--older-than", "x", "--older-than", "14d"])
+              `andThen` assertEqual "the other's flag" (Left "unknown profile rollback argument: --older-than") (parsed ["rollback", "--older-than", "1d"])
+              `andThen` assertEqual "history changes nothing to dry-run" (Left "unknown profile history argument: --dry-run") (parsed ["history", "--dry-run"])
+              `andThen` assertEqual "--to with no value" (Left "--to requires a value") (parsed ["rollback", "--to"]),
+      runTest "the current generation is the one the profile's link names by its bare name, and none for another target or no link, as upstream reads it" $
+        assertEqual "bare" (Just (number 3)) (Gen.currentGeneration profile (Just (asciiOsPath "profile-3-link")))
+          `andThen` assertEqual "the -link quirk" (Just (number 3)) (Gen.currentGeneration profile (Just (asciiOsPath "profile-3-link.tmp")))
+          `andThen` assertEqual "absolute" Nothing (Gen.currentGeneration profile (Just (Gen.generationName profile (number 3))))
+          `andThen` assertEqual "another profile's" Nothing (Gen.currentGeneration profile (Just (asciiOsPath "other-3-link")))
+          `andThen` assertEqual "no link" Nothing (Gen.currentGeneration profile Nothing),
+      runTest "a rollback switches to the newest generation below the current one, or the one --to names, and is refused in upstream's terms otherwise" $
+        let listed = map generation [1, 2, 3, 5]
+            plan wanted current = Gen.rollbackPlan wanted (number <$> current) listed
+            twoNames = Gen.generationsIn profile (map asciiOsPath ["profile-3-link.tmp", "profile-3-link"])
+         in assertEqual "below 5" (Right (generation 3)) (plan Gen.PreviousGeneration (Just 5))
+              `andThen` assertEqual "below an unlisted 4" (Right (generation 3)) (plan Gen.PreviousGeneration (Just 4))
+              `andThen` assertEqual "below the oldest" (Left (Gen.NoOlderGeneration (Just (number 1)))) (plan Gen.PreviousGeneration (Just 1))
+              `andThen` assertEqual "no current generation" (Left (Gen.NoOlderGeneration Nothing)) (plan Gen.PreviousGeneration Nothing)
+              `andThen` assertEqual "--to 2" (Right (generation 2)) (plan (Gen.GenerationAt (number 2)) (Just 5))
+              `andThen` assertEqual "--to the current one" (Right (generation 5)) (plan (Gen.GenerationAt (number 5)) (Just 5))
+              `andThen` assertEqual "--to an unlisted 4" (Left (Gen.NoSuchGeneration (number 4))) (plan (Gen.GenerationAt (number 4)) (Just 5))
+              `andThen` assertEqual "of two names for one number, the later" (Right (Gen.Generation (number 3) (at "profile-3-link.tmp"))) (Gen.rollbackPlan (Gen.GenerationAt (number 3)) Nothing twoNames),
+      runTestM "a rollback picks a listed generation below the current one with none between them, or one of the number asked for, and is refused only when there is none" $
+        propertyHolds $
+          QC.forAll genDatedListing $ \(listing, current, _) ->
+            let listed = map Gen.datedGeneration listing
+                numbers = map Gen.generationNumber listed
+                between low high n = low < n && n < high
+                previous = case (Gen.rollbackPlan Gen.PreviousGeneration current listed, current) of
+                  (Right chosen, Just now) ->
+                    let n = Gen.generationNumber chosen
+                     in QC.counterexample "the generation before" (chosen `elem` listed && n < now && not (any (between n now) numbers))
+                  (Left (Gen.NoOlderGeneration refused), _) -> QC.counterexample "refused" (refused == current && maybe True (\now -> all (>= now) numbers) current)
+                  (other, _) -> QC.counterexample (show other) False
+                asked = QC.conjoin [QC.counterexample (show n) (either (const (n `notElem` numbers)) ((== n) . Gen.generationNumber) (Gen.rollbackPlan (Gen.GenerationAt n) current listed)) | n <- map number [0 .. 30]]
+             in previous QC..&&. asked,
+      runTest "--to reads an unsigned number with an optional binary unit, refused in upstream's words otherwise" $
+        assertEqual
+          "values"
+          [Right 3, Right 3, Right 2048, Right 1048576, Right 0, Left "'-1' is not an integer", Left "invalid unit specifier 'X'", Left "'1.5' is not an integer", Left "'' is not an integer", Left "'' is not an integer", Left "'18446744073709551616' is not an integer", Left "' 3' is not an integer"]
+          (map (fmap (\(Gen.GenerationNumber n) -> n) . Gen.readGenerationNumber) ["3", "+3", "2k", "1M", "16777216T", "-1", "5x", "1.5K", "", "K", "18446744073709551616", " 3"]),
+      runTest "--older-than reads a number of days from 1 followed by d, refused in upstream's two messages otherwise" $
+        let unsuffixed spec = Left ("invalid number of days specifier '" <> spec <> "', expected something like '14d'")
+            unread spec = Left ("invalid number of days specifier '" <> spec <> "'")
+         in assertEqual
+              "values"
+              [Right (Gen.Days 14), Right (Gen.Days 3), Right (Gen.Days maxBound), unsuffixed "14", unsuffixed "", unsuffixed "14D", unread "d", unread "0d", unread "-1d", unread "1.5d", unread "2147483648d", unread " 1d"]
+              (map Gen.parseOlderThan ["14d", "+3d", "2147483647d", "14", "", "14D", "d", "0d", "-1d", "1.5d", "2147483648d", " 1d"]),
+      runTest "the cutoff is that many days of 86400 seconds before now, with no overflow at the largest count" $
+        assertEqual "two days" (Gen.EpochSeconds (1000000 - 2 * 86400)) (Gen.cutoffBefore (Gen.EpochSeconds 1000000) (Gen.Days 2))
+          `andThen` assertEqual "the largest" (Gen.EpochSeconds (negate (fromIntegral (maxBound :: Int32) * 86400))) (Gen.cutoffBefore (Gen.EpochSeconds 0) (Gen.Days maxBound)),
+      runTest "a generation's date is its day in UTC" $
+        assertEqual
+          "dates"
+          ["1970-01-01", "1970-01-01", "1970-01-02", "2020-04-10", "1969-12-31"]
+          (map (Gen.generationDate . Gen.EpochSeconds) [0, 86399, 86400, 1586520000, -1]),
+      runTest "wiping the history deletes every generation but the current one, in order of number, and all of them when none is current" $
+        let listed = [dated 1 0, dated 2 0, dated 3 0]
+         in assertEqual "current 2" (map Gen.RemoveGeneration [number 1, number 3]) (Gen.wipePlan Gen.WipeEveryOld (Just (number 2)) listed)
+              `andThen` assertEqual "none current" (map (Gen.RemoveGeneration . number) [1, 2, 3]) (Gen.wipePlan Gen.WipeEveryOld Nothing listed)
+              `andThen` assertEqual "an unlisted current one" (map (Gen.RemoveGeneration . number) [1, 2, 3]) (Gen.wipePlan Gen.WipeEveryOld (Just (number 9)) listed),
+      runTest "under a cutoff the newest generation made before it stays, those before it go newest first, and one made after it stays with a warning" $
+        let listed = [dated 1 100, dated 2 200, dated 3 300, dated 4 400]
+            older cutoff current = Gen.wipePlan (Gen.WipeOlderThan (Gen.EpochSeconds cutoff)) (number <$> current) listed
+         in assertEqual "the newest before 250 is 2" [Gen.RemoveGeneration (number 1)] (older 250 (Just 4))
+              `andThen` assertEqual "the current one stays" [] (older 250 (Just 1))
+              `andThen` assertEqual "none before the cutoff" [] (older 50 (Just 4))
+              `andThen` assertEqual "every one before it, the newest kept" (map (Gen.RemoveGeneration . number) [3, 2, 1]) (older 1000 (Just 4))
+              `andThen` assertEqual "a generation as old as the cutoff is not before it" [Gen.RemoveGeneration (number 1)] (older 300 (Just 4))
+              `andThen` assertEqual
+                "one made after the cutoff, below one made before it"
+                [Gen.KeepNewerGeneration (number 1)]
+                (Gen.wipePlan (Gen.WipeOlderThan (Gen.EpochSeconds 250)) (Just (number 3)) [dated 1 500, dated 2 200, dated 3 300]),
+      runTestM "wiping the history never deletes the current generation; under a cutoff it deletes exactly the ones made before it below the newest of those, and warns of the others below it" $
+        propertyHolds . QC.checkCoverage $
+          QC.forAll genDatedListing $ \(listing, current, cutoff) ->
+            let numbers = map (Gen.generationNumber . Gen.datedGeneration) listing
+                everyOld = Gen.wipePlan Gen.WipeEveryOld current listing
+                steps = Gen.wipePlan (Gen.WipeOlderThan cutoff) current listing
+                removed = [n | Gen.RemoveGeneration n <- steps]
+                warned = [n | Gen.KeepNewerGeneration n <- steps]
+                madeBefore entry = Gen.datedTime entry < cutoff
+                newestBefore = listToMaybe (reverse [Gen.generationNumber (Gen.datedGeneration entry) | entry <- listing, madeBefore entry])
+                below = [entry | Just newest <- [newestBefore], entry <- reverse listing, Gen.generationNumber (Gen.datedGeneration entry) < newest]
+                numberOf = Gen.generationNumber . Gen.datedGeneration
+             in QC.cover 20 (not (null removed)) "some generation is deleted"
+                  $ QC.cover 5 (not (null warned)) "a generation is kept with a warning"
+                  $ QC.cover 5 (any ((== current) . Just . numberOf) (filter madeBefore below)) "the current generation is below the newest made before the cutoff"
+                  $ QC.counterexample "every old one" (everyOld == [Gen.RemoveGeneration n | n <- numbers, Just n /= current])
+                    QC..&&. QC.counterexample "the current one" (all ((/= current) . Just) removed)
+                    QC..&&. QC.counterexample "deleted" (removed == [numberOf entry | entry <- below, madeBefore entry, Just (numberOf entry) /= current])
+                    QC..&&. QC.counterexample "warned" (warned == [numberOf entry | entry <- below, not (madeBefore entry)])
     ]
+  where
+    dated n seconds = Gen.DatedGeneration (Gen.Generation (Gen.GenerationNumber n) (asciiOsPath ("profile-" <> show n <> "-link"))) (Gen.EpochSeconds seconds)
 
 -- | A profile changed through the library against a store on disk: the
 -- default profile's directory and link made, generations made and
@@ -4775,6 +4914,14 @@ testProfileUpdateIO = do
         viaAgain <- Gen.updateProfile testLogger ops viaDir viaProfile (pure . Gen.Changed)
         viaConflict <- Gen.updateProfile testLogger ops viaDir viaProfile (adding "beta" beta)
         pure (viaAdded, viaAgain, viaConflict)
+      -- A directory standing at a generation's name, with a file in it, in
+      -- a profile whose link names generation 2.
+      let wiped = rootPath OP.</> asciiOsPath "wiped" OP.</> asciiOsPath "profile"
+      createDirectoryIfMissing True (root </> "wiped" </> "profile-1-link")
+      BS.writeFile (root </> "wiped" </> "profile-1-link" </> "kept") "kept"
+      Dir.createDirectoryLink "profile-2-link" (root </> "wiped" </> "profile")
+      wipedDirectory <- Gen.wipeHistory testLogger wiped Gen.WipeEveryOld Gen.MakeChanges
+      directoryKept <- Dir.doesFileExist (root </> "wiped" </> "profile-1-link" </> "kept")
       linked <- osLinkIfThere profile
       helloRun <- either (\(_ :: IOException) -> Nothing) Just <$> try (BS.readFile (root </> "home" </> ".nix-profile" </> "bin" </> "hello"))
       gens <- Gen.listGenerations profile
@@ -4827,6 +4974,10 @@ testProfileUpdateIO = do
           runTest "a profile whose directory is not there fails as a value, at its lock file" $
             case missingDirectory of
               Left (Gen.ProfileIOFailed reason) | "opening lock file" `T.isPrefixOf` reason -> Pass
+              other -> Fail (T.pack (show other)),
+          runTest "wiping the history unlinks a generation's name and never removes a directory standing there" $
+            case wipedDirectory of
+              Left (Gen.ProfileIOFailed reason) | "removing \"" `T.isPrefixOf` reason -> assertEqual "the directory's file" True directoryKept
               other -> Fail (T.pack (show other))
         ]
 
