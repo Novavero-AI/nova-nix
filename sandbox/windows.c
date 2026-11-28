@@ -172,11 +172,13 @@ enum sweep_outcome {
 };
 
 /* What a sweep came to: how it ended, the Win32 error behind
- * SWEEP_UNLISTED or SWEEP_UNENDED, and the process the latter concerns. */
+ * SWEEP_UNLISTED or SWEEP_UNENDED, and the process the latter concerns,
+ * its ID and its program's name. */
 struct sweep {
     enum sweep_outcome outcome;
     DWORD error;
     DWORD pid;
+    WCHAR program[MAX_PATH];
 };
 
 /* The window station and desktop name the builder starts with: an empty
@@ -402,53 +404,70 @@ static int runs_as(HANDLE process, PSID slot)
     return same;
 }
 
-/* End the process PID, which runs as the slot's account and which the
- * handle the caller holds keeps from giving its ID to another, and wait
- * until DEADLINE for it to end.  Answers 1 when it was running, 0 when it
- * had already ended, or -1 with *SWEEP saying why it could not be ended or
- * did not end in time. */
-static int end_process(DWORD pid, ULONGLONG deadline, struct sweep *sweep)
+/* Whether the process PROCESS, open to query, has not ended.  One whose
+ * exit code cannot be read counts as running, and so does one that ended
+ * with STILL_ACTIVE's value as its code, which the sweep cannot tell from
+ * one running: it ends the build that left it a failure. */
+static int still_running(HANDLE process)
 {
-    HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
-    ULONGLONG now;
-    DWORD waited;
-    int answer = 1;
-    if (process == NULL) {
-        sweep->outcome = SWEEP_UNENDED;
-        sweep->error = GetLastError();
-        sweep->pid = pid;
+    DWORD code = 0;
+    return !GetExitCodeProcess(process, &code) || code == STILL_ACTIVE;
+}
+
+/* Record in *SWEEP that the process ENTRY names, which runs as the slot's
+ * account, could not be ended, for the Win32 error ERROR. */
+static void unended(struct sweep *sweep, const PROCESSENTRY32W *entry, DWORD error)
+{
+    sweep->outcome = SWEEP_UNENDED;
+    sweep->error = error;
+    sweep->pid = entry->th32ProcessID;
+    memcpy(sweep->program, entry->szExeFile, sizeof sweep->program);
+}
+
+/* End the process ENTRY names, which runs as the slot's account and which
+ * QUERY, the caller's handle to it, keeps from giving its ID to another,
+ * and wait until DEADLINE for it to end where this process may wait on it.
+ * Answers 1 when it was running, 0 when it had already ended, or -1 with
+ * *SWEEP saying why it could not be ended or did not end in time.  The
+ * rights to end a process and to wait on it are asked for apart, as a
+ * process's DACL can grant the one and not the other; one this process
+ * may end but not wait on is counted running, for the next listing to
+ * find ended. */
+static int end_process(HANDLE query, const PROCESSENTRY32W *entry, ULONGLONG deadline, struct sweep *sweep)
+{
+    HANDLE ending;
+    HANDLE waitable;
+    if (!still_running(query))
+        return 0;
+    ending = OpenProcess(PROCESS_TERMINATE, FALSE, entry->th32ProcessID);
+    if (ending == NULL) {
+        unended(sweep, entry, GetLastError());
         return -1;
     }
-    /* A process that has already ended needs no ending. */
-    if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0) {
-        CloseHandle(process);
-        return 0;
+    /* With a handle that may end the process, TerminateProcess refuses
+     * only one that has ended or is ending. */
+    if (!TerminateProcess(ending, ENDED_BUILD_EXIT_CODE) && GetLastError() != ERROR_ACCESS_DENIED) {
+        unended(sweep, entry, GetLastError());
+        CloseHandle(ending);
+        return -1;
     }
-    /* TerminateProcess refuses a process that has ended, as this one may
-     * have since the check above. */
-    if (!TerminateProcess(process, ENDED_BUILD_EXIT_CODE)) {
+    CloseHandle(ending);
+    waitable = OpenProcess(SYNCHRONIZE, FALSE, entry->th32ProcessID);
+    if (waitable != NULL) {
+        ULONGLONG now = GetTickCount64();
+        DWORD waited = WaitForSingleObject(waitable, now < deadline ? (DWORD)(deadline - now) : 0);
         DWORD error = GetLastError();
-        if (WaitForSingleObject(process, 0) != WAIT_OBJECT_0) {
-            sweep->outcome = SWEEP_UNENDED;
-            sweep->error = error;
-            sweep->pid = pid;
-            CloseHandle(process);
+        CloseHandle(waitable);
+        if (waited == WAIT_TIMEOUT) {
+            sweep->outcome = SWEEP_LINGERING;
+            return -1;
+        }
+        if (waited != WAIT_OBJECT_0) {
+            unended(sweep, entry, error);
             return -1;
         }
     }
-    now = GetTickCount64();
-    waited = WaitForSingleObject(process, now < deadline ? (DWORD)(deadline - now) : 0);
-    if (waited == WAIT_TIMEOUT) {
-        sweep->outcome = SWEEP_LINGERING;
-        answer = -1;
-    } else if (waited != WAIT_OBJECT_0) {
-        sweep->outcome = SWEEP_UNENDED;
-        sweep->error = GetLastError();
-        sweep->pid = pid;
-        answer = -1;
-    }
-    CloseHandle(process);
-    return answer;
+    return 1;
 }
 
 /* List the processes and end each that runs as SLOT, waiting until
@@ -471,7 +490,7 @@ static long sweep_pass(PSID slot, ULONGLONG deadline, struct sweep *sweep)
         int ended;
         if (process == NULL)
             continue;
-        ended = runs_as(process, slot) ? end_process(entry.th32ProcessID, deadline, sweep) : 0;
+        ended = runs_as(process, slot) ? end_process(process, &entry, deadline, sweep) : 0;
         CloseHandle(process);
         if (ended < 0) {
             CloseHandle(snapshot);
@@ -495,9 +514,8 @@ static struct sweep sweep_slot(PSID slot)
 {
     struct sweep sweep;
     ULONGLONG deadline = GetTickCount64() + SWEEP_WAIT_SECONDS * 1000ULL;
+    memset(&sweep, 0, sizeof sweep);
     sweep.outcome = SWEEP_DONE;
-    sweep.error = 0;
-    sweep.pid = 0;
     for (;;) {
         long running = sweep_pass(slot, deadline, &sweep);
         if (running <= 0)
@@ -535,8 +553,9 @@ static int sweep_after_build(PSID slot)
                 (unsigned long)sweep.error);
         return 0;
     case SWEEP_UNENDED:
-        fprintf(stderr, "nova-nix-sandbox: cannot end process %lu, which runs as the build's account: Win32 error %lu\n",
-                (unsigned long)sweep.pid, (unsigned long)sweep.error);
+        fprintf(stderr,
+                "nova-nix-sandbox: cannot end process %lu (%ls), which runs as the build's account: Win32 error %lu\n",
+                (unsigned long)sweep.pid, sweep.program, (unsigned long)sweep.error);
         return 0;
     case SWEEP_LINGERING:
         fprintf(stderr, "nova-nix-sandbox: processes were still running as the build's account %d seconds after it ended\n",
