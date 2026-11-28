@@ -59,6 +59,7 @@ import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
 import System.FilePath ((</>))
 import Test.Harness (TestResult (..), assertEqual, bytesText, evalNixIO, evalNixIOStoreDir, nixQuotedPath, runTest, runTestIO, runTestM, sessionClosure, testLogger, testOrigin, testSessionStore)
+import Text.Read (readMaybe)
 
 -- ---------------------------------------------------------------------------
 -- Tests: NAR and hash known-answer vectors
@@ -1376,6 +1377,7 @@ testGccCoreWindows = do
           pure (rootOf, before, full)
         other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
   writes <- readIORef (esStoreWriteCache st)
+  gmpPatchLines <- BS8.lines <$> BS.readFile (cwd </> "pkgs" </> "windows" </> "by-name" </> "gc" </> "gcc-core" </> T.unpack gmpPatch)
   case outcome of
     Left err -> sequence [runTest instantiates (Fail err)]
     Right (rootOf, before, full) -> do
@@ -1396,6 +1398,22 @@ testGccCoreWindows = do
           sourcesNamed name = [storePathToText defaultStoreDir path | drv <- maybeToList gccCore, path <- drvInputSrcs drv, spName path == name]
           wordsOf name = maybe [] (T.words . variableOf name)
           flagsWith prefixes drv = [flag | flag <- wordsOf "configureFlags" drv, any (`T.isPrefixOf` flag) prefixes]
+          -- gmp's patch: the file it changes, the lines it removes, and the
+          -- digit strings among the lines it adds, each a quoted value to
+          -- sixteen places.
+          gmpPatchFiles = [rest | line <- gmpPatchLines, Just rest <- [BS.stripPrefix "+++ " line]]
+          gmpPatchRemoved = [rest | line <- gmpPatchLines, Just rest <- [BS.stripPrefix "-" line], not ("-- " `BS.isPrefixOf` rest)]
+          gmpPatchAdded = [rest | line <- gmpPatchLines, Just rest <- [BS.stripPrefix "+" line], not ("++ " `BS.isPrefixOf` rest)]
+          quoted line = [part | (index, part) <- zip [0 :: Int ..] (BS8.split '"' line), odd index]
+          isDigits text = case BS8.uncons text of
+            Just (leading, rest) -> leading `elem` ("01" :: String) && BS.length rest == 17 && "." `BS.isPrefixOf` rest && BS8.all isDigit (BS.drop 1 rest)
+            Nothing -> False
+          gmpDigits = concatMap (filter isDigits . quoted) gmpPatchAdded
+          -- Whether a base's digits, read as a number, are log 2 / log base
+          -- as this host's double precision computes it, to within
+          -- digitsTolerance.
+          nearValue :: Int -> BS.ByteString -> Bool
+          nearValue base text = maybe False (\value -> abs (value - logBase (fromIntegral base) 2) < digitsTolerance) (readMaybe (BS8.unpack text))
       sequence
         [ runTest instantiates $
             assertEqual "derivations added" (sort addedNames) (sort (map nameOf added)),
@@ -1408,16 +1426,34 @@ testGccCoreWindows = do
               "leaves added"
               (sort archives, True)
               (sort (map nameOf addedLeaves), all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
-          runTest "it reads no input source but what evaluation writes as text, the stdenv's files, the patch and the dirent header" $
+          runTest "it reads no input source but what evaluation writes as text, the stdenv's files, its two patches and the dirent header" $
             assertEqual
               "input sources not written as text"
-              ["config.site", "config.site", patch, "include", "include", "include", "setup.sh", "setup.sh"]
+              ["config.site", "config.site", patch, gmpPatch, "include", "include", "include", "setup.sh", "setup.sh"]
               (sort [spName path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]),
           runTest "gcc-core names its patch, its build inputs and its three libraries' archives where setup.sh and preConfigure read them" $
             assertEqual
               "patches, buildInputs and the archives"
               (sourcesNamed patch, [outputOf direntRoot, outputOf binutilsRoot], map (outputNamed . snd) mathArchives, True)
               (wordsOf "patches" gccCore, wordsOf "buildInputs" gccCore, [wordsOf variable gccCore | (variable, _) <- mathArchives], isJust gccCore),
+          runTest "gcc-core names gmp's patch and applies it once preConfigure has unpacked gmp" $
+            assertEqual
+              "gmpPatch and the preConfigure lines from gmp's unpacking"
+              ( sourcesNamed gmpPatch,
+                ["tar xf \"$gmpSrc\"", "mv gmp-4.3.2 gmp", "(cd gmp && patch -p1 -i \"$gmpPatch\")"]
+              )
+              ( wordsOf "gmpPatch" gccCore,
+                take 3 (dropWhile (/= "tar xf \"$gmpSrc\"") (maybe [] (map T.strip . T.lines . variableOf "preConfigure") gccCore))
+              ),
+          runTest "gmp's patch has gmp's base table written from fixed digits, log 2 / log base for each base from 2 to 256, in place of gmp's log, and changes nothing else" $
+            assertEqual
+              "the file it changes, the lines it removes, how many digit strings it adds, and whether each base's are its value"
+              (["b/gen-bases.c"], removedByGmpPatch, length tableBases, [(base, True) | base <- tableBases])
+              ( gmpPatchFiles,
+                gmpPatchRemoved,
+                length gmpDigits,
+                [(base, nearValue base text) | (base, text) <- zip tableBases gmpDigits]
+              ),
           runTest "gcc-core's flags name the target binutils is configured for and the outputs of the headers, binutils and the dirent library, and no sysroot" $
             assertEqual
               "flags"
@@ -1470,6 +1506,29 @@ testGccCoreWindows = do
     mingwVersion = "8.0.3"
     patch :: Text
     patch = "fix-tinycc-attribute.patch"
+    gmpPatch :: Text
+    gmpPatch = "gmp-bases-digits.patch"
+    -- The lines gmp's patch takes out of its table generator: the math
+    -- header, the double that holds each base's value, the value's
+    -- computation with the build machine's log, and the two formats that
+    -- print the double.
+    removedByGmpPatch :: [BS.ByteString]
+    removedByGmpPatch =
+      [ "#include <math.h>",
+        "",
+        "double chars_per_bit_exactly;",
+        "  chars_per_bit_exactly = 0.69314718055994530942 / log ((double) base);",
+        "          printf (\"%u, %.16f, 0x%x },\\n\",",
+        "          printf (\"%u, %.16f, CNST_LIMB(0x\","
+      ]
+    -- The bases gmp's table holds a value for, each with its digits.
+    tableBases :: [Int]
+    tableBases = [2 .. 256]
+    -- How far a base's digits may be from the value this host computes:
+    -- far outside their rounding to sixteen places and any host log's
+    -- error, and far inside the gap between two bases' values.
+    digitsTolerance :: Double
+    digitsTolerance = 1.0e-15
     target :: Text
     target = "i686-w64-mingw32"
     -- The variable gcc-core's preConfigure unpacks each library from, and
@@ -1713,14 +1772,14 @@ testGcc46CxxWindows = do
               "leaves added"
               ([cxxArchive], True)
               (map nameOf addedLeaves, all (\drv -> isFetch drv && isFixedOutput drv) addedLeaves),
-          runTest "it reads no input source but what evaluation writes as text and the stdenv's files" $
+          runTest "it reads no input source but what evaluation writes as text, the stdenv's files and gmp's patch" $
             assertEqual
               "input sources not written as text"
-              ["config.site", "include", "setup.sh"]
+              ["config.site", gmpPatch, "include", "setup.sh"]
               (sort [spName path | drv <- added, path <- drvInputSrcs drv, not (wroteAsText path)]),
-          runTest "gcc46-cxx names gcc-core's four archives and the g++ archive where setup.sh and preConfigure read them, with gcc46 and binutils as its build inputs and no patch" $
+          runTest "gcc46-cxx names gcc-core's four archives, gcc-core's patch of gmp and the g++ archive where setup.sh and preConfigure read them, with gcc46 and binutils as its build inputs and no patch of GCC's own" $
             assertEqual
-              "the archives, buildInputs and patches"
+              "the archives, gmp's patch, buildInputs and patches"
               ( [wordsOf variable gccCore | variable <- coreArchives] ++ [outputNamed cxxArchive],
                 [outputOf gcc46Root, outputOf binutilsRoot],
                 [],
@@ -1761,6 +1820,11 @@ testGcc46CxxWindows = do
               "languages, libraries and registry"
               ["--enable-languages=c,c++", "--disable-shared", "--disable-win32-registry"]
               (flagsWith ["--enable-languages=", "--enable-shared", "--disable-shared", "--enable-win32-registry", "--disable-win32-registry"] gccCxx),
+          runTest "gcc46-cxx patches gmp's source with gmp's patch once preConfigure has unpacked it" $
+            assertEqual
+              "the preConfigure lines from gmp's unpacking"
+              ["tar xf \"$gmpSrc\"", "mv gmp-4.3.2 gmp", "(cd gmp && patch -p1 -i \"$gmpPatch\")"]
+              (take 3 (dropWhile (/= "tar xf \"$gmpSrc\"") (maybe [] (map T.strip . T.lines . variableOf "preConfigure") gccCxx))),
           runTest "gcc46-cxx unsets the stdenv's C_INCLUDE_PATH, and nothing else, before configure" $
             assertEqual
               "preConfigure's unset lines"
@@ -1787,9 +1851,12 @@ testGcc46CxxWindows = do
     target = "i686-w64-mingw32"
     cxxArchive :: Text
     cxxArchive = "gcc-g++-4.6.4.tar.gz"
-    -- The variables gcc-core names its archives in, which gcc46-cxx takes.
+    -- The variables gcc-core names its archives and gmp's patch in, which
+    -- gcc46-cxx takes.
     coreArchives :: [Text]
-    coreArchives = ["src", "gmpSrc", "mpfrSrc", "mpcSrc"]
+    coreArchives = ["src", "gmpSrc", "gmpPatch", "mpfrSrc", "mpcSrc"]
+    gmpPatch :: Text
+    gmpPatch = "gmp-bases-digits.patch"
     gccCxxRoot :: Text
     gccCxxRoot = "pkgs.gcc46-cxx"
     gccCoreRoot :: Text

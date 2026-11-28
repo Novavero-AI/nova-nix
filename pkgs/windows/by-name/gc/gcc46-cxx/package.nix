@@ -14,9 +14,11 @@
 # the build and the host and the target is binutils', so GCC takes itself
 # for a cross compiler and its programs install as
 # bin/i686-w64-mingw32-<name>.exe, i686-w64-mingw32-g++.exe among them; it
-# configures from a build directory beside its source; and --with-as and
-# --with-ld compile in the paths of binutils' assembler and linker.
-# gcc-core says why of each.
+# configures from a build directory beside its source; --with-as and
+# --with-ld compile in the paths of binutils' assembler and linker; and
+# gmp is patched to write its table of digits per bit from fixed digits,
+# without which this rung's compilers differ between the x64 and ARM64
+# legs.  gcc-core says why of each.
 #
 # GCC's installation guide has a cross compiler given its target's headers
 # and libraries before it is configured, with --with-headers and
@@ -135,6 +137,7 @@ seedStdenv.mkDerivation {
   inherit (gcc-core)
     src
     gmpSrc
+    gmpPatch
     mpfrSrc
     mpcSrc
     ;
@@ -149,6 +152,7 @@ seedStdenv.mkDerivation {
     tar xf "$cxxSrc" -C ..
     tar xf "$gmpSrc"
     mv gmp-${gcc-core.gmpVersion} gmp
+    (cd gmp && patch -p1 -i "$gmpPatch")
     tar xf "$mpfrSrc"
     mv mpfr-${gcc-core.mpfrVersion} mpfr
     tar xf "$mpcSrc"
