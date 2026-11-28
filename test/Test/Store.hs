@@ -69,7 +69,7 @@ import Nix.Logger (Logger (..))
 import Nix.Push (computeClosure)
 import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, closeStore, collectGarbage, copyPathInto, deleteSpecificPaths, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, reachableFrom, referencesMap, referrersFirst, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, specificStillAliveMessage, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv)
-import Nix.Store.Access (AclEntry (..), DirAccess (..), DirSecurity (..), Distrust (..), StoreAccounts (..), accessSddl, descriptorDistrust, distrustMessage, parseSecurityDescriptor, securityDistrust, sidFromText, stateDirectories, storeDirectories, validPathSddl)
+import Nix.Store.Access (AclEntry (..), DirAccess (..), DirSecurity (..), Distrust (..), StoreAccounts (..), ValidNode (..), accessSddl, descriptorDistrust, distrustMessage, parseSecurityDescriptor, securityDistrust, sidFromText, stateDirectories, storeDirectories, validPathSddl)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), Ultimate (..), UnregisterResult (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathFromHashPart, queryPathInfo, queryReferences, queryReferrers, queryValidDerivers, registerPath, registerPaths, unregisterPathRow)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
@@ -2132,22 +2132,26 @@ testStoreAccessIO = do
         withBuilders $ \accounts ->
           assertEqual "SDDL" (sddlFor someUser StoreAccess) (accessSddl accounts StateAccess)
             `andThen` assertEqual "SDDL" (sddlFor someUser StoreAccess) (sddlFor someUser StateAccess),
-      runTest "a registered path is the service's, with a protected DACL for the service, SYSTEM and Administrators, read and execute for Users and the build accounts' group, and read-control for its owner" $
+      runTest "a registered path is the service's, with a protected DACL for the service, SYSTEM and Administrators, read and execute for Users and the build accounts' group, and read-control for its owner, passed down from a directory alone" $
         withBuilders $ \accounts ->
           assertEqual
             "single user"
             "O:S-1-5-21-1-2-3-1001D:P(A;OICI;0x1f01ff;;;S-1-5-21-1-2-3-1001)(A;OICI;0x1f01ff;;;S-1-5-18)(A;OICI;0x1f01ff;;;S-1-5-32-544)(A;OICI;0x1200a9;;;S-1-5-32-545)(A;OICI;0x20000;;;S-1-3-4)"
-            (validPathSddl accounts {saBuilders = Nothing})
+            (validPathSddl accounts {saBuilders = Nothing} ValidDirectory)
             `andThen` assertEqual
               "build accounts"
               "O:S-1-5-21-1-2-3-1001D:P(A;OICI;0x1f01ff;;;S-1-5-21-1-2-3-1001)(A;OICI;0x1f01ff;;;S-1-5-18)(A;OICI;0x1f01ff;;;S-1-5-32-544)(A;OICI;0x1200a9;;;S-1-5-32-545)(A;OICI;0x1200a9;;;S-1-5-21-1-2-3-1100)(A;OICI;0x20000;;;S-1-3-4)"
-              (validPathSddl accounts)
+              (validPathSddl accounts ValidDirectory)
+            `andThen` assertEqual
+              "a file or a link, with no inheritance flags"
+              "O:S-1-5-21-1-2-3-1001D:P(A;;0x1f01ff;;;S-1-5-21-1-2-3-1001)(A;;0x1f01ff;;;S-1-5-18)(A;;0x1f01ff;;;S-1-5-32-544)(A;;0x1200a9;;;S-1-5-32-545)(A;;0x1200a9;;;S-1-5-21-1-2-3-1100)(A;;0x20000;;;S-1-3-4)"
+              (validPathSddl accounts ValidLeaf)
             `andThen` maybe
               (Fail "SYSTEM is not a SID")
               ( assertEqual
                   "SYSTEM as the service"
                   "O:S-1-5-18D:P(A;OICI;0x1f01ff;;;S-1-5-18)(A;OICI;0x1f01ff;;;S-1-5-32-544)(A;OICI;0x1200a9;;;S-1-5-32-545)(A;OICI;0x20000;;;S-1-3-4)"
-                  . validPathSddl
+                  . (`validPathSddl` ValidDirectory)
                   . singleUser
               )
               (sidFromText localSystem),
@@ -2455,7 +2459,9 @@ testStoreAccessIO = do
         fresh "valid-path" $ do
           let root = scratch "valid-path" </> "path"
               tool = root </> "sub" </> "tool.exe"
-              validEntries = [allow user fullControl | user /= localSystem] <> [allow localSystem fullControl, allow "S-1-5-32-544" fullControl, allow "S-1-5-32-545" readAndExecute, allow "S-1-3-4" readControl]
+              -- A directory's entries are passed down; a file's carry no
+              -- inheritance flags.
+              validEntries flags = map (\(sid, mask) -> DaclEntry 0 flags mask (Just sid)) ([(user, fullControl) | user /= localSystem] <> [(localSystem, fullControl), ("S-1-5-32-544", fullControl), ("S-1-5-32-545", readAndExecute), ("S-1-3-4", readControl)])
               -- READ_CONTROL alone, which OWNER RIGHTS is given.
               readControl = 0x20000
           createDirectoryIfMissing True (takeDirectory tool)
@@ -2465,9 +2471,9 @@ testStoreAccessIO = do
           before <- ExecBit.narHashOfPath processCaseHack root
           canonicalizeMetadata root
           after <- ExecBit.narHashOfPath processCaseHack root
-          rootDacl <- carries "the path" validEntries root
-          dirDacl <- carries "a directory in it" validEntries (takeDirectory tool)
-          fileDacl <- carries "a file in it" validEntries tool
+          rootDacl <- carries "the path" (validEntries passedDown) root
+          dirDacl <- carries "a directory in it" (validEntries passedDown) (takeDirectory tool)
+          fileDacl <- carries "a file in it" (validEntries 0x0) tool
           owners <- traverse entryOwner [root, takeDirectory tool, tool, root </> "data"]
           executable <- ExecBit.isExecutable tool
           pure $

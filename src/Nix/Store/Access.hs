@@ -125,6 +125,7 @@ module Nix.Store.Access
     distrustMessage,
 
     -- * A registered path
+    ValidNode (..),
     withValidPathAccess,
 
     -- * The Windows access control list
@@ -242,24 +243,40 @@ createDirectoryWith access path = Posix.createDirectory path $ case access of
 #endif
 
 -- | Run an action given the step that registering a path takes for each
--- of its nodes on Windows: the node itself, a link not followed, is
--- given the service as its owner and the protected DACL 'validPathSddl'
--- describes for the t'StoreAccounts' of this machine, which no build
--- account may change.  The DACL is each node's own, not one inherited from the
--- path's root, so the walk that sets it is the caller's, which does not
--- follow a link.  On POSIX the step does nothing, and the walk's own
--- ownership change stands for it.
-withValidPathAccess :: ((FilePath -> IO ()) -> IO a) -> IO a
+-- of its nodes on Windows, given the kind of node it is: the node
+-- itself, a link not followed, is given the service as its owner and the
+-- protected DACL 'validPathSddl' describes for the t'StoreAccounts' of
+-- this machine, which no build account may change.  The DACL is each
+-- node's own, not one inherited from the path's root, so the walk that
+-- sets it is the caller's, which does not follow a link.  On POSIX the
+-- step does nothing, and the walk's own ownership change stands for it.
+withValidPathAccess :: ((ValidNode -> FilePath -> IO ()) -> IO a) -> IO a
 #if defined(mingw32_HOST_OS)
 withValidPathAccess use = do
   accounts <- storeAccounts
-  withCWString (T.unpack (validPathSddl accounts)) $ \cSddl ->
-    alloca $ \descriptorOut -> do
-      failUnlessSuccess "ConvertStringSecurityDescriptorToSecurityDescriptorW" (c_nn_descriptor_from_sddl cSddl descriptorOut)
-      bracket (peek descriptorOut) (void . localFree) (use . giveValidPathAccess)
+  withDescriptor (validPathSddl accounts ValidDirectory) $ \directory ->
+    withDescriptor (validPathSddl accounts ValidLeaf) $ \leaf ->
+      use $ \node -> giveValidPathAccess $ case node of
+        ValidDirectory -> directory
+        ValidLeaf -> leaf
+  where
+    withDescriptor sddl inner =
+      withCWString (T.unpack sddl) $ \cSddl ->
+        alloca $ \descriptorOut -> do
+          failUnlessSuccess "ConvertStringSecurityDescriptorToSecurityDescriptorW" (c_nn_descriptor_from_sddl cSddl descriptorOut)
+          bracket (peek descriptorOut) (void . localFree) inner
 #else
-withValidPathAccess use = use (const (pure ()))
+withValidPathAccess use = use (\_ _ -> pure ())
 #endif
+
+-- | The kind of node of a registered path, by what its DACL can pass on.
+data ValidNode
+  = -- | A directory, whose entries pass to what it holds.
+    ValidDirectory
+  | -- | A file or a link, which holds nothing: Windows keeps no
+    -- inheritance flags on such a node's entries, so it is given none.
+    ValidLeaf
+  deriving (Eq, Show)
 
 -- | Create a store's directory, given its path, where it is missing,
 -- with any missing parent of it, as @createDirectoryIfMissing True@
@@ -849,24 +866,29 @@ wideHighDigits = 4
 accessSddl :: StoreAccounts -> DirAccess -> Text
 accessSddl accounts access = protectedDacl <> foldMap grantSddl (accessGrants accounts access)
 
--- | The security descriptor, in SDDL, that each node of a path is given
--- when the path is registered, on Windows: the service as its owner, and
--- a protected DACL of allow entries inherited below that grants full
+-- | The security descriptor, in SDDL, that a node of a path of the kind
+-- given is given when the path is registered, on Windows: the service as
+-- its owner, and a protected DACL of allow entries that grants full
 -- control to the service, SYSTEM and Administrators, read and execute to
 -- Users and the build accounts' group where there is one, and read
 -- access to its own DACL alone to its owner (@OWNER RIGHTS@), which
 -- takes the place of the rights an owner otherwise has whatever the DACL
--- says.  A build account that made a node, and owns it where the
--- service has not taken it, can then change nothing of it.
-validPathSddl :: StoreAccounts -> Text
-validPathSddl accounts =
+-- says.  A directory's entries are inherited below (@OICI@), and a file's
+-- or a link's carry no inheritance flags, which Windows would not keep on
+-- them.  A build account that made a node, and owns it where the service
+-- has not taken it, can then change nothing of it.
+validPathSddl :: StoreAccounts -> ValidNode -> Text
+validPathSddl accounts node =
   "O:" <> sidText (saService accounts) <> protectedDacl <> foldMap grantSddl grants
   where
+    inheritance = case node of
+      ValidDirectory -> PassedDown
+      ValidLeaf -> ItselfAlone
     grants =
-      map (Grant PassedDown fileAllAccess) (trustedAccounts accounts)
-        <> [Grant PassedDown readAndExecute usersSid]
-        <> [Grant PassedDown readAndExecute builders | builders <- toList (saBuilders accounts)]
-        <> [Grant PassedDown readControl ownerRightsSid]
+      map (Grant inheritance fileAllAccess) (trustedAccounts accounts)
+        <> [Grant inheritance readAndExecute usersSid]
+        <> [Grant inheritance readAndExecute builders | builders <- toList (saBuilders accounts)]
+        <> [Grant inheritance readControl ownerRightsSid]
 
 -- | One allow entry of a DACL nova-nix writes: whether it is passed to
 -- what a directory holds, the rights, and the account it grants them to.
