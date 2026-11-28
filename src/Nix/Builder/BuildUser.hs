@@ -190,8 +190,8 @@ userPoolDir stateDir = fromMaybe defaultStateDir stateDir PosixPath.</> "userpoo
 -- @build-users-group@ and the name of the peer's primary group, where the
 -- system gives one: a peer whose primary group is the build users' is
 -- refused, whatever @trusted-users@ says, as upstream's daemon refuses
--- one, since a build user is whom a build runs as.  macOS gives a peer no
--- group, so there the answer is never.
+-- one, since a build user is whom a build runs as.  Linux and macOS both
+-- give a socket's peer its primary group, as upstream reads it on each.
 peerInBuildUsersGroup :: ByteString -> Maybe ByteString -> Bool
 peerInBuildUsersGroup group peerGroup = not (BS.null group) && peerGroup == Just group
 

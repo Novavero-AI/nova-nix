@@ -138,6 +138,7 @@ module Nix.Store.GC
     GcRoot (..),
     findRoots,
     addOutLinkRoot,
+    addIndirectRoot,
     gcRootsDir,
     autoRootsDir,
     gcRootsDirName,
@@ -520,6 +521,13 @@ addOutLinkRoot store rawLink sp = do
             Right () -> do
               publishRecord (stDir store) linkBytes
               pure (Right link)
+
+-- | Record a link someone else made as a root, by the bytes of its
+-- absolute spelling, as upstream records an indirect root: what
+-- the link names is kept for as long as it names a store path, and a
+-- record whose link has gone is removed as roots are found.
+addIndirectRoot :: Store -> BS.ByteString -> IO ()
+addIndirectRoot store = publishRecord (stDir store)
 
 -- | Write an out-link's record into @auto@ by rename, given the bytes of
 -- the link's spelling, unless a record with that content is already

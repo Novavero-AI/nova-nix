@@ -133,7 +133,10 @@ library
     Nix.CacheDirectory
     Nix.Compression
     Nix.Config
+    Nix.Daemon.Auth
     Nix.Daemon.Connection
+    Nix.Daemon.Listen
+    Nix.Daemon.LocalStore
     Nix.Daemon.Ops
     Nix.Daemon.Protocol
     Nix.Daemon.Wire
@@ -183,6 +186,7 @@ library
     , ram                 >= 0.20 && < 1
     , filelock            >= 0.1.1 && < 0.2
     , mtl                 >= 2.2 && < 2.4
+    , network             >= 3.2 && < 3.3
     , nova-cache:{nova-cache, xz, zstandard, bzip2} >= 0.14 && < 0.15
     , process             >= 1.6 && < 1.7
     , random              >= 1.2 && < 1.4

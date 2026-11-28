@@ -723,6 +723,39 @@
           "usage": "nova-nix profile wipe-history --older-than AGE"
         }
       ]
+    },
+    {
+      "description": "Serves the store, as `nix daemon` does, to clients that speak upstream Nix's worker protocol, such as upstream's `nix` given `--store daemon`, on a Unix socket at `$NIX_DAEMON_SOCKET_PATH`, else `daemon-socket/socket` in `$NIX_STATE_DIR`, else `/nix/var/nix/daemon-socket/socket`, or where `--socket-path` puts it. The socket is writable by every user, so the directory it is in decides who reaches it. A client is trusted when `trusted-users` names it, may connect when it is trusted or `allowed-users` names it, and may not when its group is `build-users-group`; each names users, groups as `@GROUP`, or everyone as `*`. A client the daemon does not trust may not repair, has its settings limited as upstream's daemon limits them, and is shown roots without what holds them. The daemon holds the store open while it runs, so a collection waits for it to stop, and serves each connection on its own. It answers queries of the store: which paths are valid, their info, referrers and derivers, a derivation's outputs, the roots, and a path's NAR, and it keeps temporary and indirect roots; a client asking it to build, substitute, add paths or collect garbage is told it does not yet. nova-nix's own commands open the store themselves. A store directory that upstream Nix's database also manages, such as `/nix/store` where upstream Nix is installed, is refused. It runs on Linux and macOS.",
+      "examples": [
+        {
+          "arguments": [
+            "daemon"
+          ],
+          "command": "nova-nix daemon",
+          "description": "Serve the platform store, as root, to every user's clients.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "daemon",
+            "--store",
+            "/srv/nix/store",
+            "--socket-path",
+            "/srv/nix/daemon-socket/socket",
+            "--force-untrusted"
+          ],
+          "command": "nova-nix daemon --store /srv/nix/store --socket-path /srv/nix/daemon-socket/socket --force-untrusted",
+          "description": "Serve a store under `/srv`, on a socket beside it, trusting no client.",
+          "output": []
+        }
+      ],
+      "name": "nova-nix daemon",
+      "synopsis": [
+        {
+          "summary": "Serve the store to other users' Nix clients over a Unix socket, until stopped",
+          "usage": "nova-nix daemon"
+        }
+      ]
     }
   ],
   "configuration": {
@@ -839,7 +872,7 @@
         "name": "require-drop-supplementary-groups"
       },
       {
-        "description": "The group whose members builds run as, one build to a member at a time, when nova-nix runs as root on Linux or macOS; with it empty a build runs as the user nova-nix runs as (default: `nixbld` for root, empty otherwise)",
+        "description": "The group whose members builds run as, one build to a member at a time, when nova-nix runs as root on Linux or macOS, and whose members may not connect to the daemon; with it empty a build runs as the user nova-nix runs as (default: `nixbld` for root, empty otherwise)",
         "flag": null,
         "name": "build-users-group"
       },
@@ -867,6 +900,21 @@
         "description": "Text put after the prompt of an interactive `develop` shell",
         "flag": null,
         "name": "bash-prompt-suffix"
+      },
+      {
+        "description": "The users the daemon trusts, each a name, `@GROUP` for a group's members, or `*` for everyone (default `root`)",
+        "flag": null,
+        "name": "trusted-users"
+      },
+      {
+        "description": "The users who may connect to the daemon, named as `trusted-users` names them; a trusted user always may (default `*`)",
+        "flag": null,
+        "name": "allowed-users"
+      },
+      {
+        "description": "Substituters a client the daemon does not trust may ask it for, besides those it uses",
+        "flag": null,
+        "name": "trusted-substituters"
       }
     ]
   },
@@ -1543,6 +1591,50 @@
       ]
     },
     {
+      "argument": null,
+      "commands": [
+        "nova-nix daemon"
+      ],
+      "description": "Trust every client, without asking who it is",
+      "name": "--force-trusted",
+      "spellings": [
+        "--force-trusted"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix daemon"
+      ],
+      "description": "Trust no client, without asking who it is",
+      "name": "--force-untrusted",
+      "spellings": [
+        "--force-untrusted"
+      ]
+    },
+    {
+      "argument": null,
+      "commands": [
+        "nova-nix daemon"
+      ],
+      "description": "Admit and trust each client as `trusted-users` and `allowed-users` say (the default)",
+      "name": "--default-trust",
+      "spellings": [
+        "--default-trust"
+      ]
+    },
+    {
+      "argument": "PATH",
+      "commands": [
+        "nova-nix daemon"
+      ],
+      "description": "Listen on the socket at `PATH`, in place of `$NIX_DAEMON_SOCKET_PATH` and the default",
+      "name": "--socket-path",
+      "spellings": [
+        "--socket-path"
+      ]
+    },
+    {
       "argument": "DIR",
       "commands": [
         "nova-nix eval",
@@ -1558,7 +1650,8 @@
         "nova-nix profile list",
         "nova-nix profile history",
         "nova-nix profile rollback",
-        "nova-nix profile wipe-history"
+        "nova-nix profile wipe-history",
+        "nova-nix daemon"
       ],
       "description": "Use `DIR` as the store (default: the platform store)",
       "name": "--store",
@@ -1590,7 +1683,7 @@
     }
   ],
   "global": {
-    "description": "nova-nix evaluates Nix expressions, builds derivations, starts shells with a derivation's build environment, reports what a derivation's closure relies on, pushes store paths to a binary cache, keeps profiles of packages and maintains its store, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` has another status, 104, for an output that differs, and `develop`, once its shell has started, exits with the shell's.",
+    "description": "nova-nix evaluates Nix expressions, builds derivations, starts shells with a derivation's build environment, reports what a derivation's closure relies on, pushes store paths to a binary cache, keeps profiles of packages, maintains its store and serves it to other users' Nix clients, one command per invocation, and reads its settings from `nix.conf` as upstream Nix does. Each command takes the flags listed with it, after the command's name. A command exits with status 0 when it succeeds, and with status 1 when it fails, after saying why on stderr; `build --check` has another status, 104, for an output that differs, and `develop`, once its shell has started, exits with the shell's.",
     "examples": [
       {
         "arguments": [
