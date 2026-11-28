@@ -50,6 +50,7 @@ import Data.Word (Word32)
 import HttpFixture (Reply (..), httpResponse, withHttpServer, withKeepAliveDirectoryServer)
 import Nix.Builder (BuildResult (..))
 import qualified Nix.Builder.Cores as Cores
+import Nix.CacheDirectory (directoryUrl)
 import qualified Nix.Cli.Args as Cli
 import qualified Nix.Cli.Reference as Ref
 import Nix.Config (NixConfig (..))
@@ -1559,7 +1560,8 @@ runDevelopCLI bash binary fixture ambientEnv root store marker shellTemp = do
     _ -> pure (Left ())
   structuredPrinted@(_, structuredPrintedOut, _) <- structured "print-dev-env" []
   structuredLeft <- sort <$> Dir.listDirectory structuredTemp
-  descriptors <- substitutedDescriptors run substituting inShell fixture root
+  descriptors <- substitutedDescriptors run substituting inShell fixture root "http" withKeepAliveDirectoryServer
+  directDescriptors <- substitutedDescriptors run substituting inShell fixture root "file" (\cache use -> use (directoryUrl cache))
   direct <- Proc.readCreateProcessWithExitCode (Proc.proc "/bin/sh" ["-c", "ls /dev/fd/"]) {Proc.env = Just env, Proc.close_fds = True} ""
   gcrootEnvironment <- case T.splitOn "|" (T.pack seenOut) of
     [_, gcroot] -> Right <$> BS.readFile (T.unpack gcroot)
@@ -1609,6 +1611,9 @@ runDevelopCLI bash binary fixture ambientEnv root store marker shellTemp = do
       runTest "after a substitution over HTTP, the command starts with the descriptors a process started directly has" $
         assertRight "substituted" descriptors $ \listing ->
           assertEqual "descriptors" (snd3 direct) listing,
+      runTest "after a substitution from a file:// cache, the command starts with the descriptors a process started directly has" $
+        assertRight "substituted" directDescriptors $ \listing ->
+          assertEqual "descriptors" (snd3 direct) listing,
       runTest "print-dev-env prints a script bash sources, followed by a newline" $
         assertEqual "sourced" (ExitSuccess, T.unpack fixtureGreeting) (fst3 sourced, snd3 sourced)
           `andThen` (if "eval \"${shellHook:-}\"\n\n" `isSuffixOf` printedOut then Pass else Fail (outcome printed)),
@@ -1644,27 +1649,31 @@ runDevelopCLI bash binary fixture ambientEnv root store marker shellTemp = do
     snd3 (_, out, _) = out
 
 -- | What @ls /dev/fd/@ prints in a @develop@ shell whose capture first
--- substitutes the fixture's build input from a binary cache served over
--- HTTP by a server that keeps its connections open, which leaves one in
--- the HTTP client's pool: the input is built into a store of its own,
--- pushed to a directory as a signed cache, and the directory served on
--- loopback.  Given the CLI, @develop@ into a
--- store with flags, the command the shell runs, the fixture and the
--- root.  'Left' with what went wrong.
+-- substitutes the fixture's build input from a binary cache: the input is
+-- built into a store of its own, pushed to a directory as a signed cache,
+-- and the directory handed to the substitution by its URL, as the given
+-- function serves it.  Served over HTTP by a server that keeps its
+-- connections open, the substitution leaves one in the HTTP client's pool;
+-- read through its @file:\/\/@ URL, it opens the cache's files.  Given the
+-- CLI, @develop@ into a store with flags, the command the shell runs, the
+-- fixture, the root, a label naming this run's cache and store under it,
+-- and the serving.  'Left' with what went wrong.
 substitutedDescriptors ::
   ([String] -> IO (ExitCode, String, String)) ->
   (FilePath -> [String] -> IO (ExitCode, String, String)) ->
   (String -> [String]) ->
   FilePath ->
   FilePath ->
+  String ->
+  (FilePath -> (Text -> IO (ExitCode, String, String)) -> IO (ExitCode, String, String)) ->
   IO (Either Text String)
-substitutedDescriptors run develop inShell fixture root = do
+substitutedDescriptors run develop inShell fixture root label serving = do
   seed <- BS.pack <$> QC.generate (QC.vectorOf ed25519SeedBytes QC.arbitrary)
   case throwawayKey seed of
     Left err -> pure (Left (T.pack err))
     Right (keyText, publicKey) -> do
-      let keyFile = root </> "cache-secret-key"
-          cache = root </> "cache"
+      let keyFile = root </> ("cache-secret-key-" <> label)
+          cache = root </> ("cache-" <> label)
           source = root </> "source-store"
       BS.writeFile keyFile (TE.encodeUtf8 keyText)
       built@(_, builtOut, _) <- run ["build", "--expr", "{ fixture }: builtins.head (import fixture { marker = \"\"; }).buildInputs", "--argstr", "fixture", fixture, "--store", source, "--no-out-link", "--no-sandbox"]
@@ -1672,9 +1681,9 @@ substitutedDescriptors run develop inShell fixture root = do
         Nothing -> pure (Left ("build: " <> T.pack (show built)))
         Just tool -> do
           pushed <- run ["push", "--cache", "file://" <> cache, "--secret-key-file", keyFile, "--store", source, tool]
-          shown <- withKeepAliveDirectoryServer cache $ \base ->
+          shown <- serving cache $ \base ->
             develop
-              (root </> "substituted-store")
+              (root </> ("substituted-store-" <> label))
               (["--substituter", T.unpack base, "--trusted-key", T.unpack (Signing.renderPublicKey publicKey)] <> inShell "ls /dev/fd/")
           pure $ case shown of
             (ExitSuccess, listing, err)

@@ -127,6 +127,7 @@ library
     Nix.Builder.Sandbox
     Nix.Builder.Sandbox.Spawn
     Nix.Builder.Unpack
+    Nix.CacheDirectory
     Nix.Compression
     Nix.Config
     Nix.Daemon.Protocol

@@ -73,22 +73,7 @@ testSubstituter = do
   -- sibling names the way a store on that volume would.
   tmpSensitivity <- tempCaseSensitivity
   sequence
-    [ -- sortCaches: priority ordering
-      runTest "sortCaches priority ordering" $
-        let c1 = Subst.CacheConfig "https://a.example.com" ["key-a"] 40
-            c2 = Subst.CacheConfig "https://b.example.com" ["key-b"] 10
-            c3 = Subst.CacheConfig "https://c.example.com" ["key-c"] 30
-            sorted = Subst.sortCaches [c1, c2, c3]
-         in case sorted of
-              [s1, s2, s3] ->
-                if Subst.ccPriority s1 == 10 && Subst.ccPriority s2 == 30 && Subst.ccPriority s3 == 40
-                  then Pass
-                  else Fail ("bad order: " <> T.pack (show (map Subst.ccPriority sorted)))
-              _ -> Fail "expected 3 caches",
-      -- sortCaches: empty list
-      runTest "sortCaches empty" $
-        assertEqual "empty-sort" [] (Subst.sortCaches []),
-      -- readBodyCapped: the client-side body cap (mirror of the server's
+    [ -- readBodyCapped: the client-side body cap (mirror of the server's
       -- readBodyLimited).  A body reader is just IO ByteString yielding
       -- chunks then empty.
       runTestM "readBodyCapped concatenates under the cap" $ do
@@ -1660,7 +1645,7 @@ testSubstituterRetry = do
                           config = (defaultBuildConfig (StoreDir root)) {bcCaches = caches}
                       bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
                         bracket (openStore testLogger (StoreDir root)) closeStore $ \store -> do
-                          offers <- evalStateT (traverse (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy quietRetry Realise.NoFallback caches) (high :| [low])) Subst.emptyNarInfoMemo
+                          offers <- evalStateT (traverse (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy quietRetry Realise.NoFallback caches) (high :| [low])) Subst.emptyCacheMemo
                           case traverse offeredSubstitute offers of
                             Nothing -> pure (Fail ("not offered: " <> T.pack (show (fmap offerCache offers))))
                             Just batch -> do
@@ -1670,6 +1655,11 @@ testSubstituterRetry = do
                 withHttpServer (route (const narInfoOk) (const narOk)) $ \base _ _ ->
                   assertEqual "references" (Realise.Offered base [])
                     <$> queryOffer Realise.NoFallback [trustingCache base 40] sp,
+              runTestM "an HTTP cache configured with trailing slashes is asked, and named, without them" $
+                withHttpServer (route (const narInfoOk) (const narOk)) $ \base requests _ -> do
+                  offer <- queryOffer Realise.NoFallback [trustingCache (base <> "//") 40] sp
+                  seen <- requests
+                  pure (assertEqual "offer and requests" (Realise.Offered base [], [narInfoPath]) (offer, seen)),
               runTestM "a reference query passes over a narinfo no trusted key signed" $
                 withHttpServer (route (const unsignedNarInfo) (const narOk)) $ \base _ _ ->
                   assertEqual "references" Realise.NotOffered
@@ -1865,7 +1855,7 @@ testSubstituterRetry = do
     statusCode = T.unpack . T.take 3
     quietRetry = RetryEffects {reSleepMs = const (pure ()), reJitter = pure 0, reWarn = const (pure ())}
     queryOffer fallback caches path =
-      offerCache <$> evalStateT (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy quietRetry fallback caches path) Subst.emptyNarInfoMemo
+      offerCache <$> evalStateT (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy quietRetry fallback caches path) Subst.emptyCacheMemo
     hash = T.replicate 32 "b"
     sp = StorePath hash "retry"
     narInfoPath = "/" <> TE.encodeUtf8 hash <> ".narinfo"

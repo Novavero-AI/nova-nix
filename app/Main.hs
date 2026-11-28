@@ -951,21 +951,23 @@ recordedDerivation drvClosure = either (failWith . ("error: " <>)) pure . record
 chosenStoreDir :: CliOpts -> IO StoreDir
 chosenStoreDir opts = canonicalStoreDir (maybe platformStoreDir StoreDir (optStore opts))
 
--- | Default priority for a config- or CLI-configured substituter
--- (cache.nixos.org is 40).
+-- | The priority a config- or CLI-configured HTTP substituter is asked at
+-- (cache.nixos.org is 40).  A @file:\/\/@ one is asked at the priority its
+-- @nix-cache-info@ states ("Nix.Substituter").
 substituterPriority :: Int
 substituterPriority = 50
 
 -- | Turn resolved settings into the cache list.  One 'CacheConfig' per
--- substituter, each carrying the whole trusted-key set: upstream's keys
--- are not bound to a substituter, so a narinfo from any cache is accepted
--- by any trusted key.  A substituter with no trusted key anywhere is not
--- refused here (it simply accepts nothing at the signature gate), matching
--- upstream, where @substituters@ and @trusted-public-keys@ are independent.
+-- substituter, by its URL as configured, each carrying the whole
+-- trusted-key set: upstream's keys are not bound to a substituter, so a
+-- narinfo from any cache is accepted by any trusted key.  A substituter
+-- with no trusted key anywhere is not refused here (it simply accepts
+-- nothing at the signature gate), matching upstream, where @substituters@
+-- and @trusted-public-keys@ are independent.
 configToCaches :: NixConfig -> [CacheConfig]
 configToCaches config =
   [ CacheConfig
-      { ccUrl = T.dropWhileEnd (== '/') url,
+      { ccUrl = url,
         ccPublicKeys = ncTrustedPublicKeys config,
         ccPriority = substituterPriority
       }

@@ -139,7 +139,7 @@ import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (foreignOwnedNode, isPlainFile, writableByOthers)
 import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathPrefix, storePathToFilePath, storePathToText, unStoreDir)
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
-import Nix.Substituter (CacheConfig, NarInfoMemo, SubstResult (..), Substitute, emptyNarInfoMemo, fetchSubstituteWith, narStreamFailure, queryNextOfferWith, queryReferencesWith, substitutePath, withXzAttempt)
+import Nix.Substituter (CacheConfig, CacheMemo, SubstResult (..), Substitute, emptyCacheMemo, fetchSubstituteWith, narStreamFailure, queryNextOfferWith, queryReferencesWith, substitutePath, withXzAttempt)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
@@ -2637,7 +2637,7 @@ buildWithDeps config store rootDrv rootDrvPath = do
       graph <- acyclicGraph <$> buildDepGraph (readDrvFromStore config) rootDrv rootDrvPath
       either (pure . stoppedResult) realiseGraph graph
     realiseGraph depGraph = do
-      result <- evalStateT (realise (realiseSettings config) (bcMode config) (realiseEffects config store) depGraph rootDrvPath) emptyNarInfoMemo
+      result <- evalStateT (realise (realiseSettings config) (bcMode config) (realiseEffects config store) depGraph rootDrvPath) emptyCacheMemo
       case result of
         Left failure -> pure (BuildFailure (realiseFailureMessage (bcStoreDir config) failure) (realiseFailureStatus failure))
         Right () ->
@@ -2698,7 +2698,7 @@ realiseRequestsWith config effects requests = do
   either (pure . Left) realiseIn graph
   where
     realiseIn depGraph = do
-      result <- evalStateT (realiseRequests (realiseSettings config) effects depGraph requests) emptyNarInfoMemo
+      result <- evalStateT (realiseRequests (realiseSettings config) effects depGraph requests) emptyCacheMemo
       pure (first (\failure -> BuildStop (requestsFailureMessage (bcStoreDir config) failure) (requestsFailureStatus failure)) result)
 
 -- | Check one derivation the store holds, every output of it, as
@@ -2745,9 +2745,9 @@ readDrvFromStore config sp = do
 -- Realisation effects
 -- ---------------------------------------------------------------------------
 
--- | A realisation's effects, which carry a t'NarInfoMemo' through the run,
--- so each cache is asked about each path once.
-type Realising = StateT NarInfoMemo IO
+-- | A realisation's effects, which carry a t'CacheMemo' through the run,
+-- so each cache is opened once and asked about each path once.
+type Realising = StateT CacheMemo IO
 
 -- | The store, caches and builder that "Nix.Realise" drives.
 realiseEffects :: BuildConfig -> Store -> RealiseEffects Substitute Realising
@@ -2787,7 +2787,7 @@ substEffects config store =
 -- narinfo is read ('fetchSubstituteWith'), and the outcome is a failed one.
 substituteFromCaches :: BuildConfig -> Store -> [StorePath] -> IO ClosureOutcome
 substituteFromCaches config store paths =
-  evalStateT (substituteClosure (substEffects config store) paths) emptyNarInfoMemo
+  evalStateT (substituteClosure (substEffects config store) paths) emptyCacheMemo
 
 -- | Build one derivation, naming it in any failure.
 buildReporting :: BuildConfig -> Store -> Derivation -> StorePath -> IO (Either Text ())
