@@ -81,6 +81,9 @@ module Nix.Store
     NarStreamFailure (..),
     ArchiveEnd (..),
     sinkNarStream,
+    checkNarClaim,
+    narHashMismatch,
+    narSizeMismatch,
 
     -- * Link ordering (exposed for testing)
     orderLinks,
@@ -135,6 +138,7 @@ import Nix.Store.Metadata (canonicalizeMetadata)
 import Nix.Store.Path
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode, createSymlinkOfKind)
 import Nix.Store.Upstream
+import qualified NovaCache.Base64 as B64
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NAR.Stream as Stream
@@ -1148,6 +1152,39 @@ sinkNarStream end sink source = case end of
             let consumed = BS.take (BS.length held - BS.length (unconsumed result)) held
              in pure (Right (Hash.hashFinalize (Hash.hashUpdate ctx consumed), count + BS.length consumed))
     stopWith failure = Left failure <$ abortNarUnpack sink
+
+-- | Hold an archive's hash and size, as read, to what its path's info
+-- claims: the hash first, then the size, as upstream's import of a NAR
+-- checks them, each refused in upstream's words ('narHashMismatch',
+-- 'narSizeMismatch') naming the path as given.
+checkNarClaim :: Text -> Hash.NixHash -> Integer -> Hash.NixHash -> Integer -> Either Text ()
+checkNarClaim path claimedHash claimedSize gotHash gotSize
+  | gotHash /= claimedHash = Left (narHashMismatch path claimedHash gotHash)
+  | gotSize /= claimedSize = Left (narSizeMismatch path claimedSize gotSize)
+  | otherwise = Right ()
+
+-- | Upstream's refusal of an archive whose hash is not the one its
+-- path's info claims, both in SRI form.
+narHashMismatch :: Text -> Hash.NixHash -> Hash.NixHash -> Text
+narHashMismatch path (Hash.NixHash specified) (Hash.NixHash got) =
+  importMismatch "hash" path (sri specified) (sri got)
+  where
+    sri digest = narHashAlgorithm <> "-" <> B64.encode digest
+
+-- | Upstream's refusal of an archive whose size is not the one its
+-- path's info claims.
+narSizeMismatch :: Text -> Integer -> Integer -> Text
+narSizeMismatch path specified got = importMismatch "size" path (T.pack (show specified)) (T.pack (show got))
+
+-- | The shape upstream gives both refusals: what mismatched, the path,
+-- and what was specified above what was got.
+importMismatch :: Text -> Text -> Text -> Text -> Text
+importMismatch what path specified got =
+  what <> " mismatch importing path '" <> path <> "';\n  specified: " <> specified <> "\n  got:       " <> got
+
+-- | The algorithm a NAR hash is taken with, as SRI names it.
+narHashAlgorithm :: Text
+narHashAlgorithm = "sha256"
 
 -- ---------------------------------------------------------------------------
 -- Eval source materialization

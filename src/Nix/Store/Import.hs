@@ -43,11 +43,10 @@ import Nix.Daemon.Protocol (ContentAddress, ContentAddressMethod (..), caAlgo, c
 import Nix.Derivation (Derivation (..), DerivationOutput (..), drvExtension, drvFileDerivation, fixedOutput, fixedOutputModulo, fromATerm, inputAddressed, inputAddressedModulo)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, hexToBytes, makeFixedOutputPath, makeStorePath, makeTextPath, sha256Digest)
 import Nix.Logger (logWarning)
-import Nix.Store (NarStreamFailure (..), PathRegistration (..), Store (..), UpstreamHazard (..), canonicalizeMetadata, finishNarUnpack, isValid, newNarUnpackSink, registerPath, registrationFor, sinkNarStream, upstreamManagedRefusal, volumeCaseHack, withPathLock)
+import Nix.Store (ArchiveEnd (..), NarStreamFailure (..), PathRegistration (..), Store (..), UpstreamHazard (..), canonicalizeMetadata, checkNarClaim, finishNarUnpack, isValid, newNarUnpackSink, registerPath, registrationFor, sinkNarStream, upstreamManagedRefusal, volumeCaseHack, withPathLock)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir, StorePath (spName), badStorePathText, defaultStoreDir, storePathBasename, storePathToFilePath, storePathToText)
 import Nix.Substituter (checkContentAddress)
-import qualified NovaCache.Base64 as B64
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NarInfo as NarInfo
 import qualified NovaCache.Signing as Signing
@@ -106,7 +105,7 @@ importNar store requirement claim source = runExceptT $ do
     caseHack = volumeCaseHack (stCaseSensitivity store)
     restoreAndCheck narHash = do
       sink <- liftIO (newNarUnpackSink (stCaseSensitivity store) dest)
-      (digest, size) <- withExceptT streamFailure (ExceptT (sinkNarStream sink source))
+      (digest, size) <- withExceptT streamFailure (ExceptT (sinkNarStream AtEndOfInput sink source))
       liftEither (heldToClaim narHash digest size)
       ExceptT (finishNarUnpack sink)
       liftIO (canonicalizeMetadata dest)
@@ -118,13 +117,7 @@ importNar store requirement claim source = runExceptT $ do
     streamFailure failure = case failure of
       NarStreamRefused reason -> reason
       NarStreamMalformed reason -> reason
-    heldToClaim (Hash.NixHash expected) (Hash.NixHash got) size
-      | got /= expected = Left (mismatch "hash" (sriText expected) (sriText got))
-      | size /= prNarSize claim = Left (mismatch "size" (T.pack (show (prNarSize claim))) (T.pack (show size)))
-      | otherwise = Right ()
-    mismatch what specified got =
-      what <> " mismatch importing path '" <> logical <> "';\n  specified: " <> specified <> "\n  got:       " <> got
-    sriText digest = sha256Algo <> "-" <> B64.encode digest
+    heldToClaim narHash got size = checkNarClaim logical narHash (toInteger (prNarSize claim)) got (toInteger size)
 
 -- | Run a write of a path that leaves it only when it succeeds: what was
 -- at the path is cleared first, and the path is cleared again on a

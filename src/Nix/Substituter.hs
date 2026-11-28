@@ -169,7 +169,7 @@ import Nix.Hash (FileIngestionMethod (..), ModuloHash, moduloHashFinalize, modul
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, fetchStatusFailure, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Logger (Logger (..), logWarning)
 import Nix.Realise (Fallback (..), Offer (..))
-import Nix.Store (ArchiveEnd (..), CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), UpstreamHazard (..), abortNarUnpack, acquirePathLock, canonicalizeMetadata, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, sinkNarStream, unpackNarEntry, upstreamManagedRefusal, volumeCaseHack)
+import Nix.Store (ArchiveEnd (..), CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), UpstreamHazard (..), abortNarUnpack, acquirePathLock, canonicalizeMetadata, checkNarClaim, finishNarUnpack, isValid, narHashMismatch, narSizeMismatch, newNarUnpackSink, releasePathLock, sinkNarStream, unpackNarEntry, upstreamManagedRefusal, volumeCaseHack)
 import Nix.Store.DB (PathRegistration (..), Ultimate (..))
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir, StorePath (spHash, spName), parseStorePathBaseName, storePathHashLen, storePathToFilePath, storePathToText)
@@ -844,13 +844,7 @@ verifyNarHash narInfo rawNar =
     Left err -> Left ("invalid narinfo NarHash: " <> T.pack err)
     Right declared
       | declared == actual -> Right declared
-      | otherwise ->
-          Left
-            ( "NAR hash mismatch: narinfo declares "
-                <> NarInfo.niNarHash narInfo
-                <> " but downloaded bytes hash to "
-                <> Hash.formatNixHash actual
-            )
+      | otherwise -> Left (narHashMismatch (NarInfo.niStorePath narInfo) declared actual)
   where
     actual = Hash.hashBytes rawNar
 
@@ -862,13 +856,7 @@ verifyNarHash narInfo rawNar =
 verifyNarSize :: NarInfo.NarInfo -> BS.ByteString -> Either Text ()
 verifyNarSize narInfo rawNar
   | toInteger (BS.length rawNar) == NarInfo.niNarSize narInfo = Right ()
-  | otherwise =
-      Left
-        ( "NAR size mismatch: narinfo declares "
-            <> T.pack (show (NarInfo.niNarSize narInfo))
-            <> " bytes but downloaded "
-            <> T.pack (show (BS.length rawNar))
-        )
+  | otherwise = Left (narSizeMismatch (NarInfo.niStorePath narInfo) (NarInfo.niNarSize narInfo) (toInteger (BS.length rawNar)))
 
 -- | Whether a served narinfo describes the requested path: the hash and
 -- name components of its declared StorePath must equal the requested
@@ -1179,38 +1167,16 @@ consumeNarStream sensitivity destPath narInfo declaredDigest narSource = do
   streamed <- sinkNarStream AtRootClose sink narSource
   case streamed of
     Left failure -> pure (Left (narStreamFailure failure))
-    Right (digest, narBytes)
-      | toInteger narBytes /= NarInfo.niNarSize narInfo -> do
-          abortNarUnpack sink
-          -- The archive completed, so it arrived whole: a size that
-          -- still disagrees is the narinfo misdeclaring.
-          pure
-            ( Left
-                ( FatalFailure
-                    ( "NAR size mismatch: narinfo declares "
-                        <> T.pack (show (NarInfo.niNarSize narInfo))
-                        <> " bytes but the stream carried "
-                        <> T.pack (show narBytes)
-                    )
-                )
-            )
-      | digest /= declaredDigest -> do
-          abortNarUnpack sink
-          -- Size matched, so the archive arrived whole; wrong bytes
-          -- are deterministic corruption, not a hiccup.
-          pure
-            ( Left
-                ( FatalFailure
-                    ( "NAR hash mismatch: narinfo declares "
-                        <> NarInfo.niNarHash narInfo
-                        <> " but downloaded bytes hash to "
-                        <> Hash.formatNixHash digest
-                    )
-                )
-            )
-      | otherwise -> do
-          finished <- finishNarUnpack sink
-          pure (either (Left . FatalFailure) (const (Right narBytes)) finished)
+    Right (digest, narBytes) -> case checkNarClaim (NarInfo.niStorePath narInfo) declaredDigest (NarInfo.niNarSize narInfo) digest (toInteger narBytes) of
+      -- The archive completed, so it arrived whole: a hash or a size
+      -- that still disagrees is the narinfo misdeclaring or the bytes
+      -- corrupt, neither of which a retry changes.
+      Left refusal -> do
+        abortNarUnpack sink
+        pure (Left (FatalFailure refusal))
+      Right () -> do
+        finished <- finishNarUnpack sink
+        pure (either (Left . FatalFailure) (const (Right narBytes)) finished)
 
 -- | Why a streamed NAR stopped, as the attempt's failure.  A name or
 -- shape the store refuses is a property of the archive, not of this

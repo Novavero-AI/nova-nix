@@ -405,6 +405,43 @@ testSubstituter = do
                             (prNarHash reg, prNarSize reg, onDisk)
                         )
                     other -> pure (Fail ("expected the archive substituted, got: " <> T.pack (show other))),
+      -- Upstream holds an imported NAR's hash before its size and words
+      -- each refusal as a mismatch importing the path, the hash in SRI
+      -- form, and the streamed and the whole pipelines hold it the same.
+      runTestM "a NAR's hash and then its size are held to its narinfo in upstream's words, by both pipelines" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpDir = tmpBase </> "nova-nix-test-stream-claim-words"
+            honest = streamTestNarInfo streamTestNar
+            path = NarInfo.niStorePath honest
+            sri bytes = "sha256-" <> B64.encode (case CHash.hashBytes bytes of CHash.NixHash raw -> raw)
+            lyingHash info = info {NarInfo.niNarHash = CHash.formatNixHash (CHash.hashBytes "not the nar")}
+            lyingSize info = info {NarInfo.niNarSize = NarInfo.niNarSize info + 1}
+            hashRefusal = "hash mismatch importing path '" <> path <> "';\n  specified: " <> sri "not the nar" <> "\n  got:       " <> sri streamTestNar
+            sizeRefusal =
+              "size mismatch importing path '"
+                <> path
+                <> "';\n  specified: "
+                <> T.pack (show (BS.length streamTestNar + 1))
+                <> "\n  got:       "
+                <> T.pack (show (BS.length streamTestNar))
+            heldBoth (label, info, declared, refusal) = do
+              forceRemoveIfExists tmpDir
+              createDirectoryIfMissing True tmpDir
+              source <- chunkReader (streamChunks 7 streamTestNar)
+              streamed <- Subst.consumeNarStream tmpSensitivity (tmpDir </> "out") info declared source
+              pure
+                ( assertEqual (label <> ", streamed") (Left refusal) (either (Left . Subst.attemptFailureMessage) Right streamed)
+                    `andThen` assertEqual (label <> ", whole") (Left refusal) (void (Subst.verifyNar info streamTestNar))
+                )
+        results <-
+          traverse
+            heldBoth
+            [ ("a wrong hash", lyingHash honest, CHash.hashBytes "not the nar", hashRefusal),
+              ("a wrong size", lyingSize honest, streamTestDigest, sizeRefusal),
+              ("both wrong, the hash first", lyingHash (lyingSize honest), CHash.hashBytes "not the nar", hashRefusal)
+            ]
+        forceRemoveIfExists tmpDir
+        pure (foldr andThen Pass results),
       -- A narinfo lying about NarSize in either direction is refused
       -- at NarDone - the grammar completed, so the mismatch is the
       -- narinfo misdeclaring, and fatal.
@@ -1345,8 +1382,8 @@ testSubstituter = do
         pure $ case (hashResult, sizeResult, reLock) of
           (Subst.SubstError hashErr, Subst.SubstError sizeErr, Just _)
             | written -> Fail "an unverified NAR reached the store path"
-            | not ("NAR hash mismatch" `T.isInfixOf` hashErr) -> Fail ("wrong hash error: " <> hashErr)
-            | not ("NAR size mismatch" `T.isInfixOf` sizeErr) -> Fail ("wrong size error: " <> sizeErr)
+            | not ("hash mismatch importing path" `T.isPrefixOf` hashErr) -> Fail ("wrong hash error: " <> hashErr)
+            | not ("size mismatch importing path" `T.isPrefixOf` sizeErr) -> Fail ("wrong size error: " <> sizeErr)
             | otherwise -> Pass
           (_, _, Nothing) -> Fail "lock still held after a refused NAR"
           other -> Fail ("expected two SubstError results, got: " <> T.pack (show other))
