@@ -16,7 +16,7 @@ import System.FilePath ((</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 import qualified System.Process as Proc
 import Test.BuildUser (buildUsersRootChild, buildUsersRootFlag, testBuildUsersPure, testBuildUsersUnprivilegedIO)
-import Test.Builder (sandboxBuildChild, sandboxBuildChildFlag, sandboxEscapeChild, sandboxEscapeChildFlag, sandboxFallbackChild, sandboxFallbackChildFlag, sandboxForkerChild, sandboxForkerChildFlag, sandboxThawChild, sandboxThawChildFlag, testBuildCheckIO, testBuildCores, testBuildCoresIO, testBuildDirIO, testBuildLogIO, testBuildOrchestrator, testBuildenvBuildIO, testBuildenvDerivations, testBuilder, testBuilderLayout, testDarwinSandboxIO, testDependentBuildIO, testExecWrapper, testFetchMirrors, testFetchurlUnpack, testFlatOutputFormIO, testLinuxSandboxIO, testOutputCycleBuildIO, testOutputOrderIO, testPassAsFile, testProfileGenerations, testProfileManifest, testProfileTree, testProfileUpdateIO, testReferenceClosureIO, testSandboxFallbackIO, testSandboxPure, testSandboxSpawnIO, testScrubbedBuildEnvIO, testSourceDateEpochIO, testSubstituteFromCaches, testTrivialBuildIO, testUnpackBuildIO, testWantedOutputsIO)
+import Test.Builder (sandboxBuildChild, sandboxBuildChildFlag, sandboxEscapeChild, sandboxEscapeChildFlag, sandboxFallbackChild, sandboxFallbackChildFlag, sandboxForkerChild, sandboxForkerChildFlag, sandboxThawChild, sandboxThawChildFlag, sessionChild, sessionChildFlag, testBuildCheckIO, testBuildCores, testBuildCoresIO, testBuildDirIO, testBuildLogIO, testBuildOrchestrator, testBuildenvBuildIO, testBuildenvDerivations, testBuilder, testBuilderLayout, testBuilderStartIO, testDarwinSandboxIO, testDependentBuildIO, testExecWrapper, testFetchMirrors, testFetchurlUnpack, testFlatOutputFormIO, testLinuxSandboxIO, testOutputCycleBuildIO, testOutputOrderIO, testPassAsFile, testProfileGenerations, testProfileManifest, testProfileTree, testProfileUpdateIO, testReferenceClosureIO, testSandboxFallbackIO, testSandboxPure, testSandboxSpawnIO, testScrubbedBuildEnvIO, testSourceDateEpochIO, testSubstituteFromCaches, testTrivialBuildIO, testUnpackBuildIO, testWantedOutputsIO)
 import Test.CData (arenaGuardChild, arenaGuardChildFlag, testArenaGuard, testBytecodeCompile, testBytecodeCorrupt, testBytecodeCountSpill, testBytecodePerElement, testBytecodeTags, testCAttrSet, testCThunk, testLambdaShape, testSymbol, testUnknownTags, testValueCountWidths)
 import Test.Cli (cliJsonPath, testBuildCoresCLI, testBuildUmaskCLI, testCheckCLI, testCliReference, testClosedStdoutCLI, testConfigBytesCLI, testDevelopCLI, testE2E, testEvalPolicyCLI, testExecWrapperCLI, testImportFromDerivationCLI, testNixConfig, testOutLinkCLI, testProfileCLI, testResultPrinterCLI, testSandboxSessionsCLI, testSubstituterListingsCLI, testTargetArgsCLI, testTrustCLI, testUncaughtIOFailureCLI, writeCliJsonFlag)
 import Test.Daemon (testDaemonFixtures, testDaemonProtocol, testDaemonServer, testDaemonWire)
@@ -52,6 +52,7 @@ main = do
     [flag, marker, ready] | flag == sandboxThawChildFlag -> sandboxThawChild marker ready
     [flag, source] | flag == namesOnlyChildFlag -> inTestSession (namesOnlyChild source)
     [flag] | flag == arenaCycleChildFlag -> arenaCycleChild
+    [flag] | flag == sessionChildFlag -> sessionChild
     [flag] | flag == writeCliJsonFlag -> BS.writeFile cliJsonPath Ref.referenceJson
     flag : rest | flag == windowsSandboxInstallFlag -> windowsSandboxInstall rest
     flag : rest | flag == windowsSandboxServiceFlag -> windowsSandboxService rest
@@ -91,6 +92,7 @@ runSuite = do
           testStorePaths,
           testDerivation,
           testTrivialBuildIO,
+          testBuilderStartIO,
           testBuildDirIO,
           testStoreAccessIO,
           testBuildLogIO,

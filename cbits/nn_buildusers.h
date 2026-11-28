@@ -1,14 +1,15 @@
-/* The processes of a build user, for a build that runs as one
- * (Nix.Builder.BuildUser): its builder's start, which drops to the build
- * user between the fork and the exec, and the kill of every process the
- * user has.  POSIX only; every other platform compiles stubs that answer
- * ENOSYS, because the cabal c-sources entry is unconditional and the
- * Haskell side calls them only on Linux and macOS. */
+/* The start of a builder outside the sandbox, as upstream's child starts
+ * one, as the user nova-nix runs as or as a build user, which it drops to
+ * between the fork and the exec, and the kill of every process a build
+ * user has (Nix.Builder.BuildUser).  POSIX only; every other platform
+ * compiles stubs that answer ENOSYS, because the cabal c-sources entry is
+ * unconditional and the Haskell side calls them only on Linux and
+ * macOS. */
 #ifndef NN_BUILDUSERS_H
 #define NN_BUILDUSERS_H
 
-/* The step of a start that failed, which nn_spawn_as_user answers in
- * *STEP with the errno it failed with. */
+/* The step of a start that failed, which nn_spawn_as_user and
+ * nn_spawn_as_invoker answer in *STEP with the errno it failed with. */
 enum nn_spawn_step {
   NN_SPAWN_PIPE = 1,
   NN_SPAWN_FORK = 2,
@@ -37,6 +38,11 @@ int nn_spawn_as_user(const char *program, char *const argv[], char *const envp[]
                      int output_fd, unsigned int uid, unsigned int gid, int group_count, const unsigned int *groups,
                      int *pid, int *step);
 
+/* Start PROGRAM as nn_spawn_as_user does, but as the user and groups the
+ * caller has, which it keeps. */
+int nn_spawn_as_invoker(const char *program, char *const argv[], char *const envp[], const char *cwd, int input_fd,
+                        int output_fd, int *pid, int *step);
+
 /* Send SIGKILL to every process whose user is UID, from a child that is
  * that user, as kill(-1) reaches only the processes its caller may
  * signal.  Answers 0 with *STATUS 0 once the signal went out, or with
@@ -47,11 +53,6 @@ int nn_spawn_as_user(const char *program, char *const argv[], char *const envp[]
  * process, and EPERM, before any child exists, for a caller that is not
  * root, whose child could only become the caller itself. */
 int nn_kill_user(unsigned int uid, int *status);
-
-/* Wait for the child PID to end, leaving it to be reaped, so its process
- * id names no other process until it is.  Answers 0, or the errno of a
- * wait that failed. */
-int nn_await_exit(int pid);
 
 /* The system's description of the signal SIGNAL. */
 const char *nn_signal_text(int signal);
