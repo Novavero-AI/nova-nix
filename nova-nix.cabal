@@ -131,6 +131,7 @@ library
     Nix.Compression
     Nix.Config
     Nix.Daemon.Auth
+    Nix.Daemon.Client
     Nix.Daemon.Connection
     Nix.Daemon.Listen
     Nix.Daemon.LocalStore
@@ -379,6 +380,7 @@ test-suite nova-nix-test
     Test.CData
     Test.Cli
     Test.Daemon
+    Test.DaemonClient
     Test.Derivation
     Test.Eval
     Test.Exceptions
