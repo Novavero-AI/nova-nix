@@ -2257,11 +2257,11 @@ testGccLatestWindows = do
                 "--with-ld=" <> outputOf binutilsRoot <> "/bin/" <> target <> "-ld.exe"
               ]
               (flagsWith ["--target=", "--with-headers", "--with-libs", "--with-sysroot", "--with-build-sysroot", "--with-native-system-header-dir", "--with-as=", "--with-ld="] gccLatest),
-          runTest "gcc-latest builds with gcc10's drivers and binutils' archiver, linker and resource compiler, by the target's names" $
+          runTest "gcc-latest builds with gcc10's drivers and binutils' archiver, linker and resource compiler, by the target's names, the resource compiler named in the environment and run with --use-temp-file" $
             assertEqual
-              "tools"
-              ["CC=" <> target <> "-gcc", "CXX=" <> target <> "-g++", "AR=" <> target <> "-ar", "LD=" <> target <> "-ld", "WINDRES=" <> target <> "-windres"]
-              (flagsWith ["CC=", "CXX=", "AR=", "LD=", "STRIP=", "RANLIB=", "WINDRES="] gccLatest),
+              "tools, and WINDRES"
+              (["CC=" <> target <> "-gcc", "CXX=" <> target <> "-g++", "AR=" <> target <> "-ar", "LD=" <> target <> "-ld"], target <> "-windres --use-temp-file")
+              (flagsWith ["CC=", "CXX=", "AR=", "LD=", "STRIP=", "RANLIB=", "WINDRES="] gccLatest, maybe "" (variableOf "WINDRES") gccLatest),
           runTest "gcc-latest gives every link it makes --no-insert-timestamp, and LDFLAGS nothing else" $
             assertEqual
               "LDFLAGS"
@@ -2585,11 +2585,11 @@ testGccCoreX8664Windows = do
                 "--with-ld=" <> outputOf binutilsX8664Root <> "/bin/" <> target <> "-ld.exe"
               ]
               (flagsWith ["--target=", "--with-headers", "--with-libs", "--with-sysroot", "--with-build-sysroot", "--with-native-system-header-dir", "--with-as=", "--with-ld="] gccCore),
-          runTest "gcc-core-x86_64 builds with gcc-latest's drivers and binutils' archiver, linker and resource compiler, by their target's names" $
+          runTest "gcc-core-x86_64 builds with gcc-latest's drivers and binutils' archiver, linker and resource compiler, by their target's names, the resource compiler named in the environment and run with --use-temp-file" $
             assertEqual
-              "tools"
-              ["CC=" <> host <> "-gcc", "CXX=" <> host <> "-g++", "AR=" <> host <> "-ar", "LD=" <> host <> "-ld", "WINDRES=" <> host <> "-windres"]
-              (flagsWith ["CC=", "CXX=", "AR=", "LD=", "STRIP=", "RANLIB=", "WINDRES="] gccCore),
+              "tools, and WINDRES"
+              (["CC=" <> host <> "-gcc", "CXX=" <> host <> "-g++", "AR=" <> host <> "-ar", "LD=" <> host <> "-ld"], host <> "-windres --use-temp-file")
+              (flagsWith ["CC=", "CXX=", "AR=", "LD=", "STRIP=", "RANLIB=", "WINDRES="] gccCore, maybe "" (variableOf "WINDRES") gccCore),
           runTest "gcc-core-x86_64 gives every link it makes --no-insert-timestamp, and LDFLAGS nothing else" $
             assertEqual
               "LDFLAGS"
@@ -2891,11 +2891,11 @@ testGccX8664Windows = do
                 "--with-ld=" <> outputOf binutilsX8664Root <> "/bin/" <> target <> "-ld.exe"
               ]
               (flagsWith ["--target=", "--with-headers", "--with-libs", "--with-sysroot", "--with-build-sysroot", "--with-native-system-header-dir", "--with-as=", "--with-ld="] gcc),
-          runTest "gcc-x86_64 builds with gcc-latest's drivers and binutils' archiver, linker and resource compiler, by their target's names" $
+          runTest "gcc-x86_64 builds with gcc-latest's drivers and binutils' archiver, linker and resource compiler, by their target's names, the resource compiler named in the environment and run with --use-temp-file" $
             assertEqual
-              "tools"
-              ["CC=" <> host <> "-gcc", "CXX=" <> host <> "-g++", "AR=" <> host <> "-ar", "LD=" <> host <> "-ld", "WINDRES=" <> host <> "-windres"]
-              (flagsWith ["CC=", "CXX=", "AR=", "LD=", "STRIP=", "RANLIB=", "WINDRES="] gcc),
+              "tools, and WINDRES"
+              (["CC=" <> host <> "-gcc", "CXX=" <> host <> "-g++", "AR=" <> host <> "-ar", "LD=" <> host <> "-ld"], host <> "-windres --use-temp-file")
+              (flagsWith ["CC=", "CXX=", "AR=", "LD=", "STRIP=", "RANLIB=", "WINDRES="] gcc, maybe "" (variableOf "WINDRES") gcc),
           runTest "gcc-x86_64 gives every link it makes --no-insert-timestamp, and LDFLAGS nothing else" $
             assertEqual
               "LDFLAGS"
@@ -3232,20 +3232,23 @@ testGccNativeX8664Windows = do
                 "--with-ld=" <> outputOf binutilsNativeRoot <> "/bin/ld.exe"
               ]
               (flagsWith ["--host=", "--target=", "--with-headers", "--with-libs", "--with-sysroot", "--with-build-sysroot", "--with-native-system-header-dir", "--with-gxx-include-dir", "--with-as=", "--with-ld="] gccNative),
-          runTest "gcc-native-x86_64 builds the host's programs with gcc-x86_64's drivers and binutils-x86_64's archiver, linker and resource compiler, and the build machine's with gcc-latest's drivers and binutils' archiver and ranlib, each by its target's name" $
+          runTest "gcc-native-x86_64 builds the host's programs with gcc-x86_64's drivers and binutils-x86_64's archiver, linker and resource compiler, and the build machine's with gcc-latest's drivers and binutils' archiver and ranlib, each by its target's name, the resource compiler named in the environment and run with --use-temp-file" $
             assertEqual
-              "tools"
-              [ "CC=" <> target <> "-gcc",
-                "CXX=" <> target <> "-g++",
-                "AR=" <> target <> "-ar",
-                "LD=" <> target <> "-ld",
-                "WINDRES=" <> target <> "-windres",
-                "CC_FOR_BUILD=" <> buildTarget <> "-gcc",
-                "CXX_FOR_BUILD=" <> buildTarget <> "-g++",
-                "AR_FOR_BUILD=" <> buildTarget <> "-ar",
-                "RANLIB_FOR_BUILD=" <> buildTarget <> "-ranlib"
-              ]
-              (flagsWith ["CC=", "CXX=", "AR=", "LD=", "STRIP=", "RANLIB=", "WINDRES=", "CC_FOR_BUILD=", "CXX_FOR_BUILD=", "AR_FOR_BUILD=", "RANLIB_FOR_BUILD=", "LD_FOR_BUILD=", "NM_FOR_BUILD="] gccNative),
+              "tools, and WINDRES"
+              ( [ "CC=" <> target <> "-gcc",
+                  "CXX=" <> target <> "-g++",
+                  "AR=" <> target <> "-ar",
+                  "LD=" <> target <> "-ld",
+                  "CC_FOR_BUILD=" <> buildTarget <> "-gcc",
+                  "CXX_FOR_BUILD=" <> buildTarget <> "-g++",
+                  "AR_FOR_BUILD=" <> buildTarget <> "-ar",
+                  "RANLIB_FOR_BUILD=" <> buildTarget <> "-ranlib"
+                ],
+                target <> "-windres --use-temp-file"
+              )
+              ( flagsWith ["CC=", "CXX=", "AR=", "LD=", "STRIP=", "RANLIB=", "WINDRES=", "CC_FOR_BUILD=", "CXX_FOR_BUILD=", "AR_FOR_BUILD=", "RANLIB_FOR_BUILD=", "LD_FOR_BUILD=", "NM_FOR_BUILD="] gccNative,
+                maybe "" (variableOf "WINDRES") gccNative
+              ),
           runTest "gcc-native-x86_64 gives every link it makes --no-insert-timestamp, and LDFLAGS nothing else" $
             assertEqual
               "LDFLAGS"
@@ -3329,7 +3332,6 @@ testGccNativeX8664Windows = do
         "CXX=",
         "AR=",
         "LD=",
-        "WINDRES=",
         "CC_FOR_BUILD=",
         "CXX_FOR_BUILD=",
         "AR_FOR_BUILD=",
