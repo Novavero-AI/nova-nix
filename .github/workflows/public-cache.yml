@@ -90,10 +90,6 @@ jobs:
       - name: Install nova-nix
         run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
 
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
-
       # Every source pkgs/windows fetches, for --all below to publish: one
       # the cache holds comes from it, and one it lacks is fetched from its
       # upstream host here, the once.
@@ -187,9 +183,11 @@ jobs:
       - name: Install nova-nix
         run: cabal install exe:nova-nix --install-method=copy --installdir="$env:RUNNER_TEMP\bin" --overwrite-policy=always
 
-      # The store root wants pre-creating on the runner, as the Windows job
-      # found; cygpath keeps the separators Windows-native so the store dir
-      # the binary renders paths through has one spelling.
+      # A fresh store in a directory nova-nix makes for it, which no other
+      # account can change: nova-nix refuses a store under a directory
+      # another account could change, whatever the runner's own directories
+      # allow.  The separators are Windows-native, so the store dir the
+      # binary renders paths through has one spelling.
       - name: Substitute the whole closure from the public cache
         if: needs.publish.outputs.held == 'true'
         shell: bash
@@ -197,8 +195,7 @@ jobs:
           LC_ALL: C
         run: |
           set -euo pipefail
-          store=$(cygpath -w "$RUNNER_TEMP/public-store")
-          mkdir -p "$RUNNER_TEMP/public-store"
+          store='C:\nova-public-cache\store'
           log="$RUNNER_TEMP/substitute.log"
           out=$("$RUNNER_TEMP/bin/nova-nix.exe" build pkgs/windows/hello.nix \
             --store "$store" \
@@ -223,7 +220,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          store=$(cygpath -w "$RUNNER_TEMP/public-store")
+          store='C:\nova-public-cache\store'
           log="$RUNNER_TEMP/sources.log"
           if ! bash .github/cache/realise-sources.sh "$RUNNER_TEMP/bin/nova-nix.exe" --store "$store" 2> "$log"; then
             cat "$log" >&2

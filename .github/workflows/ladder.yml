@@ -123,10 +123,6 @@ jobs:
           name: ladder-handoff-server
           path: ${{ runner.temp }}/handoff-server
 
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
-
       # Every source pkgs/windows fetches, from the public cache where it
       # holds it, so the builds below fetch none.  Outside substitute mode
       # they name no substituter and substitute nothing.
@@ -360,10 +356,6 @@ jobs:
         with:
           name: handoff-mes-${{ inputs.os }}
           path: ${{ runner.temp }}/handoff
-
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
       # The keep-failed setting, which -K turns on, for every build below:
       # a build that fails keeps its directory, under the store's
@@ -1059,10 +1051,6 @@ jobs:
           name: handoff-tinycc-${{ inputs.os }}
           path: ${{ runner.temp }}/handoff
 
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
-
       # The keep-failed setting, which -K turns on, for every build below:
       # a build that fails keeps its directory, under the store's
       # .nova-nix\builds, for the job's last step to upload from.  It goes
@@ -1356,10 +1344,6 @@ jobs:
           name: handoff-gcc46-${{ inputs.os }}
           path: ${{ runner.temp }}/handoff
 
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
-
       # The keep-failed setting, which -K turns on, for every build below:
       # a build that fails keeps its directory, under the store's
       # .nova-nix\builds, for the job's last step to upload from.  It goes
@@ -1570,10 +1554,6 @@ jobs:
         with:
           name: handoff-gcc46-cxx-${{ inputs.os }}
           path: ${{ runner.temp }}/handoff
-
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
       # The keep-failed setting, which -K turns on, for every build below:
       # a build that fails keeps its directory, under the store's
@@ -1836,10 +1816,6 @@ jobs:
           name: handoff-gcc10-${{ inputs.os }}
           path: ${{ runner.temp }}/handoff
 
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
-
       # The keep-failed setting, which -K turns on, for every build below:
       # a build that fails keeps its directory, under the store's
       # .nova-nix\builds, for the job's last step to upload from.  It goes
@@ -2065,10 +2041,6 @@ jobs:
         with:
           name: handoff-gcc-latest-${{ inputs.os }}
           path: ${{ runner.temp }}/handoff
-
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
       # The keep-failed setting, which -K turns on, for every build below:
       # a build that fails keeps its directory, under the store's
@@ -2355,10 +2327,6 @@ jobs:
           name: handoff-x86_64-${{ inputs.os }}
           path: ${{ runner.temp }}/handoff
 
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
-
       # The keep-failed setting, which -K turns on, for every build below:
       # a build that fails keeps its directory, under the store's
       # .nova-nix\builds, for the job's last step to upload from.  It goes
@@ -2559,10 +2527,6 @@ jobs:
         with:
           name: handoff-gcc-x86_64-${{ inputs.os }}
           path: ${{ runner.temp }}/handoff
-
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
       # The keep-failed setting, which -K turns on, for every build below:
       # a build that fails keeps its directory, under the store's
@@ -2811,10 +2775,6 @@ jobs:
         with:
           name: handoff-native-x86_64-${{ inputs.os }}
           path: ${{ runner.temp }}/handoff
-
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
       # The keep-failed setting, which -K turns on, for every build below:
       # a build that fails keeps its directory, under the store's
