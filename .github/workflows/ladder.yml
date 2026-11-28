@@ -35,6 +35,11 @@ name: Ladder
 # hand each other the rungs it changes, and a run in seed mode names no
 # cache holding rungs it did not build.
 #
+# A build that fails in a stage after Mes keeps its directory, and the
+# stage's job uploads the config.log files in it as an artifact: what a
+# configure tested is there and not in the job's log.  Mes's builds run
+# no configure.
+#
 # With publish set, each stage publishes what it holds to the public cache
 # once its checks pass, with that token.  GitHub refuses a job that
 # references the environment from any other ref, so a job names it only
@@ -359,6 +364,18 @@ jobs:
       - name: Provision the store root
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # The keep-failed setting, which -K turns on, for every build below:
+      # a build that fails keeps its directory, under the store's
+      # .nova-nix\builds, for the job's last step to upload from.  It goes
+      # in the machine-wide nix.conf, which nova-nix reads on Windows from
+      # %ProgramData%\nix, since the steps below replace NIX_CONFIG with
+      # the substituters they name.
+      - name: Keep a failed build's directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData\nix" | Out-Null
+          Set-Content -Path "$env:ProgramData\nix\nix.conf" -Value 'keep-failed = true'
 
       - name: Serve the handoff
         shell: bash
@@ -982,6 +999,25 @@ jobs:
           NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
         run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
+      # The config.log files of a build that failed, from the directory it
+      # kept: configure writes each test's commands and what they printed
+      # there, and only its verdicts to the job's log.  A job that failed
+      # anywhere but a build, or in a build that runs no configure, has
+      # none.  The builds are under the store's .nova-nix, a hidden
+      # directory.  Kept two weeks: a failure is read within days of its
+      # run, and one that stands fails the next run too, which uploads its
+      # own.
+      - name: Upload a failed build's config.log files
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: config-logs-tinycc-${{ inputs.os }}
+          path: C:\nix\store\.nova-nix\builds\**\config.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
   # ---------------------------------------------------------------------------
   # GCC 4.6.4: the seed stdenv builds binutils, whose as, ar and ld
   # test/data/binutils.nix has build a program that runs, GCC 4.6.4's C
@@ -1026,6 +1062,18 @@ jobs:
       - name: Provision the store root
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # The keep-failed setting, which -K turns on, for every build below:
+      # a build that fails keeps its directory, under the store's
+      # .nova-nix\builds, for the job's last step to upload from.  It goes
+      # in the machine-wide nix.conf, which nova-nix reads on Windows from
+      # %ProgramData%\nix, since the steps below replace NIX_CONFIG with
+      # the substituters they name.
+      - name: Keep a failed build's directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData\nix" | Out-Null
+          Set-Content -Path "$env:ProgramData\nix\nix.conf" -Value 'keep-failed = true'
 
       - name: Serve the handoff
         shell: bash
@@ -1252,6 +1300,25 @@ jobs:
           NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
         run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
+      # The config.log files of a build that failed, from the directory it
+      # kept: configure writes each test's commands and what they printed
+      # there, and only its verdicts to the job's log.  A job that failed
+      # anywhere but a build, or in a build that runs no configure, has
+      # none.  The builds are under the store's .nova-nix, a hidden
+      # directory.  Kept two weeks: a failure is read within days of its
+      # run, and one that stands fails the next run too, which uploads its
+      # own.
+      - name: Upload a failed build's config.log files
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: config-logs-gcc46-${{ inputs.os }}
+          path: C:\nix\store\.nova-nix\builds\**\config.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
   # ---------------------------------------------------------------------------
   # GCC 4.6.4 C++: gcc46 builds GCC 4.6.4 with C++, gcc46-cxx, whose g++
   # test/data/gcc46-cxx.nix has link a C++ program that runs, and whose
@@ -1292,6 +1359,18 @@ jobs:
       - name: Provision the store root
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # The keep-failed setting, which -K turns on, for every build below:
+      # a build that fails keeps its directory, under the store's
+      # .nova-nix\builds, for the job's last step to upload from.  It goes
+      # in the machine-wide nix.conf, which nova-nix reads on Windows from
+      # %ProgramData%\nix, since the steps below replace NIX_CONFIG with
+      # the substituters they name.
+      - name: Keep a failed build's directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData\nix" | Out-Null
+          Set-Content -Path "$env:ProgramData\nix\nix.conf" -Value 'keep-failed = true'
 
       - name: Serve the handoff
         shell: bash
@@ -1431,6 +1510,25 @@ jobs:
           NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
         run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
+      # The config.log files of a build that failed, from the directory it
+      # kept: configure writes each test's commands and what they printed
+      # there, and only its verdicts to the job's log.  A job that failed
+      # anywhere but a build, or in a build that runs no configure, has
+      # none.  The builds are under the store's .nova-nix, a hidden
+      # directory.  Kept two weeks: a failure is read within days of its
+      # run, and one that stands fails the next run too, which uploads its
+      # own.
+      - name: Upload a failed build's config.log files
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: config-logs-gcc46-cxx-${{ inputs.os }}
+          path: C:\nix\store\.nova-nix\builds\**\config.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
   # ---------------------------------------------------------------------------
   # GCC 10: gcc46-cxx builds GCC 10.4.0 with C and C++, gcc10, with GMP,
   # MPFR and MPC in its tree, whose gcc and g++
@@ -1476,6 +1574,18 @@ jobs:
       - name: Provision the store root
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # The keep-failed setting, which -K turns on, for every build below:
+      # a build that fails keeps its directory, under the store's
+      # .nova-nix\builds, for the job's last step to upload from.  It goes
+      # in the machine-wide nix.conf, which nova-nix reads on Windows from
+      # %ProgramData%\nix, since the steps below replace NIX_CONFIG with
+      # the substituters they name.
+      - name: Keep a failed build's directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData\nix" | Out-Null
+          Set-Content -Path "$env:ProgramData\nix\nix.conf" -Value 'keep-failed = true'
 
       - name: Serve the handoff
         shell: bash
@@ -1668,6 +1778,25 @@ jobs:
           NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
         run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
+      # The config.log files of a build that failed, from the directory it
+      # kept: configure writes each test's commands and what they printed
+      # there, and only its verdicts to the job's log.  A job that failed
+      # anywhere but a build, or in a build that runs no configure, has
+      # none.  The builds are under the store's .nova-nix, a hidden
+      # directory.  Kept two weeks: a failure is read within days of its
+      # run, and one that stands fails the next run too, which uploads its
+      # own.
+      - name: Upload a failed build's config.log files
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: config-logs-gcc10-${{ inputs.os }}
+          path: C:\nix\store\.nova-nix\builds\**\config.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
   # ---------------------------------------------------------------------------
   # GCC 16: gcc10 builds GCC 16.2.0 with C and C++, gcc-latest, with GMP,
   # MPFR and MPC in its tree, against the current MinGW-w64,
@@ -1710,6 +1839,18 @@ jobs:
       - name: Provision the store root
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # The keep-failed setting, which -K turns on, for every build below:
+      # a build that fails keeps its directory, under the store's
+      # .nova-nix\builds, for the job's last step to upload from.  It goes
+      # in the machine-wide nix.conf, which nova-nix reads on Windows from
+      # %ProgramData%\nix, since the steps below replace NIX_CONFIG with
+      # the substituters they name.
+      - name: Keep a failed build's directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData\nix" | Out-Null
+          Set-Content -Path "$env:ProgramData\nix\nix.conf" -Value 'keep-failed = true'
 
       - name: Serve the handoff
         shell: bash
@@ -1858,6 +1999,25 @@ jobs:
           NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
         run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
+      # The config.log files of a build that failed, from the directory it
+      # kept: configure writes each test's commands and what they printed
+      # there, and only its verdicts to the job's log.  A job that failed
+      # anywhere but a build, or in a build that runs no configure, has
+      # none.  The builds are under the store's .nova-nix, a hidden
+      # directory.  Kept two weeks: a failure is read within days of its
+      # run, and one that stands fails the next run too, which uploads its
+      # own.
+      - name: Upload a failed build's config.log files
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: config-logs-gcc-latest-${{ inputs.os }}
+          path: C:\nix\store\.nova-nix\builds\**\config.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
   # ---------------------------------------------------------------------------
   # x86_64: gcc-latest builds binutils for x86_64-w64-mingw32,
   # binutils-x86_64, whose assembler, archiver, dlltool and linker
@@ -1909,6 +2069,18 @@ jobs:
       - name: Provision the store root
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # The keep-failed setting, which -K turns on, for every build below:
+      # a build that fails keeps its directory, under the store's
+      # .nova-nix\builds, for the job's last step to upload from.  It goes
+      # in the machine-wide nix.conf, which nova-nix reads on Windows from
+      # %ProgramData%\nix, since the steps below replace NIX_CONFIG with
+      # the substituters they name.
+      - name: Keep a failed build's directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData\nix" | Out-Null
+          Set-Content -Path "$env:ProgramData\nix\nix.conf" -Value 'keep-failed = true'
 
       - name: Serve the handoff
         shell: bash
@@ -2124,6 +2296,25 @@ jobs:
           NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
         run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
+      # The config.log files of a build that failed, from the directory it
+      # kept: configure writes each test's commands and what they printed
+      # there, and only its verdicts to the job's log.  A job that failed
+      # anywhere but a build, or in a build that runs no configure, has
+      # none.  The builds are under the store's .nova-nix, a hidden
+      # directory.  Kept two weeks: a failure is read within days of its
+      # run, and one that stands fails the next run too, which uploads its
+      # own.
+      - name: Upload a failed build's config.log files
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: config-logs-x86_64-${{ inputs.os }}
+          path: C:\nix\store\.nova-nix\builds\**\config.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
   # ---------------------------------------------------------------------------
   # GCC 16 x86_64: gcc-latest builds GCC 16.2.0 with C and C++ for
   # x86_64-w64-mingw32, gcc-x86_64, with GMP, MPFR and MPC in its tree,
@@ -2167,6 +2358,18 @@ jobs:
       - name: Provision the store root
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # The keep-failed setting, which -K turns on, for every build below:
+      # a build that fails keeps its directory, under the store's
+      # .nova-nix\builds, for the job's last step to upload from.  It goes
+      # in the machine-wide nix.conf, which nova-nix reads on Windows from
+      # %ProgramData%\nix, since the steps below replace NIX_CONFIG with
+      # the substituters they name.
+      - name: Keep a failed build's directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData\nix" | Out-Null
+          Set-Content -Path "$env:ProgramData\nix\nix.conf" -Value 'keep-failed = true'
 
       - name: Serve the handoff
         shell: bash
@@ -2294,6 +2497,25 @@ jobs:
           NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
         run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
+      # The config.log files of a build that failed, from the directory it
+      # kept: configure writes each test's commands and what they printed
+      # there, and only its verdicts to the job's log.  A job that failed
+      # anywhere but a build, or in a build that runs no configure, has
+      # none.  The builds are under the store's .nova-nix, a hidden
+      # directory.  Kept two weeks: a failure is read within days of its
+      # run, and one that stands fails the next run too, which uploads its
+      # own.
+      - name: Upload a failed build's config.log files
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: config-logs-gcc-x86_64-${{ inputs.os }}
+          path: C:\nix\store\.nova-nix\builds\**\config.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
   # ---------------------------------------------------------------------------
   # Native x86_64: gcc-x86_64 builds binutils and GCC 16.2.0 with C and C++
   # that run on x86_64 Windows and write x86_64-w64-mingw32,
@@ -2341,6 +2563,18 @@ jobs:
       - name: Provision the store root
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # The keep-failed setting, which -K turns on, for every build below:
+      # a build that fails keeps its directory, under the store's
+      # .nova-nix\builds, for the job's last step to upload from.  It goes
+      # in the machine-wide nix.conf, which nova-nix reads on Windows from
+      # %ProgramData%\nix, since the steps below replace NIX_CONFIG with
+      # the substituters they name.
+      - name: Keep a failed build's directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData\nix" | Out-Null
+          Set-Content -Path "$env:ProgramData\nix\nix.conf" -Value 'keep-failed = true'
 
       - name: Serve the handoff
         shell: bash
@@ -2513,6 +2747,25 @@ jobs:
           NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
         run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
 
+      # The config.log files of a build that failed, from the directory it
+      # kept: configure writes each test's commands and what they printed
+      # there, and only its verdicts to the job's log.  A job that failed
+      # anywhere but a build, or in a build that runs no configure, has
+      # none.  The builds are under the store's .nova-nix, a hidden
+      # directory.  Kept two weeks: a failure is read within days of its
+      # run, and one that stands fails the next run too, which uploads its
+      # own.
+      - name: Upload a failed build's config.log files
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: config-logs-native-x86_64-${{ inputs.os }}
+          path: C:\nix\store\.nova-nix\builds\**\config.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
   # ---------------------------------------------------------------------------
   # Stdenv: the package set's stdenv, the seed stdenv's builder and tools
   # with the native x86_64 toolchain, whose compilers and linker its
@@ -2562,6 +2815,18 @@ jobs:
       - name: Provision the store root
         shell: pwsh
         run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
+
+      # The keep-failed setting, which -K turns on, for every build below:
+      # a build that fails keeps its directory, under the store's
+      # .nova-nix\builds, for the job's last step to upload from.  It goes
+      # in the machine-wide nix.conf, which nova-nix reads on Windows from
+      # %ProgramData%\nix, since the steps below replace NIX_CONFIG with
+      # the substituters they name.
+      - name: Keep a failed build's directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData\nix" | Out-Null
+          Set-Content -Path "$env:ProgramData\nix\nix.conf" -Value 'keep-failed = true'
 
       - name: Serve the handoff
         shell: bash
@@ -2797,3 +3062,22 @@ jobs:
         env:
           NOVA_CACHE_API_KEY: ${{ secrets.NOVA_CACHE_API_KEY }}
         run: bash .github/cache/publish.sh "$RUNNER_TEMP/bin/nova-nix.exe"
+
+      # The config.log files of a build that failed, from the directory it
+      # kept: configure writes each test's commands and what they printed
+      # there, and only its verdicts to the job's log.  A job that failed
+      # anywhere but a build, or in a build that runs no configure, has
+      # none.  The builds are under the store's .nova-nix, a hidden
+      # directory.  Kept two weeks: a failure is read within days of its
+      # run, and one that stands fails the next run too, which uploads its
+      # own.
+      - name: Upload a failed build's config.log files
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: config-logs-stdenv-${{ inputs.os }}
+          path: C:\nix\store\.nova-nix\builds\**\config.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
