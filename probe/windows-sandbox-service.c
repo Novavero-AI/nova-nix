@@ -17,7 +17,10 @@
  *     start made directly on the unnamed window station's desktops;
  *   - whether CreateProcessAsUserW opens the builder's image as the
  *     caller or as the token, by a builder only the service may read and
- *     one only the slot may read;
+ *     one only the slot may read; and whether either way to have the image
+ *     opened as the slot works: a launcher, this program started as the
+ *     slot, which starts the image itself, or CreateProcessAsUserW called
+ *     impersonating the slot;
  *   - whether a build can start a process outside its job: through Task
  *     Scheduler, a task it makes as itself; through WMI's
  *     Win32_Process.Create; and whether it can register a COM server in
@@ -1350,6 +1353,9 @@ struct service_context {
      * helper is followed by a sweep of its slot's processes. */
     int helper_system_desktop;
     int sweep_after;
+    /* Whether a direct start calls CreateProcessAsUserW impersonating the
+     * slot's token. */
+    int impersonate_start;
 };
 
 /* A pipe's reader, gathering what comes until the pipe ends. */
@@ -1737,6 +1743,7 @@ static void direct_build(struct service_context *c, const struct slot *slot, con
     ULONGLONG deadline;
     ULONGLONG ended;
     HRESULT made;
+    memset(&process, 0, sizeof process);
     memset(result, 0, sizeof *result);
     result->log_end_ms = -1;
     result->status = "";
@@ -1802,9 +1809,22 @@ static void direct_build(struct service_context *c, const struct slot *slot, con
     startup.StartupInfo.hStdOutput = log_write;
     startup.StartupInfo.hStdError = log_write;
     startup.lpAttributeList = list;
-    if (!CreateProcessAsUserW(slot->token, NULL, (LPWSTR)join(command, END), NULL, NULL, TRUE,
-                              CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
-                              environment_block(slot), widen(slot->build), &startup.StartupInfo, &process)) {
+    if (c->impersonate_start && !ImpersonateLoggedOnUser(slot->token)) {
+        result->start_error = GetLastError();
+        say("MEASURE direct start ImpersonateLoggedOnUser %s: %s", slot->name, error_text(result->start_error));
+        return;
+    }
+    {
+        BOOL created = CreateProcessAsUserW(slot->token, NULL, (LPWSTR)join(command, END), NULL, NULL, TRUE,
+                                            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                                            environment_block(slot), widen(slot->build), &startup.StartupInfo, &process);
+        DWORD error = created ? 0 : GetLastError();
+        if (c->impersonate_start)
+            RevertToSelf();
+        if (!created)
+            SetLastError(error);
+    }
+    if (process.hProcess == NULL) {
         result->start_error = GetLastError();
         CloseHandle(log_write);
         CloseHandle(nul);
@@ -2207,6 +2227,19 @@ static void main_phase(struct service_context *c)
         snprintf(label, sizeof label, "helper start, %s", image_labels[i]);
         through_helper(c, &c->slots[0], child_command(images[i], L"identity"), &b);
         say_build(label, &b);
+        /* The builder a launcher starts: this program, which the slot may
+         * read, started as the slot, which then starts the image itself,
+         * so the image is opened with the slot's own token. */
+        snprintf(label, sizeof label, "helper start of a launcher that starts the %s", image_labels[i]);
+        through_helper(c, &c->slots[0],
+                       child_command(c->probe, join(L"exec \"", widen(images[i]), L"\" child identity", END)), &b);
+        say_build(label, &b);
+        /* CreateProcessAsUserW called impersonating the slot. */
+        c->impersonate_start = 1;
+        snprintf(label, sizeof label, "direct start impersonating the slot, %s", image_labels[i]);
+        direct_build(c, &c->slots[0], child_command(images[i], L"identity"), DESKTOP_SYSTEM, &b);
+        say_build(label, &b);
+        c->impersonate_start = 0;
     }
 
     {
@@ -2673,6 +2706,37 @@ static void child_escaped(const WCHAR *marker, const WCHAR *builder_pid, const W
         CloseHandle(copy);
 }
 
+/* As a launcher: start ARGUMENTS, quoted each, with this process's own
+ * token, standard handles and console, wait for it, and exit as it did;
+ * a start that fails says why and answers its error. */
+static DWORD child_exec(int count, WCHAR **arguments)
+{
+    STARTUPINFOW startup;
+    PROCESS_INFORMATION process;
+    WCHAR *line = join(L"", END);
+    DWORD code = 0;
+    int i;
+    for (i = 0; i < count; i++)
+        line = join(line, i > 0 ? L" \"" : L"\"", arguments[i], L"\"", END);
+    memset(&startup, 0, sizeof startup);
+    startup.cb = sizeof startup;
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    if (!CreateProcessW(NULL, line, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &process)) {
+        code = GetLastError();
+        say("launcher start of %s as the slot: %s", utf8(arguments[0]), error_text(code));
+        return code;
+    }
+    say("launcher start of %s as the slot: started", utf8(arguments[0]));
+    WaitForSingleObject(process.hProcess, INFINITE);
+    GetExitCodeProcess(process.hProcess, &code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return code;
+}
+
 /* Open another window station, by name, for all the access a build would
  * want of one. */
 static void child_open_station(const WCHAR *name)
@@ -2699,6 +2763,8 @@ static int child_command_run(int count, WCHAR **arguments)
         child_net(utf8(arguments[3]));
     else if (wcsncmp(op, L"escape-", 7) == 0)
         child_escape(utf8(op));
+    else if (wcscmp(op, L"exec") == 0 && count > 3)
+        return (int)child_exec(count - 3, arguments + 3);
     else if (wcscmp(op, L"open-station") == 0 && count > 3)
         child_open_station(arguments[3]);
     else if (wcscmp(op, L"escaped") == 0 && count > 5)
