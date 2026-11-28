@@ -188,6 +188,16 @@ jobs:
         run: |
           NOVA_NIX_BIN=$(cabal list-bin exe:nova-nix) .github/parity/profile-cases.sh
 
+      # The flake registries both read, from fixture files and from
+      # upstream's default global registry, which both download, through
+      # `registry list` and `registry resolve`.  It reads nothing of the
+      # nixpkgs tree, so it runs whatever the evaluator cases found; the
+      # script skips a row whose upstream is older than 2.36.0.
+      - name: Flake registries vs upstream Nix
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          NOVA_NIX_BIN=$(cabal list-bin exe:nova-nix) .github/parity/registry-cases.sh
+
   # The one context branch protection requires of this workflow, so that
   # bumping a matrix row leaves the required name unchanged.  A required
   # check that is skipped counts as passed, so this job runs whatever the

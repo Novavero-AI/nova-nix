@@ -7,6 +7,7 @@
 -- decoded path names.
 module Nix.Fetch.Download
   ( DownloadSource (..),
+    urlSource,
     unescapeUrlPath,
     withUrlBody,
     downloadBytes,
@@ -17,9 +18,13 @@ import Control.Exception (IOException, catch)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.Either (fromRight)
 import Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Data.Word (Word8)
 import qualified Network.HTTP.Client as HTTP
+import Nix.Eval.Policy (fileUrlPrefix)
 import Nix.Http (FetchRetryPolicy, attemptFailureMessage, downloadUrlWith, fetchWriteFailure, ioRetryEffects, retryTransient)
 import Nix.Logger (Logger)
 import System.IO (IOMode (ReadMode), withBinaryFile)
@@ -31,6 +36,15 @@ data DownloadSource
   | -- | A URL the HTTP client requests.
     RemoteUrl !Text
   deriving (Eq, Show)
+
+-- | Where a download reads a URL from: for a @file:\/\/@ URL the file its
+-- path names, decoded as curl decodes it ('unescapeUrlPath'), and
+-- otherwise the URL.  A path that decodes to bytes with no UTF-8 reading
+-- is read as written.
+urlSource :: Text -> DownloadSource
+urlSource url = case T.stripPrefix fileUrlPrefix url of
+  Just path -> LocalFile (T.unpack (fromRight path (TE.decodeUtf8' (unescapeUrlPath (TE.encodeUtf8 path)))))
+  Nothing -> RemoteUrl url
 
 -- | A URL path's bytes with each @%@ and two hex digits decoded, as curl
 -- decodes a @file:\/\/@ URL's path; a @%@ without two hex digits after it

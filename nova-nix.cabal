@@ -139,6 +139,7 @@ library
     Nix.Fetch.Attrs
     Nix.Fetch.Download
     Nix.Fetch.Input
+    Nix.Fetch.Registry
     Nix.Fetch.Tar
     Nix.Fetch.Tree
     Nix.Fetch.Url
@@ -393,6 +394,7 @@ test-suite nova-nix-test
     Test.Pkgs
     Test.Push
     Test.Realise
+    Test.Registry
     Test.Store
     Test.Substituter
     Test.Trust

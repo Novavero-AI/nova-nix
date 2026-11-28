@@ -130,6 +130,11 @@ data Command
     -- current one, or with @--older-than@, as the command line spells its
     -- age, those older than that but the newest of them.
     CmdProfileWipeHistory !ProfileSelection !(Maybe String) !Changes
+  | -- | @registry list@: print the entries of every flake registry.
+    CmdRegistryList
+  | -- | @registry resolve@: print each flake reference, as the command
+    -- line spells it, resolved against the registries.
+    CmdRegistryResolve ![String]
   | -- | No command given, or @eval@ given no target.  Usage on stderr,
     -- non-zero: a bare invocation is
     -- a usage error, and a caller testing the exit status must see one.
@@ -463,6 +468,7 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     go opts ("push" : rest) = goPush opts emptyPushArgs rest
     go opts ("store" : rest) = goStore opts rest
     go opts ("profile" : rest) = goProfile opts rest
+    go opts ("registry" : rest) = goRegistry opts rest
     go _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     go _ (flag : _)
@@ -675,6 +681,28 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
     goStoreGc _ _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     goStoreGc _ _ (arg : _) = Left ("unknown store gc argument: " ++ arg)
+    -- Sub-parser for registry verbs.
+    goRegistry _ [] = Left ("registry: expected a subcommand (" ++ registryVerbs ++ ")")
+    goRegistry opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
+    goRegistry opts ("list" : rest) = goRegistryList opts rest
+    goRegistry opts ("resolve" : rest) = goRegistryResolve opts [] rest
+    goRegistry _ (sub : _) = Left ("unknown registry subcommand: " ++ sub ++ " (expected: " ++ registryVerbs ++ ")")
+    registryVerbs = "list, resolve"
+    goRegistryList opts [] = Right opts {optCommand = CmdRegistryList}
+    goRegistryList opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
+    goRegistryList opts (flag : features : rest)
+      | flag == extraFeaturesFlag = goRegistryList (withFeatures features opts) rest
+    goRegistryList _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goRegistryList _ (arg : _) = Left ("unknown registry list argument: " ++ arg)
+    goRegistryResolve opts refs [] = Right opts {optCommand = CmdRegistryResolve refs}
+    goRegistryResolve opts _ (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}
+    goRegistryResolve opts refs (flag : features : rest)
+      | flag == extraFeaturesFlag = goRegistryResolve (withFeatures features opts) refs rest
+    goRegistryResolve _ _ [flag]
+      | flag `elem` valueFlags = Left (flag ++ " requires a value")
+    goRegistryResolve _ _ (arg@('-' : _) : _) = Left ("unknown registry resolve flag: " ++ arg)
+    goRegistryResolve opts refs (ref : rest) = goRegistryResolve opts (refs ++ [ref]) rest
     -- Sub-parser for profile verbs.
     goProfile _ [] = Left ("profile: expected a subcommand (" ++ profileVerbs ++ ")")
     goProfile opts (flag : _) | Just answer <- answered flag = Right opts {optCommand = answer}

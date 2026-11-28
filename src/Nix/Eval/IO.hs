@@ -100,14 +100,14 @@ import Nix.Eval.CThunk (CThunkPtr, cthunkMarkBlackhole, cthunkMarkPending, cthun
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Context (contextRequest)
-import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), SymlinkResolution (..), WalkStop (..), allowPathIn, fileUrlPrefix, forbiddenPathMessage, hostPathRules, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, linkTarget, noAllowedPaths, pathComponents, pathsRestricted, storeRootPrefix, uriAccess, walkPath)
+import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), SymlinkResolution (..), WalkStop (..), allowPathIn, forbiddenPathMessage, hostPathRules, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, linkTarget, noAllowedPaths, pathComponents, pathsRestricted, storeRootPrefix, uriAccess, walkPath)
 import Nix.Eval.RealiseContext (ContextRefusal (..), ContextRequest (..), PendingOrigin (..), Plan (..), SessionMode (..), firstInvalidPath, planRealisation, readableIn, referenceClosure)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetKeys, bytesToTextLossy, evaluated, marshalLambda, pathCell, primopCell, readComputed, readPending, storePathOrThrow, stringCell, warnMessage, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.Fetch.Archive (FetchFailure (..), UnpackedArchive (..), unpackArchive)
-import Nix.Fetch.Download (DownloadSource (..), downloadBytes, unescapeUrlPath, withUrlBody)
+import Nix.Fetch.Download (DownloadSource (..), downloadBytes, urlSource, withUrlBody)
 import Nix.Fetch.Tree (Blob, Tree, treeNarHash, withTreeNarSource)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
 import Nix.Http (defaultFetchRetryPolicy)
@@ -1724,16 +1724,12 @@ runEvalIOTraced st (EvalIO action) = do
 -- Store copy helpers
 -- ---------------------------------------------------------------------------
 
--- | Where a fetch reads a URL from: a @file:\/\/@ URL's path, decoded as
--- curl decodes one and named on the drive the evaluator reads it on
--- ('qualifyPath'), and any other URL through the HTTP client.  A path
--- that decodes to bytes with no UTF-8 reading is read as written.
+-- | Where a fetch reads a URL from ('urlSource'), a @file:\/\/@ URL's
+-- path named on the drive the evaluator reads it on ('qualifyPath').
 downloadSourceOf :: Text -> EvalIO DownloadSource
-downloadSourceOf url = case T.stripPrefix fileUrlPrefix url of
-  Just path ->
-    LocalFile . T.unpack
-      <$> qualifyPath (fromRight path (TE.decodeUtf8' (unescapeUrlPath (TE.encodeUtf8 path))))
-  Nothing -> pure (RemoteUrl url)
+downloadSourceOf url = case urlSource url of
+  LocalFile path -> LocalFile . T.unpack <$> qualifyPath (T.pack path)
+  remote -> pure remote
 
 -- | Upstream's refusals of a @file:\/\/@ tarball before it is read
 -- (@downloadTarball_@ in tarball.cc at 2.36.0): a relative path, a path

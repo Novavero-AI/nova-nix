@@ -23,6 +23,14 @@ module Nix.Fetch.Input
     inputToUrl,
     inputToUrlString,
 
+    -- * Comparing and overriding
+    sameInput,
+    inputContains,
+    inputIsDirect,
+    inputRef,
+    inputRevision,
+    applyOverrides,
+
     -- * Git names
     isLegalRefName,
   )
@@ -529,6 +537,76 @@ inputToUrlString :: PathRules -> [(ByteString, ByteString)] -> Input -> Checked 
 inputToUrlString rules extra input = do
   url <- inputToUrl rules input
   pure (renderUrl url {urlQuery = Map.union (urlQuery url) (Map.fromList extra)})
+
+-- ---------------------------------------------------------------------------
+-- Comparing and overriding
+-- ---------------------------------------------------------------------------
+
+-- | Whether two inputs are one, as upstream's @Input::operator==@ tells:
+-- by their attributes.
+sameInput :: Input -> Input -> Bool
+sameInput a b = inputAttrs a == inputAttrs b
+
+-- | Whether an input is the other, or the other without its @ref@ and
+-- @rev@ (@Input::contains@), as a registry entry matches a reference.
+inputContains :: Input -> Input -> Bool
+inputContains container other =
+  sameInput container other
+    || inputAttrs container == Map.delete "ref" (Map.delete "rev" (inputAttrs other))
+
+-- | Whether an input names a source of its own rather than an entry in
+-- the registries (@Input::isDirect@): every input but an indirect one,
+-- including one no scheme reads.
+inputIsDirect :: Input -> Bool
+inputIsDirect input = inputScheme input /= Just SchemeIndirect
+
+-- | The input's @ref@, as upstream's @Input::getRef@ reads it.
+inputRef :: Input -> Checked (Maybe ByteString)
+inputRef = maybeStrAttr "ref" . inputAttrs
+
+-- | The input's revision's digest, as upstream's @Input::getRev@ reads it.
+inputRevision :: Input -> Checked (Maybe ByteString)
+inputRevision = inputRev . inputAttrs
+
+-- | An input with a @ref@ and a revision put in place of its own, as its
+-- scheme's @applyOverrides@ puts them, in upstream's words where the
+-- scheme refuses.  A forge takes one of the two, an indirect or Mercurial
+-- input both, and a Git input both, so long as it then has a @ref@ beside
+-- a revision.  The other schemes take neither, and an input no scheme
+-- reads is left as it is.
+applyOverrides :: PathRules -> Maybe ByteString -> Maybe ByteString -> Input -> Checked Input
+applyOverrides rules ref rev input = case inputScheme input of
+  Nothing -> pure input
+  Just SchemeGitHub -> forge
+  Just SchemeGitLab -> forge
+  Just SchemeSourceHut -> forge
+  Just SchemeIndirect -> pure both
+  Just SchemeMercurial -> pure both
+  Just SchemeGit -> do
+    hasRef <- inputRef both
+    hasRev <- inputRevision both
+    case (hasRef, hasRev) of
+      (Nothing, Just _) -> shown both >>= \shownAfter -> refuse ("Git input '" <> shownAfter <> "' has a commit hash but no branch/tag name")
+      _ -> pure both
+  Just SchemeFile -> unsettable
+  Just SchemeTarball -> unsettable
+  Just SchemePath -> unsettable
+  where
+    attrs = inputAttrs input
+    revValue digest = AttrString (gitRev digest)
+    both = input {inputAttrs = maybe id (Map.insert "ref" . AttrString) ref (maybe id (Map.insert "rev" . revValue) rev attrs)}
+    forge = case (ref, rev) of
+      (Just name, Just digest) -> do
+        shownInput <- shown input
+        refuse ("cannot apply both a commit hash (" <> bytesToTextLossy (gitRev digest) <> ") and a branch/tag name ('" <> bytesToTextLossy name <> "') to input '" <> shownInput <> "'")
+      (Nothing, Just digest) -> pure input {inputAttrs = Map.insert "rev" (revValue digest) (Map.delete "ref" attrs)}
+      (Just name, Nothing) -> pure input {inputAttrs = Map.insert "ref" (AttrString name) (Map.delete "rev" attrs)}
+      (Nothing, Nothing) -> pure input
+    unsettable = case (ref, rev) of
+      (Just name, _) -> shown input >>= \shownInput -> refuse ("don't know how to set branch/tag name of input '" <> shownInput <> "' to '" <> bytesToTextLossy name <> "'")
+      (Nothing, Just digest) -> shown input >>= \shownInput -> refuse ("don't know how to set revision of input '" <> shownInput <> "' to '" <> bytesToTextLossy (gitRev digest) <> "'")
+      (Nothing, Nothing) -> pure input
+    shown = fmap bytesToTextLossy . inputToUrlString rules []
 
 -- | The input's revision, as upstream's @Input::getRev@ reads it: a hash
 -- with its algorithm named, else a SHA-1.

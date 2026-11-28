@@ -104,6 +104,8 @@ data CommandName
   | ProfileHistoryCommand
   | ProfileRollbackCommand
   | ProfileWipeHistoryCommand
+  | RegistryListCommand
+  | RegistryResolveCommand
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | What the reference says about a command, or about the global form.
@@ -175,6 +177,8 @@ commandWords name = case name of
   ProfileHistoryCommand -> ["profile", "history"]
   ProfileRollbackCommand -> ["profile", "rollback"]
   ProfileWipeHistoryCommand -> ["profile", "wipe-history"]
+  RegistryListCommand -> ["registry", "list"]
+  RegistryResolveCommand -> ["registry", "resolve"]
 
 -- | A command as it is invoked, @nova-nix store gc@.
 commandInvocation :: CommandName -> Text
@@ -494,6 +498,31 @@ command name = case name of
                  Example "Say which generations would be deleted, and delete none." ("profile" :| ["wipe-history", "--dry-run"]) []
                ]
       }
+  RegistryListCommand ->
+    CommandEntry
+      { commandForms = Form "" "Print the entries of every flake registry" :| [],
+        commandDescription =
+          "Prints each entry of the flake registries, as `nix registry list` does: the registry, `user`, `system` or `global`, padded to six columns, then the reference the entry maps and the one it maps it to. "
+            <> registryRules,
+        commandExamples =
+          Example "List the entries of the registries." ("registry" :| ["list"]) []
+            :| [Example "List them with the flake-only references read, as `flakes` lets them be." ("registry" :| ["list", "--extra-experimental-features", "flakes"]) []]
+      }
+  RegistryResolveCommand ->
+    CommandEntry
+      { commandForms = Form "REF..." "Print each flake reference resolved against the registries" :| [],
+        commandDescription =
+          "Prints each flake reference resolved against the flake registries, as `nix registry resolve` does: the first entry, in the order the registries are listed and each in its file's order, that maps the reference replaces it, and the lookup starts again until no entry maps it. An entry that does not set a `ref` or a revision passes on the reference's own, and an `exact` one maps only a reference with neither. A reference still naming a registry entry at the end, such as `nixpkgs` with no entry for it, is refused, as is a lookup that follows 100 entries. A reference is read as `builtins.parseFlakeRef` reads one, so a path must be absolute. "
+            <> registryRules,
+        commandExamples =
+          Example "Resolve the registry's `nixpkgs`." ("registry" :| ["resolve", "--extra-experimental-features", "flakes", "nixpkgs"]) []
+            :| []
+      }
+
+-- | Where the registries are and how they are read, as the descriptions of
+-- the registry commands say.
+registryRules :: Text
+registryRules = "The registries are the user's, `nix/registry.json` under the XDG config home; the machine's, `registry.json` in `NIX_CONF_DIR`; and the global one `flake-registry` names, downloaded when it is a URL. A file that is not there holds no entries, and one that cannot be read is warned of, the entries before what failed kept. An entry naming a GitHub, GitLab, sourcehut, path or registry reference needs `flakes`, as upstream's does."
 
 -- | What a profile is and where it is, as the descriptions of the
 -- commands that change one say.
@@ -677,7 +706,7 @@ flag name = case name of
   NoAllowImportFromDerivationFlag ->
     long "no-allow-import-from-derivation" Nothing "Refuse to build or substitute what a path's context names when `import` or another builtin reads the path, even an output already valid" evaluating
   ExtraExperimentalFeaturesFlag ->
-    long "extra-experimental-features" (Just "FEATURES") "Turn on the experimental features `FEATURES` names, upstream's names separated by spaces, beside those `experimental-features` turns on: `flakes` lets `builtins.parseFlakeRef` and `builtins.flakeRefToString` read a GitHub, GitLab, sourcehut, path or registry reference" evaluating
+    long "extra-experimental-features" (Just "FEATURES") "Turn on the experimental features `FEATURES` names, upstream's names separated by spaces, beside those `experimental-features` turns on: `flakes` lets `builtins.parseFlakeRef`, `builtins.flakeRefToString` and the registry commands read a GitHub, GitLab, sourcehut, path or registry reference" featured
   SubstituterFlag ->
     long "substituter" (Just "URL") "Try this binary cache before building" evaluating
   TrustedKeyFlag ->
@@ -771,6 +800,7 @@ flag name = case name of
     -- those that evaluate.
     selecting = CommandFlag (BuildCommand :| [DevelopCommand, PrintDevEnvCommand, TrustCommand, ProfileAddCommand])
     evaluating = CommandFlag (EvalCommand :| [BuildCommand, DevelopCommand, PrintDevEnvCommand, TrustCommand, ProfileAddCommand])
+    featured = CommandFlag (EvalCommand :| [BuildCommand, DevelopCommand, PrintDevEnvCommand, TrustCommand, ProfileAddCommand, RegistryListCommand, RegistryResolveCommand])
     -- The commands whose builds keep-failed can keep: trust builds only
     -- with builtins, which keep nothing.
     building = CommandFlag (EvalCommand :| [BuildCommand, DevelopCommand, PrintDevEnvCommand, ProfileAddCommand])
@@ -819,6 +849,7 @@ configuration =
                Setting "allow-import-from-derivation" "Let a builtin that reads a path build or substitute what the path's context names (default: true)" (Just NoAllowImportFromDerivationFlag),
                Setting "trace-import-from-derivation" "Warn, naming the first output, when a builtin that reads a path realises what its context names" Nothing,
                Setting "experimental-features" "Experimental features to turn on, by upstream's names (default: none); a name upstream does not know is dropped with a warning" (Just ExtraExperimentalFeaturesFlag),
+               Setting "flake-registry" "The global flake registry, a path or a URL, none when empty (default: upstream's, `flake-registry.json` on `channels.nixos.org`)" Nothing,
                Setting "sandbox" "Whether a build runs in a sandbox: `true`, `relaxed` (a build that is fixed-output or sets `__noChroot` does not) or `false` (default: `true` on Linux, `false` elsewhere)" (Just SandboxFlag),
                Setting "sandbox-fallback" "Build unsandboxed, after a warning, where a Linux system cannot make the sandbox; on macOS such a build fails (default `true`)" Nothing,
                Setting "sandbox-paths" "Host paths a sandboxed build sees, each `TARGET=SOURCE` or a path naming itself, with `?` after one that may be missing (default: on Linux `/bin/sh` as a release archive's bundled shell; on macOS `/System/Library/Frameworks`, `/System/Library/PrivateFrameworks`, `/bin/sh`, `/bin/bash` and `/usr/lib`)" Nothing,

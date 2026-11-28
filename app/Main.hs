@@ -61,12 +61,16 @@ import Nix.Eval.CStats (CRoot (..), countSites, renderCensus, takeCensus, valueR
 import Nix.Eval.CallDepth (topLevelCallDepth)
 import Nix.Eval.CanonPath (canonPathValue)
 import Nix.Eval.IO (EvalFailure (..), EvalIO, EvalState (..), SessionSettings (..), SessionStore (..), allowEvalPath, evalBaseEnv, evalSearchPath, nixPathValue, readImportTarget, renderEvalFailure, resolveImportTarget, runEvalIOTraced, sourceCopies, withEvalSession)
-import Nix.Eval.Policy (ImportFromDerivation (..))
+import Nix.Eval.Policy (ImportFromDerivation (..), hostPathRules)
 import Nix.Eval.Print (printAmbiguous)
 import Nix.Eval.Symbol (symbolIntern)
 import Nix.Eval.Types (clistThunks, mkStrBytes, mkThunkBc)
 import Nix.ExperimentalFeature (addFeatures, featureSetWarnings, parseFeatures)
 import Nix.Expr.Resolve (undefinedVariableMessage)
+import Nix.Fetch.Input (InputContext (..))
+import Nix.Fetch.Registry (Registry, RegistryLocations (..), RegistryUse (..), globalRegistryFrom, readRegistries, registryFileName, registryListLines, resolveFlakeRef)
+import Nix.Fetch.Url (Checked, runChecked)
+import Nix.Flake.Ref (flakeRefToString, parseFlakeRef)
 import Nix.HostPath (hostPathFromBytes, hostPathText)
 import Nix.Http (defaultFetchRetryPolicy)
 import Nix.Json (Json, renderJson)
@@ -224,6 +228,8 @@ main = do
     CmdProfileHistory selection -> profileHistoryCommand config storeDir selection
     CmdProfileRollback selection to changes -> profileRollbackCommand config storeDir selection to changes
     CmdProfileWipeHistory selection olderThan changes -> profileWipeHistoryCommand config storeDir selection olderThan changes
+    CmdRegistryList -> registryListCommand config
+    CmdRegistryResolve refs -> registryResolveCommand config refs
     CmdUsage -> mapM_ (TIO.hPutStrLn stderr) helpLines >> exitFailure
     CmdHelp -> toStdout (mapM_ TIO.putStrLn helpLines)
     CmdVersion -> toStdout (putStrLn versionLine)
@@ -1861,6 +1867,76 @@ profileListCommand config storeDir selection format = do
     ListText -> do
       styling <- stdoutStyling
       toStdout (mapM_ TIO.putStrLn (listLines styling storeDir manifest))
+
+-- ---------------------------------------------------------------------------
+-- Flake registries
+-- ---------------------------------------------------------------------------
+
+-- | Print each entry of the flake registries, as upstream's
+-- @registry list@ does.
+registryListCommand :: NixConfig -> IO ()
+registryListCommand config = do
+  logger <- cliLogger
+  registries <- commandRegistries logger config
+  entries <- checkedOrFail logger (registryListLines hostPathRules registries)
+  toStdout (mapM_ BC.putStrLn entries)
+
+-- | Print each flake reference resolved against the registries, as
+-- upstream's @registry resolve@ does: one at a time, each printed before
+-- the next is read, and the registries read when the first reference
+-- has been.
+registryResolveCommand :: NixConfig -> [String] -> IO ()
+registryResolveCommand config refs = do
+  logger <- cliLogger
+  let resolveEach held arg = do
+        ref <- commandLineBytes "a flake reference" arg >>= checkedOrFail logger . parseFlakeRef (registryContext config)
+        registries <- maybe (commandRegistries logger config) pure held
+        resolved <- checkedOrFail logger (resolveFlakeRef hostPathRules AllRegistries registries ref >>= flakeRefToString (registryContext config))
+        toStdout (BC.putStrLn resolved)
+        pure (Just registries)
+  foldM_ resolveEach Nothing refs
+
+-- | The context flake references and registry entries are read in: the
+-- configured features, under this host's path rules.
+registryContext :: NixConfig -> InputContext
+registryContext config = InputContext (ncExperimentalFeatures config) hostPathRules
+
+-- | The registries a lookup asks, read as upstream reads them for a
+-- command, each warning reading gave reported.  A global registry that
+-- cannot be downloaded fails the command.
+commandRegistries :: Logger -> NixConfig -> IO [Registry]
+commandRegistries logger config = do
+  locations <- registryLocations config
+  outcome <- readRegistries logger defaultFetchRetryPolicy (registryContext config) locations
+  case outcome of
+    Left err -> failWith ("error: " <> err)
+    Right (registries, warnings) -> registries <$ mapM_ (logWarning logger) warnings
+
+-- | Where the registries are on this machine: the user's under the
+-- config home @nix.conf@ is read from, the machine's in @NIX_CONF_DIR@
+-- or the platform's config directory, and the global one where
+-- @flake-registry@ says.
+registryLocations :: NixConfig -> IO RegistryLocations
+registryLocations config = do
+  home <- OsDir.getXdgDirectory OsDir.XdgConfig mempty
+  confDir <- mfilter (not . BS.null) <$> configVariable nixConfDirVar
+  systemDir <- maybe platformSystemConfDir (fmap Just . variableHostPath nixConfDirVar) confDir
+  user <- OP.decodeFS (home OP.</> Config.nixConfDirName OP.</> registryFileName)
+  system <- traverse (OP.decodeFS . (OP.</> registryFileName)) systemDir
+  pure
+    RegistryLocations
+      { userRegistryFile = user,
+        systemRegistryFile = system,
+        globalRegistry = globalRegistryFrom (ncFlakeRegistry config)
+      }
+
+-- | A checked step's value, its warnings reported and a refusal failing
+-- the command in its words.
+checkedOrFail :: Logger -> Checked a -> IO a
+checkedOrFail logger step = do
+  let (result, warnings) = runChecked step
+  mapM_ (logWarning logger) warnings
+  either (failWith . ("error: " <>)) pure result
 
 -- | Print each generation of a profile and what changed in it from the
 -- one listed before it, as upstream's @profile history@ does.  A

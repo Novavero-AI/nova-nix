@@ -708,6 +708,62 @@
           "usage": "nova-nix profile wipe-history --older-than AGE"
         }
       ]
+    },
+    {
+      "description": "Prints each entry of the flake registries, as `nix registry list` does: the registry, `user`, `system` or `global`, padded to six columns, then the reference the entry maps and the one it maps it to. The registries are the user's, `nix/registry.json` under the XDG config home; the machine's, `registry.json` in `NIX_CONF_DIR`; and the global one `flake-registry` names, downloaded when it is a URL. A file that is not there holds no entries, and one that cannot be read is warned of, the entries before what failed kept. An entry naming a GitHub, GitLab, sourcehut, path or registry reference needs `flakes`, as upstream's does.",
+      "examples": [
+        {
+          "arguments": [
+            "registry",
+            "list"
+          ],
+          "command": "nova-nix registry list",
+          "description": "List the entries of the registries.",
+          "output": []
+        },
+        {
+          "arguments": [
+            "registry",
+            "list",
+            "--extra-experimental-features",
+            "flakes"
+          ],
+          "command": "nova-nix registry list --extra-experimental-features flakes",
+          "description": "List them with the flake-only references read, as `flakes` lets them be.",
+          "output": []
+        }
+      ],
+      "name": "nova-nix registry list",
+      "synopsis": [
+        {
+          "summary": "Print the entries of every flake registry",
+          "usage": "nova-nix registry list"
+        }
+      ]
+    },
+    {
+      "description": "Prints each flake reference resolved against the flake registries, as `nix registry resolve` does: the first entry, in the order the registries are listed and each in its file's order, that maps the reference replaces it, and the lookup starts again until no entry maps it. An entry that does not set a `ref` or a revision passes on the reference's own, and an `exact` one maps only a reference with neither. A reference still naming a registry entry at the end, such as `nixpkgs` with no entry for it, is refused, as is a lookup that follows 100 entries. A reference is read as `builtins.parseFlakeRef` reads one, so a path must be absolute. The registries are the user's, `nix/registry.json` under the XDG config home; the machine's, `registry.json` in `NIX_CONF_DIR`; and the global one `flake-registry` names, downloaded when it is a URL. A file that is not there holds no entries, and one that cannot be read is warned of, the entries before what failed kept. An entry naming a GitHub, GitLab, sourcehut, path or registry reference needs `flakes`, as upstream's does.",
+      "examples": [
+        {
+          "arguments": [
+            "registry",
+            "resolve",
+            "--extra-experimental-features",
+            "flakes",
+            "nixpkgs"
+          ],
+          "command": "nova-nix registry resolve --extra-experimental-features flakes nixpkgs",
+          "description": "Resolve the registry's `nixpkgs`.",
+          "output": []
+        }
+      ],
+      "name": "nova-nix registry resolve",
+      "synopsis": [
+        {
+          "summary": "Print each flake reference resolved against the registries",
+          "usage": "nova-nix registry resolve REF..."
+        }
+      ]
     }
   ],
   "configuration": {
@@ -782,6 +838,11 @@
         "description": "Experimental features to turn on, by upstream's names (default: none); a name upstream does not know is dropped with a warning",
         "flag": "--extra-experimental-features",
         "name": "experimental-features"
+      },
+      {
+        "description": "The global flake registry, a path or a URL, none when empty (default: upstream's, `flake-registry.json` on `channels.nixos.org`)",
+        "flag": null,
+        "name": "flake-registry"
       },
       {
         "description": "Whether a build runs in a sandbox: `true`, `relaxed` (a build that is fixed-output or sets `__noChroot` does not) or `false` (default: `true` on Linux, `false` elsewhere)",
@@ -1060,9 +1121,11 @@
         "nova-nix develop",
         "nova-nix print-dev-env",
         "nova-nix trust",
-        "nova-nix profile add"
+        "nova-nix profile add",
+        "nova-nix registry list",
+        "nova-nix registry resolve"
       ],
-      "description": "Turn on the experimental features `FEATURES` names, upstream's names separated by spaces, beside those `experimental-features` turns on: `flakes` lets `builtins.parseFlakeRef` and `builtins.flakeRefToString` read a GitHub, GitLab, sourcehut, path or registry reference",
+      "description": "Turn on the experimental features `FEATURES` names, upstream's names separated by spaces, beside those `experimental-features` turns on: `flakes` lets `builtins.parseFlakeRef`, `builtins.flakeRefToString` and the registry commands read a GitHub, GitLab, sourcehut, path or registry reference",
       "name": "--extra-experimental-features",
       "spellings": [
         "--extra-experimental-features"

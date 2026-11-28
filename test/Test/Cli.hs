@@ -2513,6 +2513,8 @@ cliOperands name flagName = case name of
   Ref.ProfileHistoryCommand -> []
   Ref.ProfileRollbackCommand -> []
   Ref.ProfileWipeHistoryCommand -> []
+  Ref.RegistryListCommand -> []
+  Ref.RegistryResolveCommand -> ["nixpkgs"]
   where
     expression = concat [["--expr", "1"] | flagName /= Ref.ExprFlag]
 
@@ -2533,6 +2535,8 @@ cliSelects name parsed = case (name, parsed) of
   (Ref.ProfileHistoryCommand, Cli.CmdProfileHistory {}) -> True
   (Ref.ProfileRollbackCommand, Cli.CmdProfileRollback {}) -> True
   (Ref.ProfileWipeHistoryCommand, Cli.CmdProfileWipeHistory {}) -> True
+  (Ref.RegistryListCommand, Cli.CmdRegistryList) -> True
+  (Ref.RegistryResolveCommand, Cli.CmdRegistryResolve _) -> True
   _ -> False
 
 -- | One word read back as a POSIX shell reads it, for what

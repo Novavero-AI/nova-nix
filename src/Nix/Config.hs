@@ -229,7 +229,10 @@ data NixConfig = NixConfig
     ncKeepFailed :: !Bool,
     -- | Upstream's @experimental-features@, with the warnings its values
     -- gave, which the caller reports.
-    ncExperimentalFeatures :: !FeatureSet
+    ncExperimentalFeatures :: !FeatureSet,
+    -- | Upstream's @flake-registry@: the path or URL of the global flake
+    -- registry, none when empty.
+    ncFlakeRegistry :: !ByteString
   }
   deriving (Eq, Show)
 
@@ -291,7 +294,8 @@ defaultNixConfig =
       ncAllowedImpureHostDeps = PathSetValue KeepsDefault Set.empty,
       ncDarwinLogSandboxViolations = False,
       ncKeepFailed = False,
-      ncExperimentalFeatures = noFeatures
+      ncExperimentalFeatures = noFeatures,
+      ncFlakeRegistry = defaultFlakeRegistry
     }
 
 -- ---------------------------------------------------------------------------
@@ -753,6 +757,7 @@ resolveName name =
       | n == bashPromptPrefixKey = Just (BytesSetting BashPromptPrefixField)
       | n == bashPromptSuffixKey = Just (BytesSetting BashPromptSuffixField)
       | n == experimentalFeaturesKey = Just FeaturesSetting
+      | n == flakeRegistryKey = Just (BytesSetting FlakeRegistryField)
       | otherwise = Nothing
 
 -- | A setting this layer resolves, by the shape of its value: a list of
@@ -800,6 +805,7 @@ data BytesField
   | BashPromptField
   | BashPromptPrefixField
   | BashPromptSuffixField
+  | FlakeRegistryField
   deriving (Eq, Show)
 
 -- | The scalar settings, which only ever replace.
@@ -878,6 +884,7 @@ setBytes SslCertFileField v config = config {ncSslCertFile = Just v}
 setBytes BashPromptField v config = config {ncBashPrompt = v}
 setBytes BashPromptPrefixField v config = config {ncBashPromptPrefix = v}
 setBytes BashPromptSuffixField v config = config {ncBashPromptSuffix = v}
+setBytes FlakeRegistryField v config = config {ncFlakeRegistry = v}
 
 -- | Upstream's Boolean spellings (@BaseSetting\<bool\>::parse@): anything
 -- else is an error with upstream's wording, which names the setting alone,
@@ -970,6 +977,13 @@ darwinLogSandboxViolationsKey = "darwin-log-sandbox-violations"
 
 experimentalFeaturesKey :: ByteString
 experimentalFeaturesKey = "experimental-features"
+
+flakeRegistryKey :: ByteString
+flakeRegistryKey = "flake-registry"
+
+-- | Upstream's global flake registry, the default of @flake-registry@.
+defaultFlakeRegistry :: ByteString
+defaultFlakeRegistry = "https://channels.nixos.org/flake-registry.json"
 
 -- | The setting for what a build that fails leaves, which upstream gives no
 -- other name.
