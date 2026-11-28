@@ -79,6 +79,7 @@ module Nix.Store
     finishNarUnpack,
     abortNarUnpack,
     NarStreamFailure (..),
+    ArchiveEnd (..),
     sinkNarStream,
 
     -- * Link ordering (exposed for testing)
@@ -1089,24 +1090,45 @@ data NarStreamFailure
     NarStreamMalformed !Text
   deriving (Eq, Show)
 
+-- | Where a NAR fed to 'sinkNarStream' ends.
+data ArchiveEnd
+  = -- | At the end of its input: a byte after the root node's close fails
+    -- the archive as malformed.
+    AtEndOfInput
+  | -- | At the root node's close: the input after it is left unread, as
+    -- upstream's restore leaves the rest of the source it reads a NAR
+    -- from.
+    AtRootClose
+  deriving (Eq, Show)
+
 -- | Feed a chunk source through the streaming NAR parser into a sink,
 -- hashing and counting exactly the bytes the parser consumes, and
--- return the archive's SHA-256 and size once its root node closes.
--- The recorded symlinks are not created yet ('finishNarUnpack'), so a
--- caller checks the digest before any link exists.  On a failure the
--- sink is already aborted.
-sinkNarStream :: NarUnpackSink -> IO BS.ByteString -> IO (Either NarStreamFailure (Hash.NixHash, Int))
-sinkNarStream sink source = go Hash.hashInit 0 Stream.narStream `onException` abortNarUnpack sink
+-- return the archive's SHA-256 and size once it ends where the
+-- 'ArchiveEnd' says it does.  The recorded symlinks are not created yet
+-- ('finishNarUnpack'), so a caller checks the digest before any link
+-- exists.  On a failure the sink is already aborted.
+sinkNarStream :: ArchiveEnd -> NarUnpackSink -> IO BS.ByteString -> IO (Either NarStreamFailure (Hash.NixHash, Int))
+sinkNarStream end sink source = case end of
+  AtEndOfInput -> drive Stream.narStream (const BS.empty)
+  AtRootClose -> drive Stream.narPrefix id
   where
-    go !ctx !count step = case step of
-      Stream.NarAwait continue -> do
-        chunk <- source
-        go (Hash.hashUpdate ctx chunk) (count + BS.length chunk) (continue chunk)
-      Stream.NarYield event next -> do
-        sunk <- sinkNarEvent sink event
-        either (stopWith . NarStreamRefused) (const (go ctx count next)) sunk
-      Stream.NarFail msg -> stopWith (NarStreamMalformed (T.pack msg))
-      Stream.NarDone () -> pure (Right (Hash.hashFinalize ctx, count))
+    -- The last chunk fed is held back from the digest until the parser
+    -- asks for another or finishes, since the input after the root
+    -- node's close is a suffix of that chunk and not the archive's.
+    drive :: Stream.NarStep r -> (r -> BS.ByteString) -> IO (Either NarStreamFailure (Hash.NixHash, Int))
+    drive start unconsumed = go Hash.hashInit 0 BS.empty start `onException` abortNarUnpack sink
+      where
+        go !ctx !count held step = case step of
+          Stream.NarAwait continue -> do
+            chunk <- source
+            go (Hash.hashUpdate ctx held) (count + BS.length held) chunk (continue chunk)
+          Stream.NarYield event next -> do
+            sunk <- sinkNarEvent sink event
+            either (stopWith . NarStreamRefused) (const (go ctx count held next)) sunk
+          Stream.NarFail msg -> stopWith (NarStreamMalformed (T.pack msg))
+          Stream.NarDone result ->
+            let consumed = BS.take (BS.length held - BS.length (unconsumed result)) held
+             in pure (Right (Hash.hashFinalize (Hash.hashUpdate ctx consumed), count + BS.length consumed))
     stopWith failure = Left failure <$ abortNarUnpack sink
 
 -- ---------------------------------------------------------------------------
@@ -1191,7 +1213,7 @@ restoreSource store srcText sp = do
     caseHack = pathCaseHack (stCaseSensitivity store) srcText
     restore = do
       sink <- newNarUnpackSink (stCaseSensitivity store) dest
-      streamed <- ExecBit.withNarSource caseHack src (sinkNarStream sink)
+      streamed <- ExecBit.withNarSource caseHack src (sinkNarStream AtEndOfInput sink)
       case streamed of
         Left (NarStreamRefused reason) -> pure (Left reason)
         Left (NarStreamMalformed reason) -> pure (Left ("the dump of " <> srcText <> " does not parse: " <> reason))

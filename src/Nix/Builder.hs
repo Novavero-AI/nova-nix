@@ -134,7 +134,7 @@ import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, c
 import Nix.Logger (Logger (..))
 import Nix.Push (narHashMatches)
 import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, DifferingRebuild (..), Fallback (..), FetchOutcome (..), Offer (QueryFailed), RealiseEffects (..), RealiseSettings (..), Realised (..), Registration (..), SubstEffects (..), SubstitutesSetting (..), Undelivered (..), checkedOutputPath, noWriteAccessMessage, realise, realiseFailureMessage, realiseFailureStatus, realiseRequests, requestsFailureMessage, requestsFailureStatus, substituteClosure)
-import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, canonicalizeMetadata, finishNarUnpack, freshCopyPath, isValid, moveOutput, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, replaceWithCopy, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
+import Nix.Store (ArchiveEnd (..), CaseSensitivity, PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, canonicalizeMetadata, finishNarUnpack, freshCopyPath, isValid, moveOutput, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, replaceWithCopy, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (foreignOwnedNode, isPlainFile, writableByOthers)
 import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathPrefix, storePathToFilePath, storePathToText, unStoreDir)
@@ -2026,9 +2026,9 @@ writeBody outPath ctx0 body =
 -- spelled for the store's volume, and nothing is held whole.  An xz body
 -- is decompressed on the way ('fetchurlXzLimits').  The store refusing
 -- what the archive holds is fatal, and a body that ends short of a whole
--- archive is transient ('narStreamFailure').  Bytes after the archive's
--- end fail it as malformed, where upstream's restore stops reading at
--- that end (@parseDump@ in archive.cc) and never sees them.
+-- archive is transient ('narStreamFailure').  The archive ends at its
+-- root node's close and the body after it is left unread, as upstream's
+-- restore stops reading the download there.
 restoreNarBody :: CaseSensitivity -> FilePath -> NarEncoding -> HTTP.BodyReader -> IO (Either AttemptFailure ())
 restoreNarBody sensitivity outPath encoding body = case encoding of
   PlainNar -> restore (HTTP.brRead body)
@@ -2036,7 +2036,7 @@ restoreNarBody sensitivity outPath encoding body = case encoding of
   where
     restore source = do
       sink <- newNarUnpackSink sensitivity outPath
-      streamed <- sinkNarStream sink source
+      streamed <- sinkNarStream AtRootClose sink source
       case streamed of
         Left failure -> pure (Left (narStreamFailure failure))
         Right _ -> first FatalFailure <$> finishNarUnpack sink

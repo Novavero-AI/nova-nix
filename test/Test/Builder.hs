@@ -6196,6 +6196,7 @@ testFetchurlUnpack = do
             Map.fromList
               [ ("/tree.nar", narSpecVector),
                 ("/tree.nar.xz", treeXz),
+                ("/trailing.nar", narSpecVector <> "bytes after the archive"),
                 ("/other.nar", narSpecFileVector),
                 ("/plain.nar", fileNar "hello"),
                 ("/link.nar", symlinkNar victimName),
@@ -6292,6 +6293,10 @@ testFetchurlUnpack = do
             sequence
               [ runTestM "an unpack fetch restores the NAR it downloads, under that NAR's hash" $
                   fetchCase "unpack" ("/tree.nar" :| []) unpackAttrs recursiveHash narSpecVector narSpecVector restoredTree,
+                -- Upstream's restore stops at the root node's close, so
+                -- what a body holds after the archive is never read.
+                runTestM "an unpack fetch stops at the archive's end and leaves the bytes after it unread" $
+                  fetchCase "unpack-trailing" ("/trailing.nar" :| []) unpackAttrs recursiveHash narSpecVector narSpecVector restoredTree,
                 runTestM "an unpack fetch of a .xz URL restores the NAR it decompresses" $
                   fetchCase "unpack-xz" ("/tree.nar.xz" :| []) unpackAttrs recursiveHash narSpecVector narSpecVector restoredTree,
                 runTestM "an unpack fetch whose tree has another hash moves to the next URL" $
