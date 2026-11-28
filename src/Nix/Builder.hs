@@ -144,7 +144,7 @@ import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.Xz as Xz
-import System.Directory (createDirectoryIfMissing, removePathForcibly)
+import System.Directory (removePathForcibly)
 import qualified System.Environment
 import System.Exit (ExitCode (..))
 import System.FilePath (isAbsolute, isPathSeparator, takeDirectory, takeFileName, (</>))
@@ -870,7 +870,6 @@ runPlannedBuild config context drv run buildDir plans finish = do
       -- the name beside one may hold a fresh copy one left half made.
       clearScratch = for_ plans $ \p -> removePathForcibly (scratchDir p) *> removePathForcibly (freshCopyPath (scratchDir p))
   clearScratch
-  createDirectoryIfMissing True (unStoreDir (bcStoreDir config))
   -- The cleanup contract: outputs are written at their store paths, not
   -- in the build directory, so an interrupt or a throw between the
   -- builder starting and registration committing would otherwise strand
