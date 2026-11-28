@@ -574,11 +574,12 @@ jobs:
       # The sandbox helper's Windows backend, run as the service that logs
       # each build slot on would run it: as a virtual service account
       # granted the privileges that start a process as another account.
-      # The suite, run as the runner's administrator, makes two build-slot
-      # accounts and a test service running as its virtual account, starts
-      # the service, which runs the account checks, and prints their log;
-      # it removes the service and the accounts, each one's rights first,
-      # however the checks end.  The user a build must be kept from is the
+      # The suite, run as the runner's administrator, makes the build
+      # accounts' group, nixbld, two build-slot accounts in it and a test
+      # service running as its virtual account, starts the service, which
+      # runs the account checks, the store's layout among them, and prints
+      # their log; it removes the service, the accounts, each one's rights
+      # first, and the group, however the checks end.  The user a build must be kept from is the
       # runner's: its profile, TEMP, APPDATA and hive, this step's process,
       # a file only it may read and a file in its profile, both of which
       # the step makes and removes.  The checks' directory is made in the
@@ -610,14 +611,14 @@ jobs:
           }
           exit $result
 
-      # The account checks remove the accounts and the test service they
-      # make, and their rights; this removes any a run that ended early
-      # left, by the name prefixes the checks give them
-      # (test/Test/WindowsSandbox.hs), and leaves such an account's or
-      # service's rights on its SID, which the discarded runner takes with
-      # it.  Windows PowerShell carries the LocalAccounts module itself,
-      # where PowerShell 7 loads it through a compatibility session, and
-      # sc.exe deletes a service, for which it has no cmdlet.
+      # The account checks remove the accounts, the group and the test
+      # service they make, and their rights; this removes any a run that
+      # ended early left, by the name prefixes the checks give them
+      # (test/Test/WindowsSandbox.hs) and the group's name, and leaves such
+      # an account's or service's rights on its SID, which the discarded
+      # runner takes with it.  Windows PowerShell carries the LocalAccounts
+      # module itself, where PowerShell 7 loads it through a compatibility
+      # session, and sc.exe deletes a service, for which it has no cmdlet.
       - name: Remove leftover build accounts and test services (Windows)
         if: always() && runner.os == 'Windows'
         shell: powershell
@@ -632,6 +633,13 @@ jobs:
           @(Get-LocalUser | Where-Object Name -like 'nnslot*') | ForEach-Object {
             "removing the leftover account $($_.Name)"
             Remove-LocalUser -SID $_.SID
+          }
+          # The runner has no nixbld group of its own, so one here is the
+          # checks'.
+          $group = Get-LocalGroup -Name 'nixbld' -ErrorAction SilentlyContinue
+          if ($group) {
+            'removing the leftover group nixbld'
+            Remove-LocalGroup -SID $group.SID
           }
 
       # A crash or a memory-pressure kill on macOS leaves a report the
