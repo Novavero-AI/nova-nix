@@ -161,6 +161,7 @@ library
 
   autogen-modules:  Paths_nova_nix
   other-modules:
+    Nix.Builder.Job
     Nix.Eval.Arena
     Nix.Store.Exclusive
     Paths_nova_nix
@@ -184,7 +185,10 @@ library
     , filelock            >= 0.1.1 && < 0.2
     , mtl                 >= 2.2 && < 2.4
     , nova-cache:{nova-cache, xz, zstandard, bzip2} >= 0.14 && < 0.15
-    , process             >= 1.6 && < 1.7
+    -- 1.6.8 is the first whose OpenExtHandle holds the process and its
+    -- job alone, the job a Windows builder's limit is set on
+    -- (Nix.Builder.Job).
+    , process             >= 1.6.8 && < 1.7
     , random              >= 1.2 && < 1.4
     , regex-tdfa          >= 1.3 && < 1.4
     -- Nix.Store.DB wraps a read-only direct-sqlite handle in Connection,

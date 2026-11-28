@@ -16,7 +16,7 @@ import System.FilePath ((</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 import qualified System.Process as Proc
 import Test.BuildUser (buildUsersRootChild, buildUsersRootFlag, testBuildUsersPure, testBuildUsersUnprivilegedIO)
-import Test.Builder (sandboxBuildChild, sandboxBuildChildFlag, sandboxEscapeChild, sandboxEscapeChildFlag, sandboxFallbackChild, sandboxFallbackChildFlag, sandboxForkerChild, sandboxForkerChildFlag, sandboxThawChild, sandboxThawChildFlag, testBuildCheckIO, testBuildCores, testBuildCoresIO, testBuildDirIO, testBuildLogIO, testBuildOrchestrator, testBuildenvBuildIO, testBuildenvDerivations, testBuilder, testBuilderLayout, testDarwinSandboxIO, testDependentBuildIO, testExecWrapper, testFetchMirrors, testFetchurlUnpack, testFlatOutputFormIO, testLinuxSandboxIO, testOutputCycleBuildIO, testOutputOrderIO, testPassAsFile, testProfileGenerations, testProfileManifest, testProfileTree, testProfileUpdateIO, testReferenceClosureIO, testSandboxFallbackIO, testSandboxPure, testSandboxSpawnIO, testScrubbedBuildEnvIO, testSourceDateEpochIO, testSubstituteFromCaches, testTrivialBuildIO, testUnpackBuildIO, testWantedOutputsIO)
+import Test.Builder (builderJobChild, builderJobChildFlag, sandboxBuildChild, sandboxBuildChildFlag, sandboxEscapeChild, sandboxEscapeChildFlag, sandboxFallbackChild, sandboxFallbackChildFlag, sandboxForkerChild, sandboxForkerChildFlag, sandboxThawChild, sandboxThawChildFlag, testBuildCheckIO, testBuildCores, testBuildCoresIO, testBuildDirIO, testBuildLogIO, testBuildOrchestrator, testBuildenvBuildIO, testBuildenvDerivations, testBuilder, testBuilderJobIO, testBuilderLayout, testDarwinSandboxIO, testDependentBuildIO, testExecWrapper, testFetchMirrors, testFetchurlUnpack, testFlatOutputFormIO, testLinuxSandboxIO, testOutputCycleBuildIO, testOutputOrderIO, testPassAsFile, testProfileGenerations, testProfileManifest, testProfileTree, testProfileUpdateIO, testReferenceClosureIO, testSandboxFallbackIO, testSandboxPure, testSandboxSpawnIO, testScrubbedBuildEnvIO, testSourceDateEpochIO, testSubstituteFromCaches, testTrivialBuildIO, testUnpackBuildIO, testWantedOutputsIO)
 import Test.CData (arenaGuardChild, arenaGuardChildFlag, testArenaGuard, testBytecodeCompile, testBytecodeCorrupt, testBytecodeCountSpill, testBytecodePerElement, testBytecodeTags, testCAttrSet, testCThunk, testLambdaShape, testSymbol, testUnknownTags, testValueCountWidths)
 import Test.Cli (cliJsonPath, testBuildCoresCLI, testBuildUmaskCLI, testCheckCLI, testCliReference, testClosedStdoutCLI, testConfigBytesCLI, testDevelopCLI, testE2E, testEvalPolicyCLI, testExecWrapperCLI, testImportFromDerivationCLI, testNixConfig, testOutLinkCLI, testProfileCLI, testResultPrinterCLI, testSandboxSessionsCLI, testSubstituterListingsCLI, testTargetArgsCLI, testTrustCLI, testUncaughtIOFailureCLI, writeCliJsonFlag)
 import Test.Daemon (testDaemonFixtures, testDaemonProtocol, testDaemonServer, testDaemonWire)
@@ -26,7 +26,7 @@ import Test.Exceptions (testInterruptsPropagate)
 import Test.Fetch (testExperimentalFeatures, testFetchUrls, testFlakeRefBuiltins, testFlakeRefs)
 import Test.Harness (evalChild, evalChildFlag, inTestSession)
 import Test.Parser (testCurPos, testExprTypes, testLexer, testLineEndings, testParserErrors, testParserExprs, testParserIntegration, testSourceBytes, testSourceBytesIO, testStaticGlobalsSync, testStringAttrKeys, testUndefinedVariables, testUndefinedVariablesIO)
-import Test.Pkgs (testBinutilsNativeX8664Windows, testBinutilsWindows, testBinutilsX8664Windows, testBusyboxWindows, testChecksForbidSubstitutes, testGcc10Windows, testGcc46CxxWindows, testGcc46Windows, testGccCoreWindows, testGccCoreX8664Windows, testGccLatestWindows, testGccNativeX8664Windows, testGccX8664Windows, testGnumakeWindows, testMesWindows, testMingwW64CrtX8664Windows, testMingwW64LatestWindows, testPkgsFetchurl, testSeedStdenvWindows, testStage0Pe32Chain, testStdenvWindows, testTinyccWindows, testWindowsRungs, testWindowsSources, testWorkflowSpellings)
+import Test.Pkgs (testBashWindows, testBinutilsNativeX8664Windows, testBinutilsWindows, testBinutilsX8664Windows, testBusyboxWindows, testChecksForbidSubstitutes, testGcc10Windows, testGcc46CxxWindows, testGcc46Windows, testGccCoreWindows, testGccCoreX8664Windows, testGccLatestWindows, testGccNativeX8664Windows, testGccX8664Windows, testGnumakeWindows, testMesWindows, testMingwW64CrtX8664Windows, testMingwW64LatestWindows, testPkgsFetchurl, testSeedStdenvWindows, testStage0Pe32Chain, testStdenvWindows, testTinyccWindows, testWindowsRungs, testWindowsSources, testWorkflowSpellings)
 import Test.Push (testPushClosureIO, testPushDirectory, testPushMultipart, testPushPure)
 import Test.Realise (testDepGraph, testRealise)
 import Test.Store (testCaseSensitiveVolumeIO, testExecBit, testFoldingVolumeIO, testGcPure, testHashHelpers, testLinkOrdering, testNarKnownAnswer, testNarNameSafety, testParseStorePath, testPathInfo, testPathLocks, testSerialiseIfReadableIO, testStoreAccessIO, testStoreDB, testStoreDelete, testStoreGC, testStoreGCUpstreamManaged, testStoreImports, testStoreMetadata, testStoreNameSinks, testStoreNameSinksIO, testStoreOps, testStoreOpsIO, testStorePaths, testStoreWritesUpstreamManaged, testSymlinkWalksIO)
@@ -52,6 +52,7 @@ main = do
     [flag, marker, ready] | flag == sandboxThawChildFlag -> sandboxThawChild marker ready
     [flag, source] | flag == namesOnlyChildFlag -> inTestSession (namesOnlyChild source)
     [flag] | flag == arenaCycleChildFlag -> arenaCycleChild
+    [flag] | flag == builderJobChildFlag -> builderJobChild
     [flag] | flag == writeCliJsonFlag -> BS.writeFile cliJsonPath Ref.referenceJson
     flag : rest | flag == windowsSandboxInstallFlag -> windowsSandboxInstall rest
     flag : rest | flag == windowsSandboxServiceFlag -> windowsSandboxService rest
@@ -91,6 +92,7 @@ runSuite = do
           testStorePaths,
           testDerivation,
           testTrivialBuildIO,
+          testBuilderJobIO,
           testBuildDirIO,
           testStoreAccessIO,
           testBuildLogIO,
@@ -140,6 +142,7 @@ runSuite = do
           testBinutilsNativeX8664Windows,
           testGccNativeX8664Windows,
           testStdenvWindows,
+          testBashWindows,
           testChecksForbidSubstitutes,
           testWindowsSources,
           testWindowsRungs,

@@ -249,6 +249,27 @@ unsigned long nn_entry_set_owner_dacl(const wchar_t *path, void *descriptor,
   return error;
 }
 
+unsigned long nn_job_die_on_unhandled_exception(void *job, const char **failed) {
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+
+  *failed = NULL;
+  /* The limits are set as a whole, so the job's own, the process
+   * library's KILL_ON_JOB_CLOSE among them, are read first and kept. */
+  if (!QueryInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                 &limits, sizeof limits, NULL)) {
+    *failed = "QueryInformationJobObject";
+    return GetLastError();
+  }
+  limits.BasicLimitInformation.LimitFlags |=
+      JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+  if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                               &limits, sizeof limits)) {
+    *failed = "SetInformationJobObject";
+    return GetLastError();
+  }
+  return ERROR_SUCCESS;
+}
+
 #else /* !_WIN32 */
 
 /* Per-directory case sensitivity is an NTFS feature; APFS decides at
