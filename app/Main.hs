@@ -19,6 +19,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (isDigit)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Functor.Identity (Identity (..))
 import Data.IORef (readIORef)
 import Data.Int (Int32)
@@ -970,6 +971,15 @@ substituterPriority = 50
 -- with no trusted key anywhere is not refused here (it simply accepts
 -- nothing at the signature gate), matching upstream, where @substituters@
 -- and @trusted-public-keys@ are independent.
+--
+-- A substituter listed again is dropped and the first listing keeps its
+-- place, as upstream drops one it already has before it opens them, so a
+-- cache is not asked a second time for a path it failed to deliver.  Two
+-- listings are one when they are spelled alike.  Upstream compares them
+-- once parsed, so spellings that differ only in percent-escapes, the
+-- order of a query's parameters, a fragment or a port's leading zeros are
+-- one substituter there and two here; one with a trailing slash and one
+-- without are two in both.
 configToCaches :: NixConfig -> [CacheConfig]
 configToCaches config =
   [ CacheConfig
@@ -977,7 +987,7 @@ configToCaches config =
         ccPublicKeys = ncTrustedPublicKeys config,
         ccPriority = substituterPriority
       }
-  | url <- ncSubstituters config
+  | url <- nubOrd (ncSubstituters config)
   ]
 
 -- | What a failed substitute leads to on this run.  The flag only turns
