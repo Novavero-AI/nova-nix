@@ -789,8 +789,8 @@ jobs:
           echo "== gnumake built in $((SECONDS - start)) s"
 
       # make --version prints its version line, and make builds greeting.txt
-      # from greeting.in through a pattern rule whose recipe is cmd.exe's
-      # copy, which make runs from a batch file, having no sh.exe on PATH.
+      # from greeting.in through a pattern rule whose recipe is
+      # mescc-tools-extra's cp, which make starts itself, without a shell.
       - name: GNU make runs
         shell: bash
         run: |
