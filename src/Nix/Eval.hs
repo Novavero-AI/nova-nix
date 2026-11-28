@@ -137,6 +137,7 @@ import Data.Word (Word32, Word8)
 import Foreign.Ptr (Ptr)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), drvFile, drvFileATerm, drvFileDerivation, drvFilePath, inputAddressed, textToPlatform, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAttrs, structuredAttrsKey)
+import Nix.DrvName (drvNameDash)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
 import Nix.Eval.Builtin (Builtin, builtinName)
 import qualified Nix.Eval.Builtin as Builtin
@@ -3113,20 +3114,10 @@ builtinParseDrvName val = do
   (name, version) <- parseName <$> structuredStringValue RefuseContext val
   valuesSet SetParseDrvName (Map.fromList [("name", mkStrBytes name), ("version", mkStrBytes version)])
 
+-- | A derivation name's name and version, split at 'drvNameDash' over
+-- the string's bytes; the version is empty when nothing splits it.
 parseName :: BS.ByteString -> (BS.ByteString, BS.ByteString)
-parseName t =
-  case findVersionDash t 0 of
-    Nothing -> (t, "")
-    Just idx -> (BS.take idx t, BS.drop (idx + 1) t)
-
-findVersionDash :: BS.ByteString -> Int -> Maybe Int
-findVersionDash t idx = case BC.uncons (BS.drop idx t) of
-  Nothing -> Nothing
-  Just ('-', after)
-    | Just (d, _) <- BC.uncons after,
-      isDigit d ->
-        Just idx
-  Just _ -> findVersionDash t (idx + 1)
+parseName t = maybe (t, "") (\at -> (BS.take at t, BS.drop (at + 1) t)) (drvNameDash BC.uncons t)
 
 -- ---------------------------------------------------------------------------
 -- Builtin implementations - serialization + hashing

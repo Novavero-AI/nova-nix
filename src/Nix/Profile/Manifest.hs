@@ -63,7 +63,6 @@ import Control.Monad (foldM)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Char (isAsciiLower, isAsciiUpper)
 import Data.Foldable (toList)
 import Data.Int (Int32)
 import Data.List.NonEmpty (NonEmpty)
@@ -77,6 +76,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Nix.Builder.Buildenv (Activity (..))
 import Nix.Daemon.Protocol (OutputName (..), OutputsSpec (AllOutputs), namedOutputs, outputsSpecNames)
+import Nix.DrvName (drvNameDash)
 import Nix.HostPath (hostPathText)
 import Nix.Json (Json (..), parseJson, renderJson)
 import Nix.Store.Path (StoreDir, StorePath (spName), defaultStoreDir, parseStorePath, storePathBasename, storePathToFilePath, storePathToText)
@@ -318,28 +318,16 @@ flakeAttribute source = sourceAttrPath source <> maybe "" (("^" <>) . T.intercal
 outputsSpelled :: OutputsSpec -> [Text]
 outputsSpelled spec = maybe ["*"] (\names -> [name | OutputName name <- Set.toAscList names]) (outputsSpecNames spec)
 
--- | The name part of a derivation name: everything before the first dash
--- that something other than a letter follows, as upstream's @DrvName@
--- constructor in names.cc splits one; the whole name when there is no
--- such dash.
+-- | The name part of a derivation name: everything before the dash it
+-- splits at ('drvNameDash'), or the whole name when nothing splits it.
 drvNameName :: Text -> Text
 drvNameName = fst . splitDrvName
 
--- | A derivation name split at the first dash something other than a
--- letter follows, into the name before it and the version after it, as
--- upstream splits one; the whole name and an empty version when there is
--- no such dash.
+-- | A derivation name split at the dash it splits at ('drvNameDash'),
+-- into the name before it and the version after it; the whole name and
+-- an empty version when nothing splits it.
 splitDrvName :: Text -> (Text, Text)
-splitDrvName name = go 0 name
-  where
-    go !taken rest = case T.uncons rest of
-      Nothing -> (name, "")
-      Just ('-', after)
-        | Just (next, _) <- T.uncons after,
-          not (isAsciiLetter next) ->
-            (T.take taken name, after)
-      Just (_, after) -> go (taken + 1) after
-    isAsciiLetter c = isAsciiLower c || isAsciiUpper c
+splitDrvName name = maybe (name, "") (\at -> (T.take at name, T.drop (at + 1) name)) (drvNameDash T.uncons name)
 
 -- | Add an element under a name, or under the name with @-1@, @-2@ and
 -- on appended when it is taken (@ProfileManifest::addElement@ in
