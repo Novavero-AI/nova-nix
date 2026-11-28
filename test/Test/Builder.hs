@@ -6147,14 +6147,14 @@ testSubstituteFromCaches = do
       -- The top path's own offer fetched without what it references, then
       -- whether each path is valid.
       fetchedAlone config store = do
-        offer <- evalStateT (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy (ioRetryEffects testLogger) Realise.NoFallback (bcCaches config) top) Subst.emptyNarInfoMemo
+        offer <- evalStateT (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy (ioRetryEffects testLogger) Realise.NoFallback (bcCaches config) top) Subst.emptyCacheMemo
         outcome <- traverse (substitutePaths config store Realise.RegisterAll . (:| [])) (offeredSubstitute offer)
         (,) outcome <$> mapM (isValid store) [dep, top]
       -- The dep path's own substitute: the path it names, then what fetching
       -- it registering nothing and then registering it gives, each with
       -- whether the path is valid after.
       probedThenFetched config store = do
-        offer <- evalStateT (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy (ioRetryEffects testLogger) Realise.NoFallback (bcCaches config) dep) Subst.emptyNarInfoMemo
+        offer <- evalStateT (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy (ioRetryEffects testLogger) Realise.NoFallback (bcCaches config) dep) Subst.emptyCacheMemo
         let substitute = offeredSubstitute offer
             fetchAs registration = do
               outcome <- traverse (substitutePaths config store registration . (:| [])) substitute

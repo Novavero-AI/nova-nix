@@ -362,7 +362,7 @@ command name = case name of
           Form "--cache URL PATH..." "Push store paths (and their closures) to a binary cache"
             :| [Form "--cache URL --all" "Push every valid path except derivations, and their closures"],
         commandDescription =
-          "Copies the closure of each `PATH`, or with `--all` every valid path except derivations, to the binary cache at `URL`. A `PATH` is a store path, in full or as its base name; a derivation is refused, since a binary cache serves outputs. Paths the cache already holds are skipped, and every NAR is in place before any narinfo announces it. An `http://` or `https://` `URL` is a nova-cache server, which signs what it receives, and a narinfo is read back to check that the server signed it. A `file://` `URL` names a directory, which gets the layout upstream's `nix copy --to file://` writes, so that any web server can serve it: `nix-cache-info`, a narinfo for each path, signed with the secret key in `--secret-key-file`, and the NARs under `nar/`. The key file is one `nix-store --generate-binary-cache-key` writes, and a substituter of the cache trusts its public key. It prints how many paths it pushed and how many the cache already held.",
+          "Copies the closure of each `PATH`, or with `--all` every valid path except derivations, to the binary cache at `URL`. A `PATH` is a store path, in full or as its base name; a derivation is refused, since a binary cache serves outputs. Paths the cache already holds are skipped, and every NAR is in place before any narinfo announces it. An `http://` or `https://` `URL` is a nova-cache server, which signs what it receives, and a narinfo is read back to check that the server signed it. A `file://` `URL` names a directory, which gets the layout upstream's `nix copy --to file://` writes, so that any web server can serve it and a substituter can read it through the same `URL`: `nix-cache-info`, a narinfo for each path, signed with the secret key in `--secret-key-file`, and the NARs under `nar/`. The key file is one `nix-store --generate-binary-cache-key` writes, and a substituter of the cache trusts its public key. It prints how many paths it pushed and how many the cache already held.",
         commandExamples =
           Example
             "Push every path in the store except derivations, compressed with zstd, to a cache that takes the API key in `cache-api-key`."
@@ -738,7 +738,7 @@ configuration :: Configuration
 configuration =
   Configuration
     { configSettings =
-        Setting "substituters" "Binary caches a build substitutes from" (Just SubstituterFlag)
+        Setting "substituters" "Binary caches a build substitutes from, each the `http://` or `https://` URL of one a server serves or the `file://` URL of a directory, such as one `push` writes (`file:///D:/cache` on Windows), which is asked at the `Priority` its `nix-cache-info` states, `0` when it states none" (Just SubstituterFlag)
           :| [ Setting "trusted-public-keys" "Public keys, one of whose signatures a substituted path must carry" (Just TrustedKeyFlag),
                Setting "fallback" "Build from source when a substitute fails" (Just FallbackFlag),
                Setting "keep-failed" "Keep the directory of a build that fails, and the rebuild of an output `--check` finds different as `PATH.check` (default `false`)" (Just KeepFailedFlag),
