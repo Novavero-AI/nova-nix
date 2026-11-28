@@ -33,6 +33,7 @@
 #undef stat
 #undef lstat
 #undef fstat
+#undef mkdir
 
 /* The size msvcrt gives a pipe's buffer when bash makes one. */
 #define PIPE_BUFFER_BYTES 65536
@@ -303,6 +304,13 @@ w32_fstat (int fd, struct stat *st)
     return -1;
   fix_stat (0, st);
   return 0;
+}
+
+int
+w32_mkdir (const char *path, mode_t mode)
+{
+  (void) mode;
+  return _mkdir (path);
 }
 
 /* F_OK, R_OK and W_OK as msvcrt answers them; X_OK as w32_stat does. */

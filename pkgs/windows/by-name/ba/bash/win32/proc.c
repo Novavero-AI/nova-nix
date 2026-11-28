@@ -735,15 +735,6 @@ times (struct tms *t)
   return clock ();
 }
 
-int
-getpagesize (void)
-{
-  SYSTEM_INFO info;
-
-  GetSystemInfo (&info);
-  return (int) info.dwPageSize;
-}
-
 /* bash's malloc takes its memory from sbrk.  The break moves through a
    region reserved on the first call, whose pages are committed as it
    grows and released as it shrinks. */

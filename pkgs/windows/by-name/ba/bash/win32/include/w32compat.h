@@ -53,7 +53,8 @@ extern int setuid (uid_t);
 extern int setgid (gid_t);
 extern int getgroups (int, gid_t *);
 
-/* Memory, for bash's malloc. */
+/* Memory, for bash's malloc.  libgcc defines getpagesize, which MinGW-w64
+   declares nowhere. */
 extern void *sbrk (ptrdiff_t);
 extern int getpagesize (void);
 
