@@ -1587,7 +1587,7 @@ storeGcCommand storeDir printRoots = do
       closeStore store
       toStdout (mapM_ (\root -> TIO.putStrLn (T.pack (grLink root) <> " -> " <> grPath root)) roots)
     else do
-      results <- collectGarbage store
+      results <- collectGarbage store Set.empty
       closeStore store
       either (failWith . ("store gc: " <>)) (toStdout . TIO.putStrLn . gcSummaryLine) results
 

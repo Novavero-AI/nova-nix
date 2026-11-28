@@ -65,6 +65,8 @@ module Nix.Derivation
 
     -- * The .drv file
     drvExtension,
+    fixedOutputModulo,
+    inputAddressedModulo,
     DrvFile,
     drvFileDerivation,
     drvFileATerm,
@@ -443,6 +445,28 @@ drvFile name drv =
 -- | What a derivation's file name ends in, after the derivation's name.
 drvExtension :: Text
 drvExtension = ".drv"
+
+-- | The modulo hash of a fixed-output derivation, as upstream hashes one
+-- for what depends on it: the SHA-256 of
+-- @fixed:out:\<algo\>:\<hash\>:\<path\>@, which leaves the rest of the
+-- derivation out, so what depends on a fixed output does not change when
+-- the way it is fetched does.  'Nothing' for a derivation that is not one
+-- output named @out@ with a hash.
+fixedOutputModulo :: Derivation -> Maybe ByteString
+fixedOutputModulo drv = case drvOutputs drv of
+  [DerivationOutput name outPath algoField hashHex]
+    | name == fixedOutputName,
+      not (T.null algoField),
+      not (T.null hashHex) ->
+        Just (sha256Digest (TE.encodeUtf8 ("fixed:out:" <> algoField <> ":" <> hashHex <> ":" <> SP.storePathToText SP.defaultStoreDir outPath)))
+  _ -> Nothing
+
+-- | The modulo hash of any other derivation, as upstream hashes it, given
+-- the modulo hash (hex) of each input
+-- derivation with the outputs taken from it: the SHA-256 of its rendering
+-- with those hashes in place of the input derivations ('toATermForHash').
+inputAddressedModulo :: [(Text, [Text])] -> Derivation -> ByteString
+inputAddressedModulo inputHashes drv = sha256Digest (toATermForHash False (Just inputHashes) drv)
 
 -- | The @.drv@ file of a derivation named @name@ with every output
 -- input-addressed.  Upstream makes one by deferring its outputs with their

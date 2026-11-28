@@ -282,6 +282,10 @@ A root keeps a store path and everything it refers to. Roots live in
   a symlink into the store roots the path it points into, and a regular
   file named `<hash>-<name>` roots that path. Nothing in nova-nix makes
   one.
+- **Upstream's roots.** For a store at `/nix/store`, or `<root>/nix/store`,
+  the roots under upstream's `gcroots/` and `profiles/` in
+  `/nix/var/nix` (or `<root>/nix/var/nix`) count too, read the same way:
+  upstream's clients keep their roots and profiles there.
 
 The collector walks the references in the database from the roots. It
 removes the rows of every other valid path in one transaction, then every

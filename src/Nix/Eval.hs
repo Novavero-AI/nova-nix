@@ -135,7 +135,7 @@ import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import Data.Word (Word32, Word8)
 import Foreign.Ptr (Ptr)
-import Nix.Derivation (Derivation (..), DerivationOutput (..), drvFile, drvFileATerm, drvFileDerivation, drvFilePath, inputAddressed, textToPlatform, toATermForHash)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), drvFile, drvFileATerm, drvFileDerivation, drvFilePath, fixedOutputModulo, inputAddressed, inputAddressedModulo, textToPlatform, toATermForHash)
 import Nix.Derivation.StructuredAttrs (StructuredAttrs (..), encodeStructuredAttrs, structuredAttrsKey)
 import Nix.DrvName (drvNameDash)
 import Nix.Eval.AllocSite (EnvSite (..), SetSite (..))
@@ -4690,15 +4690,11 @@ resolveInputModulo (sp, outs) = do
 -- computes a derivation's hash, so a store-read input yields the value it had
 -- in-session.
 derivationModuloHex :: (MonadEval m) => Derivation -> m Text
-derivationModuloHex drv = case drvOutputs drv of
-  [DerivationOutput "out" outPath algoField hashHex]
-    | not (T.null algoField) && not (T.null hashHex) ->
-        let outPathText = storePathToText defaultStoreDir outPath
-            fixedForm = "fixed:out:" <> algoField <> ":" <> hashHex <> ":" <> outPathText
-         in pure (bytesToHexText (sha256Digest (TE.encodeUtf8 fixedForm)))
-  _ -> do
+derivationModuloHex drv = case fixedOutputModulo drv of
+  Just modulo -> pure (bytesToHexText modulo)
+  Nothing -> do
     inputSubst <- inputModuloHashes (drvInputDrvs drv)
-    pure (bytesToHexText (sha256Digest (toATermForHash False (Just inputSubst) drv)))
+    pure (bytesToHexText (inputAddressedModulo inputSubst drv))
 
 -- | The modulo hash (hex) of each input derivation, with the outputs taken
 -- from it, in path order, as 'Nix.Derivation.inputAddressed' and
