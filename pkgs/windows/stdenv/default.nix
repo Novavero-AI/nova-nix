@@ -44,6 +44,7 @@
   seedStdenv,
   binutils-native-x86_64,
   gcc-native-x86_64,
+  unusedPrebuilt,
 }:
 let
   system = "x86_64-windows";
@@ -102,6 +103,9 @@ in
         # gcc -dumpmachine prints, since config.guess cannot work out the
         # platform from busybox's uname, whose system name is Windows_NT.
         buildTriple = "x86_64-w64-mingw32";
+        # The files the seed stdenv's unpack phase removes from the
+        # archive: prebuilt code no build uses (../unused-prebuilt.json).
+        unusedPrebuilt = unusedPrebuilt (attrs.src or null);
       }
       # Parallel installing follows parallel building unless the package
       # says otherwise, as nixpkgs' mkDerivation sets it.

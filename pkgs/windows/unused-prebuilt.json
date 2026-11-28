@@ -1,0 +1,191 @@
+[
+  {
+    "archive": "binutils-2.41.tar.xz",
+    "why": "Inputs to the DejaGnu test suites of binutils and gas (the NFP tests of objdump.exp and tic54x's macro.s), which make check runs. The rungs that unpack this archive configure, build and install, and run no test suite.",
+    "paths": [
+      "binutils-2.41/binutils/testsuite/binutils-all/nfp/test1_nfp6000.nffw",
+      "binutils-2.41/binutils/testsuite/binutils-all/nfp/test2_nfp6000.nffw",
+      "binutils-2.41/gas/testsuite/gas/tic54x/macros.lib"
+    ]
+  },
+  {
+    "archive": "binutils-2.41.tar.xz",
+    "why": "zlib's contrib/masmx64 and contrib/masmx86 objects, assembled with MASM for building zlib with Microsoft's compiler. The tree's zlib directory is built by its own Makefile, whose sources are zlib's C files alone.",
+    "paths": [
+      "binutils-2.41/zlib/contrib/masmx64/gvmat64.obj",
+      "binutils-2.41/zlib/contrib/masmx64/inffasx64.obj",
+      "binutils-2.41/zlib/contrib/masmx86/gvmat32.obj",
+      "binutils-2.41/zlib/contrib/masmx86/inffas32.obj"
+    ]
+  },
+  {
+    "archive": "binutils-with-gold-2.46.tar.bz2",
+    "why": "Inputs to the DejaGnu test suites of binutils and gas (the NFP tests of objdump.exp and tic54x's macro.s), which make check runs. The rungs that unpack this archive configure, build and install, and run no test suite.",
+    "paths": [
+      "binutils-with-gold-2.46/binutils/testsuite/binutils-all/nfp/test1_nfp6000.nffw",
+      "binutils-with-gold-2.46/binutils/testsuite/binutils-all/nfp/test2_nfp6000.nffw",
+      "binutils-with-gold-2.46/gas/testsuite/gas/tic54x/macros.lib"
+    ]
+  },
+  {
+    "archive": "binutils-with-gold-2.46.tar.bz2",
+    "why": "zlib's contrib/masmx64 and contrib/masmx86 objects, assembled with MASM for building zlib with Microsoft's compiler. The tree's zlib directory is built by its own Makefile, whose sources are zlib's C files alone.",
+    "paths": [
+      "binutils-with-gold-2.46/zlib/contrib/masmx64/gvmat64.obj",
+      "binutils-with-gold-2.46/zlib/contrib/masmx64/inffasx64.obj",
+      "binutils-with-gold-2.46/zlib/contrib/masmx86/gvmat32.obj",
+      "binutils-with-gold-2.46/zlib/contrib/masmx86/inffas32.obj"
+    ]
+  },
+  {
+    "archive": "gcc-10.4.0.tar.xz",
+    "why": "Test data of libgo, GCC's Go runtime and library, read by the Go tests of its debug, go/internal and runtime/pprof packages. GCC configures libgo only when Go is among the languages it builds, and the rungs that unpack this archive build C, or C and C++.",
+    "paths": [
+      "gcc-10.4.0/libgo/go/debug/dwarf/testdata/cppunsuptypes.elf",
+      "gcc-10.4.0/libgo/go/debug/dwarf/testdata/cycle.elf",
+      "gcc-10.4.0/libgo/go/debug/dwarf/testdata/line-clang.elf",
+      "gcc-10.4.0/libgo/go/debug/dwarf/testdata/line-gcc-win.bin",
+      "gcc-10.4.0/libgo/go/debug/dwarf/testdata/line-gcc.elf",
+      "gcc-10.4.0/libgo/go/debug/dwarf/testdata/ranges.elf",
+      "gcc-10.4.0/libgo/go/debug/dwarf/testdata/split.elf",
+      "gcc-10.4.0/libgo/go/debug/dwarf/testdata/typedef.elf",
+      "gcc-10.4.0/libgo/go/debug/dwarf/testdata/typedef.elf4",
+      "gcc-10.4.0/libgo/go/debug/dwarf/testdata/typedef.macho",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/compressed-32.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/compressed-64.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/gcc-386-freebsd-exec",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/gcc-amd64-linux-exec",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/gcc-amd64-openbsd-debug-with-rela.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-clang-arm.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-clang-x86.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc424-x86-64.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc441-x86-64.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc441-x86.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc482-aarch64.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc482-ppc64le.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc492-arm.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc492-mips64.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc492-mipsle.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc493-mips64le.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc5-ppc.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc531-s390x.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc540-mips.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc620-sparc64.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc720-riscv64.obj",
+      "gcc-10.4.0/libgo/go/debug/elf/testdata/zdebug-test-gcc484-x86-64.obj",
+      "gcc-10.4.0/libgo/go/debug/pe/testdata/gcc-386-mingw-exec",
+      "gcc-10.4.0/libgo/go/debug/pe/testdata/gcc-386-mingw-no-symbols-exec",
+      "gcc-10.4.0/libgo/go/debug/pe/testdata/gcc-386-mingw-obj",
+      "gcc-10.4.0/libgo/go/debug/pe/testdata/gcc-amd64-mingw-exec",
+      "gcc-10.4.0/libgo/go/debug/pe/testdata/gcc-amd64-mingw-obj",
+      "gcc-10.4.0/libgo/go/debug/pe/testdata/vmlinuz-4.15.0-47-generic",
+      "gcc-10.4.0/libgo/go/go/internal/gccgoimporter/testdata/escapeinfo.gox",
+      "gcc-10.4.0/libgo/go/go/internal/gccgoimporter/testdata/libimportsar.a",
+      "gcc-10.4.0/libgo/go/go/internal/gccgoimporter/testdata/time.gox",
+      "gcc-10.4.0/libgo/go/go/internal/gccgoimporter/testdata/unicode.gox",
+      "gcc-10.4.0/libgo/go/go/internal/gccgoimporter/testdata/v1reflect.gox",
+      "gcc-10.4.0/libgo/go/go/internal/gcimporter/testdata/versions/test_go1.7_0.a",
+      "gcc-10.4.0/libgo/go/go/internal/gcimporter/testdata/versions/test_go1.7_1.a",
+      "gcc-10.4.0/libgo/go/runtime/pprof/testdata/test32",
+      "gcc-10.4.0/libgo/go/runtime/pprof/testdata/test32be",
+      "gcc-10.4.0/libgo/go/runtime/pprof/testdata/test64",
+      "gcc-10.4.0/libgo/go/runtime/pprof/testdata/test64be"
+    ]
+  },
+  {
+    "archive": "gcc-10.4.0.tar.xz",
+    "why": "zlib's contrib/masmx64 and contrib/masmx86 objects, assembled with MASM for building zlib with Microsoft's compiler. The tree's zlib directory is built by its own Makefile, whose sources are zlib's C files alone.",
+    "paths": [
+      "gcc-10.4.0/zlib/contrib/masmx64/gvmat64.obj",
+      "gcc-10.4.0/zlib/contrib/masmx64/inffasx64.obj",
+      "gcc-10.4.0/zlib/contrib/masmx86/gvmat32.obj",
+      "gcc-10.4.0/zlib/contrib/masmx86/inffas32.obj"
+    ]
+  },
+  {
+    "archive": "gcc-16.2.0.tar.xz",
+    "why": "Test data of libgo, GCC's Go runtime and library, read by the Go tests of its debug, go/internal and runtime/pprof packages. GCC configures libgo only when Go is among the languages it builds, and the rungs that unpack this archive build C, or C and C++.",
+    "paths": [
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/bitfields.elf4",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/cppunsuptypes.elf",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/cycle.elf",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/line-clang-dwarf5.elf",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/line-clang.elf",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/line-gcc-dwarf5.elf",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/line-gcc-win.bin",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/line-gcc.elf",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/ranges.elf",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/rnglistx.elf",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/split.elf",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/typedef.elf",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/typedef.elf4",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/typedef.elf5",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/typedef.macho",
+      "gcc-16.2.0/libgo/go/debug/dwarf/testdata/typedef.macho4",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/compressed-32.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/compressed-64.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/gcc-386-freebsd-exec",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/gcc-amd64-linux-exec",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/gcc-amd64-openbsd-debug-with-rela.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-clang-arm.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-clang-x86.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc424-x86-64.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc441-x86-64.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc441-x86.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc482-aarch64.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc482-ppc64le.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc492-arm.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc492-mips64.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc492-mipsle.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc493-mips64le.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc5-ppc.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc531-s390x.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc540-mips.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc620-sparc64.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc720-riscv64.obj",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc930-ranges-no-rela-x86-64",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/go-relocation-test-gcc930-ranges-with-rela-x86-64",
+      "gcc-16.2.0/libgo/go/debug/elf/testdata/zdebug-test-gcc484-x86-64.obj",
+      "gcc-16.2.0/libgo/go/debug/pe/testdata/gcc-386-mingw-exec",
+      "gcc-16.2.0/libgo/go/debug/pe/testdata/gcc-386-mingw-no-symbols-exec",
+      "gcc-16.2.0/libgo/go/debug/pe/testdata/gcc-386-mingw-obj",
+      "gcc-16.2.0/libgo/go/debug/pe/testdata/gcc-amd64-mingw-exec",
+      "gcc-16.2.0/libgo/go/debug/pe/testdata/gcc-amd64-mingw-obj",
+      "gcc-16.2.0/libgo/go/debug/pe/testdata/vmlinuz-4.15.0-47-generic",
+      "gcc-16.2.0/libgo/go/go/internal/gccgoimporter/testdata/libimportsar.a",
+      "gcc-16.2.0/libgo/go/go/internal/gcimporter/testdata/versions/test_go1.7_0.a",
+      "gcc-16.2.0/libgo/go/go/internal/gcimporter/testdata/versions/test_go1.7_1.a",
+      "gcc-16.2.0/libgo/go/runtime/pprof/testdata/test32",
+      "gcc-16.2.0/libgo/go/runtime/pprof/testdata/test32be",
+      "gcc-16.2.0/libgo/go/runtime/pprof/testdata/test64",
+      "gcc-16.2.0/libgo/go/runtime/pprof/testdata/test64be"
+    ]
+  },
+  {
+    "archive": "gcc-16.2.0.tar.xz",
+    "why": "zlib's contrib/masmx64 and contrib/masmx86 objects, assembled with MASM for building zlib with Microsoft's compiler. The tree's zlib directory is built by its own Makefile, whose sources are zlib's C files alone.",
+    "paths": [
+      "gcc-16.2.0/zlib/contrib/masmx64/gvmat64.obj",
+      "gcc-16.2.0/zlib/contrib/masmx64/inffasx64.obj",
+      "gcc-16.2.0/zlib/contrib/masmx86/gvmat32.obj",
+      "gcc-16.2.0/zlib/contrib/masmx86/inffas32.obj"
+    ]
+  },
+  {
+    "archive": "gcc-core-4.6.4.tar.gz",
+    "why": "zlib's contrib/masmx64 and contrib/masmx86 objects, assembled with MASM for building zlib with Microsoft's compiler. The tree's zlib directory is built by its own Makefile, whose sources are zlib's C files alone.",
+    "paths": [
+      "gcc-4.6.4/zlib/contrib/masmx64/gvmat64.obj",
+      "gcc-4.6.4/zlib/contrib/masmx64/inffasx64.obj",
+      "gcc-4.6.4/zlib/contrib/masmx86/gvmat32.obj",
+      "gcc-4.6.4/zlib/contrib/masmx86/inffas32.obj"
+    ]
+  },
+  {
+    "archive": "stage0-pe32-a81c837.tar.gz",
+    "why": "The original hex0, whose DOS header the generators in stage0-pe32's x86/Development copy when regenerate.sh remakes the chain's hex sources. The chain builds from those sources as they are checked in, and reads nothing under x86/Development.",
+    "paths": [
+      "stage0-pe32-a81c8374592e8e897c0863d31c6480ea69669009/x86/Development/hex0_32-original.exe"
+    ]
+  }
+]
