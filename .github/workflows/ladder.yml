@@ -45,6 +45,11 @@ name: Ladder
 # the store started one from outside it, such as the host's cmd.exe
 # (.github/bootstrap/process-audit.sh).
 #
+# Each stage records its rungs with the NAR hash its handoff's narinfo
+# states for each, in mode and on each leg, and uploads the record, which
+# Ladder (NAR hashes) in seed-ladder.yml compares across the legs when
+# both build from the seed.
+#
 # With publish set, each stage publishes what it holds to the public cache
 # once its checks pass, with that token.  GitHub refuses a job that
 # references the environment from any other ref, so a job names it only
@@ -296,6 +301,29 @@ jobs:
           "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
             --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
             --compression zstd --all
+
+      # This stage's rungs and the NAR hash the handoff's narinfo states
+      # for each, which Ladder (NAR hashes) in seed-ladder.yml compares
+      # with the other leg's (.github/cache/rung-hashes.sh).
+      - name: Record the stage's NAR hashes
+        shell: bash
+        env:
+          LEG: ${{ inputs.os }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rung-hashes"
+          CACHE_URL=$HANDOFF_URL bash .github/cache/rung-hashes.sh "$RUNNER_TEMP/bin/nova-nix.exe" mes "$LEG" "$RUNNER_TEMP/rung-hashes/mes-$LEG"
+
+      # Kept for the 30 days a run can be re-run in: a re-run of Ladder
+      # (NAR hashes) alone reads every stage's record.
+      - name: Upload the stage's NAR hashes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rung-hashes-mes-${{ inputs.os }}
+          path: ${{ runner.temp }}/rung-hashes/mes-${{ inputs.os }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
 
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server
@@ -1001,6 +1029,29 @@ jobs:
             --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
             --compression zstd --all
 
+      # This stage's rungs and the NAR hash the handoff's narinfo states
+      # for each, which Ladder (NAR hashes) in seed-ladder.yml compares
+      # with the other leg's (.github/cache/rung-hashes.sh).
+      - name: Record the stage's NAR hashes
+        shell: bash
+        env:
+          LEG: ${{ inputs.os }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rung-hashes"
+          CACHE_URL=$HANDOFF_URL bash .github/cache/rung-hashes.sh "$RUNNER_TEMP/bin/nova-nix.exe" tinycc "$LEG" "$RUNNER_TEMP/rung-hashes/tinycc-$LEG"
+
+      # Kept for the 30 days a run can be re-run in: a re-run of Ladder
+      # (NAR hashes) alone reads every stage's record.
+      - name: Upload the stage's NAR hashes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rung-hashes-tinycc-${{ inputs.os }}
+          path: ${{ runner.temp }}/rung-hashes/tinycc-${{ inputs.os }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server
         if: ${{ !cancelled() }}
@@ -1318,6 +1369,29 @@ jobs:
             --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
             --compression zstd --all
 
+      # This stage's rungs and the NAR hash the handoff's narinfo states
+      # for each, which Ladder (NAR hashes) in seed-ladder.yml compares
+      # with the other leg's (.github/cache/rung-hashes.sh).
+      - name: Record the stage's NAR hashes
+        shell: bash
+        env:
+          LEG: ${{ inputs.os }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rung-hashes"
+          CACHE_URL=$HANDOFF_URL bash .github/cache/rung-hashes.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc46 "$LEG" "$RUNNER_TEMP/rung-hashes/gcc46-$LEG"
+
+      # Kept for the 30 days a run can be re-run in: a re-run of Ladder
+      # (NAR hashes) alone reads every stage's record.
+      - name: Upload the stage's NAR hashes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rung-hashes-gcc46-${{ inputs.os }}
+          path: ${{ runner.temp }}/rung-hashes/gcc46-${{ inputs.os }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server
         if: ${{ !cancelled() }}
@@ -1543,6 +1617,29 @@ jobs:
           "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
             --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
             --compression zstd --all
+
+      # This stage's rungs and the NAR hash the handoff's narinfo states
+      # for each, which Ladder (NAR hashes) in seed-ladder.yml compares
+      # with the other leg's (.github/cache/rung-hashes.sh).
+      - name: Record the stage's NAR hashes
+        shell: bash
+        env:
+          LEG: ${{ inputs.os }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rung-hashes"
+          CACHE_URL=$HANDOFF_URL bash .github/cache/rung-hashes.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc46-cxx "$LEG" "$RUNNER_TEMP/rung-hashes/gcc46-cxx-$LEG"
+
+      # Kept for the 30 days a run can be re-run in: a re-run of Ladder
+      # (NAR hashes) alone reads every stage's record.
+      - name: Upload the stage's NAR hashes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rung-hashes-gcc46-cxx-${{ inputs.os }}
+          path: ${{ runner.temp }}/rung-hashes/gcc46-cxx-${{ inputs.os }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
 
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server
@@ -1828,6 +1925,29 @@ jobs:
             --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
             --compression zstd --all
 
+      # This stage's rungs and the NAR hash the handoff's narinfo states
+      # for each, which Ladder (NAR hashes) in seed-ladder.yml compares
+      # with the other leg's (.github/cache/rung-hashes.sh).
+      - name: Record the stage's NAR hashes
+        shell: bash
+        env:
+          LEG: ${{ inputs.os }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rung-hashes"
+          CACHE_URL=$HANDOFF_URL bash .github/cache/rung-hashes.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc10 "$LEG" "$RUNNER_TEMP/rung-hashes/gcc10-$LEG"
+
+      # Kept for the 30 days a run can be re-run in: a re-run of Ladder
+      # (NAR hashes) alone reads every stage's record.
+      - name: Upload the stage's NAR hashes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rung-hashes-gcc10-${{ inputs.os }}
+          path: ${{ runner.temp }}/rung-hashes/gcc10-${{ inputs.os }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server
         if: ${{ !cancelled() }}
@@ -2064,6 +2184,29 @@ jobs:
           "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
             --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
             --compression zstd --all
+
+      # This stage's rungs and the NAR hash the handoff's narinfo states
+      # for each, which Ladder (NAR hashes) in seed-ladder.yml compares
+      # with the other leg's (.github/cache/rung-hashes.sh).
+      - name: Record the stage's NAR hashes
+        shell: bash
+        env:
+          LEG: ${{ inputs.os }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rung-hashes"
+          CACHE_URL=$HANDOFF_URL bash .github/cache/rung-hashes.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc-latest "$LEG" "$RUNNER_TEMP/rung-hashes/gcc-latest-$LEG"
+
+      # Kept for the 30 days a run can be re-run in: a re-run of Ladder
+      # (NAR hashes) alone reads every stage's record.
+      - name: Upload the stage's NAR hashes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rung-hashes-gcc-latest-${{ inputs.os }}
+          path: ${{ runner.temp }}/rung-hashes/gcc-latest-${{ inputs.os }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
 
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server
@@ -2378,6 +2521,29 @@ jobs:
             --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
             --compression zstd --all
 
+      # This stage's rungs and the NAR hash the handoff's narinfo states
+      # for each, which Ladder (NAR hashes) in seed-ladder.yml compares
+      # with the other leg's (.github/cache/rung-hashes.sh).
+      - name: Record the stage's NAR hashes
+        shell: bash
+        env:
+          LEG: ${{ inputs.os }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rung-hashes"
+          CACHE_URL=$HANDOFF_URL bash .github/cache/rung-hashes.sh "$RUNNER_TEMP/bin/nova-nix.exe" x86_64 "$LEG" "$RUNNER_TEMP/rung-hashes/x86_64-$LEG"
+
+      # Kept for the 30 days a run can be re-run in: a re-run of Ladder
+      # (NAR hashes) alone reads every stage's record.
+      - name: Upload the stage's NAR hashes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rung-hashes-x86_64-${{ inputs.os }}
+          path: ${{ runner.temp }}/rung-hashes/x86_64-${{ inputs.os }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server
         if: ${{ !cancelled() }}
@@ -2594,6 +2760,29 @@ jobs:
           "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
             --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
             --compression zstd --all
+
+      # This stage's rungs and the NAR hash the handoff's narinfo states
+      # for each, which Ladder (NAR hashes) in seed-ladder.yml compares
+      # with the other leg's (.github/cache/rung-hashes.sh).
+      - name: Record the stage's NAR hashes
+        shell: bash
+        env:
+          LEG: ${{ inputs.os }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rung-hashes"
+          CACHE_URL=$HANDOFF_URL bash .github/cache/rung-hashes.sh "$RUNNER_TEMP/bin/nova-nix.exe" gcc-x86_64 "$LEG" "$RUNNER_TEMP/rung-hashes/gcc-x86_64-$LEG"
+
+      # Kept for the 30 days a run can be re-run in: a re-run of Ladder
+      # (NAR hashes) alone reads every stage's record.
+      - name: Upload the stage's NAR hashes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rung-hashes-gcc-x86_64-${{ inputs.os }}
+          path: ${{ runner.temp }}/rung-hashes/gcc-x86_64-${{ inputs.os }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
 
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server
@@ -2860,6 +3049,29 @@ jobs:
           "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
             --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
             --compression zstd --all
+
+      # This stage's rungs and the NAR hash the handoff's narinfo states
+      # for each, which Ladder (NAR hashes) in seed-ladder.yml compares
+      # with the other leg's (.github/cache/rung-hashes.sh).
+      - name: Record the stage's NAR hashes
+        shell: bash
+        env:
+          LEG: ${{ inputs.os }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rung-hashes"
+          CACHE_URL=$HANDOFF_URL bash .github/cache/rung-hashes.sh "$RUNNER_TEMP/bin/nova-nix.exe" native-x86_64 "$LEG" "$RUNNER_TEMP/rung-hashes/native-x86_64-$LEG"
+
+      # Kept for the 30 days a run can be re-run in: a re-run of Ladder
+      # (NAR hashes) alone reads every stage's record.
+      - name: Upload the stage's NAR hashes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rung-hashes-native-x86_64-${{ inputs.os }}
+          path: ${{ runner.temp }}/rung-hashes/native-x86_64-${{ inputs.os }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
 
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server
@@ -3206,6 +3418,39 @@ jobs:
           greeter=$(outputOf greeter) || exit 1
           "$greeter/bin/greeter.exe" | prints greeter.exe "Hello from libgreet, a dependency built from source by nova-nix!"
           exit "$status"
+
+      # No stage takes a handoff from this one, so the store is pushed to
+      # it for the narinfos the record below reads, and not uploaded.
+      - name: Push the store to the handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/nova-nix.exe" push --store 'C:\nix\store' \
+            --cache "$HANDOFF_URL" --key-file "$HANDOFF_API_KEY_FILE" \
+            --compression zstd --all
+
+      # This stage's rungs and the NAR hash the handoff's narinfo states
+      # for each, which Ladder (NAR hashes) in seed-ladder.yml compares
+      # with the other leg's (.github/cache/rung-hashes.sh).
+      - name: Record the stage's NAR hashes
+        shell: bash
+        env:
+          LEG: ${{ inputs.os }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rung-hashes"
+          CACHE_URL=$HANDOFF_URL bash .github/cache/rung-hashes.sh "$RUNNER_TEMP/bin/nova-nix.exe" stdenv "$LEG" "$RUNNER_TEMP/rung-hashes/stdenv-$LEG"
+
+      # Kept for the 30 days a run can be re-run in: a re-run of Ladder
+      # (NAR hashes) alone reads every stage's record.
+      - name: Upload the stage's NAR hashes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rung-hashes-stdenv-${{ inputs.os }}
+          path: ${{ runner.temp }}/rung-hashes/stdenv-${{ inputs.os }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
 
       # A job whose handoff never served has no server to stop.
       - name: Stop the handoff server
