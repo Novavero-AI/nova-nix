@@ -88,3 +88,27 @@ unsigned long nn_test_dacl_entry(void *descriptor, unsigned long index,
   }
   return ERROR_SUCCESS;
 }
+
+/* The owner of the entry at path, in the string form
+ * ConvertSidToStringSidW writes, to *sid for the caller to release with
+ * LocalFree.  Returns 0 or the Win32 error code. */
+unsigned long nn_test_owner_read(const wchar_t *path, wchar_t **sid) {
+  PSID owner = NULL;
+  PSECURITY_DESCRIPTOR read = NULL;
+  DWORD error;
+
+  *sid = NULL;
+  error = GetNamedSecurityInfoW(path, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                                &owner, NULL, NULL, NULL, &read);
+  if (error != ERROR_SUCCESS) {
+    return error;
+  }
+  if (owner == NULL) {
+    error = ERROR_INVALID_SECURITY_DESCR;
+  } else if (!ConvertSidToStringSidW(owner, sid)) {
+    error = GetLastError();
+    *sid = NULL;
+  }
+  LocalFree(read);
+  return error;
+}

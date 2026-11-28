@@ -142,6 +142,113 @@ unsigned long nn_entry_security(const wchar_t *path, void **descriptor,
   return ERROR_SUCCESS;
 }
 
+/* A local account's name, qualified by the computer's NetBIOS name so
+ * the lookup searches this machine's accounts alone and never a domain's,
+ * fits in this many characters with room to spare: a NetBIOS name is at
+ * most 15 and a local account's name at most 256. */
+enum { NN_QUALIFIED_NAME_CHARS = 300 };
+
+unsigned long nn_local_group_sid(const wchar_t *name, wchar_t **sid,
+                                 const char **failed) {
+  wchar_t qualified[NN_QUALIFIED_NAME_CHARS];
+  DWORD computerChars = MAX_COMPUTERNAME_LENGTH + 1;
+  union {
+    SID sid;
+    BYTE bytes[SECURITY_MAX_SID_SIZE];
+  } found;
+  DWORD sidSize = sizeof found;
+  wchar_t domain[MAX_COMPUTERNAME_LENGTH + 1];
+  DWORD domainChars = MAX_COMPUTERNAME_LENGTH + 1;
+  SID_NAME_USE use;
+  size_t nameChars = wcslen(name);
+  DWORD error;
+
+  *sid = NULL;
+  *failed = NULL;
+  if (!GetComputerNameW(qualified, &computerChars)) {
+    *failed = "GetComputerNameW";
+    return GetLastError();
+  }
+  if (computerChars + 1 + nameChars + 1 > NN_QUALIFIED_NAME_CHARS) {
+    *failed = "nn_local_group_sid";
+    return ERROR_INVALID_PARAMETER;
+  }
+  qualified[computerChars] = L'\\';
+  wmemcpy(qualified + computerChars + 1, name, nameChars + 1);
+  if (!LookupAccountNameW(NULL, qualified, &found.sid, &sidSize, domain,
+                          &domainChars, &use)) {
+    error = GetLastError();
+    if (error == ERROR_NONE_MAPPED) {
+      return ERROR_SUCCESS;
+    }
+    *failed = "LookupAccountNameW";
+    return error;
+  }
+  if (use != SidTypeAlias) {
+    return ERROR_SUCCESS;
+  }
+  if (!ConvertSidToStringSidW(&found.sid, sid)) {
+    *failed = "ConvertSidToStringSidW";
+    *sid = NULL;
+    return GetLastError();
+  }
+  return ERROR_SUCCESS;
+}
+
+unsigned long nn_descriptor_from_sddl(const wchar_t *sddl, void **descriptor) {
+  PSECURITY_DESCRIPTOR made = NULL;
+
+  *descriptor = NULL;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+          sddl, SDDL_REVISION_1, &made, NULL)) {
+    return GetLastError();
+  }
+  *descriptor = made;
+  return ERROR_SUCCESS;
+}
+
+unsigned long nn_entry_set_owner_dacl(const wchar_t *path, void *descriptor,
+                                      const char **failed) {
+  PSID owner = NULL;
+  PACL dacl = NULL;
+  BOOL present = FALSE;
+  BOOL defaulted = FALSE;
+  HANDLE entry;
+  DWORD error;
+
+  *failed = NULL;
+  if (!GetSecurityDescriptorOwner(descriptor, &owner, &defaulted)) {
+    *failed = "GetSecurityDescriptorOwner";
+    return GetLastError();
+  }
+  if (!GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted)) {
+    *failed = "GetSecurityDescriptorDacl";
+    return GetLastError();
+  }
+  /* WRITE_OWNER and WRITE_DAC are the rights the two writes take, and
+   * READ_CONTROL lets the write read what it keeps.  The flags open a
+   * directory, and a link itself rather than what it leads to. */
+  entry = CreateFileW(path, READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      NULL, OPEN_EXISTING,
+                      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                      NULL);
+  if (entry == INVALID_HANDLE_VALUE) {
+    *failed = "CreateFileW";
+    return GetLastError();
+  }
+  error = SetSecurityInfo(entry, SE_FILE_OBJECT,
+                          OWNER_SECURITY_INFORMATION |
+                              DACL_SECURITY_INFORMATION |
+                              PROTECTED_DACL_SECURITY_INFORMATION,
+                          owner, NULL, dacl, NULL);
+  CloseHandle(entry);
+  if (error != ERROR_SUCCESS) {
+    *failed = "SetSecurityInfo";
+  }
+  return error;
+}
+
 #else /* !_WIN32 */
 
 /* Per-directory case sensitivity is an NTFS feature; APFS decides at

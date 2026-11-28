@@ -34,7 +34,12 @@
 -- modification time.  A symlink keeps its attributes, and its own time
 -- is set as on POSIX.  The attribute keeps a file from being written; on
 -- a directory it does not stop an entry being added or removed, which
--- only an access control list could.
+-- only an access control list can.  So every node, a symlink included,
+-- is also given the store's service as its owner, as upstream gives a
+-- node to the store's user, and a valid path's protected DACL
+-- ('Nix.Store.Access.validPathSddl'), which lets no build account change
+-- it.  An access control list is no part of a NAR, so a path's NAR hash
+-- is the same before and after.
 --
 -- 'metadataChanges' decides what one node needs from what it reads of
 -- it, without touching the filesystem, and 'canonicalizeMetadata' walks
@@ -73,6 +78,7 @@ import Data.Word (Word32)
 import Control.Exception (bracket)
 import Data.Bits (testBit, (.|.))
 import Data.Foldable (traverse_)
+import Nix.Store.Access (withValidPathAccess)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
 import Nix.Store.Win32Path (win32FilePath)
@@ -300,24 +306,31 @@ isPlainFile path = do
     WalkSymlink -> pure False
     WalkAbsent -> ioError (mkIOError doesNotExistErrorType "isPlainFile" Nothing (Just path))
 
--- A directory is done after its entries, so nothing done to them comes
--- after its own time is set.
-canonicalizeMetadata path = do
+canonicalizeMetadata path = withValidPathAccess (`canonicalizeNode` path)
+
+-- | Make a node canonical, given the step that gives one node a valid
+-- path's owner and DACL.  A directory is done after its entries, so
+-- nothing done to them comes after its own time is set, and its DACL,
+-- protected, is set after theirs, so none of it is passed to them.
+canonicalizeNode :: (FilePath -> IO ()) -> FilePath -> IO ()
+canonicalizeNode giveAccess path = do
   node <- classifyWalkNode path
   case node of
-    WalkSymlink -> setStoreTime path
+    WalkSymlink -> setStoreTime path *> giveAccess path
     WalkDirectory -> do
-      Dir.listDirectory path >>= traverse_ (canonicalizeMetadata . (path </>))
-      sealNode path
-    WalkRegular -> sealNode path
+      Dir.listDirectory path >>= traverse_ (canonicalizeNode giveAccess . (path </>))
+      sealNode giveAccess path
+    WalkRegular -> sealNode giveAccess path
     WalkAbsent -> pure ()
 
--- | Set a file's or directory's time and give it the read-only attribute.
-sealNode :: FilePath -> IO ()
-sealNode path = do
+-- | Set a file's or directory's time, give it the read-only attribute,
+-- then a valid path's owner and DACL.
+sealNode :: (FilePath -> IO ()) -> FilePath -> IO ()
+sealNode giveAccess path = do
   setStoreTime path
   perms <- Dir.getPermissions path
   Dir.setPermissions path (Dir.setOwnerWritable False perms)
+  giveAccess path
 
 -- | Set a node's own modification time to 'storeModificationTime'.  The
 -- node is opened for its attributes alone, which its read-only attribute

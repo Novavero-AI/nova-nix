@@ -46,6 +46,27 @@ unsigned long nn_dir_create_sddl(const wchar_t *path, const wchar_t *sddl);
 unsigned long nn_entry_security(const wchar_t *path, void **descriptor,
                                 unsigned long *length, const char **failed);
 
+/* The SID of the local group the name names on this machine, in the
+ * string form ConvertSidToStringSidW writes, written to *sid for the
+ * caller to release with LocalFree; *sid is NULL where the machine has no
+ * local group of that name, none at all or an account of another kind.
+ * Returns 0, or the Win32 error code of the call that failed, with
+ * *failed naming that call (a static string) and *sid NULL. */
+unsigned long nn_local_group_sid(const wchar_t *name, wchar_t **sid,
+                                 const char **failed);
+
+/* The self-relative security descriptor the SDDL string describes,
+ * written to *descriptor for the caller to release with LocalFree.
+ * Returns 0, or the Win32 error code. */
+unsigned long nn_descriptor_from_sddl(const wchar_t *sddl, void **descriptor);
+
+/* Give the entry at path itself, a link not followed, the owner and the
+ * DACL, protected, of the security descriptor given.  Returns 0, or the
+ * Win32 error code of the call that failed, with *failed naming that
+ * call (a static string). */
+unsigned long nn_entry_set_owner_dacl(const wchar_t *path, void *descriptor,
+                                      const char **failed);
+
 #endif
 
 #endif
