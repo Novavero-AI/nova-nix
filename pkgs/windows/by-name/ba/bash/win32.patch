@@ -315,6 +315,56 @@
  
    if (path == 0)
      return (path);
+@@ -535,7 +539,39 @@
+   return (NULL);
+ }
+ 
++#if defined (_WIN32)
++/* PATH, or PATH with .exe added where PATH is no program and the file
++   with .exe is one: a program's file is named with the .exe a command
++   leaves out.  As busybox-w32's search does, nothing is added to a name
++   that already ends in .exe or a dot.  *STATUSP is the status of PATH on
++   entry, and of the file returned on return. */
+ static char *
++windows_program (char *path, int *statusp)
++{
++  char *exe;
++  size_t len;
++  int status;
++
++  len = strlen (path);
++  if ((*statusp & FS_EXECABLE) || (len > 0 && path[len - 1] == '.') ||
++      (len >= 4 && strcasecmp (path + len - 4, ".exe") == 0))
++    return (path);
++  exe = (char *)xmalloc (len + 5);
++  strcpy (exe, path);
++  strcpy (exe + len, ".exe");
++  status = file_status (exe);
++  if ((status & FS_EXECABLE) == 0)
++    {
++      free (exe);
++      return (path);
++    }
++  free (path);
++  *statusp = status;
++  return (exe);
++}
++#endif /* _WIN32 */
++
++static char *
+ find_in_path_element (const char *name, char *path, int flags, size_t name_len, struct stat *dotinfop, int *rflagsp)
+ {
+   int status;
+@@ -553,6 +589,9 @@
+   full_path = sh_makepath (xpath, name, 0);
+ 
+   status = file_status (full_path);
++#if defined (_WIN32)
++  full_path = windows_program (full_path, &status);
++#endif
+ 
+   if (xpath != path)
+     free (xpath);
 --- a/general.c
 +++ b/general.c
 @@ -863,7 +863,7 @@

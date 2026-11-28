@@ -17,7 +17,8 @@
 # A script's PATH keeps the value the script gives it.  The command search
 # and a program's environment split it at `;' and at a `:' that does not
 # end a drive letter, so C:\a\bin:C:\b\bin names two directories, and a
-# program finds them joined with `;'.  /dev/null and /dev/tty open as NUL
+# program finds them joined with `;'.  In each directory the search takes
+# NAME.exe where NAME is no program, as busybox-w32's does.  /dev/null and /dev/tty open as NUL
 # and CON, and /dev/fd/N as a duplicate of descriptor N.
 #
 # The configuration is a builder's: no job control, which needs process
