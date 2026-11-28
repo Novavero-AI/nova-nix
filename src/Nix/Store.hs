@@ -137,8 +137,7 @@ import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NAR.Stream as Stream
 import System.Directory
-  ( createDirectoryIfMissing,
-    doesDirectoryExist,
+  ( doesDirectoryExist,
     doesPathExist,
     listDirectory,
     renamePath,
@@ -547,7 +546,6 @@ foldlIO z (x : xs) f = do
 writeDrvAterm :: Store -> StorePath -> BS.ByteString -> IO ()
 writeDrvAterm store sp aterm = do
   let destPath = storePathToFilePath (stDir store) sp
-  createDirectoryIfMissing True (unStoreDir (stDir store))
   existing <- try (BS.readFile destPath)
   unless (either (\(_ :: IOException) -> False) (== aterm) existing) $ do
     Dir.removePathForcibly destPath

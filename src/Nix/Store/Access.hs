@@ -89,11 +89,13 @@ module Nix.Store.Access
 
     -- * Creating a directory
     createDirectoryWith,
+    createStoreDirectory,
     createStateDirectory,
     checkStateDirectory,
 
     -- * A directory already there
     storeDirectories,
+    stateDirectories,
     DirSecurity (..),
     AclEntry (..),
     Distrust (..),
@@ -195,39 +197,55 @@ createDirectoryWith access path = Posix.createDirectory path $ case access of
   OwnerAccess -> ownerModes
 #endif
 
+-- | Create a store's directory, given its path, where it is missing,
+-- with any missing parent of it, as @createDirectoryIfMissing True@
+-- does: the directories 'createStateDirectory' creates and checks, less
+-- the state directory, for what is written into a store before it is
+-- opened.  On POSIX that is all it does.  On Windows the store's
+-- directory is open to whom 'StoreAccess' says and each parent to whom
+-- 'ParentAccess' says, and one already there is refused as
+-- 'createStateDirectory' refuses one.
+createStoreDirectory :: FilePath -> IO ()
+#if defined(mingw32_HOST_OS)
+createStoreDirectory storeDir = do
+  user <- tokenUserSid
+  full <- getFullPathName storeDir
+  traverse_ (prepareDirectory user full) (storeDirectories full)
+#else
+createStoreDirectory = createDirectoryIfMissing True
+#endif
+
 -- | Create a store's state directory, given its path, where it is
 -- missing, with the store directory it is in and any missing parent of
 -- that, as @createDirectoryIfMissing True@ does.  On POSIX that is all
 -- it does: the modes are the default, narrowed by the umask.  On
--- Windows it takes the directories 'storeDirectories' gives, outermost
--- first.  One that is missing is created, open to whom its access says.
--- One already there, or made by another process before this one could
--- make it, is refused unless it can be trusted with a store
--- ('descriptorDistrust'), with a 'userError' naming it and what is
--- wrong ('distrustMessage'), before anything is created in it; then
--- something other than a directory there fails with an
+-- Windows it takes the directories 'stateDirectories' gives, outermost
+-- first.  One that is missing is created, open to whom its access says.  One already there, or made by another process
+-- before this one could make it, is refused unless it can be trusted
+-- with a store ('descriptorDistrust'), with a 'userError' naming it and
+-- what is wrong ('distrustMessage'), before anything is created in it;
+-- then something other than a directory there fails with an
 -- 'System.IO.Error.isAlreadyExistsError' exception naming it.
 createStateDirectory :: FilePath -> IO ()
 #if defined(mingw32_HOST_OS)
 createStateDirectory stateDir = do
   user <- tokenUserSid
   full <- getFullPathName stateDir
-  traverse_ (prepareDirectory user (takeDirectory full)) (storeDirectories full)
+  traverse_ (prepareDirectory user (takeDirectory full)) (stateDirectories full)
 #else
 createStateDirectory = createDirectoryIfMissing True
 #endif
 
 -- | Refuse a store, given its state directory, before anything is read
 -- from it, as 'createStateDirectory' refuses one: on Windows each of the
--- directories 'storeDirectories' gives that exists must be trusted with a
--- store, and one that does not exist is passed over.  On POSIX it checks
--- nothing.
+-- directories it takes that exists must be trusted with a store, and one
+-- that does not exist is passed over.  On POSIX it checks nothing.
 checkStateDirectory :: FilePath -> IO ()
 #if defined(mingw32_HOST_OS)
 checkStateDirectory stateDir = do
   user <- tokenUserSid
   full <- getFullPathName stateDir
-  for_ (storeDirectories full) $ \(dir, _) ->
+  for_ (stateDirectories full) $ \(dir, _) ->
     entrySecurity dir >>= traverse_ (refuseUntrusted user (takeDirectory full) dir)
 #else
 checkStateDirectory _ = pure ()
@@ -313,19 +331,24 @@ tokenUserSid =
 -- A directory already there
 -- ---------------------------------------------------------------------------
 
--- | The directories on the way to a store's state directory, given its
--- full path on Windows, outermost first, each with the access it is
--- created with where it is missing: the state directory and the store
--- directory it is in with 'StoreAccess', and each parent of the store
--- directory with 'ParentAccess'.  The volume root, the drive
+-- | The directories down to a store's directory, given its full path on
+-- Windows, outermost first, each with the access it is created with
+-- where it is missing: the store's directory with 'StoreAccess', and
+-- each parent of it with 'ParentAccess'.  The volume root, the drive
 -- 'System.FilePath.Windows.splitDrive' gives, is never among them (the
--- module header says why).  It follows Windows' path rules on every
--- platform.
+-- module header says why), so a store at a drive root has none.  It
+-- follows Windows' path rules on every platform.
 storeDirectories :: FilePath -> [(FilePath, DirAccess)]
-storeDirectories stateDir = reverse (zip (reverse below) (StoreAccess : StoreAccess : repeat ParentAccess))
+storeDirectories storeDir = reverse (zip (reverse below) (StoreAccess : repeat ParentAccess))
   where
-    (root, rest) = Windows.splitDrive stateDir
+    (root, rest) = Windows.splitDrive storeDir
     below = map (root Windows.</>) (scanl1 (Windows.</>) (Windows.splitDirectories rest))
+
+-- | The directories 'storeDirectories' gives for the store directory a
+-- state directory is in, given the state directory's full path on
+-- Windows, then the state directory itself, with 'StoreAccess'.
+stateDirectories :: FilePath -> [(FilePath, DirAccess)]
+stateDirectories stateDir = storeDirectories (Windows.takeDirectory stateDir) <> [(stateDir, StoreAccess)]
 
 -- | The owner and DACL of a directory, as its security descriptor holds
 -- them.

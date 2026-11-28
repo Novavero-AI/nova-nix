@@ -56,7 +56,7 @@ module Nix.Eval.IO
   )
 where
 
-import Control.Exception (Exception, IOException, SomeAsyncException, SomeException, bracket, bracket_, catch, catchJust, displayException, fromException, onException, throwIO, try)
+import Control.Exception (Exception, IOException, SomeAsyncException, SomeException, bracket, bracket_, catch, catchJust, displayException, fromException, onException, throwIO, try, tryJust)
 import Control.Monad (mfilter, unless, void, when)
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Control.Monad.IO.Class (liftIO)
@@ -65,6 +65,7 @@ import Crypto.Random (getRandomBytes)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import Data.Either (fromRight, isRight)
+import Data.Foldable (traverse_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.List (find)
@@ -109,6 +110,7 @@ import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, 
 import Nix.Logger (Logger (..))
 import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Store (UpstreamHazard (..), canonicalizeMetadata, unpackNarEntry, upstreamManagedRefusal)
+import Nix.Store.Access (createStoreDirectory)
 import Nix.Store.CaseSensitive (pathCaseHack, probeCaseSensitivity, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Ops (BuildStop (..), EvalObjects (..), StoreOps (..), StoreQueries (..), nothingToAdd)
@@ -758,7 +760,6 @@ instance MonadEval EvalIO where
     writtenFor Computed $ do
       filePath <- evalFilePath sp
       wrapIO $ do
-        Dir.createDirectoryIfMissing True (takeDirectory filePath)
         -- Adopt an existing file only when its bytes are these bytes: an
         -- interrupted earlier run can leave a truncated file here, and
         -- skipping on bare existence adopted it under this path's hash.
@@ -981,7 +982,6 @@ instance MonadEval EvalIO where
     writtenFor origin $ do
       filePath <- evalFilePath sp
       wrapIO $ do
-        Dir.createDirectoryIfMissing True (takeDirectory filePath)
         -- Same verified adoption as the other writers: an unconditional
         -- write would crash on a sealed leftover (the write hits
         -- read-only).
@@ -1501,13 +1501,24 @@ readCaseHack path = do
 -- asks here before it writes, so a store upstream Nix's database may
 -- also manage is refused at the first write, uncatchably
 -- ("Nix.Store.Upstream"): a writer clears a tree there that does not
--- reproduce its address, which may be one upstream registered.  An
--- evaluation that writes nothing never asks.
+-- reproduce its address, which may be one upstream registered.  The
+-- store's directory is made here too, where it is missing, as the
+-- store's open makes it ('createStoreDirectory'): a write can come
+-- before the store is opened, and on Windows a directory made any other
+-- way takes what its parent passes down.  A store a directory on the way
+-- to it makes untrustworthy is refused the same way, in the open's
+-- words.  An evaluation that writes nothing never asks.
 evalFilePath :: SP.StorePath -> EvalIO FilePath
 evalFilePath sp = do
   storeDir <- EvalIO (asks esStoreDir)
   refusal <- wrapIO (upstreamManagedRefusal ReplacesUpstreamPaths storeDir)
-  maybe (pure (storeFilePath storeDir sp)) throwEvalError refusal
+  traverse_ throwEvalError refusal
+  made <- wrapIO (tryJust refusedStore (createStoreDirectory (SP.unStoreDir storeDir)))
+  either throwEvalError (const (pure (storeFilePath storeDir sp))) made
+  where
+    refusedStore err
+      | isUserError err = Just (T.pack (ioeGetErrorString err))
+      | otherwise = Nothing
 
 -- | Resolve path-value text to a filesystem location against the store
 -- this evaluation was given.  The read counterpart of 'evalFilePath':
@@ -1706,11 +1717,10 @@ runEvalIOTraced st (EvalIO action) = do
 -- address names, with the store volume's own sibling-name handling.
 unpackToStoreVerified :: FilePath -> NAR.NarEntry -> BS.ByteString -> IO (Either Text ())
 unpackToStoreVerified dest entry expectedDigest = do
-  Dir.createDirectoryIfMissing True (takeDirectory dest)
   -- Probed per write rather than carried in 'EvalState': the store
   -- directory need not exist when evaluation starts, and the probe
-  -- answers for a path on disk.  It was created just above, and the
-  -- cost is one pathconf call per tree.
+  -- answers for a path on disk.  'evalFilePath' made it before this
+  -- destination was named, and the cost is one pathconf call per tree.
   sensitivity <- probeCaseSensitivity (takeDirectory dest)
   onDiskNar <- narBytesIfPresent (volumeCaseHack sensitivity) dest
   placed <-

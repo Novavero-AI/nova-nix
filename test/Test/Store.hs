@@ -63,7 +63,7 @@ import Nix.Http (defaultFetchRetryPolicy, ioRetryEffects)
 import Nix.Push (computeClosure)
 import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv)
-import Nix.Store.Access (AclEntry (..), DirAccess (..), DirSecurity (..), Distrust (..), accessSddl, descriptorDistrust, distrustMessage, parseSecurityDescriptor, securityDistrust, sidFromText, storeDirectories)
+import Nix.Store.Access (AclEntry (..), DirAccess (..), DirSecurity (..), Distrust (..), accessSddl, descriptorDistrust, distrustMessage, parseSecurityDescriptor, securityDistrust, sidFromText, stateDirectories, storeDirectories)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
@@ -1680,20 +1680,20 @@ testStoreAccessIO = do
           pure $
             assertEqual "protected before the open" (Just False) (daclProtected <$> before)
               `andThen` assertEqual "the DACL after the open" before after,
-      runTest "the directories a store's open checks are those below its volume root, outermost first, the store's and its state directory's made with StoreAccess and the others with ParentAccess" $
+      runTest "the directories down to a store are those below its volume root, outermost first, the store's made with StoreAccess and its parents with ParentAccess" $
+        assertEqual "the default store" [("C:\\nix", ParentAccess), ("C:\\nix\\store", StoreAccess)] (storeDirectories "C:\\nix\\store")
+          `andThen` assertEqual
+            "a store further down"
+            [("D:\\a", ParentAccess), ("D:\\a\\_temp", ParentAccess), ("D:\\a\\_temp\\store", StoreAccess)]
+            (storeDirectories "D:\\a\\_temp\\store")
+          `andThen` assertEqual "a store at a drive root" [] (storeDirectories "E:\\")
+          `andThen` assertEqual "a trailing separator" [("C:\\nix", ParentAccess), ("C:\\nix\\store", StoreAccess)] (storeDirectories "C:\\nix\\store\\"),
+      runTest "the directories a store's open checks are those down to the store, then its state directory, made with StoreAccess" $
         assertEqual
           "the default store"
           [("C:\\nix", ParentAccess), ("C:\\nix\\store", StoreAccess), ("C:\\nix\\store\\.nova-nix", StoreAccess)]
-          (storeDirectories "C:\\nix\\store\\.nova-nix")
-          `andThen` assertEqual
-            "a store further down"
-            [("D:\\a", ParentAccess), ("D:\\a\\_temp", ParentAccess), ("D:\\a\\_temp\\store", StoreAccess), ("D:\\a\\_temp\\store\\.nova-nix", StoreAccess)]
-            (storeDirectories "D:\\a\\_temp\\store\\.nova-nix")
-          `andThen` assertEqual "a store at a drive root" [("E:\\.nova-nix", StoreAccess)] (storeDirectories "E:\\.nova-nix")
-          `andThen` assertEqual
-            "a trailing separator"
-            [("C:\\nix", ParentAccess), ("C:\\nix\\store", StoreAccess), ("C:\\nix\\store\\.nova-nix", StoreAccess)]
-            (storeDirectories "C:\\nix\\store\\.nova-nix\\"),
+          (stateDirectories "C:\\nix\\store\\.nova-nix")
+          `andThen` assertEqual "a store at a drive root" [("E:\\.nova-nix", StoreAccess)] (stateDirectories "E:\\.nova-nix"),
       decides "install-nova-nix's DACL, on a directory the user owns, is trusted with a store" (Just someUser) (Just installerEntries) accepted,
       decides "a directory Administrators own, as one an elevated shell makes is, is trusted" (Just administrators) (Just installerEntries) accepted,
       decides "a directory SYSTEM owns is trusted" (Just localSystem) (Just installerEntries) accepted,
@@ -1848,6 +1848,33 @@ testStoreAccessIO = do
           openStore testLogger (StoreDir root) >>= closeStore
           outcome <- try (openStore testLogger (StoreDir root) >>= closeStore)
           pure (either (\err -> Fail ("the second open failed: " <> T.pack (show (err :: IOException)))) (const Pass) outcome),
+      -- An evaluation's write can come before the store is opened: its
+      -- directories are made as the open makes them, and the state
+      -- directory, which only the open makes, is not.
+      onWindows "a store an evaluation writes to first is made closed to other users, its parents too" $ \user ->
+        fresh "eval-first" $ do
+          let root = scratch "eval-first" </> "nix" </> "store"
+          written <- evalNixIOStore (StoreDir root) tmpBase "builtins.toFile \"written\" \"by an evaluation\""
+          outer <- carries "the outer parent" (parentEntries user) (scratch "eval-first")
+          inner <- carries "the inner parent" (parentEntries user) (scratch "eval-first" </> "nix")
+          storeDir <- carries "the store directory" (storeEntries user) root
+          stateMade <- doesDirectoryExist (root </> metaDirName)
+          pure $
+            either (\err -> Fail ("the evaluation failed: " <> err)) (const Pass) written
+              `andThen` outer
+              `andThen` inner
+              `andThen` storeDir
+              `andThen` assertEqual "the state directory made" False stateMade,
+      onWindows "an evaluation's write into a store whose parent lets Authenticated Users change it is refused in the open's words" $ \_ ->
+        fresh "eval-refused" $ do
+          (root, parent, code, said) <- madeThenChanged "eval-refused" ["/grant", "*" <> T.unpack authenticatedUsers <> ":(OI)(CI)(M)"]
+          store <- unStoreDir <$> canonicalStoreDir (StoreDir root)
+          written <- evalNixIOStore (StoreDir root) tmpBase "builtins.toFile \"written\" \"by an evaluation\""
+          pure $ case (code, written, sidFromText authenticatedUsers) of
+            (ExitFailure _, _, _) -> Fail ("icacls could not grant the right: " <> T.pack said)
+            (ExitSuccess, Left err, Just grantee)
+              | T.pack (distrustMessage parent store (WritableBy grantee)) `T.isInfixOf` err -> Pass
+            (ExitSuccess, outcome, _) -> Fail ("expected the write refused, got: " <> T.pack (show outcome)),
       -- LOCAL SERVICE stands for another user: giving a directory away
       -- takes the restore privilege an elevated shell holds.
       onWindows "a store whose parent another account owns is refused, naming the parent and its owner" $ \_ ->
