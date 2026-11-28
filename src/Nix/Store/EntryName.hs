@@ -4,11 +4,13 @@
 -- A NAR carries names and link targets as bytes.  Upstream's restore on
 -- POSIX appends each name to the destination path as it finds it and
 -- hands each target to @symlink@ unchanged (@RestoreSink@ in fs-sink.cc
--- at 2.24.9), refusing only what the archive grammar refuses: an empty
--- name, @.@, @..@, a @/@ or a NUL (@parse@ in archive.cc).  Those
--- refusals hold on every host, through the parser's own check.  Every
--- other limit belongs to a filesystem, so it is decided per host
--- ('NameRules'): a name the host cannot hold is refused before anything
+-- at 2.24.9), refusing only what its archive parser refuses: an empty
+-- name, @.@, @..@, a @/@ or a NUL in a name, a name over 255 bytes or a
+-- target over 4095, an empty target or one holding NUL, and a node 64
+-- directories deep (@parse@ in archive.cc at 2.36.0).  Those refusals
+-- hold on every host, through nova-cache's parser, which makes the same
+-- ones.  Every other limit belongs to a filesystem, so it is decided per
+-- host ('NameRules'): a name the host cannot hold is refused before anything
 -- is written, and a store path holding one does not materialize there,
 -- whichever way it arrives.
 --
