@@ -105,6 +105,7 @@ library
     Nix.Store.DB
     Nix.Store.GC
     Nix.Store.Handle
+    Nix.Store.Import
     Nix.Store.Lock
     Nix.Store.Symlink
     Nix.Store.CaseSensitive

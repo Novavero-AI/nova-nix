@@ -12,6 +12,7 @@ module Test.Store
     testFoldingVolumeIO,
     testStoreDB,
     testPathInfo,
+    testStoreImports,
     testParseStorePath,
     testStoreAccessIO,
     testStoreOpsIO,
@@ -38,7 +39,7 @@ import Control.Monad (filterM, forM, join, when)
 import Data.Bits (complement, popCount, shiftR, xor, (.&.), (.|.))
 import qualified Data.ByteString as BS
 import Data.Char (isDigit)
-import Data.Either (isLeft, isRight)
+import Data.Either (fromLeft, isLeft, isRight)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isPrefixOf, nub, sort)
 import qualified Data.Map.Strict as Map
@@ -56,7 +57,7 @@ import HttpFixture (Reply (..), httpResponse, withHttpServer)
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuildStop (..), buildDerivation, buildWithDeps, checkDerivation, defaultBuildConfig, verifyFetchHash)
 import Nix.Builder.BuildDir (createBuildDir)
 import qualified Nix.Daemon.Protocol as Proto
-import Nix.Derivation (Derivation (..), DerivationOutput (..), currentPlatform, toATerm)
+import Nix.Derivation (Derivation (..), DerivationOutput (..), currentPlatform, drvFileATerm, drvFileDerivation, drvFilePath, inputAddressed, toATerm)
 import Nix.Eval (NixValue (..))
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.IO (EvalState (..), sourceCopies)
@@ -67,12 +68,13 @@ import Nix.Http (defaultFetchRetryPolicy, ioRetryEffects)
 import Nix.Logger (Logger (..))
 import Nix.Push (computeClosure)
 import qualified Nix.Realise as Realise
-import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv)
+import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, closeStore, collectGarbage, copyPathInto, deleteSpecificPaths, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, reachableFrom, referencesMap, referrersFirst, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, specificStillAliveMessage, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv)
 import Nix.Store.Access (AclEntry (..), DirAccess (..), DirSecurity (..), Distrust (..), accessSddl, descriptorDistrust, distrustMessage, parseSecurityDescriptor, securityDistrust, sidFromText, stateDirectories, storeDirectories)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), Ultimate (..), UnregisterResult (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathFromHashPart, queryPathInfo, queryReferences, queryReferrers, queryValidDerivers, registerPath, registerPaths, unregisterPathRow)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
 import qualified Nix.Store.ExecBit as ExecBit
+import Nix.Store.Import (SignatureRequirement (..), addTextToStore, importNar)
 import Nix.Store.Metadata (MetadataChange (..), NodeKind (..), NodeMetadata (..), Ownership (..), canonicalPermissions, executablePermissions, metadataChanges, readOnlyPermissions, storeModificationTime)
 import Nix.Store.Ops (EvalObjects (..), StoreOps (..), StoreQueries (..), localQueries, withLocalStore, withOpenedOnFirstUse)
 import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, qualifyPathText, storePathHashLen, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
@@ -80,6 +82,7 @@ import Nix.Store.Path.Internal (StorePath (..))
 import Nix.Store.Upstream (UpstreamHazard (..), upstreamManagedRefusal)
 import qualified Nix.Substituter as Subst
 import NodeStatus (NodeStatus (..), nodeStatus)
+import qualified NovaCache.Base64 as B64
 import qualified NovaCache.Hash as CHash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NarInfo as NarInfo
@@ -95,7 +98,7 @@ import qualified System.Info as SI
 import qualified System.OsPath as OP
 import qualified System.Process as Proc
 import System.Timeout (timeout)
-import Test.Harness (TestResult (..), andThen, assertEqual, assertEvalErrorIO, bytesText, canonicalAs, chunkReader, deleteNamed, evalAndBuild, evalNix, evalNixIOIn, evalNixIOStore, findTestShell, forceRemoveIfExists, genContentAddress, genDrvName, genFixturePath, genSignatures, mkTestBuildDrv, narInfoRequest, narSpecFileVector, narSpecVector, offeredThenFetched, parseErrorTag, posixOnlyEntries, quotedAsCxx, removeIfExists, runTest, runTestM, servedPaths, sigTestKeyText, simpleTestDrv, symlinksAvailable, testDrvPath, testEvalState, testLogger, walkWatchdogMicros, withTempStore)
+import Test.Harness (TestResult (..), andThen, assertEqual, assertEvalErrorIO, bytesText, canonicalAs, chunkReader, deleteNamed, evalAndBuild, evalDerivationIOStore, evalNix, evalNixIOIn, evalNixIOStore, findTestShell, forceRemoveIfExists, genContentAddress, genDrvName, genFixturePath, genSignatures, mkTestBuildDrv, narInfoRequest, narSpecFileVector, narSpecVector, offeredThenFetched, parseErrorTag, posixOnlyEntries, quotedAsCxx, removeIfExists, runTest, runTestM, servedPaths, sigTestKeyText, simpleTestDrv, symlinksAvailable, testDrvPath, testEvalState, testLogger, walkWatchdogMicros, withTempStore)
 import qualified Test.QuickCheck as QC
 import Text.Read (readMaybe)
 
@@ -1493,6 +1496,269 @@ testPathInfo = do
               assertEqual "the link" (Right link) rooted
                 `andThen` assertEqual "the record" (Just linkBytes) recorded
                 `andThen` assertEqual "the roots" [GcRoot link (pathText top)] roots
+    ]
+
+-- | What a daemon takes into a store and deletes from it: a NAR imported
+-- with its path's info, held to its signatures or its content address,
+-- its hash and size and, for a derivation, its outputs; a text added as
+-- a client adds a @.drv@; upstream's delete of named paths; and the
+-- roots the collector keeps, upstream's own and the extra ones a caller
+-- names.
+testStoreImports :: IO [Bool]
+testStoreImports = do
+  putStrLn "store/imports-and-deletes"
+  tmpBase <- getTemporaryDirectory
+  shell <- findTestShell
+  let root = tmpBase </> "nova-nix-test-imports"
+      dir = StoreDir (root </> "nix" </> "store")
+      state = root </> "nix" </> "var" </> "nix"
+      at hash = StorePath (T.replicate 32 hash)
+      pathText = T.pack . storePathToFilePath dir
+      inStore action = do
+        forceRemoveIfExists root
+        bracket (openStore testLogger dir) closeStore action `finally` forceRemoveIfExists root
+      -- A NAR of one file and the claim it arrives with: unsigned, with
+      -- no content address, its hash and size as the bytes give them.
+      narOf contents = NAR.serialise (NAR.NarRegular False contents)
+      claimFor sp nar =
+        PathRegistration sp (CHash.formatNixHash (CHash.hashBytes nar)) (BS.length nar) Nothing [] NotUltimate Set.empty Nothing
+      source nar = chunkReader [nar]
+      importWith store requirement claim nar = source nar >>= importNar store requirement claim
+      -- The key 'sigTestKeyText' names, and a claim signed by it.
+      keys = either (const []) pure (Signing.parseSecretKey sigTestKeyText >>= Signing.toPublicKey)
+      signedBy claim = case Signing.parseSecretKey sigTestKeyText >>= (`Signing.sign` fingerprintOf claim) of
+        Right sig -> claim {prSignatures = either (const Set.empty) Set.singleton (Proto.parseSignature (TE.encodeUtf8 sig))}
+        Left _ -> claim
+      fingerprintOf claim =
+        NarInfo.NarInfo
+          { NarInfo.niStorePath = storePathToText defaultStoreDir (prPath claim),
+            NarInfo.niUrl = "",
+            NarInfo.niCompression = "",
+            NarInfo.niFileHash = Nothing,
+            NarInfo.niFileSize = Nothing,
+            NarInfo.niNarHash = prNarHash claim,
+            NarInfo.niNarSize = toInteger (prNarSize claim),
+            NarInfo.niReferences = [],
+            NarInfo.niDeriver = Nothing,
+            NarInfo.niSigs = [],
+            NarInfo.niCA = Nothing
+          }
+      -- A derivation with no inputs, its outputs where its name makes
+      -- them, and its .drv's ATerm and path.
+      derivationNamed name = do
+        made <- inputAddressed name [] (mkTestBuildDrv shell (at "0" name) "true")
+        pure (drvFileDerivation made, drvFileATerm made, drvFilePath made)
+      textClaim sp contents refs =
+        (claimFor sp (narOf contents)) {prReferences = refs, prContentAddress = Proto.contentAddressFromParts Proto.TextMethod "sha256" (sha256Digest contents)}
+      registration sp refs = PathRegistration sp "sha256:x" 1 Nothing refs NotUltimate Set.empty Nothing
+      plant store sp = do
+        createDirectoryIfMissing True (storePathToFilePath dir sp)
+        BS.writeFile (storePathToFilePath dir sp </> "data") (TE.encodeUtf8 (spName sp))
+        registerPath (stDB store) (registration sp [])
+      plantReferring store sp refs = do
+        createDirectoryIfMissing True (storePathToFilePath dir sp)
+        registerPath (stDB store) (registration sp refs)
+      onDisk sp = Dir.doesPathExist (storePathToFilePath dir sp)
+  linked <- symlinksAvailable
+  sequence
+    [ runTestM "an unsigned NAR of an input-addressed path is refused, and nothing is written" $
+        inStore $ \store -> do
+          let sp = at "a" "unsigned"
+              nar = narOf "contents"
+          outcome <- importWith store (RequireSignature keys) (claimFor sp nar) nar
+          written <- onDisk sp
+          valid <- isValid store sp
+          pure (assertEqual "outcome" (Left ("cannot add path '" <> storePathToText defaultStoreDir sp <> "' because it lacks a signature by a trusted key")) outcome `andThen` assertEqual "written, valid" (False, False) (written, valid)),
+      runTestM "a NAR signed by a trusted key is imported and registered with its signature" $
+        inStore $ \store -> do
+          let sp = at "b" "signed"
+              nar = narOf "contents"
+              claim = signedBy (claimFor sp nar)
+          outcome <- importWith store (RequireSignature keys) claim nar
+          info <- queryPathInfo (stDB store) sp
+          contents <- BS.readFile (storePathToFilePath dir sp)
+          pure $
+            assertEqual "outcome" (Right ()) outcome
+              `andThen` assertEqual "contents" "contents" contents
+              `andThen` assertEqual "signatures" (Just (prSignatures claim)) (piSignatures <$> info)
+              `andThen` assertEqual "signed" False (Set.null (prSignatures claim)),
+      runTestM "an unsigned NAR whose content address makes its path is imported, and one whose tree does not reproduce the address is refused" $
+        inStore $ \store -> do
+          let nar = narOf "addressed"
+              digest = sha256Digest nar
+              address = Proto.contentAddressFromParts (Proto.FixedMethod NarIngestion) "sha256" digest
+              other = narOf "something else"
+          case makeFixedOutputPath "addressed" "sha256" NarIngestion digest of
+            Left err -> pure (Fail (T.pack (show err)))
+            Right sp -> do
+              accepted <- importWith store (RequireSignature keys) (claimFor sp nar) {prContentAddress = address} nar
+              info <- queryPathInfo (stDB store) sp
+              let lying = case makeFixedOutputPath "lying" "sha256" NarIngestion digest of
+                    Right path -> path
+                    Left _ -> sp
+              refused <- importWith store (RequireSignature keys) (claimFor lying other) {prContentAddress = address} other
+              lyingWritten <- onDisk lying
+              pure $
+                assertEqual "accepted" (Right ()) accepted
+                  `andThen` assertEqual "address recorded" (Just address) (piContentAddress <$> info)
+                  `andThen` assertEqual "lying written" False lyingWritten
+                  `andThen` case refused of
+                    Left reason | ("ca hash mismatch importing path '" <> storePathToText defaultStoreDir lying <> "'") `T.isPrefixOf` reason -> Pass
+                    unexpected -> Fail ("expected the address mismatch, got: " <> T.pack (show unexpected)),
+      runTestM "a content address that does not make its path is warned of each time upstream tests it, and refused" $
+        inStore $ \store -> do
+          let sp = at "d" "misaddressed"
+              nar = narOf "misaddressed"
+              claim = (claimFor sp nar) {prContentAddress = Proto.contentAddressFromParts (Proto.FixedMethod NarIngestion) "sha256" (sha256Digest nar)}
+              logical = storePathToText defaultStoreDir sp
+              warnings = length . filter (== ("warning: path '" <> logical <> "' claims to be content-addressed but isn't"))
+          (unsigned, unsignedLines) <- withLogged store (\logging -> importWith logging (RequireSignature keys) claim nar)
+          (signed, signedLines) <- withLogged store (\logging -> importWith logging (RequireSignature keys) (signedBy claim) nar)
+          (unchecked, uncheckedLines) <- withLogged store (\logging -> importWith logging SignaturesNotRequired claim nar)
+          written <- onDisk sp
+          let refusal = Left ("cannot add path '" <> logical <> "' to the Nix store because it claims to be content-addressed but isn't")
+          pure $
+            assertEqual "unsigned" (Left ("cannot add path '" <> logical <> "' because it lacks a signature by a trusted key")) unsigned
+              `andThen` assertEqual "signed" refusal signed
+              `andThen` assertEqual "unchecked" refusal unchecked
+              `andThen` assertEqual "warnings of each" (1, 2, 1) (warnings unsignedLines, warnings signedLines, warnings uncheckedLines)
+              `andThen` assertEqual "written" False written,
+      runTestM "a NAR whose hash or size is not the claim's is refused in upstream's words, and its tree removed" $
+        inStore $ \store -> do
+          let sp = at "c" "mismatch"
+              nar = narOf "contents"
+              wrongHash = (claimFor sp nar) {prNarHash = CHash.formatNixHash (CHash.hashBytes "not the nar")}
+              wrongSize = (claimFor sp nar) {prNarSize = BS.length nar + 1}
+              sri bytes = "sha256-" <> B64.encode (case CHash.hashBytes bytes of CHash.NixHash raw -> raw)
+          hashed <- importWith store SignaturesNotRequired wrongHash nar
+          sized <- importWith store SignaturesNotRequired wrongSize nar
+          written <- onDisk sp
+          valid <- isValid store sp
+          pure $
+            assertEqual
+              "hash"
+              (Left ("hash mismatch importing path '" <> storePathToText defaultStoreDir sp <> "';\n  specified: " <> sri "not the nar" <> "\n  got:       " <> sri nar))
+              hashed
+              `andThen` assertEqual "size" (Left ("size mismatch importing path '" <> storePathToText defaultStoreDir sp <> "';\n  specified: " <> T.pack (show (BS.length nar + 1)) <> "\n  got:       " <> T.pack (show (BS.length nar)))) sized
+              `andThen` assertEqual "written, valid" (False, False) (written, valid),
+      runTestM "a .drv with a wrong output path is refused, imported or added, and the one its name makes is taken" $
+        inStore $ \store ->
+          case derivationNamed "checked" of
+            Left err -> pure (Fail (T.pack (show err)))
+            Right (drv, aterm, drvPath) -> do
+              let wrongOut = at "1" "checked"
+                  wrongDrv = drv {drvOutputs = [out {doPath = wrongOut} | out <- drvOutputs drv], drvEnv = Map.insert "out" (TE.encodeUtf8 (storePathToText defaultStoreDir wrongOut)) (drvEnv drv)}
+                  wrongAterm = toATerm wrongDrv
+                  rightOut = case drvOutputs drv of
+                    out : _ -> doPath out
+                    [] -> wrongOut
+                  expected = Left ("derivation has incorrect output '" <> storePathToText defaultStoreDir wrongOut <> "', should be '" <> storePathToText defaultStoreDir rightOut <> "'")
+              case makeTextPath "checked.drv" (sha256Digest wrongAterm) [] of
+                Left err -> pure (Fail (T.pack (show err)))
+                Right wrongPath -> do
+                  imported <- importWith store SignaturesNotRequired (textClaim wrongPath wrongAterm []) (narOf wrongAterm)
+                  added <- addTextToStore store "checked.drv" wrongAterm []
+                  wrongValid <- isValid store wrongPath
+                  taken <- addTextToStore store "checked.drv" aterm []
+                  pure $
+                    assertEqual "imported" expected imported
+                      `andThen` assertEqual "added" (Left (fromLeft "" expected)) added
+                      `andThen` assertEqual "the wrong one, valid" False wrongValid
+                      `andThen` assertEqual "the right one" (Right drvPath) taken,
+      -- The store hashes the input as the evaluator did, so a derivation
+      -- the evaluator made is taken by its outputs.
+      runTestM "a .drv the evaluator made, with an input derivation, is taken once its input is" $ do
+        let expression = "let input = derivation { name = \"input\"; system = \"x\"; builder = \"/bin/sh\"; }; in derivation { name = \"outer\"; system = \"x\"; builder = \"/bin/sh\"; dep = input; }"
+        inputDrv <- evalDerivationIOStore dir "." ("(" <> expression <> ").dep")
+        outerDrv <- evalDerivationIOStore dir "." expression
+        inStore $ \store -> case (inputDrv, outerDrv) of
+          (Right input, Right outer) -> do
+            let refsOf drv = drvInputSrcs drv <> Map.keys (drvInputDrvs drv)
+            inputAdded <- addTextToStore store "input.drv" (toATerm input) (refsOf input)
+            outerAdded <- addTextToStore store "outer.drv" (toATerm outer) (refsOf outer)
+            pure $ case (inputAdded, outerAdded) of
+              (Right _, Right _) -> Pass
+              other -> Fail ("expected both taken, got: " <> T.pack (show other))
+          other -> pure (Fail ("evaluation failed: " <> T.pack (show other))),
+      runTestM "a referrer and its referent named together delete in either order" $
+        inStore $ \store -> do
+          -- Path order puts the referrer first in one pair, last in the
+          -- other.
+          let earlyReferrer = at "d" "early-referrer"
+              lateReferent = at "f" "late-referent"
+              earlyReferent = at "g" "early-referent"
+              lateReferrer = at "h" "late-referrer"
+          plant store lateReferent
+          plantReferring store earlyReferrer [lateReferent]
+          plant store earlyReferent
+          plantReferring store lateReferrer [earlyReferent]
+          first <- deleteSpecificPaths store Set.empty (Set.fromList [earlyReferrer, lateReferent])
+          second <- deleteSpecificPaths store Set.empty (Set.fromList [earlyReferent, lateReferrer])
+          left <- mapM (\sp -> (,) <$> isValid store sp <*> onDisk sp) [earlyReferrer, lateReferent, earlyReferent, lateReferrer]
+          pure $
+            assertEqual "referrer first" (Right (map pathText [earlyReferrer, lateReferent])) (gcrDeleted <$> first)
+              `andThen` assertEqual "referent first" (Right (map pathText [lateReferrer, earlyReferent])) (gcrDeleted <$> second)
+              `andThen` assertEqual "left" (replicate 4 (False, False)) left,
+      runTestM "a named path a path not named references, a root keeps or an extra root keeps is left, with upstream's refusal" $
+        inStore $ \store -> do
+          let referent = at "i" "referent"
+              referrer = at "j" "referrer"
+              kept = at "k" "kept"
+              refusal sp = Left (specificStillAliveMessage (storePathToText defaultStoreDir sp))
+          plant store referent
+          plantReferring store referrer [referent]
+          plant store kept
+          referenced <- deleteSpecificPaths store Set.empty (Set.singleton referent)
+          extra <- deleteSpecificPaths store (Set.singleton kept) (Set.singleton kept)
+          stillThere <- mapM (isValid store) [referent, referrer, kept]
+          pure $
+            assertEqual "referenced" (refusal referent) (gcrDeleted <$> referenced)
+              `andThen` assertEqual "an extra root" (refusal kept) (gcrDeleted <$> extra)
+              `andThen` assertEqual "still valid" [True, True, True] stillThere,
+      runTestM "the collector keeps what the extra roots given reference" $
+        inStore $ \store -> do
+          let top = at "l" "extra-top"
+              dep = at "m" "extra-dep"
+              garbage = at "n" "garbage"
+          plant store dep
+          plantReferring store top [dep]
+          plant store garbage
+          collected <- collectGarbage store (Set.singleton top)
+          valid <- mapM (isValid store) [top, dep, garbage]
+          pure (assertEqual "deleted" (Right [pathText garbage]) (gcrDeleted <$> collected) `andThen` assertEqual "valid" [True, True, False] valid),
+      runTestM "roots under upstream's gcroots and profiles keep their closures for a store where upstream keeps its own" $
+        if not linked
+          then Pass <$ putStrLn "  SKIP  symlinks unavailable"
+          else inStore $ \store -> do
+            let profiled = at "p" "profiled"
+                profiledDep = at "q" "profiled-dep"
+                rooted = at "r" "rooted"
+                garbage = at "s" "unrooted"
+            plant store profiledDep
+            plantReferring store profiled [profiledDep]
+            plant store rooted
+            plant store garbage
+            createDirectoryIfMissing True (state </> "profiles" </> "per-user" </> "u")
+            createDirectoryIfMissing True (state </> "gcroots")
+            Dir.createDirectoryLink (storePathToFilePath dir profiled) (state </> "profiles" </> "per-user" </> "u" </> "profile-1-link")
+            Dir.createDirectoryLink "profile-1-link" (state </> "profiles" </> "per-user" </> "u" </> "profile")
+            Dir.createDirectoryLink (storePathToFilePath dir rooted) (state </> "gcroots" </> "rooted")
+            collected <- collectGarbage store Set.empty
+            valid <- mapM (isValid store) [profiled, profiledDep, rooted, garbage]
+            pure (assertEqual "valid" [True, True, True, False] valid `andThen` assertEqual "collected" True (either (const False) (const True) collected)),
+      runTestM "referrersFirst puts each path before every one of them it references" $ do
+        -- Edges from a higher number to a lower one, so the graph is
+        -- acyclic, self-references included.
+        let named n = T.justifyRight 3 '0' (T.pack (show n))
+            genEdges = QC.listOf ((\a b -> (named (max a b), named (min a b))) <$> QC.chooseInt (0, 20) <*> QC.chooseInt (0, 20))
+            ordered edges =
+              let paths = Set.fromList (concat [[a, b] | (a, b) <- edges])
+                  references = Map.fromListWith (<>) [(a, [b]) | (a, b) <- edges]
+                  order = referrersFirst references paths
+                  position path = length (takeWhile (/= path) order)
+               in sort order == Set.toAscList paths && and [position a < position b | (a, b) <- edges, a /= b]
+        result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} (QC.forAll genEdges ordered)
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
     ]
 
 -- | The schema an earlier nova-nix made a store's database with, before it
@@ -2983,7 +3249,7 @@ testStoreGC = do
               PathRegistration orphan "sha256:o" 1 Nothing [] NotUltimate Set.empty Nothing
             ]
         -- A refused collection is a failure of the test, not a result.
-        collect = collectGarbage store >>= either (throwIO . userError . T.unpack) pure
+        collect = collectGarbage store Set.empty >>= either (throwIO . userError . T.unpack) pure
     permanent <-
       sequence
         [ -- A regular file named like the path, under gcroots: upstream's
@@ -3046,7 +3312,7 @@ testStoreGC = do
               conn
               "INSERT INTO ValidPaths (path, hash, registrationTime, deriver, narSize) VALUES (?, ?, 0, NULL, 0)"
               (foreignRow, "sha256:z" :: T.Text)
-            collected <- collectGarbage store
+            collected <- collectGarbage store Set.empty
             deleted <- deleteNamed store (basenameOf dep)
             SQL.execute conn "DELETE FROM ValidPaths WHERE path = ?" (SQL.Only foreignRow)
             SQL.close conn
@@ -3244,7 +3510,7 @@ testStoreGC = do
                                 "deleting '" <> pathText orphan <> "'"
                               ]
                         Dir.removePathForcibly link
-                        (collected, logged) <- withLogged store collectGarbage
+                        (collected, logged) <- withLogged store (`collectGarbage` Set.empty)
                         pure $
                           if isRight collected && all (`elem` logged) expected
                             then Pass
@@ -3371,7 +3637,7 @@ testStoreGCUpstreamManaged = do
   results <-
     sequence
       [ runTestM "a collection and a checked delete refuse a store upstream's database manages" $ do
-          collected <- collectGarbage store
+          collected <- collectGarbage store Set.empty
           deleted <- deleteNamed store (spHash upstreamPath <> "-" <> spName upstreamPath)
           treeKept <- Dir.doesPathExist (tree </> "data")
           let names err = all (`T.isInfixOf` err) ["upstream Nix's database", "also manages the store", "db.sqlite", T.pack (unStoreDir opened)]
@@ -3385,7 +3651,7 @@ testStoreGCUpstreamManaged = do
           createDirectoryIfMissing True (unStoreDir sibling)
           plant sibling
           other <- openStore testLogger sibling
-          collected <- collectGarbage other
+          collected <- collectGarbage other Set.empty
           closeStore other
           treeGone <- not <$> Dir.doesPathExist (storePathToFilePath sibling upstreamPath)
           pure $ case collected of
@@ -3408,7 +3674,7 @@ testStoreGCUpstreamManaged = do
               plant linkedStore
               Dir.createDirectoryLink (unStoreDir linkedStore) link
               viaLink <- openStore testLogger (StoreDir link)
-              collected <- collectGarbage viaLink
+              collected <- collectGarbage viaLink Set.empty
               closeStore viaLink
               treeKept <- Dir.doesPathExist (storePathToFilePath linkedStore upstreamPath </> "data")
               Dir.removePathForcibly linkRoot
@@ -3423,7 +3689,7 @@ testStoreGCUpstreamManaged = do
               unlock = Dir.setPermissions dbDir (Dir.setOwnerReadable True (Dir.setOwnerSearchable True (Dir.setOwnerWritable True Dir.emptyPermissions)))
           Dir.setPermissions dbDir Dir.emptyPermissions
           examinable <- try (Dir.getPermissions upstreamDb) :: IO (Either IOException Dir.Permissions)
-          collected <- collectGarbage store `finally` unlock
+          collected <- collectGarbage store Set.empty `finally` unlock
           treeKept <- Dir.doesPathExist (tree </> "data")
           case examinable of
             Right _ -> Pass <$ putStrLn "  SKIP  an empty-permission directory can be searched here"
@@ -3432,7 +3698,7 @@ testStoreGCUpstreamManaged = do
               other -> Fail ("expected the refusal, got: " <> T.pack (show (other, treeKept))),
         runTestM "without upstream's database the same tree is swept" $ do
           Dir.removeFile upstreamDb
-          collected <- collectGarbage store
+          collected <- collectGarbage store Set.empty
           treeGone <- not <$> Dir.doesPathExist tree
           pure $ case collected of
             Right results | gcrDeleted results == [T.pack (storePathToFilePath opened upstreamPath)], treeGone -> Pass

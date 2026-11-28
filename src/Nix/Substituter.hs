@@ -123,6 +123,7 @@ module Nix.Substituter
     verifyNarHash,
     verifyNarSize,
     checkStatedAddress,
+    checkContentAddress,
     narInfoMatchesPath,
     decompressorFor,
     decompressNar,
@@ -163,7 +164,7 @@ import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.CacheDirectory (CacheInfo (..), CacheOpenFailure (..), cacheFilePath, fileUrlDirectory, openCacheDirectory)
 import Nix.Compression (NarCompression (..), parseNarCompression)
-import Nix.Daemon.Protocol (ContentAddress, ContentAddressMethod (..), Signature, caAlgo, caDigest, caMethod, parseContentAddress, parseSignature)
+import Nix.Daemon.Protocol (ContentAddress, ContentAddressMethod (..), Signature, caAlgo, caDigest, caMethod, parseContentAddress, parseSignature, renderContentAddress)
 import Nix.Hash (FileIngestionMethod (..), ModuloHash, moduloHashFinalize, moduloHashInit, moduloHashUpdate)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, fetchStatusFailure, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Logger (Logger (..), logWarning)
@@ -780,12 +781,21 @@ checkStatedAddress caseHack dir sp destPath stated = case stated of
   Nothing -> pure (Right Nothing)
   Just spelled -> case parseContentAddress spelled of
     Left err -> pure (Left ("narinfo CA '" <> spelled <> "' does not parse: " <> err))
-    Right address -> case moduloHashInit (caAlgo address) (TE.encodeUtf8 (spHash sp)) of
-      Nothing -> pure (Left ("narinfo CA '" <> spelled <> "' names an algorithm nova-nix cannot hash with"))
-      Just start -> (>>= compared address) <$> treeDigest caseHack (caMethod address) start destPath
+    Right address -> (Just address <$) <$> checkContentAddress caseHack dir sp destPath address
+
+-- | Hold the tree at a path to a content address, as upstream's store
+-- holds a path it adds once the NAR's hash and size are checked: the tree
+-- is hashed as the address's method reads it, its NAR, or for a flat or
+-- text address the bytes of the regular file it must be, modulo the
+-- path's hash part, and refused in upstream's words when that differs,
+-- the path spelled under the store directory given.
+checkContentAddress :: NAR.CaseHack -> StoreDir -> StorePath -> FilePath -> ContentAddress -> IO (Either Text ())
+checkContentAddress caseHack dir sp destPath address = case moduloHashInit (caAlgo address) (TE.encodeUtf8 (spHash sp)) of
+  Nothing -> pure (Left ("content address '" <> renderContentAddress address <> "' names an algorithm nova-nix cannot hash with"))
+  Just start -> (>>= compared) <$> treeDigest caseHack (caMethod address) start destPath
   where
-    compared address got
-      | got == caDigest address = Right (Just address)
+    compared got
+      | got == caDigest address = Right ()
       | otherwise =
           Left
             ( "ca hash mismatch importing path '"

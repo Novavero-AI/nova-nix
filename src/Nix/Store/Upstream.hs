@@ -27,6 +27,7 @@ module Nix.Store.Upstream
   ( UpstreamHazard (..),
     upstreamManagedRefusal,
     upstreamDatabasePath,
+    upstreamStateDir,
   )
 where
 
@@ -45,28 +46,36 @@ import System.IO.Error (isDoesNotExistError)
 -- Layout
 -- ---------------------------------------------------------------------------
 
--- | The database upstream Nix would keep for a store in this directory,
--- when the directory is one upstream's local store uses.  That store is
--- @\/nix\/store@, with its state in @nixStateDir@, @\/nix\/var\/nix@
--- unless @NIX_STATE_DIR@ or the build moves it; or, opened with a root,
--- @\<root\>\/nix\/store@ with its state in @\<root\>\/nix\/var\/nix@
--- (@LocalFSStoreConfig@).  The database is @db\/db.sqlite@ in the state
--- directory (@LocalStore@).
-upstreamDatabasePath :: FilePath -> Maybe FilePath
-upstreamDatabasePath dir
-  | upstreamStoreDirTail `isSuffixOf` splitDirectories trimmed = Just (takeDirectory trimmed </> upstreamDatabaseRelPath)
+-- | The state directory upstream Nix would keep for a store in this
+-- directory, when the directory is one upstream's local store uses:
+-- @\/nix\/var\/nix@ for @\/nix\/store@, unless @NIX_STATE_DIR@ or the
+-- build moves it, and for a store opened with a root,
+-- @\<root\>\/nix\/store@, @\<root\>\/nix\/var\/nix@.
+upstreamStateDir :: FilePath -> Maybe FilePath
+upstreamStateDir dir
+  | upstreamStoreDirTail `isSuffixOf` splitDirectories trimmed = Just (takeDirectory trimmed </> upstreamStateRelPath)
   | otherwise = Nothing
   where
     trimmed = dropTrailingPathSeparator dir
+
+-- | The database upstream Nix would keep for a store in this directory:
+-- @db\/db.sqlite@ in its state directory ('upstreamStateDir').
+upstreamDatabasePath :: FilePath -> Maybe FilePath
+upstreamDatabasePath dir = (</> upstreamDatabaseRelPath) <$> upstreamStateDir dir
 
 -- | The last two components of every directory upstream's local store
 -- keeps a store in.
 upstreamStoreDirTail :: [FilePath]
 upstreamStoreDirTail = ["nix", "store"]
 
--- | Upstream's database, relative to the directory that holds its store.
+-- | Upstream's state directory, relative to the directory that holds its
+-- store.
+upstreamStateRelPath :: FilePath
+upstreamStateRelPath = "var" </> "nix"
+
+-- | Upstream's database, relative to its state directory.
 upstreamDatabaseRelPath :: FilePath
-upstreamDatabaseRelPath = "var" </> "nix" </> "db" </> "db.sqlite"
+upstreamDatabaseRelPath = "db" </> "db.sqlite"
 
 -- ---------------------------------------------------------------------------
 -- The refusal

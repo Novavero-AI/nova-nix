@@ -5634,7 +5634,7 @@ testReferenceClosureIO = do
     recorded <- Set.fromList <$> queryReferences (stDB store) outSP
     createDirectoryIfMissing True (gcRootsDir sd)
     BS.writeFile rootFile ""
-    collected <- collectGarbage store
+    collected <- collectGarbage store Set.empty
     validity <- mapM (isValid store) [outSP, libRuntime, srcRuntime, stray]
     runtimesOnDisk <- mapM (Dir.doesPathExist . (</> "data") . onDisk) [libRuntime, srcRuntime]
     let recordedAmong = filter (\sp -> Set.member (pathText sp) recorded)
