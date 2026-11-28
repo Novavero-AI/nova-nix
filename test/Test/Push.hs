@@ -39,7 +39,7 @@ import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), PushS
 import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), ed25519SeedBytes, loadSecretKeyFile, pushTarget, pushToDirectory, signNarInfo)
 import qualified Nix.Realise as Realise
 import Nix.Store (Store (..), addToStore, closeStore, openStore, releasePathLock, writeDrv)
-import Nix.Store.DB (PathInfo (..), PathRegistration (..), queryReferences, registerPaths)
+import Nix.Store.DB (PathInfo (..), PathRegistration (..), Ultimate (..), queryReferences, registerPaths)
 import Nix.Store.Path (StoreDir (..), parseStorePath, storePathToFilePath)
 import Nix.Store.Path.Internal (StorePath (..))
 import qualified Nix.Substituter as Subst
@@ -210,7 +210,10 @@ testPushPure = do
           piNarHash = recordedHash,
           piNarSize = 1234,
           piDeriver = Nothing,
-          piRegTime = 0
+          piRegTime = 0,
+          piUltimate = NotUltimate,
+          piSignatures = Set.empty,
+          piContentAddress = Nothing
         }
 
 -- | Closure computation against a real (temp) store database.
@@ -227,7 +230,10 @@ testPushClosureIO = do
               prNarHash = "sha256:" <> T.replicate 52 "0",
               prNarSize = 1,
               prDeriver = Nothing,
-              prReferences = refs
+              prReferences = refs,
+              prUltimate = NotUltimate,
+              prSignatures = Set.empty,
+              prContentAddress = Nothing
             }
     registerPaths (stDB store) [regFor spTop [spMid], regFor spMid [spLeaf], regFor spLeaf []]
     fromTop <- computeClosure store [spTop]

@@ -38,11 +38,13 @@ and would take them for debris.
 
 ## The database
 
-[`src/Nix/Store/DB.hs`] keeps two tables, named and shaped after two of
+[`src/Nix/Store/DB.hs`] keeps three tables, named and shaped after
 upstream's: `ValidPaths`, a row per registered path with its NAR hash and
-size, its deriver and its registration time, and `Refs`, a row per
-reference from one valid path to another. A path is valid when it has a
-row. The database runs in WAL mode with foreign keys on, and a connection
+size, its deriver, its registration time, whether this store built it,
+its signatures and the content address its name was made from; `Refs`, a
+row per reference from one valid path to another; and
+`DerivationOutputs`, the outputs of each valid derivation. A path is valid
+when it has a row. The database runs in WAL mode with foreign keys on, and a connection
 waits up to an hour for another's lock, as upstream's does. A read-only
 evaluation opens it read-only and writes no row.
 
@@ -272,8 +274,8 @@ A root keeps a store path and everything it refers to. Roots live in
 
 - **Out-links.** `build` links its output from `./result`, or the path
   `--out-link` gives, and a profile links each of its generations the same
-  way. The link's absolute path is recorded in a file in `gcroots/auto/`
-  named by the SHA-256 of that path. A record whose link is gone is
+  way. The bytes of the link's absolute path are recorded in a file in
+  `gcroots/auto/` named by their SHA-256. A record whose link is gone is
   removed by the next walk, and one whose link no longer points into the
   store roots nothing.
 - **Permanent roots** are the operator's: anywhere else under `gcroots/`,

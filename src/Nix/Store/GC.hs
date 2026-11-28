@@ -29,15 +29,15 @@
 --   to its output ('addOutLinkRoot', upstream's @addPermRoot@): the
 --   out-link @PATH -> \<store path\>@, @.\/result@ unless @--out-link@
 --   names another path, plus a record
---   @gcroots\/auto\/\<sha256 of PATH\>@ holding PATH's absolute
---   spelling.  Upstream's record is a symlink to the out-link; here it
---   is a regular file with the same content, because the record must be
---   writable on every platform the store runs on.  The out-link itself
---   is a native symlink everywhere, with the Developer Mode requirement
---   the README states for symlinks.  A record whose out-link no longer
---   exists is stale and removed by the next walk, as upstream removes
---   its stale @auto@ links; one whose out-link exists but no longer
---   points into the store is simply not a root.
+--   @gcroots\/auto\/\<sha256 of PATH\>@ holding the bytes of PATH's
+--   absolute spelling.  Upstream's record is a symlink to the out-link;
+--   here it is a regular file with the same content, because the record
+--   must be writable on every platform the store runs on.  The out-link
+--   itself is a native symlink everywhere, with the Developer Mode
+--   requirement the README states for symlinks.  A record whose out-link
+--   no longer exists is stale and removed by the next walk, as upstream
+--   removes its stale @auto@ links; one whose out-link exists but no
+--   longer points into the store is simply not a root.
 --
 -- Upstream also finds runtime roots (open files and mapped executables
 -- of running processes, through @\/proc@ on Linux and @lsof@ elsewhere)
@@ -186,8 +186,8 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import GHC.IO.Exception (IOErrorType (InappropriateType))
-import Nix.Eval.CanonPath (canonPath)
 import Nix.Hash (sha256Digest)
+import Nix.HostPath (absolutePath, hostPathBytes, hostPathFromBytes)
 import Nix.Logger (Logger (..))
 import Nix.Store.DB (UnregisterResult (..), isValidPath, metaDirName, queryAllReferences, queryAllValidPaths, unregisterPathRow, unregisterPathRows)
 import Nix.Store.Handle (Store (..), withCollectorLock)
@@ -196,11 +196,12 @@ import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, parseStorePath
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode, createSymlinkOfKind)
 import Nix.Store.Upstream (UpstreamHazard (..), upstreamManagedRefusal)
 import qualified NovaCache.Base32 as Base32
-import System.Directory (createDirectoryIfMissing, doesPathExist, getFileSize, getSymbolicLinkTarget, listDirectory, makeAbsolute, pathIsSymbolicLink, removePathForcibly, renamePath)
+import System.Directory (createDirectoryIfMissing, doesPathExist, getFileSize, getSymbolicLinkTarget, listDirectory, pathIsSymbolicLink, removePathForcibly, renamePath)
+import qualified System.Directory.OsPath as OsDir
 import System.FilePath (normalise, splitDirectories, takeDirectory, takeFileName, (</>))
 import qualified System.FilePath.Windows as Windows
 import System.IO.Error (ioeGetErrorType, isDoesNotExistError, isPermissionError)
-import System.OsPath (encodeFS)
+import System.OsPath (decodeFS, encodeFS)
 import Text.Printf (printf)
 
 -- ---------------------------------------------------------------------------
@@ -223,17 +224,18 @@ gcRootsDir dir = unStoreDir dir </> metaDirName </> gcRootsDirName
 autoRootsDir :: StoreDir -> FilePath
 autoRootsDir dir = gcRootsDir dir </> autoRootsDirName
 
--- | The record name for an out-link: nix-base32 of the SHA-256 of the
--- link's absolute spelling, so one out-link has one record however
--- often it is re-registered.  Upstream hashes with SHA-1; the digest is
--- an internal key and the store has no SHA-1 primitive to spend on it.
-indirectRootRecordName :: FilePath -> FilePath
-indirectRootRecordName link = T.unpack (Base32.encode (sha256Digest (TE.encodeUtf8 (T.pack link))))
+-- | The record name for an out-link, given the bytes of its absolute
+-- spelling ('Nix.HostPath.hostPathBytes'): nix-base32 of their SHA-256,
+-- so one out-link has one record however often it is re-registered.
+-- Upstream hashes with SHA-1; the digest is an internal key and the store
+-- has no SHA-1 primitive to spend on it.
+indirectRootRecordName :: BS.ByteString -> FilePath
+indirectRootRecordName link = T.unpack (Base32.encode (sha256Digest link))
 
 -- | Where a record is written before it is renamed into @auto@: under
 -- the metadata directory, which the roots walk never enters, so a
 -- listing under the shared lease sees a record whole or not at all.
-recordStagingPath :: StoreDir -> FilePath -> FilePath
+recordStagingPath :: StoreDir -> BS.ByteString -> FilePath
 recordStagingPath dir link = unStoreDir dir </> metaDirName </> indirectRootRecordName link <> stagingSuffix
 
 -- | The suffix of a record still being written.
@@ -291,6 +293,11 @@ rootInsideStoreMessage link =
   "creating a garbage collector root ("
     <> quotedPath link
     <> ") in the Nix store is forbidden (are you running nova-nix build inside the store?)"
+
+-- | The refusal of a Windows out-link holding an unpaired surrogate,
+-- which has no bytes for its record to hold.
+unrecordableLinkMessage :: FilePath -> Text
+unrecordableLinkMessage link = "cannot register '" <> T.pack link <> "' as a garbage collector root: its name has no UTF-8 form"
 
 -- | Upstream's refusal to clobber something that is not a store link.
 alreadyExistsMessage :: FilePath -> Text
@@ -383,7 +390,10 @@ walkRoots logger storeDir path = walk `catch` unreadable
         WalkRegular
           | isUnderDir (autoRootsDir storeDir) path -> do
               recorded <- BS.readFile path
-              followIndirect logger storeDir path (T.unpack (TE.decodeUtf8Lenient recorded))
+              -- A record holding bytes no host path has, which on Windows
+              -- only a hand edit leaves, names no out-link.
+              outLink <- traverse decodeFS (hostPathFromBytes recorded)
+              maybe (pure []) (followIndirect logger storeDir path) outLink
           | otherwise ->
               pure [RootCandidate path sp Nothing | Just sp <- [parseStorePathBaseName (T.pack (takeFileName path))]]
         WalkAbsent -> pure []
@@ -431,12 +441,16 @@ isUnderDir dir path = splitDirectories (normalise dir) `isPrefixOf` splitDirecto
 
 -- | Register an out-link as an indirect root: upstream's @addPermRoot@.
 -- The link's spelling is made absolute and collapsed without resolving
--- symlinks (upstream's @canonPath@), so a @..@ cannot spell a link into
--- the store past the refusal, and the store directory it is compared
--- with is the handle's canonical one.  A link inside the store is
--- refused, as is clobbering anything that is not already a symlink into
--- the store; an existing store link is replaced.  The link's parent
--- directories are created, as upstream's @makeSymlink@ creates them.
+-- symlinks ('absolutePath', upstream's @canonPath@), so a @..@ cannot
+-- spell a link into the store past the refusal, and the store directory
+-- it is compared with is the handle's canonical one.  The spelling is
+-- the link's own bytes throughout, so a link no text can spell is
+-- created, recorded and found again under the name it was given; on
+-- Windows one holding an unpaired surrogate, which has no bytes to
+-- record, is refused.  A link inside the store is refused, as is
+-- clobbering anything that is not already a symlink into the store; an
+-- existing store link is replaced.  The link's parent directories are
+-- created, as upstream's @makeSymlink@ creates them.
 -- The link is created first and the record second, so a failed link
 -- (Windows without Developer Mode) leaves no record naming it; the
 -- record is written under the metadata directory and renamed into
@@ -449,10 +463,14 @@ isUnderDir dir path = splitDirectories (normalise dir) `isPrefixOf` splitDirecto
 -- link is briefly absent rather than briefly two things.
 addOutLinkRoot :: Store -> FilePath -> StorePath -> IO (Either Text FilePath)
 addOutLinkRoot store rawLink sp = do
-  link <- T.unpack . canonPath . T.pack <$> makeAbsolute rawLink
+  cwd <- OsDir.getCurrentDirectory
+  spelled <- absolutePath cwd <$> encodeFS rawLink
+  link <- decodeFS spelled
   if isUnderDir (unStoreDir (stDir store)) link
     then pure (Left (rootInsideStoreMessage link))
-    else do
+    else maybe (pure (Left (unrecordableLinkMessage link))) (linkTo spelled link) (hostPathBytes spelled)
+  where
+    linkTo spelled link linkBytes = do
       node <- classifyWalkNode link
       replaceable <- case node of
         WalkAbsent -> pure True
@@ -463,22 +481,21 @@ addOutLinkRoot store rawLink sp = do
         else do
           when (node == WalkSymlink) (removePathForcibly link)
           createDirectoryIfMissing True (takeDirectory link)
-          linkPath <- encodeFS link
           target <- encodeFS (storePathToFilePath (stDir store) sp)
-          created <- createSymlinkOfKind linkPath target
+          created <- createSymlinkOfKind spelled target
           case created of
             Left err -> pure (Left err)
             Right () -> do
-              publishRecord (stDir store) link
+              publishRecord (stDir store) linkBytes
               pure (Right link)
 
--- | Write an out-link's record into @auto@ by rename, unless a record
--- with that content is already there.
-publishRecord :: StoreDir -> FilePath -> IO ()
-publishRecord dir link = do
-  let record = autoRootsDir dir </> indirectRootRecordName link
-      staging = recordStagingPath dir link
-      content = TE.encodeUtf8 (T.pack link)
+-- | Write an out-link's record into @auto@ by rename, given the bytes of
+-- the link's spelling, unless a record with that content is already
+-- there.
+publishRecord :: StoreDir -> BS.ByteString -> IO ()
+publishRecord dir content = do
+  let record = autoRootsDir dir </> indirectRootRecordName content
+      staging = recordStagingPath dir content
   createDirectoryIfMissing True (autoRootsDir dir)
   existing <- try (BS.readFile record) :: IO (Either IOException BS.ByteString)
   when (existing /= Right content) $ do

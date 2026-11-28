@@ -152,6 +152,8 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Ord (comparing)
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -161,13 +163,13 @@ import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.CacheDirectory (CacheInfo (..), CacheOpenFailure (..), cacheFilePath, fileUrlDirectory, openCacheDirectory)
 import Nix.Compression (NarCompression (..), parseNarCompression)
-import Nix.Daemon.Protocol (ContentAddressMethod (..), caAlgo, caDigest, caMethod, parseContentAddress)
+import Nix.Daemon.Protocol (ContentAddress, ContentAddressMethod (..), Signature, caAlgo, caDigest, caMethod, parseContentAddress, parseSignature)
 import Nix.Hash (FileIngestionMethod (..), ModuloHash, moduloHashFinalize, moduloHashInit, moduloHashUpdate)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, fetchStatusFailure, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Logger (Logger (..), logWarning)
 import Nix.Realise (Fallback (..), Offer (..))
 import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), UpstreamHazard (..), abortNarUnpack, acquirePathLock, canonicalizeMetadata, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, sinkNarStream, unpackNarEntry, upstreamManagedRefusal, volumeCaseHack)
-import Nix.Store.DB (PathRegistration (..))
+import Nix.Store.DB (PathRegistration (..), Ultimate (..))
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir, StorePath (spHash, spName), parseStorePathBaseName, storePathHashLen, storePathToFilePath, storePathToText)
 import qualified NovaCache.Base32 as Nix32
@@ -675,7 +677,7 @@ unpackAndVerify store sp narInfo rawNar =
   -- narinfo must not leave an unpacked-but-unregistered path behind.
   case verifiedInputs of
     Left err -> pure (SubstError err)
-    Right (verified, refs, deriver) -> unpackVerifiedNar store sp verified refs deriver
+    Right (verified, refs, deriver) -> unpackVerifiedNar store sp verified refs deriver (narInfoSignatures narInfo)
   where
     verifiedInputs = do
       verified <- verifyNar narInfo rawNar
@@ -686,14 +688,14 @@ unpackAndVerify store sp narInfo rawNar =
 -- | The strict pipeline's unpack sink: deserialize a t'VerifiedNar',
 -- materialize it at the store path, seal it read-only, and recheck the
 -- tree on disk against the carried digest before building its
--- registration from the references and deriver.  Follows the same
+-- registration from the references, deriver and signatures.  Follows the same
 -- per-path lock protocol as the live pipeline: the lock is taken
 -- before the stale destination is cleared, validity re-checks under
 -- it, and a success carries the lock still held.  A store upstream
 -- Nix's database may also manage is refused before the lock, as the
 -- live pipeline refuses it.
-unpackVerifiedNar :: Store -> StorePath -> VerifiedNar -> [StorePath] -> Maybe Text -> IO SubstResult
-unpackVerifiedNar store sp verified refs deriver =
+unpackVerifiedNar :: Store -> StorePath -> VerifiedNar -> [StorePath] -> Maybe Text -> Set Signature -> IO SubstResult
+unpackVerifiedNar store sp verified refs deriver sigs =
   case NAR.deserialise (verifiedNarBytes verified) of
     Left err -> pure (SubstError ("NAR deserialisation failed: " <> T.pack err))
     Right narEntry -> do
@@ -744,7 +746,7 @@ unpackVerifiedNar store sp verified refs deriver =
                 Left err -> do
                   Dir.removePathForcibly destPath
                   pure (SubstError err)
-                Right () ->
+                Right address ->
                   pure $
                     SubstSuccess
                       PathRegistration
@@ -758,7 +760,10 @@ unpackVerifiedNar store sp verified refs deriver =
                           -- Integer conversion that could wrap.
                           prNarSize = BS.length (verifiedNarBytes verified),
                           prDeriver = deriver,
-                          prReferences = refs
+                          prReferences = refs,
+                          prUltimate = NotUltimate,
+                          prSignatures = sigs,
+                          prContentAddress = address
                         }
                       lock
 
@@ -768,10 +773,11 @@ unpackVerifiedNar store sp verified refs deriver =
 -- or for a flat or text address the bytes of the regular file it must
 -- be, modulo the path's hash part, and refused in upstream's words when
 -- that differs.  A narinfo that states no address holds the tree to its
--- NarHash alone, as upstream's does.
-checkStatedAddress :: NAR.CaseHack -> StoreDir -> StorePath -> FilePath -> Maybe Text -> IO (Either Text ())
+-- NarHash alone, as upstream's does.  The address the tree was held to,
+-- if any, is the one its registration records.
+checkStatedAddress :: NAR.CaseHack -> StoreDir -> StorePath -> FilePath -> Maybe Text -> IO (Either Text (Maybe ContentAddress))
 checkStatedAddress caseHack dir sp destPath stated = case stated of
-  Nothing -> pure (Right ())
+  Nothing -> pure (Right Nothing)
   Just spelled -> case parseContentAddress spelled of
     Left err -> pure (Left ("narinfo CA '" <> spelled <> "' does not parse: " <> err))
     Right address -> case moduloHashInit (caAlgo address) (TE.encodeUtf8 (spHash sp)) of
@@ -779,7 +785,7 @@ checkStatedAddress caseHack dir sp destPath stated = case stated of
       Just start -> (>>= compared address) <$> treeDigest caseHack (caMethod address) start destPath
   where
     compared address got
-      | got == caDigest address = Right ()
+      | got == caDigest address = Right (Just address)
       | otherwise =
           Left
             ( "ca hash mismatch importing path '"
@@ -1131,7 +1137,7 @@ materializeNarFromSource store sp narInfo declaredDigest refs deriver source =
             Left err -> do
               Dir.removePathForcibly destPath
               pure (Left (FatalFailure err))
-            Right () ->
+            Right address ->
               pure $
                 Right
                   PathRegistration
@@ -1142,7 +1148,10 @@ materializeNarFromSource store sp narInfo declaredDigest refs deriver source =
                       prNarHash = Hash.formatNixHash declaredDigest,
                       prNarSize = narByteCount,
                       prDeriver = deriver,
-                      prReferences = refs
+                      prReferences = refs,
+                      prUltimate = NotUltimate,
+                      prSignatures = narInfoSignatures narInfo,
+                      prContentAddress = address
                     }
 
 -- | Drive the decompressed chunk source through incremental hashing,
@@ -1289,6 +1298,14 @@ bzip2Failure bzip2Err = case bzip2Err of
 -- ---------------------------------------------------------------------------
 -- Pure helpers
 -- ---------------------------------------------------------------------------
+
+-- | The signatures a narinfo carries, which a substituted path is
+-- registered with, as upstream registers the path info it copied.  A
+-- @Sig@ line that does not parse, which upstream would refuse the narinfo
+-- for, is left out: the narinfo was accepted for a signature that did
+-- verify.
+narInfoSignatures :: NarInfo.NarInfo -> Set Signature
+narInfoSignatures = Set.fromList . concatMap (either (const []) pure . parseSignature . TE.encodeUtf8) . NarInfo.niSigs
 
 -- | Verify narinfo signatures against the cache's trusted public keys.
 -- Accepts when at least one signature verifies under at least one key,

@@ -40,7 +40,7 @@ import qualified Nix.Hash as Hash
 import Nix.Json (IntegerRange (..), Json (..), JsonBuilder (..), parseJson, parseJsonInto, renderJson)
 import Nix.Parser (parseNix)
 import Nix.Store (Store (..), closeStore, isValid, openStore, writeDrv, writeDrvClosure)
-import Nix.Store.DB (PathRegistration (..), queryReferences, registerPath)
+import Nix.Store.DB (PathRegistration (..), Ultimate (..), queryReferences, registerPath)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, storePathToFilePath, storePathToText)
 import Nix.Store.Path.Internal (StorePath (..))
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
@@ -605,7 +605,7 @@ testFromATerm = do
                 }
         -- The source row registers first, as in the build driver, where
         -- materializeEvalSources precedes the closure write.
-        registerPath (stDB store) (PathRegistration srcSp "sha256:0" 0 Nothing [])
+        registerPath (stDB store) (PathRegistration srcSp "sha256:0" 0 Nothing [] NotUltimate Set.empty Nothing)
         writeDrvClosure
           store
           ( Map.fromList
