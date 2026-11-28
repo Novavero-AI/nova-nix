@@ -1166,8 +1166,11 @@ static int wfp_self_command(const WCHAR *root)
     if (config == NULL)
         return 1;
     service = sid_of(widen(config_value(config, "service-sid")));
-    engine = open_dynamic_engine(&error);
-    if (engine == NULL || service == NULL) {
+    /* WFP refuses a change to an object's security from a dynamic
+     * session, so this one is not. */
+    engine = NULL;
+    error = FwpmEngineOpen0(NULL, RPC_C_AUTHN_WINNT, NULL, NULL, &engine);
+    if (error != 0 || engine == NULL || service == NULL) {
         say("WFP administrator's session: %s", error_text(error));
         return 0;
     }
@@ -1534,83 +1537,190 @@ static WCHAR *child_command(const char *image, const WCHAR *operation)
 }
 
 /* ------------------------------------------------------------------------
- * The service: a direct start on its own window station
+ * The service: a direct start, as the helper starts a builder
  * ------------------------------------------------------------------------ */
 
-/* Start COMMAND in SLOT with CreateProcessAsUserW from this process, on a
- * desktop of the service's unnamed window station named for the run,
- * granting the service and the slot: the start nova-nix-sandbox would make
- * if a service could not name a window station.  It has no job and no
- * pseudoconsole; it shows only whether the builder starts and where. */
-static void direct_start(struct service_context *c, const struct slot *slot, const WCHAR *command, struct build *result)
+/* Where a direct start puts the builder: lpDesktop empty, which leaves the
+ * window station to the system's rules for the token's logon session; a
+ * desktop of the service's own window station, made for the build and
+ * granting the service and the slot; or lpDesktop NULL, the service's own
+ * window station and desktop inherited. */
+enum desktop_mode {
+    DESKTOP_SYSTEM,
+    DESKTOP_OWN_STATION,
+    DESKTOP_INHERIT
+};
+
+static const char *const desktop_mode_names[] = {"lpDesktop empty", "a desktop on the service's own station",
+                                                 "lpDesktop NULL"};
+
+/* The environment block a builder gets, from builder_environment's
+ * entries. */
+static WCHAR *environment_block(const struct slot *slot)
 {
-    PSID grantees[2];
-    SECURITY_ATTRIBUTES attributes;
-    HWINSTA previous;
-    HDESK desktop;
-    WCHAR *desktop_name;
+    size_t count;
+    const char *const *entries = builder_environment(slot, &count);
+    size_t total = 2;
+    size_t i;
+    WCHAR *block;
+    WCHAR *at;
+    for (i = 0; i < count; i++)
+        total += wcslen(widen(entries[i])) + 1;
+    block = take(total * sizeof(WCHAR));
+    at = block;
+    for (i = 0; i < count; i++) {
+        WCHAR *entry = widen(entries[i]);
+        wcscpy(at, entry);
+        at += wcslen(entry) + 1;
+    }
+    return block;
+}
+
+/* Start COMMAND in SLOT as nova-nix-sandbox starts a builder, but on the
+ * desktop MODE says: CreateProcessAsUserW from this process, suspended,
+ * inheriting NUL and the log pipe alone, attached to a pseudoconsole this
+ * process owns, assigned to a job that kills on close, ends a crash and
+ * grants no breakaway, then resumed; the build ends when the job holds no
+ * process, and the job is closed after it. */
+static void direct_build(struct service_context *c, const struct slot *slot, const WCHAR *command, enum desktop_mode mode,
+                         struct build *result)
+{
     SECURITY_ATTRIBUTES inheritable;
+    HANDLE nul;
     HANDLE log_read = NULL;
     HANDLE log_write = NULL;
-    STARTUPINFOW startup;
-    PROCESS_INFORMATION process;
+    HANDLE console_in_read = NULL;
+    HANDLE console_in_write = NULL;
+    HANDLE console_out_read = NULL;
+    HANDLE console_out_write = NULL;
+    HPCON console = NULL;
+    struct reader console_reader;
     struct reader log_reader;
+    HANDLE job;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    HANDLE inherited[2];
+    SIZE_T list_size = 0;
+    LPPROC_THREAD_ATTRIBUTE_LIST list;
+    STARTUPINFOEXW startup;
+    PROCESS_INFORMATION process;
+    COORD size;
+    HDESK desktop = NULL;
+    WCHAR *desktop_name = NULL;
+    ULONGLONG deadline;
+    ULONGLONG ended;
+    HRESULT made;
     memset(result, 0, sizeof *result);
     result->log_end_ms = -1;
     result->status = "";
     result->log = "";
-    if (c->station == NULL) {
-        result->start_error = ERROR_INVALID_HANDLE;
-        return;
-    }
     c->runs++;
-    grantees[0] = c->own_sid;
-    grantees[1] = slot->sid_binary;
-    attributes.nLength = sizeof attributes;
-    attributes.lpSecurityDescriptor = grant_all(grantees, 2);
-    attributes.bInheritHandle = FALSE;
-    desktop_name = join(L"nnprobe-direct-", decimal(c->runs), END);
-    previous = c->user32.get_station();
-    c->user32.set_station(c->station);
-    desktop = c->user32.create_desktop(desktop_name, NULL, NULL, 0, GENERIC_ALL, &attributes);
-    if (desktop == NULL)
-        result->start_error = GetLastError();
-    c->user32.set_station(previous);
-    if (desktop == NULL)
-        return;
+    if (mode == DESKTOP_SYSTEM) {
+        desktop_name = L"";
+    } else if (mode == DESKTOP_OWN_STATION) {
+        PSID grantees[2];
+        SECURITY_ATTRIBUTES attributes;
+        WCHAR *name = join(L"nnprobe-direct-", decimal(c->runs), END);
+        if (!c->have_user32) {
+            result->start_error = ERROR_PROC_NOT_FOUND;
+            return;
+        }
+        grantees[0] = c->own_sid;
+        grantees[1] = slot->sid_binary;
+        attributes.nLength = sizeof attributes;
+        attributes.lpSecurityDescriptor = grant_all(grantees, 2);
+        attributes.bInheritHandle = FALSE;
+        desktop = c->user32.create_desktop(name, NULL, NULL, 0, GENERIC_ALL, &attributes);
+        if (desktop == NULL) {
+            result->start_error = GetLastError();
+            say("MEASURE direct start CreateDesktopW on the service's own station: %s", error_text(result->start_error));
+            return;
+        }
+        desktop_name = join(object_name(&c->user32, c->user32.get_station()), L"\\", name, END);
+    }
     inheritable.nLength = sizeof inheritable;
     inheritable.lpSecurityDescriptor = NULL;
     inheritable.bInheritHandle = TRUE;
+    nul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable, OPEN_EXISTING, 0, NULL);
     CreatePipe(&log_read, &log_write, &inheritable, 0);
     SetHandleInformation(log_read, HANDLE_FLAG_INHERIT, 0);
-    memset(&startup, 0, sizeof startup);
-    startup.cb = sizeof startup;
-    startup.lpDesktop = join(c->station_name, L"\\", desktop_name, END);
-    startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdInput = NULL;
-    startup.hStdOutput = log_write;
-    startup.hStdError = log_write;
-    if (!CreateProcessAsUserW(slot->token, NULL, (LPWSTR)join(command, END), NULL, NULL, TRUE, DETACHED_PROCESS, NULL,
-                              widen(slot->build), &startup, &process)) {
-        result->start_error = GetLastError();
-        CloseHandle(log_write);
-        CloseHandle(log_read);
-        c->user32.close_desktop(desktop);
+    CreatePipe(&console_in_read, &console_in_write, NULL, 0);
+    CreatePipe(&console_out_read, &console_out_write, NULL, 0);
+    size.X = 80;
+    size.Y = 25;
+    made = CreatePseudoConsole(size, console_in_read, console_out_write, 0, &console);
+    CloseHandle(console_in_read);
+    CloseHandle(console_out_write);
+    if (FAILED(made)) {
+        result->start_error = (DWORD)made;
         return;
     }
-    CloseHandle(log_write);
-    start_reader(&log_reader, log_read);
-    if (WaitForSingleObject(process.hProcess, BUILD_TIMEOUT_MS) != WAIT_OBJECT_0) {
-        result->timed_out = 1;
+    start_reader(&console_reader, console_out_read);
+    job = CreateJobObjectW(NULL, NULL);
+    memset(&limits, 0, sizeof limits);
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof limits);
+    inherited[0] = nul;
+    inherited[1] = log_write;
+    InitializeProcThreadAttributeList(NULL, 2, 0, &list_size);
+    list = take(list_size);
+    InitializeProcThreadAttributeList(list, 2, 0, &list_size);
+    UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof inherited, NULL, NULL);
+    UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, console, sizeof console, NULL, NULL);
+    memset(&startup, 0, sizeof startup);
+    startup.StartupInfo.cb = sizeof startup;
+    startup.StartupInfo.lpDesktop = desktop_name;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = nul;
+    startup.StartupInfo.hStdOutput = log_write;
+    startup.StartupInfo.hStdError = log_write;
+    startup.lpAttributeList = list;
+    if (!CreateProcessAsUserW(slot->token, NULL, (LPWSTR)join(command, END), NULL, NULL, TRUE,
+                              CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                              environment_block(slot), widen(slot->build), &startup.StartupInfo, &process)) {
+        result->start_error = GetLastError();
+        CloseHandle(log_write);
+        CloseHandle(nul);
+        CloseHandle(console_in_write);
+        ClosePseudoConsole(console);
+        CloseHandle(job);
+        if (desktop != NULL)
+            c->user32.close_desktop(desktop);
+        return;
+    }
+    if (!AssignProcessToJobObject(job, process.hProcess)) {
+        result->start_error = GetLastError();
         TerminateProcess(process.hProcess, 1);
     }
-    GetExitCodeProcess(process.hProcess, &result->exit_code);
-    if (WaitForSingleObject(log_reader.thread, LOG_END_WAIT_MS) == WAIT_OBJECT_0)
-        result->log_end_ms = 0;
-    result->log = reader_text(&log_reader);
+    CloseHandle(log_write);
+    CloseHandle(nul);
+    DeleteProcThreadAttributeList(list);
+    start_reader(&log_reader, log_read);
+    ResumeThread(process.hThread);
     CloseHandle(process.hThread);
+    deadline = GetTickCount64() + BUILD_TIMEOUT_MS;
+    for (;;) {
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+        if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting, sizeof accounting, NULL)
+            || accounting.ActiveProcesses == 0)
+            break;
+        if (GetTickCount64() > deadline) {
+            result->timed_out = 1;
+            TerminateJobObject(job, 1);
+        }
+        Sleep(POLL_MS);
+    }
+    ended = GetTickCount64();
+    GetExitCodeProcess(process.hProcess, &result->exit_code);
     CloseHandle(process.hProcess);
-    c->user32.close_desktop(desktop);
+    CloseHandle(job);
+    if (WaitForSingleObject(log_reader.thread, LOG_END_WAIT_MS) == WAIT_OBJECT_0)
+        result->log_end_ms = (long)(GetTickCount64() - ended);
+    result->log = reader_text(&log_reader);
+    CloseHandle(console_in_write);
+    ClosePseudoConsole(console);
+    WaitForSingleObject(console_reader.thread, LOG_END_WAIT_MS);
+    if (desktop != NULL)
+        c->user32.close_desktop(desktop);
 }
 
 /* ------------------------------------------------------------------------
@@ -1862,7 +1972,7 @@ static void net_build(struct service_context *c, const char *label)
     SOCKET listener = loopback_listener(&port);
     char *label_copy = take(strlen(label) + 1);
     strcpy(label_copy, label);
-    through_helper(c, &c->slots[0], child_command(c->probe, join(L"net ", decimal(port), END)), &b);
+    direct_build(c, &c->slots[0], child_command(c->probe, join(L"net ", decimal(port), END)), DESKTOP_SYSTEM, &b);
     say_build(label_copy, &b);
     if (listener != INVALID_SOCKET)
         closesocket(listener);
@@ -1900,6 +2010,7 @@ static void main_phase(struct service_context *c)
     int helper_runs;
     const char *images[3];
     const char *image_labels[3];
+    const char *station;
     int i;
     station_checks(c);
     helper_probe(c);
@@ -1908,11 +2019,29 @@ static void main_phase(struct service_context *c)
     say_build("helper start slot1 identity", &b);
     helper_runs = b.start_error == 0 && strstr(b.log, "identity user") != NULL;
     say("MEASURE helper starts a builder for the service: %s", helper_runs ? "yes" : "no");
-    if (c->station != NULL) {
-        direct_start(c, &c->slots[0], child_command(c->probe, L"identity"), &b);
-        say_build("direct start slot1 identity, on the unnamed station's desktop", &b);
-        direct_start(c, &c->slots[1], child_command(c->probe, L"identity"), &b);
-        say_build("direct start slot2 identity, on the unnamed station's desktop", &b);
+
+    for (i = DESKTOP_SYSTEM; i <= DESKTOP_INHERIT; i++) {
+        char label[160];
+        snprintf(label, sizeof label, "direct start slot1 identity, %s", desktop_mode_names[i]);
+        direct_build(c, &c->slots[0], child_command(c->probe, L"identity"), (enum desktop_mode)i, &b);
+        say_build(label, &b);
+    }
+    direct_build(c, &c->slots[0], child_command(c->probe, L"identity"), DESKTOP_SYSTEM, &b);
+    say_build("direct start slot1 identity again, lpDesktop empty", &b);
+    direct_build(c, &c->slots[1], child_command(c->probe, L"identity"), DESKTOP_SYSTEM, &b);
+    say_build("direct start slot2 identity, lpDesktop empty", &b);
+    /* Whether slot2's build can open the window station slot1's builds
+     * ran on. */
+    {
+        struct build first;
+        char name[NAME_CHARS] = "";
+        direct_build(c, &c->slots[0], child_command(c->probe, L"identity"), DESKTOP_SYSTEM, &first);
+        station = strstr(first.log, "identity station ");
+        if (station != NULL && sscanf(station, "identity station %255s", name) == 1) {
+            direct_build(c, &c->slots[1], child_command(c->probe, join(L"open-station ", widen(name), END)),
+                         DESKTOP_SYSTEM, &b);
+            say_build("direct start slot2 opens slot1's window station", &b);
+        }
     }
 
     images[0] = c->probe;
@@ -1923,22 +2052,17 @@ static void main_phase(struct service_context *c)
     image_labels[2] = "image only the slot may read";
     for (i = 0; i < 3; i++) {
         char label[160];
-        snprintf(label, sizeof label, "helper start, %s", image_labels[i]);
-        through_helper(c, &c->slots[0], child_command(images[i], L"identity"), &b);
+        snprintf(label, sizeof label, "direct start, %s", image_labels[i]);
+        direct_build(c, &c->slots[0], child_command(images[i], L"identity"), DESKTOP_SYSTEM, &b);
         say_build(label, &b);
-        if (c->station != NULL) {
-            snprintf(label, sizeof label, "direct start, %s", image_labels[i]);
-            direct_start(c, &c->slots[0], child_command(images[i], L"identity"), &b);
-            say_build(label, &b);
-        }
     }
 
     {
         static const WCHAR *const ways[] = {L"escape-task", L"escape-wmi", L"escape-hkcu"};
         for (i = 0; i < 3; i++) {
             char label[64];
-            snprintf(label, sizeof label, "helper build %s", utf8(ways[i]));
-            through_helper(c, &c->slots[0], child_command(c->probe, ways[i]), &b);
+            snprintf(label, sizeof label, "direct build %s", utf8(ways[i]));
+            direct_build(c, &c->slots[0], child_command(c->probe, ways[i]), DESKTOP_SYSTEM, &b);
             say_build(label, &b);
             record_escape(c, utf8(ways[i]), b.log);
         }
@@ -2379,6 +2503,22 @@ static void child_escaped(const WCHAR *marker, const WCHAR *builder_pid, const W
         CloseHandle(copy);
 }
 
+/* Open another window station, by name, for all the access a build would
+ * want of one. */
+static void child_open_station(const WCHAR *name)
+{
+    struct user32 u;
+    HWINSTA station;
+    if (!load_user32(&u)) {
+        say("open-station user32 did not load");
+        return;
+    }
+    station = u.open_station(name, FALSE, WINSTA_ALL_ACCESS);
+    say("open-station %s: %s", utf8(name), station != NULL ? "opened" : error_text(GetLastError()));
+    if (station != NULL)
+        u.close_station(station);
+}
+
 static int child_command_run(int count, WCHAR **arguments)
 {
     const WCHAR *op = count > 2 ? arguments[2] : L"";
@@ -2389,6 +2529,8 @@ static int child_command_run(int count, WCHAR **arguments)
         child_net(utf8(arguments[3]));
     else if (wcsncmp(op, L"escape-", 7) == 0)
         child_escape(utf8(op));
+    else if (wcscmp(op, L"open-station") == 0 && count > 3)
+        child_open_station(arguments[3]);
     else if (wcscmp(op, L"escaped") == 0 && count > 5)
         child_escaped(arguments[3], arguments[4], arguments[5]);
     else

@@ -145,18 +145,24 @@ jobs:
           & $env:PROBE_EXE phase $env:PROBE_ROOT net
           exit $LASTEXITCODE
 
-      # The probe's teardown removes what its setup made, by name; this
-      # removes the same again with Windows PowerShell's own modules, for a
-      # run that ended before the probe could.  Windows PowerShell carries
-      # the LocalAccounts module itself.
+      # The probe ends the processes its builds started outside their jobs
+      # and removes what its setup made, by name; this removes the same
+      # again with Windows PowerShell's own modules, for a run that ended
+      # before the probe could, each only where it exists.  Windows
+      # PowerShell carries the LocalAccounts and ScheduledTasks modules
+      # itself.
       - name: Remove everything the probe made
         if: always()
         shell: powershell
         run: |
-          if ($env:PROBE_EXE -and (Test-Path -LiteralPath $env:PROBE_EXE)) { & $env:PROBE_EXE teardown $env:PROBE_ROOT }
+          if ($env:PROBE_EXE -and (Test-Path -LiteralPath $env:PROBE_EXE)) {
+            & $env:PROBE_EXE escapes $env:PROBE_ROOT
+            & $env:PROBE_EXE teardown $env:PROBE_ROOT
+          }
           Remove-NetFirewallRule -Name nnprobe-block -ErrorAction SilentlyContinue
-          schtasks.exe /delete /tn nnprobe-escape-task /f 2>$null
-          sc.exe delete nnprobesvc 2>$null
+          Get-ScheduledTask -TaskName nnprobe-escape-task -ErrorAction SilentlyContinue |
+            Unregister-ScheduledTask -Confirm:$false
+          if (Get-Service -Name nnprobesvc -ErrorAction SilentlyContinue) { sc.exe delete nnprobesvc }
           @(Get-LocalUser | Where-Object Name -like 'nnprobe*') | ForEach-Object {
             "removing the leftover account $($_.Name)"
             Remove-LocalUser -SID $_.SID
