@@ -34,7 +34,10 @@
 -- shim that drops to the user between the fork and the exec
 -- ('spawnAsBuildUser'), with the groups looked up beforehand, since the
 -- process library can drop to another user only by looking the user up in
--- the forked child of this threaded process.
+-- the forked child of this threaded process.  On Linux and macOS the shim
+-- starts every builder outside the sandbox, a build that runs as the user
+-- nova-nix runs as too, with no drop ('runAsInvoker'), so each starts as
+-- upstream's child starts one and ends as upstream ends one.
 module Nix.Builder.BuildUser
   ( -- * The setting
     ProcessPrivilege (..),
@@ -62,6 +65,7 @@ module Nix.Builder.BuildUser
     killBuildUser,
     giveToBuildUser,
     runAsBuildUser,
+    runAsInvoker,
     openStoreToBuildUsers,
     worldWritableAncestor,
     worldWritableMessage,
@@ -87,7 +91,7 @@ import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, bracket, displayException, finally, mask, onException, try, uninterruptibleMask_)
 import Control.Monad (unless, void)
 import Data.Bits (complement, (.&.))
-import Foreign.C.Error (Errno (..), eINVAL, ePERM, errnoToIOError)
+import Foreign.C.Error (Errno (..), eINVAL, ePERM)
 import Foreign.C.String (CString, peekCString)
 import Foreign.C.Types (CInt (..), CUInt (..))
 import Foreign.Marshal.Alloc (alloca)
@@ -108,7 +112,8 @@ import System.IO (hClose)
 import System.Posix.Files (fileGroup, fileMode, fileOwner, fileTypeModes, getFileStatus, getSymbolicLinkStatus, otherWriteMode, setFileMode, setOwnerAndGroup)
 import System.Posix.IO (OpenFileFlags (..), OpenMode (ReadOnly, WriteOnly), closeFd, defaultFileFlags, openFd)
 import System.Posix.Process (ProcessStatus (..), getProcessStatus)
-import System.Posix.Signals (signalProcess, sigKILL)
+import System.IO.Error (catchIOError, isPermissionError)
+import System.Posix.Signals (sigKILL, signalProcessGroup)
 import System.Posix.Types (Fd (..), ProcessID)
 import qualified System.Posix.User.ByteString as User
 
@@ -314,16 +319,26 @@ giveToBuildUser :: BuildUser -> FilePath -> IO ()
 -- | Run a builder as a build user, outside any sandbox, given the logger
 -- its lines go to ('streamBuildLog'), the program, its arguments, its
 -- environment as @NAME=VALUE@ entries, and the directory it starts in.
--- It reads @\/dev\/null@, as upstream's builder does, and writes its
--- standard output and error to one pipe, the build log, with every other
--- descriptor of this process closed; it has the user's uid, the build
--- users' group and the user's supplementary groups, set between the fork
--- and the exec by a C shim.  Answers how it exited, a signal as the
--- process library reports one (the signal's number, negated), or why it
--- could not start, in upstream's words for each step.  An interrupt kills
--- it and waits for it before it passes on; the processes it leaves are the
--- caller's to kill ('killBuildUser').
+-- It is started and ended as 'runAsInvoker' starts and ends one, with the
+-- user's uid, the build users' group and the user's supplementary groups,
+-- set between the fork and the exec.  The processes it leaves outside its
+-- process group are the caller's to kill ('killBuildUser').
 runAsBuildUser :: Logger -> BuildUser -> FilePath -> [String] -> [ByteString] -> FilePath -> IO (Either Text ExitCode)
+
+-- | Run a builder outside any sandbox as the user nova-nix runs as, given
+-- what 'runAsBuildUser' is given but the user, as upstream runs one.  The
+-- program is executed by its path, with no search of @PATH@.  It leads a
+-- session of its own, so it has no controlling terminal and its process
+-- group holds what it starts; it reads @\/dev\/null@ and writes its
+-- standard output and error to one pipe, the build log, with every other
+-- descriptor of this process closed; and it dumps no core, its soft limit
+-- for one being 0.  Once the log ends, or when an interrupt comes, every
+-- process left in its group is sent SIGKILL and the builder is reaped, as
+-- upstream takes a builder's status, so a builder that closed its log and
+-- ran on ends on SIGKILL.  Answers how it exited, a signal as the process
+-- library reports one (the signal's number, negated), or why it could not
+-- start, in upstream's words for each step.  Linux and macOS only.
+runAsInvoker :: Logger -> FilePath -> [String] -> [ByteString] -> FilePath -> IO (Either Text ExitCode)
 
 -- | Open a store's directory to the build users, as upstream opens it
 -- when it runs as root with build users: owned by root and their group,
@@ -358,6 +373,8 @@ killBuildUser _ = pure (Left unsupported)
 giveToBuildUser _ _ = pure ()
 
 runAsBuildUser _ _ _ _ _ _ = pure (Left unsupported)
+
+runAsInvoker _ _ _ _ _ = pure (Left unsupported)
 
 openStoreToBuildUsers _ _ = pure ()
 
@@ -445,31 +462,35 @@ killBuildUser user = alloca $ \statusPtr -> do
 giveToBuildUser user path = setOwnerAndGroup path (fromIntegral (buUid user)) (fromIntegral (buGid user))
 
 runAsBuildUser logger user program arguments environment workDir =
+  runStarted logger (spawnAsBuildUser user program arguments environment workDir)
+
+runAsInvoker logger program arguments environment workDir =
+  runStarted logger (spawnAsInvoker program arguments environment workDir)
+
+-- | Run the builder a start begins, given its standard input and its log,
+-- to its end, as 'runAsInvoker' says.
+runStarted :: Logger -> (Fd -> Fd -> IO (Either Text ProcessID)) -> IO (Either Text ExitCode)
+runStarted logger start =
   bracket openLogPipe closePipe $ \(fromBuilder, toLog) ->
     bracket (openFd nullDevice ReadOnly defaultFileFlags {cloexec = True}) closeFd $ \input -> do
       output <- Fd . fdFD <$> handleToFd toLog
-      -- The builder is reaped only once nothing can interrupt the reap: it
-      -- is waited for without being reaped, so until then its process id
-      -- names it alone, and an interrupt's kill can reach no other process.
+      -- The builder is reaped only once nothing can interrupt the reap:
+      -- until then its process id names it alone, and names its process
+      -- group, so a kill of the group can reach no other process.
       mask $ \restore -> do
-        spawned <- spawnAsBuildUser user program arguments environment workDir input output
+        spawned <- start input output
         case spawned of
           Left reason -> pure (Left reason)
           Right pid -> do
             let reap = getProcessStatus True False pid
-                -- An interrupt may come once the builder has ended, which
+                -- An interrupt may come once the group has ended, which
                 -- the kill then fails on.
                 quietly action = void (try action :: IO (Either IOException ()))
-                stop = uninterruptibleMask_ (quietly (signalProcess sigKILL pid) *> quietly (void reap))
-            restore
-              ( do
-                  -- The builder's tree holds the only write ends now, so
-                  -- its exit ends the log.
-                  hClose toLog
-                  streamBuildLog fromBuilder logger
-                  awaitExit pid
-              )
-              `onException` stop
+                stop = uninterruptibleMask_ (quietly (signalProcessGroup sigKILL pid) *> quietly (void reap))
+                -- The builder's tree holds the only write ends once this
+                -- process closes its own, so the tree's end ends the log.
+                follow = hClose toLog *> streamBuildLog fromBuilder logger
+            (restore follow *> endGroup pid) `onException` stop
             Right . exitOf <$> reap
   where
     closePipe (fromBuilder, toLog) = hClose fromBuilder *> hClose toLog
@@ -480,11 +501,12 @@ runAsBuildUser logger user program arguments environment workDir =
       Just (Stopped signal) -> ExitFailure (negate (fromIntegral signal))
       Nothing -> ExitFailure 1
 
--- | Wait for a child to end without reaping it.
-awaitExit :: ProcessID -> IO ()
-awaitExit pid = do
-  failure <- c_nn_await_exit (fromIntegral pid)
-  unless (failure == 0) (ioError (errnoToIOError "waitid" (Errno failure) Nothing Nothing))
+-- | Send SIGKILL to what is left of a builder's process group once its log
+-- has ended.  macOS refuses the signal to a group whose only process is
+-- the builder, ended and not yet reaped (EPERM), which upstream passes
+-- over too.
+endGroup :: ProcessID -> IO ()
+endGroup pid = signalProcessGroup sigKILL pid `catchIOError` \err -> unless (isPermissionError err) (ioError err)
 
 openStoreToBuildUsers storeDir user = do
   status <- getFileStatus storeDir
@@ -513,7 +535,29 @@ invokingUserIds = (\uid gid -> (fromIntegral uid, fromIntegral gid)) <$> User.ge
 -- process id once the program has replaced the child, or why it could
 -- not, in upstream's words for each step.
 spawnAsBuildUser :: BuildUser -> FilePath -> [String] -> [ByteString] -> FilePath -> Fd -> Fd -> IO (Either Text ProcessID)
-spawnAsBuildUser user program arguments environment workDir (Fd input) (Fd output) = do
+spawnAsBuildUser user = spawnWith $ \cProgram argv envp cWorkDir input output pidPtr stepPtr ->
+  withArrayLen (map fromIntegral (buSupplementaryGids user)) $ \groupCount groups ->
+    c_nn_spawn_as_user cProgram argv envp cWorkDir input output (fromIntegral (buUid user)) (fromIntegral (buGid user)) (fromIntegral groupCount) groups pidPtr stepPtr
+
+-- | Start a builder as the user nova-nix runs as, given what
+-- 'spawnAsBuildUser' is given but the user.
+spawnAsInvoker :: FilePath -> [String] -> [ByteString] -> FilePath -> Fd -> Fd -> IO (Either Text ProcessID)
+spawnAsInvoker = spawnWith c_nn_spawn_as_invoker
+
+-- | Start a builder through the shim's call given, which takes the
+-- program, its argument and environment vectors, its directory, its
+-- input and output descriptors, and where to put its process id and the
+-- step that failed.
+spawnWith ::
+  (CString -> Ptr CString -> Ptr CString -> CString -> CInt -> CInt -> Ptr CInt -> Ptr CInt -> IO CInt) ->
+  FilePath ->
+  [String] ->
+  [ByteString] ->
+  FilePath ->
+  Fd ->
+  Fd ->
+  IO (Either Text ProcessID)
+spawnWith spawn program arguments environment workDir (Fd input) (Fd output) = do
   encoding <- getFileSystemEncoding
   let withPath = GHC.withCString encoding
   withPath program $ \cProgram ->
@@ -522,13 +566,12 @@ spawnAsBuildUser user program arguments environment workDir (Fd input) (Fd outpu
         withMany BS.useAsCString environment $ \cEnvironment ->
           withArray0 nullPtr cEnvironment $ \envp ->
             withPath workDir $ \cWorkDir ->
-              withArrayLen (map fromIntegral (buSupplementaryGids user)) $ \groupCount groups ->
-                alloca $ \pidPtr ->
-                  alloca $ \stepPtr -> do
-                    failure <- c_nn_spawn_as_user cProgram argv envp cWorkDir input output (fromIntegral (buUid user)) (fromIntegral (buGid user)) (fromIntegral groupCount) groups pidPtr stepPtr
-                    if failure == 0
-                      then Right . fromIntegral <$> peek pidPtr
-                      else Left . stepMessage failure <$> peek stepPtr
+              alloca $ \pidPtr ->
+                alloca $ \stepPtr -> do
+                  failure <- spawn cProgram argv envp cWorkDir input output pidPtr stepPtr
+                  if failure == 0
+                    then Right . fromIntegral <$> peek pidPtr
+                    else Left . stepMessage failure <$> peek stepPtr
   where
     stepMessage failure step = setupContext <> stepText step <> errnoSuffix (fromIntegral failure)
     -- The values of nn_spawn_step in nn_buildusers.h.
@@ -573,13 +616,13 @@ groupList _ _ = pure []
 foreign import ccall safe "nn_buildusers.h nn_kill_user"
   c_nn_kill_user :: CUInt -> Ptr CInt -> IO CInt
 
-foreign import ccall safe "nn_buildusers.h nn_await_exit"
-  c_nn_await_exit :: CInt -> IO CInt
-
 foreign import ccall unsafe "nn_buildusers.h nn_signal_text"
   c_nn_signal_text :: CInt -> IO CString
 
 foreign import ccall safe "nn_buildusers.h nn_spawn_as_user"
   c_nn_spawn_as_user :: CString -> Ptr CString -> Ptr CString -> CString -> CInt -> CInt -> CUInt -> CUInt -> CInt -> Ptr CUInt -> Ptr CInt -> Ptr CInt -> IO CInt
+
+foreign import ccall safe "nn_buildusers.h nn_spawn_as_invoker"
+  c_nn_spawn_as_invoker :: CString -> Ptr CString -> Ptr CString -> CString -> CInt -> CInt -> Ptr CInt -> Ptr CInt -> IO CInt
 
 #endif

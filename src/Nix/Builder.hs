@@ -48,6 +48,13 @@
 -- are.  An output must belong to the member before it is made root's
 -- ("Nix.Builder.BuildUser").
 --
+-- == Outside the sandbox
+--
+-- On Linux and macOS an unsandboxed builder, a build user's or not, is
+-- started and ended as upstream's is: in a session of its own, reading
+-- @\/dev\/null@, with no core dumps, and with every process left in its
+-- process group killed once its log ends ("Nix.Builder.BuildUser").
+--
 -- == On Windows
 --
 -- The key difference is process creation.  Upstream on Linux uses
@@ -130,7 +137,7 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder.BuildDir (BuildEnding (..), FailedBuilds (..), WorkDir (..), buildDirFor, sandboxedBuildDir, withBuildDir, workDirIn)
-import Nix.Builder.BuildUser (BuildUser, BuildUsers (NoBuildUsers), buGid, buUid, giveToBuildUser, invokingUserIds, killBuildUser, openStoreToBuildUsers, runAsBuildUser, withBuildUser, worldWritableAncestor, worldWritableMessage)
+import Nix.Builder.BuildUser (BuildUser, BuildUsers (NoBuildUsers), buGid, buUid, giveToBuildUser, invokingUserIds, killBuildUser, openStoreToBuildUsers, runAsBuildUser, runAsInvoker, withBuildUser, worldWritableAncestor, worldWritableMessage)
 import Nix.Builder.Buildenv (builtinBuildenvBuilder, runBuiltinBuildenv)
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
 import Nix.Builder.Sandbox (BuilderIds (..), DarwinOptions (..), DarwinPathInputs (..), DarwinPaths (..), DarwinPlan (..), DarwinProfile (..), HelperOutcome (..), Network, PathPresence (..), PlanInputs (..), SandboxBackend (..), SandboxConfig (..), SandboxFallback (..), SandboxPath (..), SandboxUse (..), backendFallback, chrootSkeleton, darwinOptions, darwinParameters, darwinPathsInSandbox, darwinProfile, darwinSetupFailureMessage, darwinStageName, defaultSandboxConfig, helperOutcome, hostSandboxBackend, renderDarwinPlan, renderPlan, rootRefusal, sandboxHome, sandboxPlan, sandboxUse, setupFailureMessage, setupStageName, unavailableMessage)
@@ -1076,19 +1083,24 @@ endingBuildUser identity run = case identity of
     killed <- killBuildUser user
     pure (either (Left . BuilderNotEnded) (const ran) killed)
 
--- | Run an unsandboxed builder as whom it runs as: through the process
--- library as the user nova-nix runs as ('runBuilder'), or as a build user
+-- | Run an unsandboxed builder as whom it runs as: as the user nova-nix
+-- runs as, through the process library on Windows ('runBuilder') and
+-- elsewhere as upstream starts one ('runAsInvoker'), or as a build user
 -- ('runAsBuildUser').
 runBuilderAs :: Logger -> BuilderIdentity -> BuilderInvocation -> IO (Either BuilderFailure ())
 runBuilderAs logger identity invocation = case identity of
-  AsInvoker -> runBuilder logger invocation
-  AsBuildUser user -> do
-    environment <- builderEnvironment invocation
-    ran <- runAsBuildUser logger user (invProgram invocation) (invArgs invocation) (map TE.encodeUtf8 environment) (invWorkDir invocation)
-    pure $ case ran of
-      Left reason -> Left (BuilderRefused 1 reason)
-      Right ExitSuccess -> Right ()
-      Right (ExitFailure code) -> Left (BuilderExited code)
+  AsInvoker
+    | isWindows -> runBuilder logger invocation
+    | otherwise -> started (runAsInvoker logger)
+  AsBuildUser user -> started (runAsBuildUser logger user)
+  where
+    started run = do
+      environment <- builderEnvironment invocation
+      ran <- run (invProgram invocation) (invArgs invocation) (map TE.encodeUtf8 environment) (invWorkDir invocation)
+      pure $ case ran of
+        Left reason -> Left (BuilderRefused 1 reason)
+        Right ExitSuccess -> Right ()
+        Right (ExitFailure code) -> Left (BuilderExited code)
 
 -- | The ids a builder runs as outside its sandbox.
 builderIdsOf :: BuilderIdentity -> IO BuilderIds
@@ -1787,8 +1799,9 @@ homeEnvVar =
 -- Process execution
 -- ---------------------------------------------------------------------------
 
--- | Run the builder process, handing what it writes to the logger a line
--- at a time ('streamBuildLog'), and report how it exited.
+-- | Run the builder process on Windows, through the process library,
+-- handing what it writes to the logger a line at a time
+-- ('streamBuildLog'), and report how it exited.
 --
 -- Its standard output and standard error are one pipe ('openLogPipe'),
 -- so the log holds both in the order the builder wrote them, as
@@ -1826,9 +1839,7 @@ runBuilder logger invocation = do
             -- interrupt: terminateProcess reaches only the direct child,
             -- so the tree is orphaned and keeps running.  With the job,
             -- terminateProcess becomes TerminateJobObject and reaps the
-            -- tree, and waitForProcess waits for all of it.  Ignored on
-            -- POSIX, where terminateProcess signals the builder alone and
-            -- leaves its descendants running.
+            -- tree, and waitForProcess waits for all of it.
             -- A deliberately daemonizing grandchild changes from leaking
             -- to blocking the build until it exits; that is the correct
             -- trade for a build, which owns everything it spawned.
@@ -1872,8 +1883,9 @@ builderEnvironment invocation = do
 -- | 'builderEnvironment' as the process library takes one: a name and a
 -- value, which it joins with @=@.  An entry with no @=@, which a name
 -- holding a NUL leaves, is one it cannot pass, and is left out; upstream
--- passes it, and no getenv finds a variable in it.  The sandbox helper
--- passes every entry as it is.
+-- passes it, and no getenv finds a variable in it.  The sandbox helper,
+-- and on Linux and macOS the start of an unsandboxed builder
+-- ('runAsInvoker'), pass every entry as it is.
 builderProcessEnv :: BuilderInvocation -> IO [(String, String)]
 builderProcessEnv invocation = mapMaybe asPair <$> builderEnvironment invocation
   where

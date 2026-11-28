@@ -24,6 +24,9 @@ module Test.Builder
     sandboxThawChildFlag,
     sandboxThawChild,
     testTrivialBuildIO,
+    testBuilderStartIO,
+    sessionChildFlag,
+    sessionChild,
     testBuildDirIO,
     testBuildLogIO,
     testSourceDateEpochIO,
@@ -157,7 +160,7 @@ import System.Timeout (timeout)
 import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertLeft, assertRight, bytesText, canonicalAs, deleteNamed, evalDerivationIO, evalNixIO, findTestShell, forceRemoveIfExists, genFixturePath, genTextOf, hostToolsEnv, mkTestBuildDrv, narInfoRequest, narRequest, narSpecFileVector, narSpecStr, narSpecVector, offeredSubstitute, profileFixture, pureDepGraph, runTest, runTestM, servedPaths, signedTestNarInfo, symlinksAvailable, tarDir, tarFile, tarPathOrDie, testDrvPath, testLogger, withEnvVar, withTempStore)
 import qualified Test.QuickCheck as QC
 import Text.Read (readMaybe)
-import UserResources (continueProcess, newSession, withHangupIgnored, withPseudoTerminal, withUnixListener)
+import UserResources (continueProcess, newSession, processSession, withCoreDumpsAllowed, withHangupIgnored, withPseudoTerminal, withUnixListener)
 
 -- ---------------------------------------------------------------------------
 -- Tests: Build orchestrator (Phase 3, Batch 7)
@@ -2945,6 +2948,96 @@ testTrivialBuildIO = do
           [ runTest "trivial build succeeds" $
               Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
           ]
+
+-- | The flag that makes the test binary a builder that writes its process
+-- id and its session's to @$out@.
+sessionChildFlag :: String
+sessionChildFlag = "--session-child"
+
+-- | Write this process's id and its session's to @$out@.
+sessionChild :: IO ()
+sessionChild = do
+  out <- lookupEnv "out"
+  session <- processSession
+  case (out, session) of
+    (Just path, Just (pid, sid)) -> BS.writeFile path (BS8.pack (unwords [show pid, show sid]))
+    _ -> exitFailure
+
+-- | How long the process an interrupted build's builder starts waits
+-- before it writes its marker, in seconds, well within
+-- 'processWaitMicros'.
+descendantDelaySeconds :: Int
+descendantDelaySeconds = 2
+
+-- | How an unsandboxed POSIX builder starts and ends, as upstream's child
+-- does: with no core dumps, in a session of its own, and with what it
+-- started ended by an interrupt.
+testBuilderStartIO :: IO [Bool]
+testBuilderStartIO = do
+  putStrLn "builder/start"
+  if SI.os == "mingw32"
+    then do
+      putStrLn "  SKIP  POSIX only"
+      pure []
+    else withTempStore $ \store -> do
+      shell <- findTestShell
+      self <- getExecutablePath >>= Spawn.filePathBytes
+      tmpBase <- getTemporaryDirectory
+      let outAt letter = StorePath (T.replicate 31 "s" <> T.singleton letter) "start"
+          build drv = buildDerivation (defaultBuildConfig (stDir store)) store drv testDrvPath
+          failed msg code = Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+          sessionDrv =
+            Derivation
+              { drvOutputs = [DerivationOutput {doName = "out", doPath = outAt '2', doHashAlgo = "", doHash = ""}],
+                drvInputDrvs = Map.empty,
+                drvInputSrcs = [],
+                drvPlatform = currentPlatform,
+                drvBuilder = self,
+                drvArgs = [BS8.pack sessionChildFlag],
+                drvEnv = Map.empty
+              }
+          markerDir = tmpBase </> "nova-nix-test-builder-start"
+          marker = markerDir </> "late"
+          pidFile = markerDir </> "descendant"
+          -- The descendant's process id is written whole, through a
+          -- rename, so a read finds all of it or nothing.
+          descendantScript =
+            T.concat
+              [ startedScript,
+                "(/bin/sleep " <> T.pack (show descendantDelaySeconds) <> "; echo late > \"" <> T.pack marker <> "\") & ",
+                "echo $! > \"" <> T.pack pidFile <> ".new\" && /bin/mv \"" <> T.pack pidFile <> ".new\" \"" <> T.pack pidFile <> "\"; wait"
+              ]
+          alive pid = (\(code, _, _) -> code == ExitSuccess) <$> Proc.readProcessWithExitCode "/bin/kill" ["-0", pid] ""
+      sequence
+        [ runTestM "a builder dumps no core, its soft limit for one 0 whatever nova-nix's is" $ do
+            raised <- withCoreDumpsAllowed (build (mkTestBuildDrv shell (outAt '1') "ulimit -c > $out"))
+            case raised of
+              Nothing -> Pass <$ putStrLn "  SKIP  the hard limit allows no core"
+              Just (BuildSuccess sp) -> assertEqual "its limit" "0" . BS8.strip <$> BS.readFile (storePathToFilePath (stDir store) sp)
+              Just (BuildFailure msg code) -> pure (failed msg code),
+          runTestM "a builder leads a session of its own" $ do
+            result <- build sessionDrv
+            case result of
+              BuildSuccess sp -> do
+                written <- BS.readFile (storePathToFilePath (stDir store) sp)
+                pure $ case BS8.words written of
+                  [pid, sid] -> assertEqual "its process id, and its session's" pid sid
+                  _ -> Fail ("unreadable: " <> bytesText written)
+              BuildFailure msg code -> pure (failed msg code),
+          runTestM "an interrupt ends what the builder started, before it can write its marker" $
+            bracket_ (forceRemoveIfExists markerDir *> createDirectoryIfMissing True markerDir) (forceRemoveIfExists markerDir) $
+              withAsync (build (mkTestBuildDrv shell (outAt '3') descendantScript)) $ \running -> do
+                started <- awaitStart (buildDirFor (stDir store) (outAt '3')) (isJust <$> poll running)
+                recorded <- waitUntil (Dir.doesFileExist pidFile)
+                descendant <- if recorded then BS8.unpack . BS8.strip <$> BS.readFile pidFile else pure ""
+                cancel running
+                gone <- waitUntil (not <$> alive descendant)
+                late <- Dir.doesFileExist marker
+                pure $
+                  assertEqual "started, and its descendant recorded" (True, True) (started, recorded)
+                    `andThen` assertEqual "the descendant, gone" True gone
+                    `andThen` assertEqual "its marker written" False late
+        ]
 
 -- | Where a build runs ("Nix.Builder.BuildDir"): in a directory under the
 -- store's state directory, named by the first output, that the build

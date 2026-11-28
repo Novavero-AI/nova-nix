@@ -5,11 +5,15 @@
 -- the builder's group; a pseudo-terminal, as a terminal the user types
 -- in; a Unix socket listening where the user's live ones are;
 -- @SIGHUP@ ignored, as a program started under @nohup@ has it; and
--- @SIGCONT@, which continues a stopped process.  Windows
--- has no sessions, pseudo-terminals or signals, so those answer that
--- there is none there, or run the action as it is.
+-- @SIGCONT@, which continues a stopped process.  And what the tests of a
+-- builder's start read: a process's session, and a soft limit on core
+-- dumps a builder would inherit.  Windows has no sessions,
+-- pseudo-terminals, signals or such limits, so those answer that there is
+-- none there, or run the action as it is.
 module UserResources
   ( newSession,
+    processSession,
+    withCoreDumpsAllowed,
     withPseudoTerminal,
     withUnixListener,
     withHangupIgnored,
@@ -25,11 +29,14 @@ import qualified Network.Socket as Socket
 import qualified System.Process as Proc
 
 #if !defined(mingw32_HOST_OS)
+import qualified Control.Exception as Exception
 import Data.Foldable (traverse_)
 import System.Posix.IO (closeFd)
-import System.Posix.Process (createSession)
+import System.Posix.Process (createSession, getProcessID)
+import System.Posix.Resource (Resource (ResourceCoreFileSize), ResourceLimit (..), ResourceLimits (..), getResourceLimit, setResourceLimit)
 import System.Posix.Signals (Handler (Ignore), installHandler, sigCONT, sigHUP, signalProcess)
 import System.Posix.Terminal (getSlaveTerminalName, openPseudoTerminal)
+import System.Posix.Types (CPid (..))
 #endif
 
 -- | Start a session of the calling process's own, which takes it out of
@@ -39,6 +46,37 @@ newSession :: IO Bool
 newSession = pure False
 #else
 newSession = True <$ createSession
+#endif
+
+-- | This process's id and its session's, where there are sessions.
+processSession :: IO (Maybe (Integer, Integer))
+#if defined(mingw32_HOST_OS)
+processSession = pure Nothing
+#else
+processSession = do
+  pid <- getProcessID
+  session <- c_getsid 0
+  pure (Just (fromIntegral pid, fromIntegral session))
+
+foreign import ccall unsafe "unistd.h getsid"
+  c_getsid :: CPid -> IO CPid
+#endif
+
+-- | Run an action with this process's soft limit on core dumps raised to
+-- its hard limit, which a process it starts would inherit, and put the
+-- limit back afterwards, answering what the action did; or run nothing
+-- and answer 'Nothing' where the hard limit allows no core, or is not
+-- known.
+withCoreDumpsAllowed :: IO a -> IO (Maybe a)
+#if defined(mingw32_HOST_OS)
+withCoreDumpsAllowed _ = pure Nothing
+#else
+withCoreDumpsAllowed action = do
+  limits <- getResourceLimit ResourceCoreFileSize
+  case hardLimit limits of
+    ResourceLimit 0 -> pure Nothing
+    ResourceLimitUnknown -> pure Nothing
+    hard -> Just <$> Exception.bracket_ (setResourceLimit ResourceCoreFileSize limits {softLimit = hard}) (setResourceLimit ResourceCoreFileSize limits) action
 #endif
 
 -- | Run an action given the name of a pseudo-terminal's device, which is

@@ -23,9 +23,9 @@
 #include <sys/syscall.h>
 #endif
 
-/* Both calls fork nova-nix's own process, which the GHC runtime runs
- * threaded, so each child makes only async-signal-safe calls before it
- * executes or exits: whatever another thread held at the fork, a lock of
+/* Every call here forks nova-nix's own process, which the GHC runtime
+ * runs threaded, so each child makes only async-signal-safe calls before
+ * it executes or exits: whatever another thread held at the fork, a lock of
  * the allocator's or of the name service's among them, stays held in the
  * child.  The process library can start a program as another user only
  * by looking that user up in its child, with getpwuid_r and initgroups;
@@ -42,6 +42,15 @@
 struct spawn_failure {
   int step;
   int error;
+};
+
+/* The ids a builder that runs as a build user drops to between the fork
+ * and the exec, the groups already as setgroups takes them. */
+struct build_ids {
+  uid_t uid;
+  gid_t gid;
+  int group_count;
+  const gid_t *groups;
 };
 
 /* The descriptor limit, read before the fork: the top of the range a
@@ -107,9 +116,10 @@ static void child_fail(int report, int step) {
   _exit(127);
 }
 
+/* Start PROGRAM in the forked child as upstream's child starts a builder,
+ * dropping to IDS first where there are any. */
 static void child_run(const char *program, char *const argv[], char *const envp[], const char *cwd, int input_fd,
-                      int output_fd, uid_t uid, gid_t gid, int group_count, const gid_t *groups, int report,
-                      int top) {
+                      int output_fd, const struct build_ids *ids, int report, int top) {
   sigset_t none;
   struct rlimit core;
 
@@ -140,14 +150,16 @@ static void child_run(const char *program, char *const argv[], char *const envp[
   /* The supplementary groups first, then the group, then the user, which
    * gives up the right to change the other two; setuid as root sets the
    * real, effective and saved ids, each checked as upstream checks them. */
-  if (setgroups(group_count, groups) < 0) {
-    child_fail(report, NN_SPAWN_GROUPS);
-  }
-  if (setgid(gid) < 0 || getgid() != gid || getegid() != gid) {
-    child_fail(report, NN_SPAWN_GID);
-  }
-  if (setuid(uid) < 0 || getuid() != uid || geteuid() != uid) {
-    child_fail(report, NN_SPAWN_UID);
+  if (ids != NULL) {
+    if (setgroups(ids->group_count, ids->groups) < 0) {
+      child_fail(report, NN_SPAWN_GROUPS);
+    }
+    if (setgid(ids->gid) < 0 || getgid() != ids->gid || getegid() != ids->gid) {
+      child_fail(report, NN_SPAWN_GID);
+    }
+    if (setuid(ids->uid) < 0 || getuid() != ids->uid || geteuid() != ids->uid) {
+      child_fail(report, NN_SPAWN_UID);
+    }
   }
 
   default_signals();
@@ -177,13 +189,12 @@ static int report_pipe(int ends[2]) {
 #endif
 }
 
-int nn_spawn_as_user(const char *program, char *const argv[], char *const envp[], const char *cwd, int input_fd,
-                     int output_fd, unsigned int uid, unsigned int gid, int group_count, const unsigned int *groups,
-                     int *pid, int *step) {
+/* Fork a child that starts PROGRAM, as IDS where there are any, and wait
+ * until it has executed the program or failed to. */
+static int spawn_builder(const char *program, char *const argv[], char *const envp[], const char *cwd, int input_fd,
+                         int output_fd, const struct build_ids *ids, int *pid, int *step) {
   int report[2];
-  gid_t *group_ids = NULL;
   int top = descriptor_top();
-  int i;
   pid_t child;
   struct spawn_failure failure;
   ssize_t got;
@@ -191,34 +202,11 @@ int nn_spawn_as_user(const char *program, char *const argv[], char *const envp[]
   sigset_t all;
   sigset_t original;
 
-  if (uid == 0) {
-    *step = NN_SPAWN_UID;
-    return EINVAL;
-  }
-  if (geteuid() != 0) {
-    *step = NN_SPAWN_UID;
-    return EPERM;
-  }
-
-  /* The groups as setgroups takes them, copied before the fork. */
-  if (group_count > 0) {
-    group_ids = malloc((size_t)group_count * sizeof *group_ids);
-    if (group_ids == NULL) {
-      *step = NN_SPAWN_FORK;
-      return ENOMEM;
-    }
-    for (i = 0; i < group_count; i++) {
-      group_ids[i] = (gid_t)groups[i];
-    }
-  }
-
   /* The report pipe closes at the exec, so a read that finds its end
    * means the program started. */
   if (report_pipe(report) < 0) {
-    int error = errno;
-    free(group_ids);
     *step = NN_SPAWN_PIPE;
-    return error;
+    return errno;
   }
 
   sigfillset(&all);
@@ -226,11 +214,9 @@ int nn_spawn_as_user(const char *program, char *const argv[], char *const envp[]
   child = fork();
   if (child == 0) {
     close(report[0]);
-    child_run(program, argv, envp, cwd, input_fd, output_fd, (uid_t)uid, (gid_t)gid, group_count, group_ids,
-              report[1], top);
+    child_run(program, argv, envp, cwd, input_fd, output_fd, ids, report[1], top);
   }
   pthread_sigmask(SIG_SETMASK, &original, NULL);
-  free(group_ids);
   if (child < 0) {
     int error = errno;
     close(report[0]);
@@ -257,6 +243,49 @@ int nn_spawn_as_user(const char *program, char *const argv[], char *const envp[]
   }
   *step = failure.step;
   return failure.error;
+}
+
+int nn_spawn_as_user(const char *program, char *const argv[], char *const envp[], const char *cwd, int input_fd,
+                     int output_fd, unsigned int uid, unsigned int gid, int group_count, const unsigned int *groups,
+                     int *pid, int *step) {
+  struct build_ids ids;
+  gid_t *group_ids = NULL;
+  int answer;
+  int i;
+
+  if (uid == 0) {
+    *step = NN_SPAWN_UID;
+    return EINVAL;
+  }
+  if (geteuid() != 0) {
+    *step = NN_SPAWN_UID;
+    return EPERM;
+  }
+
+  /* The groups as setgroups takes them, copied before the fork. */
+  if (group_count > 0) {
+    group_ids = malloc((size_t)group_count * sizeof *group_ids);
+    if (group_ids == NULL) {
+      *step = NN_SPAWN_FORK;
+      return ENOMEM;
+    }
+    for (i = 0; i < group_count; i++) {
+      group_ids[i] = (gid_t)groups[i];
+    }
+  }
+
+  ids.uid = (uid_t)uid;
+  ids.gid = (gid_t)gid;
+  ids.group_count = group_count;
+  ids.groups = group_ids;
+  answer = spawn_builder(program, argv, envp, cwd, input_fd, output_fd, &ids, pid, step);
+  free(group_ids);
+  return answer;
+}
+
+int nn_spawn_as_invoker(const char *program, char *const argv[], char *const envp[], const char *cwd, int input_fd,
+                        int output_fd, int *pid, int *step) {
+  return spawn_builder(program, argv, envp, cwd, input_fd, output_fd, NULL, pid, step);
 }
 
 /* Send SIGKILL to every process the caller may signal but the caller
@@ -326,15 +355,6 @@ int nn_kill_user(unsigned int uid, int *status) {
   return 0;
 }
 
-int nn_await_exit(int pid) {
-  siginfo_t info;
-  int answer;
-  do {
-    answer = waitid(P_PID, (id_t)pid, &info, WEXITED | WNOWAIT);
-  } while (answer < 0 && errno == EINTR);
-  return answer < 0 ? errno : 0;
-}
-
 const char *nn_signal_text(int signal) { return strsignal(signal); }
 
 #else /* _WIN32 */
@@ -359,14 +379,22 @@ int nn_spawn_as_user(const char *program, char *const argv[], char *const envp[]
   return ENOSYS;
 }
 
-int nn_kill_user(unsigned int uid, int *status) {
-  (void)uid;
-  *status = 1;
+int nn_spawn_as_invoker(const char *program, char *const argv[], char *const envp[], const char *cwd, int input_fd,
+                        int output_fd, int *pid, int *step) {
+  (void)program;
+  (void)argv;
+  (void)envp;
+  (void)cwd;
+  (void)input_fd;
+  (void)output_fd;
+  (void)pid;
+  *step = NN_SPAWN_FORK;
   return ENOSYS;
 }
 
-int nn_await_exit(int pid) {
-  (void)pid;
+int nn_kill_user(unsigned int uid, int *status) {
+  (void)uid;
+  *status = 1;
   return ENOSYS;
 }
 
