@@ -69,6 +69,7 @@ import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.HostPath (hostPathFromBytes, hostPathText)
 import Nix.Http (defaultFetchRetryPolicy)
 import Nix.Json (Json, renderJson)
+import Nix.Logger (Logger, escapeFilterFor, handleLogger)
 import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Profile.Generation (Change (..), ProfileFailure (..), ProfileLinkPlace (..), absolutePath, checkProfileStore, readManifest, readProfileEnvironment, resolveDefaultProfile, updateProfile)
 import Nix.Profile.Manifest (Conflict (..), ConflictSide (..), Element (..), FlakeSource (..), Manifest (..), Matcher (..), Selection (..), Selector (..), addElement, defaultPriority, elementIdentifier, flakeAttribute, manifestErrorText, manifestJson, regexMatcher, selectElements)
@@ -273,6 +274,12 @@ readerGone failure
   | fmap Errno (ioe_errno failure) == Just ePIPE && ioe_handle failure == Just stdout = Just ()
   | otherwise = Nothing
 
+-- | The logger the library reports to: each message and each line a
+-- builder writes on stderr, a builder's line filtered for what stderr is
+-- ('escapeFilterFor').
+cliLogger :: IO Logger
+cliLogger = (`handleLogger` stderr) <$> escapeFilterFor stderr
+
 -- | A 'userError' is its message alone, which 'show' would wrap in
 -- @user error (...)@; any other 'IOException' also names the operation
 -- and the file that failed.
@@ -373,7 +380,8 @@ withCliSession opts config storeDir store dataDir baseDir regions action = do
   let searchPath
         | epPureEval policy = parseNixPath (TE.encodeUtf8 (T.pack dataDir))
         | otherwise = mergeSearchPaths (optNixPaths opts) dataDir nixPath
-  withEvalSession (SessionSettings policy searchPath storeDir baseDir regions store) $ \st0 -> do
+  logger <- cliLogger
+  withEvalSession (SessionSettings policy searchPath storeDir baseDir regions store logger) $ \st0 -> do
     let st = st0 {esCallDepth = topLevelCallDepth (ncMaxCallDepth config)}
     allowSearchPathRoots st
     action st
@@ -520,7 +528,8 @@ withEvalSessionStore :: NixConfig -> CliOpts -> StoreDir -> (SessionStore -> IO 
 withEvalSessionStore config opts storeDir action
   | optReadWriteMode opts = do
       buildConfig <- buildConfigFor config opts storeDir
-      withLocalStore buildConfig (action . ReadWriteSession)
+      logger <- cliLogger
+      withLocalStore logger buildConfig (action . ReadWriteSession)
   | otherwise = withReadOnlySession config opts storeDir action
 
 -- | What a session's evaluation made: the copies of the paths it coerced,
@@ -623,7 +632,8 @@ writeRegionCensus = do
 evalAterm :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> IO ()
 evalAterm config opts storeDir dataDir target = do
   buildConfig <- buildConfigFor config opts storeDir
-  withLocalStore buildConfig $ \ops -> withTarget config opts storeDir (ReadWriteSession ops) dataDir RegionsCollect target $ \st autoArgs parsed -> do
+  logger <- cliLogger
+  withLocalStore logger buildConfig $ \ops -> withTarget config opts storeDir (ReadWriteSession ops) dataDir RegionsCollect target $ \st autoArgs parsed -> do
     val <- evalOrExit st $ do
       val <- evalParsed (pure (evalBaseEnv st)) parsed >>= autoCallFunction autoArgs
       val <$ forceDerivationAttrs val
@@ -688,6 +698,7 @@ buildCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe 
 buildCommand config opts storeDir dataDir target attrPath outLink = do
   upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("build: " <>))
   buildConfig <- buildConfigFor config opts storeDir
+  logger <- cliLogger
   -- One handle serves the evaluation, which adds and builds what an
   -- import from derivation names, and the build after it, and opens with
   -- whichever first asks for the store.  The root is registered before
@@ -696,7 +707,7 @@ buildCommand config opts storeDir dataDir target attrPath outLink = do
   -- path prints after the store has closed and the link exists, as
   -- nix-build prints it, so a failed link prints nothing a script would
   -- take for success.
-  (outcome, outputPath) <- withLocalStore buildConfig $ \ops -> do
+  (outcome, outputPath) <- withLocalStore logger buildConfig $ \ops -> do
     -- The session ends before the build starts, freeing the evaluation's
     -- memory: the build needs only what is read out of it here.  The
     -- full .drv closure (root + every transitive input) recorded during
@@ -779,7 +790,8 @@ buildConfigFor config opts storeDir = do
 withReadOnlySession :: NixConfig -> CliOpts -> StoreDir -> (SessionStore -> IO a) -> IO a
 withReadOnlySession config opts storeDir action = do
   buildConfig <- buildConfigFor config opts storeDir
-  withLocalStore buildConfig {bcSubstitution = RefuseSubstitution} $ \ops ->
+  logger <- cliLogger
+  withLocalStore logger buildConfig {bcSubstitution = RefuseSubstitution} $ \ops ->
     action (ReadOnlySession (localQueries storeDir) ops)
 
 -- | Why a build command stopped once evaluation was done.
@@ -813,7 +825,8 @@ trustCommand config opts storeDir dataDir target attrPath = do
     [] -> pure Map.empty
     inputs -> do
       upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("trust: " <>))
-      bracket (openStore storeDir) closeStore (\store -> fetchAndScan config opts store inputs)
+      logger <- cliLogger
+      bracket (openStore logger storeDir) closeStore (\store -> fetchAndScan config opts store inputs)
   toStdout (mapM_ TIO.putStrLn (renderTrustReport (trustReport facts graph drvSP)))
 
 -- | Make each fixed-output input's output valid in a way that runs
@@ -1381,7 +1394,8 @@ captureEnvironment commandName config opts storeDir dataDir target attrPath = do
   script <- readGetEnvScript dataDir
   scriptPath <- either (failWith . ("error: " <>) . badStorePathText) pure (getEnvScriptPath script)
   buildConfig <- buildConfigFor config opts storeDir
-  withLocalStore buildConfig $ \ops -> do
+  logger <- cliLogger
+  withLocalStore logger buildConfig $ \ops -> do
     (capture, evalObjects) <-
       evalTarget config opts storeDir (ReadWriteSession ops) dataDir target attrPath $ \st val -> do
         drvSP <- derivationPath val
@@ -1481,7 +1495,8 @@ pushCommand storeDir pushArgs = do
     DirectoryTarget dir secretKeyFile -> do
       secretKey <- loadSecretKeyFile secretKeyFile >>= either failWith pure
       pure (pushToDirectory (DirectoryPush dir secretKey compression))
-  store <- openStore storeDir
+  logger <- cliLogger
+  store <- openStore logger storeDir
   rootsResult <- resolvePushRoots store pushArgs
   case rootsResult of
     Left err -> do
@@ -1510,7 +1525,8 @@ pushCommand storeDir pushArgs = do
 storeDeleteCommand :: StoreDir -> [String] -> IO ()
 storeDeleteCommand storeDir rawPaths = do
   targets <- either (failWith . prefixed) pure (traverse (resolveDeleteTarget storeDir . T.pack) rawPaths)
-  store <- openStore storeDir
+  logger <- cliLogger
+  store <- openStore logger storeDir
   result <- deleteStorePaths store targets reportDeleted
   closeStore store
   either (failWith . prefixed) pure result
@@ -1530,7 +1546,8 @@ storeDeleteCommand storeDir rawPaths = do
 -- collector lock, so it does not wait behind a running build.
 storeGcCommand :: StoreDir -> Bool -> IO ()
 storeGcCommand storeDir printRoots = do
-  store <- openStore storeDir
+  logger <- cliLogger
+  store <- openStore logger storeDir
   if printRoots
     then do
       roots <- findRoots store
@@ -1560,7 +1577,7 @@ profileLinkPlace config
 -- command.cc).
 chosenProfile :: NixConfig -> ProfileSelection -> IO OsPath
 chosenProfile config selection = do
-  env <- readProfileEnvironment >>= either failError pure
+  env <- cliLogger >>= readProfileEnvironment >>= either failError pure
   defaulted <- resolveDefaultProfile (profileLinkPlace config) env >>= either failError pure
   case selection of
     DefaultProfile -> pure defaulted
@@ -1588,10 +1605,11 @@ profileAddCommand config opts storeDir dataDir target attrPath selection priorit
   checkProfileStore storeDir profile >>= either (failError . profileFailureText storeDir) pure
   readManifest profile >>= either (failError . profileFailureText storeDir) (const (pure ()))
   buildConfig <- buildConfigFor config opts storeDir
-  outcome <- withLocalStore buildConfig $ \ops -> do
+  logger <- cliLogger
+  outcome <- withLocalStore logger buildConfig $ \ops -> do
     paths <- addedPaths config opts storeDir dataDir ops target attrPath
     let element = Element paths Active priority Nothing
-    updateProfile ops storeDir profile (pure . Changed . addElement (elementIdentifier element) element)
+    updateProfile logger ops storeDir profile (pure . Changed . addElement (elementIdentifier element) element)
   either (failError . profileFailureText storeDir) (const (pure ())) outcome
 
 -- | A @--priority@ value: an int, with an optional sign, as upstream reads
@@ -1758,7 +1776,8 @@ profileRemoveCommand config storeDir selection removals = do
     RemoveAll -> pure SelectAll
     RemoveSome matchers -> SelectSome <$> traverse (removalMatcher storeDir) matchers
   profile <- chosenProfile config selection
-  outcome <- withLocalStore (defaultBuildConfig storeDir) $ \ops -> updateProfile ops storeDir profile (removing selector)
+  logger <- cliLogger
+  outcome <- withLocalStore logger (defaultBuildConfig storeDir) $ \ops -> updateProfile logger ops storeDir profile (removing selector)
   either (failError . profileFailureText storeDir) (const (pure ())) outcome
   where
     warn = TIO.hPutStrLn stderr . ("warning: " <>)

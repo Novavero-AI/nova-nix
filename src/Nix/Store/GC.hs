@@ -188,6 +188,7 @@ import qualified Data.Text.Encoding as TE
 import GHC.IO.Exception (IOErrorType (InappropriateType))
 import Nix.Eval.CanonPath (canonPath)
 import Nix.Hash (sha256Digest)
+import Nix.Logger (Logger (..))
 import Nix.Store.DB (UnregisterResult (..), isValidPath, metaDirName, queryAllReferences, queryAllValidPaths, unregisterPathRow, unregisterPathRows)
 import Nix.Store.Handle (Store (..), withCollectorLock)
 import Nix.Store.Lock (lockFileSuffix, lockedPathOf, withLockFile)
@@ -198,7 +199,6 @@ import qualified NovaCache.Base32 as Base32
 import System.Directory (createDirectoryIfMissing, doesPathExist, getFileSize, getSymbolicLinkTarget, listDirectory, makeAbsolute, pathIsSymbolicLink, removePathForcibly, renamePath)
 import System.FilePath (normalise, splitDirectories, takeDirectory, takeFileName, (</>))
 import qualified System.FilePath.Windows as Windows
-import System.IO (hPutStrLn, stderr)
 import System.IO.Error (ioeGetErrorType, isDoesNotExistError, isPermissionError)
 import System.OsPath (encodeFS)
 import Text.Printf (printf)
@@ -245,31 +245,31 @@ stagingSuffix = ".tmp"
 -- ---------------------------------------------------------------------------
 
 -- | Upstream's first progress line of a collection or a checked delete.
-findingRootsMessage :: String
+findingRootsMessage :: Text
 findingRootsMessage = "finding garbage collector roots..."
 
 -- | Upstream's progress line before the sweep.
-deletingGarbageMessage :: String
+deletingGarbageMessage :: Text
 deletingGarbageMessage = "deleting garbage..."
 
 -- | Upstream's per-path line of the sweep.
-deletingPathMessage :: Text -> String
-deletingPathMessage path = "deleting '" <> T.unpack path <> "'"
+deletingPathMessage :: Text -> Text
+deletingPathMessage path = "deleting '" <> path <> "'"
 
 -- | Upstream's line for an indirect-root record whose out-link is gone.
-removingStaleLinkMessage :: FilePath -> FilePath -> String
+removingStaleLinkMessage :: FilePath -> FilePath -> Text
 removingStaleLinkMessage record outLink =
-  "removing stale link from '" <> record <> "' to '" <> outLink <> "'"
+  "removing stale link from '" <> T.pack record <> "' to '" <> T.pack outLink <> "'"
 
 -- | Upstream's line for a symlink root naming a path the database does
 -- not hold, with the target as the link spells it.
-skippingInvalidRootMessage :: FilePath -> FilePath -> String
+skippingInvalidRootMessage :: FilePath -> FilePath -> Text
 skippingInvalidRootMessage link target =
-  "skipping invalid root from '" <> link <> "' to '" <> target <> "'"
+  "skipping invalid root from '" <> T.pack link <> "' to '" <> T.pack target <> "'"
 
 -- | Upstream's line for a roots-directory entry it cannot read.
-unreadableRootMessage :: FilePath -> String
-unreadableRootMessage path = "cannot read potential root '" <> path <> "'"
+unreadableRootMessage :: FilePath -> Text
+unreadableRootMessage path = "cannot read potential root '" <> T.pack path <> "'"
 
 -- | Upstream's refusal to delete a path a root keeps alive.  Upstream's
 -- hint names @nix-store --query --roots@ and @--query --referrers@;
@@ -340,7 +340,7 @@ data RootCandidate = RootCandidate
 -- lock as the first step of a collection.
 findRoots :: Store -> IO [GcRoot]
 findRoots store = do
-  candidates <- walkRoots (stDir store) (gcRootsDir (stDir store))
+  candidates <- walkRoots (stLogger store) (stDir store) (gcRootsDir (stDir store))
   Set.toAscList . Set.fromList . catMaybes <$> mapM validOnly candidates
   where
     validOnly candidate = do
@@ -348,7 +348,7 @@ findRoots store = do
       if valid
         then pure (Just (GcRoot (rcLink candidate) (T.pack (storePathToFilePath (stDir store) (rcPath candidate)))))
         else do
-          mapM_ (hPutStrLn stderr . skippingInvalidRootMessage (rcLink candidate)) (rcInvalidReport candidate)
+          mapM_ (logMessage (stLogger store) . skippingInvalidRootMessage (rcLink candidate)) (rcInvalidReport candidate)
           pure Nothing
 
 -- | Walk the roots directory.  A directory recurses; a symlink into the
@@ -357,32 +357,33 @@ findRoots store = do
 -- under @auto@ and a basename-named permanent root elsewhere.  An entry
 -- that cannot be read (permission denied, vanished, not a directory
 -- after all) is reported with upstream's line and contributes nothing;
--- any other failure propagates, as upstream's does.
-walkRoots :: StoreDir -> FilePath -> IO [RootCandidate]
-walkRoots storeDir path = walk `catch` unreadable
+-- any other failure propagates, as upstream's does.  What the walk
+-- reports goes to the logger.
+walkRoots :: Logger -> StoreDir -> FilePath -> IO [RootCandidate]
+walkRoots logger storeDir path = walk `catch` unreadable
   where
     walk = do
       node <- classifyWalkNode path
       case node of
         WalkDirectory -> do
           entries <- listDirectory path
-          concat <$> mapM (walkRoots storeDir . (path </>)) (sort entries)
+          concat <$> mapM (walkRoots logger storeDir . (path </>)) (sort entries)
         WalkSymlink -> do
           target <- getSymbolicLinkTarget path
           case parseStoreTarget storeDir target of
             Just sp -> pure [RootCandidate path sp (Just target)]
-            Nothing -> followIndirect storeDir path (takeDirectory path </> target)
+            Nothing -> followIndirect logger storeDir path (takeDirectory path </> target)
         WalkRegular
           | isUnderDir (autoRootsDir storeDir) path -> do
               recorded <- BS.readFile path
-              followIndirect storeDir path (T.unpack (TE.decodeUtf8Lenient recorded))
+              followIndirect logger storeDir path (T.unpack (TE.decodeUtf8Lenient recorded))
           | otherwise ->
               pure [RootCandidate path sp Nothing | Just sp <- [parseStorePathBaseName (T.pack (takeFileName path))]]
         WalkAbsent -> pure []
     unreadable :: IOException -> IO [RootCandidate]
     unreadable e
       | isPermissionError e || isDoesNotExistError e || ioeGetErrorType e == InappropriateType = do
-          hPutStrLn stderr (unreadableRootMessage path)
+          logMessage logger (unreadableRootMessage path)
           pure []
       | otherwise = throwIO e
 
@@ -390,9 +391,9 @@ walkRoots storeDir path = walk `catch` unreadable
 -- A symlink into the store is the root (reported under the out-link's
 -- own path, which is what the user created); an absent out-link makes
 -- a record under @auto@ stale, and it is removed; anything else is not
--- a root.
-followIndirect :: StoreDir -> FilePath -> FilePath -> IO [RootCandidate]
-followIndirect storeDir record outLink = do
+-- a root.  The removal is reported to the logger.
+followIndirect :: Logger -> StoreDir -> FilePath -> FilePath -> IO [RootCandidate]
+followIndirect logger storeDir record outLink = do
   node <- classifyWalkNode outLink
   case node of
     WalkSymlink -> do
@@ -400,7 +401,7 @@ followIndirect storeDir record outLink = do
       pure [RootCandidate outLink sp (Just target) | Just sp <- [parseStoreTarget storeDir target]]
     WalkAbsent
       | isUnderDir (autoRootsDir storeDir) record -> do
-          hPutStrLn stderr (removingStaleLinkMessage record outLink)
+          logMessage logger (removingStaleLinkMessage record outLink)
           removePathForcibly record
           pure []
     _ -> pure []
@@ -523,7 +524,7 @@ withLiveSet store act = unlessUpstreamManaged store $ withCollectorLock store $ 
   case checked of
     Left err -> pure (Left err)
     Right _ -> do
-      hPutStrLn stderr findingRootsMessage
+      logMessage (stLogger store) findingRootsMessage
       live <- liveSetOf store
       Right <$> act live
 
@@ -614,8 +615,8 @@ sweepPlan storeDir valid live entries =
 -- Holds the collector lock throughout.  Refused for a store upstream
 -- Nix's database may also manage, before the lock is taken, and over a
 -- database keyed under another spelling of the directory.
--- The progress lines are upstream's, on stderr; the summary is the
--- caller's to print ('gcSummaryLine').
+-- The progress lines are upstream's, told to the handle's logger; the
+-- summary is the caller's to print ('gcSummaryLine').
 collectGarbage :: Store -> IO (Either Text GcResults)
 collectGarbage store = unlessUpstreamManaged store $ withCollectorLock store $ do
   checked <- validPathsUnder store
@@ -624,11 +625,11 @@ collectGarbage store = unlessUpstreamManaged store $ withCollectorLock store $ d
     Right valid -> Right <$> sweep valid
   where
     sweep valid = do
-      hPutStrLn stderr findingRootsMessage
+      logMessage (stLogger store) findingRootsMessage
       LiveSet live <- liveSetOf store
       entries <- map T.pack <$> listDirectory (unStoreDir (stDir store))
       let plan = sweepPlan (stDir store) valid live entries
-      hPutStrLn stderr deletingGarbageMessage
+      logMessage (stLogger store) deletingGarbageMessage
       unregistered <- unregisterPathRows (stDB store) (spDeadRows plan)
       case unregistered of
         RowReferenced referrers ->
@@ -639,7 +640,7 @@ collectGarbage store = unlessUpstreamManaged store $ withCollectorLock store $ d
       freed <- foldlIO 0 (spTrees plan) deleteTree
       pure GcResults {gcrDeleted = spTrees plan, gcrBytesFreed = freed}
     deleteTree !acc path = do
-      hPutStrLn stderr (deletingPathMessage path)
+      logMessage (stLogger store) (deletingPathMessage path)
       let target = T.unpack path
       node <- classifyWalkNode target
       case node of
@@ -790,7 +791,7 @@ deleteStorePathChecked store live (StoreEntryName basename)
   | otherwise = deleteUnderPathLock
   where
     target = unStoreDir (stDir store) </> T.unpack basename
-    deleteUnderPathLock = withLockFile (target <> lockFileSuffix) $ \_ -> do
+    deleteUnderPathLock = withLockFile (stLogger store) (target <> lockFileSuffix) $ \_ -> do
       -- A holder never deletes a lock file (the 'Nix.Store.Lock'
       -- header), and neither does this delete.  A target is one when
       -- stripping the suffix leaves a well-formed store basename AND no

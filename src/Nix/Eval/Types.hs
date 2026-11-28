@@ -1628,8 +1628,9 @@ class (MonadCData m) => MonadEval m where
   -- wrote them.
   addFixedOutputFile :: PendingOrigin -> Text -> ByteString -> m Text
 
-  -- | Print a trace/warning message.
-  -- IO evaluators write to stderr; pure evaluators silently discard.
+  -- | Report a trace/warning message.
+  -- IO evaluators tell their session's logger; pure evaluators silently
+  -- discard.
   traceMessage :: Text -> m ()
 
   -- | Force a thunk to a value, with memoization.

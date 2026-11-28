@@ -4,10 +4,10 @@
 --
 -- Upstream gives the builder one channel for its standard output and
 -- standard error, so what it wrote arrives in the order it wrote it,
--- and its default logger prints each line to standard error as the line
--- completes, filtered for the terminal.  The line discipline and the
--- filter are pure ('feedBuildLog', 'endBuildLog', 'filterLogLine'); the
--- pipe and the copy loop are the IO around them.
+-- and hands its logger each line as the line completes.  The line
+-- discipline is pure ('feedBuildLog', 'endBuildLog'); the pipe and the
+-- copy loop are the IO around it, and the logger ("Nix.Logger") decides
+-- where a line goes.
 module Nix.Builder.Log
   ( -- * Line discipline
     PendingLine,
@@ -15,37 +15,28 @@ module Nix.Builder.Log
     feedBuildLog,
     endBuildLog,
 
-    -- * Terminal filter
-    EscapeFilter (..),
-    filterLogLine,
-
     -- * Streaming
     openLogPipe,
     streamBuildLog,
   )
 where
 
-import Data.Bits ((.&.))
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BS8
-import qualified Data.ByteString.Lazy as BL
 import Data.Foldable (for_)
-import Data.Word (Word8)
-import Nix.Environment (EnvLookup (..), lookupEnvBytes)
+import Nix.Logger (Logger (..))
 import qualified System.Process as Proc
 
 #if defined(mingw32_HOST_OS)
 
-import Control.Exception (IOException, catch)
-import System.IO (Handle, hIsTerminalDevice)
+import System.IO (Handle)
 
 #else
 
-import Control.Exception (IOException, catch, onException)
+import Control.Exception (onException)
 import GHC.IO.FD (fdFD)
 import GHC.IO.Handle.FD (handleToFd)
-import System.IO (Handle, hClose, hIsTerminalDevice)
+import System.IO (Handle, hClose)
 import System.Posix.IO (FdOption (CloseOnExec), setFdOption)
 import System.Posix.Types (Fd (..))
 
@@ -129,155 +120,6 @@ lineBytes :: PendingLine -> BS.ByteString
 lineBytes (PendingLine before fromCursor) = BS.concat (reverse (fromCursor : before))
 
 -- ---------------------------------------------------------------------------
--- Terminal filter
--- ---------------------------------------------------------------------------
-
--- | Which escape sequences a build-log line keeps on its way to the user.
-data EscapeFilter
-  = -- | Keep colour (an SGR sequence, CSI ending in @m@) and drop the rest,
-    -- for a terminal that renders it.
-    KeepColour
-  | -- | Drop every escape sequence.
-    DropEscapes
-  deriving (Eq, Show)
-
--- | A build-log line as upstream's logger writes it to standard error
--- (@filterANSIEscapes@, terminal.cc at 2.24.9, at the unlimited width
--- @SimpleLogger::log@ passes): an escape sequence is dropped unless the
--- filter keeps it, a tab becomes spaces up to the next multiple of
--- eight columns, a bell or carriage return is dropped, and every other
--- byte is kept.  A column is one character as upstream groups one: a
--- UTF-8 lead byte with as many continuation bytes as it announces and
--- as follow it, or any other byte alone.
-filterLogLine :: EscapeFilter -> BS.ByteString -> BS.ByteString
-filterLogLine escapes = BL.toStrict . BB.toLazyByteString . go 0
-  where
-    go :: Int -> BS.ByteString -> BB.Builder
-    go !column bytes =
-      let (plain, rest) = BS.span isPlainAscii bytes
-       in BB.byteString plain <> special (column + BS.length plain) rest
-    special column bytes = case BS.uncons bytes of
-      Nothing -> mempty
-      Just (byte, rest)
-        | byte == escapeByte ->
-            let (escape, after) = escapeSequence rest
-                escapeBytes = BS.cons byte (BS.take (BS.length rest - BS.length after) rest)
-             in kept escape escapeBytes <> go column after
-        | byte == tabByte ->
-            let width = tabStop - column `mod` tabStop
-             in BB.byteString (BS.replicate width spaceByte) <> go (column + width) rest
-        | byte == bellByte || byte == carriageReturnByte -> go column rest
-        | otherwise ->
-            let continued = BS.takeWhile isContinuation (BS.take (continuationCount byte) rest)
-             in BB.word8 byte <> BB.byteString continued <> go (column + 1) (BS.drop (BS.length continued) rest)
-    kept escape escapeBytes
-      | escapes == KeepColour && escape == ColourEscape = BB.byteString escapeBytes
-      | otherwise = mempty
-    isPlainAscii byte =
-      byte < asciiLimit
-        && byte /= escapeByte
-        && byte /= tabByte
-        && byte /= bellByte
-        && byte /= carriageReturnByte
-
--- | What an escape sequence does, as far as the filter cares.
-data EscapeKind = ColourEscape | OtherEscape
-  deriving (Eq)
-
--- | The kind of escape the bytes after an ESC begin, and the bytes after
--- its sequence, which upstream's filter reads as a CSI's parameter,
--- intermediate and final bytes, or the one byte a two-byte escape takes,
--- or nothing.
-escapeSequence :: BS.ByteString -> (EscapeKind, BS.ByteString)
-escapeSequence bytes = case BS.uncons bytes of
-  Just (byte, afterBracket)
-    | byte == csiByte ->
-        let afterParameters = BS.dropWhile (within csiParameterBytes) afterBracket
-            afterIntermediates = BS.dropWhile (within csiIntermediateBytes) afterParameters
-         in case BS.uncons afterIntermediates of
-              Just (final, after)
-                | within csiFinalBytes final -> (if final == sgrFinalByte then ColourEscape else OtherEscape, after)
-              _ -> (OtherEscape, afterIntermediates)
-    | within escapeFinalBytes byte -> (OtherEscape, afterBracket)
-  _ -> (OtherEscape, bytes)
-
--- | How many continuation bytes a UTF-8 lead byte announces.
-continuationCount :: Word8 -> Int
-continuationCount lead
-  | lead .&. 0xE0 == 0xC0 = 1
-  | lead .&. 0xF0 == 0xE0 = 2
-  | lead .&. 0xF8 == 0xF0 = 3
-  | otherwise = 0
-
--- | Whether a byte continues a UTF-8 character.
-isContinuation :: Word8 -> Bool
-isContinuation byte = byte .&. 0xC0 == 0x80
-
--- | Whether a byte lies in an inclusive range.
-within :: (Word8, Word8) -> Word8 -> Bool
-within (low, high) byte = low <= byte && byte <= high
-
--- | The control bytes the filter treats specially, and the space a tab
--- expands to.
-escapeByte, tabByte, bellByte, carriageReturnByte, spaceByte :: Word8
-escapeByte = 0x1B
-tabByte = 0x09
-bellByte = 0x07
-carriageReturnByte = 0x0D
-spaceByte = 0x20
-
--- | The byte opening a control sequence after an ESC (@[@), and the
--- final byte of a colour one (@m@).
-csiByte, sgrFinalByte :: Word8
-csiByte = 0x5B
-sgrFinalByte = 0x6D
-
--- | The ECMA-48 byte ranges upstream's filter reads a sequence by.
-csiParameterBytes, csiIntermediateBytes, csiFinalBytes, escapeFinalBytes :: (Word8, Word8)
-csiParameterBytes = (0x30, 0x3F)
-csiIntermediateBytes = (0x20, 0x2F)
-csiFinalBytes = (0x40, 0x7E)
-escapeFinalBytes = (0x40, 0x5F)
-
--- | The first byte that is not ASCII.
-asciiLimit :: Word8
-asciiLimit = 0x80
-
--- | The columns between tab stops.
-tabStop :: Int
-tabStop = 8
-
--- | The filter upstream's logger applies (@isTTY@, terminal.cc at
--- 2.24.9): colour survives only on a terminal, with @TERM@ set to
--- something other than @dumb@, and neither @NO_COLOR@ nor @NOCOLOR@
--- set.  Upstream asks about its standard error; this asks about the
--- handle the log goes to, which is standard error by default.
-escapeFilterFor :: Handle -> IO EscapeFilter
-escapeFilterFor buildLog = do
-  terminal <- hIsTerminalDevice buildLog
-  term <- lookupEnvBytes termVar
-  noColour <- traverse lookupEnvBytes noColourVars
-  pure $
-    if terminal && rendersColour term && all (== EnvUnset) noColour
-      then KeepColour
-      else DropEscapes
-  where
-    rendersColour term = case term of
-      EnvUnset -> False
-      EnvValue value -> value /= dumbTerm
-      EnvUnpairedSurrogate -> True
-
--- | The variable naming the terminal type, and the type upstream reads
--- as rendering no colour.
-termVar, dumbTerm :: BS.ByteString
-termVar = "TERM"
-dumbTerm = "dumb"
-
--- | The variables whose presence, whatever their value, turns colour off.
-noColourVars :: [BS.ByteString]
-noColourVars = ["NO_COLOR", "NOCOLOR"]
-
--- ---------------------------------------------------------------------------
 -- Streaming
 -- ---------------------------------------------------------------------------
 
@@ -326,40 +168,28 @@ openLogPipe = do
 
 #endif
 
--- | Copy a builder's output to the build log a line at a time as each
--- line completes, until every holder of the pipe's write end has
--- closed it.
+-- | Hand a builder's output to the logger ('logBuildLine') a line at a
+-- time as each line completes, until every holder of the pipe's write
+-- end has closed it, then the line left pending, if it holds any bytes.
 --
--- A line goes out filtered ('filterLogLine', under 'escapeFilterFor'
--- the log) in one write ending in a line feed, as upstream's default
--- logger writes a build-log line to standard error (@SimpleLogger@,
--- logging.cc at 2.24.9).  Upstream first reads a line beginning
--- @\@nix @ as a JSON log message from the builder and does not print
--- one that parses (@handleJSONLogMessage@); here every line is printed.
--- Upstream points @NIX_LOG_FD@ at standard error so stdenv writes such
--- lines, and nova-nix sets no @NIX_LOG_FD@.
+-- Upstream first reads a line beginning @\@nix @ as a JSON log message
+-- from the builder and does not log one that parses; here every line is
+-- logged.  Upstream points @NIX_LOG_FD@ at standard error so stdenv
+-- writes such lines, and nova-nix sets no @NIX_LOG_FD@.
 --
--- A line the log fails to take is dropped and the build goes on, as
--- upstream's @writeToStderr@ ignores a failing write (logging.cc), so a
--- reader of standard error that went away does not fail the build.  The
--- output is read to its end either way, so the builder never blocks on
--- a full pipe.
-streamBuildLog :: Handle -> Handle -> IO ()
-streamBuildLog fromBuilder buildLog = do
-  escapes <- escapeFilterFor buildLog
-  let writeLine line = BS.hPut buildLog (BS8.snoc (filterLogLine escapes line) '\n') `catch` dropLine
-      go pending = do
-        chunk <- BS.hGetSome fromBuilder readSize
-        if BS.null chunk
-          then for_ (endBuildLog pending) writeLine
-          else do
-            let (complete, rest) = feedBuildLog pending chunk
-            for_ complete writeLine
-            go rest
-  go emptyPendingLine
+-- The output is read to its end, so the builder never blocks on a full
+-- pipe.
+streamBuildLog :: Handle -> Logger -> IO ()
+streamBuildLog fromBuilder logger = go emptyPendingLine
   where
-    dropLine :: IOException -> IO ()
-    dropLine _ = pure ()
+    go pending = do
+      chunk <- BS.hGetSome fromBuilder readSize
+      if BS.null chunk
+        then for_ (endBuildLog pending) (logBuildLine logger)
+        else do
+          let (complete, rest) = feedBuildLog pending chunk
+          for_ complete (logBuildLine logger)
+          go rest
 
 -- | How much builder output one read takes at most.  The lines written
 -- do not depend on it.

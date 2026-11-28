@@ -48,7 +48,7 @@ import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import qualified System.Info as SI
 import qualified System.Process as Proc
-import Test.Harness (TestResult (..), andThen, assertEqual, assertEval, assertEvalError, assertEvalFail, assertLeft, assertRight, bytesText, evalDerivationIO, evalNixIO, evalNixIOStoreDir, forceRemoveIfExists, genDrvName, genFixturePath, genJson, genTextOf, runTest, runTestIO, runTestM, simpleTestDrv, testBaseDir, testEvalState, testOrigin)
+import Test.Harness (TestResult (..), andThen, assertEqual, assertEval, assertEvalError, assertEvalFail, assertLeft, assertRight, bytesText, evalDerivationIO, evalNixIO, evalNixIOStoreDir, forceRemoveIfExists, genDrvName, genFixturePath, genJson, genTextOf, runTest, runTestIO, runTestM, simpleTestDrv, testBaseDir, testEvalState, testLogger, testOrigin)
 import qualified Test.QuickCheck as QC
 
 -- ---------------------------------------------------------------------------
@@ -577,7 +577,7 @@ testFromATerm = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-writeDrv"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let sp = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "test.drv"
             destFile = storePathToFilePath (stDir store) sp
         writeDrv store simpleTestDrv sp
@@ -594,7 +594,7 @@ testFromATerm = do
         let tmpStore = tmpBase </> "nova-nix-test-drv-closure"
             sd = StoreDir tmpStore
         forceRemoveIfExists tmpStore
-        store <- openStore sd
+        store <- openStore testLogger sd
         let srcSp = StorePath "gggggggggggggggggggggggggggggggg" "source.tar.gz"
             drvASp = StorePath "cccccccccccccccccccccccccccccccc" "dep1.drv"
             drvBSp = StorePath "dddddddddddddddddddddddddddddddd" "top.drv"

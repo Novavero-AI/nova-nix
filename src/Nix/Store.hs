@@ -1149,7 +1149,7 @@ materializeEvalSources store sourceCache = do
     -- rather than clearing the tree the first registered.  Same protocol
     -- as the builder's withOutputLocks.
     adopt (sp, srcText) =
-      withPathLock (stDir store) sp $ \_ -> do
+      withPathLock (stLogger store) (stDir store) sp $ \_ -> do
         valid <- isValid store sp
         unless valid $ do
           let dest = storePathToFilePath (stDir store) sp
@@ -1245,7 +1245,7 @@ materializeEvalStoreWrites store storeWrites = do
     prepare (spText, (refs, mode)) =
       case parseStorePath defaultStoreDir spText of
         Nothing -> pure Nothing
-        Just sp -> withPathLock (stDir store) sp $ \_ -> do
+        Just sp -> withPathLock (stLogger store) (stDir store) sp $ \_ -> do
           valid <- isValid store sp
           if valid
             then pure Nothing
@@ -1295,7 +1295,7 @@ addSourceTree store name refs entry =
       refusal <- upstreamManagedRefusal ReplacesUpstreamPaths (stDir store)
       case refusal of
         Just reason -> pure (Left reason)
-        Nothing -> withPathLock (stDir store) sp $ \_ -> do
+        Nothing -> withPathLock (stLogger store) (stDir store) sp $ \_ -> do
           valid <- isValid store sp
           if valid then pure (Right sp) else place sp
   where

@@ -95,7 +95,7 @@ import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Encoding.Error as TE
 import Nix.Http (catchSync)
 import Nix.Push (PushArtifact (..), PushCompression, PushSummary (..), computeClosure, loadKeyFile, logNar, logPushed, logSkipped, narDirSegment, narInfoFileName, preparePath)
-import Nix.Store (Store)
+import Nix.Store (Store (..))
 import Nix.Store.Path (StorePath, defaultStoreDirText)
 import NovaCache.NarInfo (NarInfo (..), renderNarInfo)
 import NovaCache.Signing (SecretKey)
@@ -210,7 +210,7 @@ data DirectoryPush = DirectoryPush
 -- narinfo names, which no reader asks for, and narinfos for some of the
 -- paths, written deps first, so each names a NAR and references that are
 -- there.  An interrupt is not a failure: it stops the push and
--- propagates.
+-- propagates.  Its progress lines go to the store's logger.
 pushToDirectory :: DirectoryPush -> Store -> [StorePath] -> IO (Either Text PushSummary)
 pushToDirectory cfg store roots =
   -- Every synchronous exception, as for a server: the database's, the
@@ -224,13 +224,13 @@ pushToDirectory cfg store roots =
       closure <- ExceptT (computeClosure store roots)
       missing <- liftIO (filterM (fmap not . doesFileExist . inCache . narInfoFileName) closure)
       let skipped = length closure - length missing
-      logSkipped skipped
+      logSkipped (stLogger store) skipped
       -- NARs first, one at a time.  Each path's narinfo is signed and
       -- rendered as its NAR is written, and only the rendered bytes are
       -- kept, forced, so what the second phase holds reaches no NAR.
       written <- forM missing $ \sp -> do
         (artifact, narInfo) <- preparePath (dpCompression cfg) store sp
-        logNar sp artifact
+        logNar (stLogger store) sp artifact
         liftIO (writeUnlessPresent (inCache (niUrl narInfo)) (paBytes artifact))
         signed <- liftEither (signNarInfo (dpSecretKey cfg) narInfo)
         let !rendered = TE.encodeUtf8 (renderNarInfo signed)
@@ -238,7 +238,7 @@ pushToDirectory cfg store roots =
       -- Then the narinfos, in the closure's deps-first order.
       forM_ written $ \(sp, rendered) -> do
         liftIO (writeCacheFile (inCache (narInfoFileName sp)) rendered)
-        logPushed sp
+        logPushed (stLogger store) sp
       pure PushSummary {psPushed = length written, psSkipped = skipped}
 
 -- | The directories upstream's @file:\/\/@ store creates in every cache it

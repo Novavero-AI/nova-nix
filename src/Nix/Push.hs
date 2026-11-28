@@ -124,12 +124,12 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import qualified Data.Text.IO as TIO
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types as HTTP
 import Nix.Compression (compressionNameNone, compressionNameZstd)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, TransferError (..), attemptFailureMessage, catchSync, exceptionFailure, ioRetryEffects, retryTransient, statusError, withTransfer, withUserAgent)
+import Nix.Logger (Logger (..))
 import Nix.Store (Store (..), queryDeriver, queryPathInfo, queryReferences, volumeCaseHack)
 import qualified Nix.Store.DB as DB
 import qualified Nix.Store.ExecBit as ExecBit
@@ -139,7 +139,6 @@ import qualified NovaCache.NAR as NAR
 import NovaCache.NarInfo (NarInfo (..), parseNarInfo, renderNarInfo)
 import NovaCache.Signing (normalizeKeyText)
 import qualified NovaCache.Zstd as Zstd
-import System.IO (stderr)
 
 -- ---------------------------------------------------------------------------
 -- Named constants
@@ -467,16 +466,18 @@ splitParts size bytes
 -- aborts with an error.  One before the first narinfo leaves only NARs no
 -- narinfo names, which are invisible to clients; one after it leaves the
 -- narinfos already published as well.  An interrupt is not a failure: it
--- stops the push and propagates.
+-- stops the push and propagates.  Its progress lines go to the store's
+-- logger.
 pushPaths :: PushConfig -> Store -> [StorePath] -> IO (Either Text PushSummary)
 pushPaths cfg store roots =
   -- Every synchronous exception: the push raises sqlite-simple's from the
   -- database, walk failures and IO errors from the serialiser, and IO
-  -- errors from the log, and each is a failed push, reported as its
+  -- errors from the logger, and each is a failed push, reported as its
   -- exception says, as every other failure here is, for the command to
   -- word.
   runExceptT run `catchSync` \e -> pure (Left (T.pack (displayException e)))
   where
+    logger = stLogger store
     run :: ExceptT Text IO PushSummary
     run = do
       manager <- liftIO newPushManager
@@ -484,13 +485,13 @@ pushPaths cfg store roots =
       remote <- fetchRemoteHashes manager cfg
       let missing = planMissing remote closure
           skipped = length closure - length missing
-      logSkipped skipped
+      logSkipped logger skipped
       -- Phase 1: NARs, one at a time.  What is kept for phase 2 is each
       -- path's narinfo and how its upload ended, and neither holds the
       -- NAR's bytes ('mkNarInfo' forces what it takes from the artifact),
       -- so each NAR is dropped once uploaded.
       uploaded <- forM missing $ \sp -> do
-        (narInfo, upload) <- uploadNar manager cfg store 0 sp
+        (narInfo, upload) <- uploadNar logger manager cfg store 0 sp
         pure (sp, narInfo, upload)
       -- Phase 2: narinfos, only after every NAR is in place, in the
       -- closure's deps-first order: a freshly announced path's references
@@ -499,11 +500,11 @@ pushPaths cfg store roots =
       -- since a narinfo accepted there would announce a path before its
       -- references.
       forM_ uploaded $ \(sp, narInfo, upload) -> do
-        publishNarInfo manager cfg store sp narInfo upload
-        logPushed sp
+        publishNarInfo logger manager cfg store sp narInfo upload
+        logPushed logger sp
       -- Round-trip: the first pushed narinfo must come back signed.
       case uploaded of
-        ((sp, _, _) : _) -> verifySignedRoundTrip manager cfg sp
+        ((sp, _, _) : _) -> verifySignedRoundTrip logger manager cfg sp
         [] -> pure ()
       pure PushSummary {psPushed = length uploaded, psSkipped = skipped}
 
@@ -529,11 +530,11 @@ fetchRemoteHashes manager cfg = do
 -- and upload the bytes, given how many uploads of the NAR this push has
 -- begun before.  Returns the narinfo to publish in phase 2, and whether
 -- the cache confirmed the NAR.
-uploadNar :: HTTP.Manager -> PushConfig -> Store -> Int -> StorePath -> ExceptT Text IO (NarInfo, NarUpload)
-uploadNar manager cfg store begun sp = do
+uploadNar :: Logger -> HTTP.Manager -> PushConfig -> Store -> Int -> StorePath -> ExceptT Text IO (NarInfo, NarUpload)
+uploadNar logger manager cfg store begun sp = do
   (artifact, narInfo) <- preparePath (pcCompression cfg) store sp
-  logNar sp artifact
-  upload <- sendNar manager cfg begun (niUrl narInfo) (paBytes artifact)
+  logNar logger sp artifact
+  upload <- sendNar logger manager cfg begun (niUrl narInfo) (paBytes artifact)
   pure (narInfo, upload)
 
 -- | What a push uploads for one store path: its NAR, packaged as the
@@ -599,8 +600,8 @@ narHashMatches recorded computed =
 -- refusal, so the NAR is uploaded again, while fewer than
 -- 'maxNarUploads' uploads of it have been begun, and the narinfo is
 -- sent after it.
-publishNarInfo :: HTTP.Manager -> PushConfig -> Store -> StorePath -> NarInfo -> NarUpload -> ExceptT Text IO ()
-publishNarInfo manager cfg store sp narInfo upload = do
+publishNarInfo :: Logger -> HTTP.Manager -> PushConfig -> Store -> StorePath -> NarInfo -> NarUpload -> ExceptT Text IO ()
+publishNarInfo logger manager cfg store sp narInfo upload = do
   let body = TE.encodeUtf8 (renderNarInfo narInfo)
   response <- httpRequest manager "PUT" (cacheUrl cfg object) (authHeaders cfg) (Just body)
   let status = HTTP.responseStatus response
@@ -608,9 +609,9 @@ publishNarInfo manager cfg store sp narInfo upload = do
   unless (status == HTTP.status200) $ case upload of
     NarUnconfirmed begun completion
       | status == HTTP.status400 && begun < maxNarUploads -> do
-          logLine (retryTag <> refused <> "; uploading the NAR again")
-          (resent, reupload) <- uploadNar manager cfg store begun sp
-          publishNarInfo manager cfg store sp resent reupload
+          logLine logger (retryTag <> refused <> "; uploading the NAR again")
+          (resent, reupload) <- uploadNar logger manager cfg store begun sp
+          publishNarInfo logger manager cfg store sp resent reupload
       | otherwise ->
           throwError (refused <> "; the NAR's last completion: " <> completion <> " (" <> countedUploads begun <> " begun)")
     NarStored -> throwError refused
@@ -619,8 +620,8 @@ publishNarInfo manager cfg store sp narInfo upload = do
     label = "PUT " <> object
 
 -- | Fetch a just-pushed narinfo back and require a signature on it.
-verifySignedRoundTrip :: HTTP.Manager -> PushConfig -> StorePath -> ExceptT Text IO ()
-verifySignedRoundTrip manager cfg sp = do
+verifySignedRoundTrip :: Logger -> HTTP.Manager -> PushConfig -> StorePath -> ExceptT Text IO ()
+verifySignedRoundTrip logger manager cfg sp = do
   let object = narInfoFileName sp
       url = pcCacheUrl cfg <> "/" <> object
   response <- httpRequest manager "GET" url [] Nothing
@@ -628,7 +629,7 @@ verifySignedRoundTrip manager cfg sp = do
   narInfo <- liftEither (either (Left . T.pack) Right (parseNarInfo (responseText response)))
   when (null (niSigs narInfo)) $
     throwError ("round-trip check failed: " <> object <> " came back unsigned")
-  logLine "[ok]    round-trip verified, signature present"
+  logLine logger "[ok]    round-trip verified, signature present"
 
 -- ---------------------------------------------------------------------------
 -- Sending a NAR
@@ -674,10 +675,10 @@ data PartsAnswer
 
 -- | Send a NAR's bytes to its object: in one @PUT@ when they fit in one
 -- part, in parts otherwise.
-sendNar :: HTTP.Manager -> PushConfig -> Int -> Text -> BS.ByteString -> ExceptT Text IO NarUpload
-sendNar manager cfg begun object bytes
+sendNar :: Logger -> HTTP.Manager -> PushConfig -> Int -> Text -> BS.ByteString -> ExceptT Text IO NarUpload
+sendNar logger manager cfg begun object bytes
   | BS.length bytes <= partSizeBytes (pcPartSize cfg) = putWholeNar manager cfg object bytes
-  | otherwise = uploadInParts manager cfg begun object bytes
+  | otherwise = uploadInParts logger manager cfg begun object bytes
 
 -- | Send a NAR's bytes in one @PUT@.
 putWholeNar :: HTTP.Manager -> PushConfig -> Text -> BS.ByteString -> ExceptT Text IO NarUpload
@@ -689,22 +690,22 @@ putWholeNar manager cfg object bytes = do
 -- of it this push has begun before: begin one, send the parts, and
 -- complete it.  An upload whose parts the cache lost is begun again, up
 -- to 'maxNarUploads' in all.
-uploadInParts :: HTTP.Manager -> PushConfig -> Int -> Text -> BS.ByteString -> ExceptT Text IO NarUpload
-uploadInParts manager cfg begun object bytes = do
-  started <- beginUpload manager cfg uploads
+uploadInParts :: Logger -> HTTP.Manager -> PushConfig -> Int -> Text -> BS.ByteString -> ExceptT Text IO NarUpload
+uploadInParts logger manager cfg begun object bytes = do
+  started <- beginUpload logger manager cfg uploads
   case started of
     NoMultipart -> do
-      logLine (narTag <> "POST " <> uploads <> " returned HTTP 404, so the NAR goes in one request")
+      logLine logger (narTag <> "POST " <> uploads <> " returned HTTP 404, so the NAR goes in one request")
       putWholeNar manager cfg object bytes
     Begun (UploadId uploadId) -> do
       let upload = uploads <> "/" <> uploadId
-      answer <- sendParts manager cfg upload parts
+      answer <- sendParts logger manager cfg upload parts
       case answer of
-        PartsHeld -> completeUpload manager cfg (begun + 1) upload (length parts) (BS.length bytes)
+        PartsHeld -> completeUpload logger manager cfg (begun + 1) upload (length parts) (BS.length bytes)
         PartsLost lost
           | begun + 1 < maxNarUploads -> do
-              logLine (retryTag <> lost <> "; beginning a new upload")
-              uploadInParts manager cfg (begun + 1) object bytes
+              logLine logger (retryTag <> lost <> "; beginning a new upload")
+              uploadInParts logger manager cfg (begun + 1) object bytes
           | otherwise ->
               throwError (lost <> " (" <> countedUploads maxNarUploads <> " begun)")
   where
@@ -713,9 +714,9 @@ uploadInParts manager cfg begun object bytes = do
 
 -- | Begin an upload, again under the retry policy while the response is
 -- lost or is one a retry could outlive.
-beginUpload :: HTTP.Manager -> PushConfig -> Text -> ExceptT Text IO Begun
-beginUpload manager cfg uploads =
-  retrying cfg (answer <$> tryRequest manager "POST" (cacheUrl cfg uploads) (authHeaders cfg) Nothing)
+beginUpload :: Logger -> HTTP.Manager -> PushConfig -> Text -> ExceptT Text IO Begun
+beginUpload logger manager cfg uploads =
+  retrying logger cfg (answer <$> tryRequest manager "POST" (cacheUrl cfg uploads) (authHeaders cfg) Nothing)
   where
     label = "POST " <> uploads
     answer (Left err) = Left (transportFailure label err)
@@ -732,12 +733,12 @@ beginUpload manager cfg uploads =
 
 -- | Send the parts in order from part 1, stopping at the first the cache
 -- answers with 'PartsLost'.
-sendParts :: HTTP.Manager -> PushConfig -> Text -> [BS.ByteString] -> ExceptT Text IO PartsAnswer
-sendParts manager cfg upload = go . zip [1 :: Int ..]
+sendParts :: Logger -> HTTP.Manager -> PushConfig -> Text -> [BS.ByteString] -> ExceptT Text IO PartsAnswer
+sendParts logger manager cfg upload = go . zip [1 :: Int ..]
   where
     go [] = pure PartsHeld
     go ((number, part) : rest) = do
-      answer <- sendPart manager cfg (upload <> "/" <> T.pack (show number)) part
+      answer <- sendPart logger manager cfg (upload <> "/" <> T.pack (show number)) part
       case answer of
         PartsHeld -> go rest
         lost@(PartsLost _) -> pure lost
@@ -745,9 +746,9 @@ sendParts manager cfg upload = go . zip [1 :: Int ..]
 -- | Send one part, again under the retry policy while the response is
 -- lost or is one a retry could outlive: the cache replaces a part it
 -- holds, so a part that did arrive is not doubled.
-sendPart :: HTTP.Manager -> PushConfig -> Text -> BS.ByteString -> ExceptT Text IO PartsAnswer
-sendPart manager cfg path part =
-  retrying cfg (answer <$> tryRequest manager "PUT" (cacheUrl cfg path) (authHeaders cfg) (Just part))
+sendPart :: Logger -> HTTP.Manager -> PushConfig -> Text -> BS.ByteString -> ExceptT Text IO PartsAnswer
+sendPart logger manager cfg path part =
+  retrying logger cfg (answer <$> tryRequest manager "PUT" (cacheUrl cfg path) (authHeaders cfg) (Just part))
   where
     label = "PUT " <> path
     answer (Left err) = Left (transportFailure label err)
@@ -766,14 +767,14 @@ sendPart manager cfg path part =
 -- open turns out closed before any answer; a completion that arrives
 -- twice gets an error or joins the same parts, and the narinfo decides
 -- either way.
-completeUpload :: HTTP.Manager -> PushConfig -> Int -> Text -> Int -> Int -> ExceptT Text IO NarUpload
-completeUpload manager cfg begun upload count size = do
+completeUpload :: Logger -> HTTP.Manager -> PushConfig -> Int -> Text -> Int -> Int -> ExceptT Text IO NarUpload
+completeUpload logger manager cfg begun upload count size = do
   answer <- liftIO (tryRequest manager "POST" (cacheUrl cfg upload) (authHeaders cfg) (Just totals))
   case answer of
     Right response | HTTP.responseStatus response == HTTP.status200 -> pure NarStored
     unconfirmed -> do
       let completion = either (attemptFailureMessage . transportFailure label) (describeResponse label) unconfirmed
-      logLine (narTag <> completion <> "; the narinfo decides whether the NAR is stored")
+      logLine logger (narTag <> completion <> "; the narinfo decides whether the NAR is stored")
       pure (NarUnconfirmed begun completion)
   where
     label = "POST " <> upload
@@ -830,10 +831,11 @@ httpRequest manager method url headers body =
 -- policy: a 'TransientFailure' is sent again after upstream's backoff,
 -- which upstream's transfer layer applies to an upload as to a download
 -- (@TransferItem::finish@ in @filetransfer.cc@ at 2.24.9), and a
--- 'FatalFailure', or the last attempt's failure, fails the push.
-retrying :: PushConfig -> IO (Either AttemptFailure a) -> ExceptT Text IO a
-retrying cfg attempt =
-  ExceptT (first attemptFailureMessage <$> retryTransient (pcRetry cfg) ioRetryEffects attempt)
+-- 'FatalFailure', or the last attempt's failure, fails the push.  A
+-- retry is announced to the logger.
+retrying :: Logger -> PushConfig -> IO (Either AttemptFailure a) -> ExceptT Text IO a
+retrying logger cfg attempt =
+  ExceptT (first attemptFailureMessage <$> retryTransient (pcRetry cfg) (ioRetryEffects logger) attempt)
 
 -- | A response the protocol gives no meaning, as an attempt's failure:
 -- transient when it is an error upstream's transfer layer retries
@@ -898,9 +900,9 @@ parseRefText store txt = case parseStorePath (stDir store) txt of
   Just sp -> Right sp
   Nothing -> Left ("unparseable reference in store DB: " <> txt)
 
--- | Progress line on stderr (stdout stays reserved for results).
-logLine :: Text -> ExceptT Text IO ()
-logLine = liftIO . TIO.hPutStrLn stderr
+-- | Tell the logger a progress line.
+logLine :: Logger -> Text -> ExceptT Text IO ()
+logLine logger = liftIO . logMessage logger
 
 -- ---------------------------------------------------------------------------
 -- Progress lines
@@ -923,15 +925,15 @@ retryTag :: Text
 retryTag = "[retry] "
 
 -- | Report how many paths of the closure the cache holds already, if any.
-logSkipped :: Int -> ExceptT Text IO ()
-logSkipped skipped =
+logSkipped :: Logger -> Int -> ExceptT Text IO ()
+logSkipped logger skipped =
   when (skipped > 0) $
-    logLine (skipTag <> T.pack (show skipped) <> " path(s) already cached")
+    logLine logger (skipTag <> T.pack (show skipped) <> " path(s) already cached")
 
 -- | Report a path's NAR, packaged for the cache, with the NAR's size.
-logNar :: StorePath -> PushArtifact -> ExceptT Text IO ()
-logNar sp artifact = logLine (narTag <> storePathBasename sp <> " (" <> T.pack (show (paNarSize artifact)) <> " bytes)")
+logNar :: Logger -> StorePath -> PushArtifact -> ExceptT Text IO ()
+logNar logger sp artifact = logLine logger (narTag <> storePathBasename sp <> " (" <> T.pack (show (paNarSize artifact)) <> " bytes)")
 
 -- | Report a path whose narinfo the cache now holds.
-logPushed :: StorePath -> ExceptT Text IO ()
-logPushed sp = logLine (pushTag <> storePathBasename sp)
+logPushed :: Logger -> StorePath -> ExceptT Text IO ()
+logPushed logger sp = logLine logger (pushTag <> storePathBasename sp)

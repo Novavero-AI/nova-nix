@@ -75,10 +75,10 @@ import Data.Set (Set)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import qualified Data.Text.IO as TIO
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
+import Nix.Logger (Logger (..))
 import System.Exit (ExitCode (..))
-import System.IO (Handle, hClose, hFlush, stderr)
+import System.IO (hClose, hFlush)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Process as Proc
 #if defined(mingw32_HOST_OS)
@@ -106,7 +106,7 @@ import System.Posix.User (getEffectiveUserID, getRealUserID)
 -- ---------------------------------------------------------------------------
 
 -- | What the probe found for a helper, and whether the fallback warning
--- has been printed.
+-- has been given.
 data ProbeState = ProbeState
   { psAnswers :: !(Map.Map FilePath (Either Unavailability FilePath)),
     psWarned :: !Bool
@@ -148,12 +148,12 @@ probe helper = do
       Right Nothing -> Left (ProbeUnreadable "the sandbox helper's probe failed and said nothing")
       Left reason -> Left (ProbeUnreadable reason)
 
--- | Print the fallback warning ('fallbackWarning'), the first time this
--- process falls back.
-warnFallback :: Unavailability -> IO ()
-warnFallback cause = do
+-- | Give the logger the fallback warning ('fallbackWarning'), the first
+-- time this process falls back.
+warnFallback :: Logger -> Unavailability -> IO ()
+warnFallback logger cause = do
   first <- modifyMVar probeCache $ \state -> pure (state {psWarned = True}, not (psWarned state))
-  when first (TIO.hPutStrLn stderr (fallbackWarning cause))
+  when first (logMessage logger (fallbackWarning cause))
 
 -- | Upstream's @isRootUser@ (users.cc at 2.24.9): whether the process
 -- runs as uid 0, which is where @require-drop-supplementary-groups@
@@ -178,7 +178,7 @@ data HelperRun = HelperRun
   }
   deriving (Eq, Show)
 
--- | Run the helper over a builder, given the build log, the helper, the
+-- | Run the helper over a builder, given the logger, the helper, the
 -- plan, the directory it starts in, and the program and arguments it
 -- runs.  It is spawned as a builder is ("Nix.Builder"), with its
 -- protocol around it ("Nix.Builder.Sandbox"): an empty environment, so the
@@ -210,8 +210,8 @@ data HelperRun = HelperRun
 -- killed by a signal no process can handle, though on Linux the builder
 -- is set to die with the helper and takes its namespace with it, not
 -- necessarily before this returns.
-runHelper :: Handle -> FilePath -> ByteString -> FilePath -> [String] -> IO HelperRun
-runHelper buildLog helper plan workDir command =
+runHelper :: Logger -> FilePath -> ByteString -> FilePath -> [String] -> IO HelperRun
+runHelper logger helper plan workDir command =
   bracket openLogPipe closePipe $ \(fromBuilder, toLog) ->
     E.mask $ \restore -> do
       (stdinEnd, stdoutEnd, _, process) <- Proc.createProcess (spawnWith toLog)
@@ -221,7 +221,7 @@ runHelper buildLog helper plan workDir command =
         restore
           ( do
               delivered <- maybe (pure (Left "the sandbox helper has no standard input")) deliver stdinEnd
-              streamBuildLog fromBuilder buildLog
+              streamBuildLog fromBuilder logger
               exitCode <- Proc.waitForProcess process
               status <- maybe (pure BS.empty) BS.hGetContents stdoutEnd
               pure (HelperRun delivered exitCode status)
@@ -374,12 +374,12 @@ sealChroot root storeDir = do
 -- so a directory the build swapped for a link is unlinked, not entered.
 -- It is refused while anything is mounted in the chroot
 -- ('mountPointsWithin').
-withChroot :: FilePath -> [SkeletonEntry] -> (FilePath -> IO a) -> IO (Either Text a)
+withChroot :: Logger -> FilePath -> [SkeletonEntry] -> (FilePath -> IO a) -> IO (Either Text a)
 #if defined(mingw32_HOST_OS)
-withChroot _ _ _ = pure (Left (unavailabilityCause PlatformUnsupported))
+withChroot _ _ _ _ = pure (Left (unavailabilityCause PlatformUnsupported))
 #else
-withChroot buildDir skeleton action = do
-  leftover <- removeChroot clearLeftover parent
+withChroot logger buildDir skeleton action = do
+  leftover <- removeChroot (clearLeftover logger) parent
   case leftover of
     Left reason -> pure (Left reason)
     Right () -> do

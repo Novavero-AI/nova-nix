@@ -116,7 +116,6 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
-import qualified Data.Text.IO as TIO
 import Data.Word (Word32)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
@@ -132,6 +131,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, current
 import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, renderAttrsShell, stringsAttr, structuredAttrsKey, withOutputPlaceholders)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
+import Nix.Logger (Logger (..))
 import Nix.Push (narHashMatches)
 import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, DifferingRebuild (..), Fallback (..), FetchOutcome (..), Offer (QueryFailed), RealiseEffects (..), RealiseSettings (..), Realised (..), Registration (..), SubstEffects (..), SubstitutesSetting (..), Undelivered (..), checkedOutputPath, noWriteAccessMessage, realise, realiseFailureMessage, realiseFailureStatus, realiseRequests, requestsFailureMessage, requestsFailureStatus, substituteClosure)
 import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, canonicalizeMetadata, finishNarUnpack, freshCopyPath, isValid, moveOutput, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, replaceWithCopy, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
@@ -347,11 +347,6 @@ data BuildConfig = BuildConfig
     -- build's. A foreign system with no entry here is refused rather than
     -- spawned natively; see 'execWrapperFor'.
     bcExecWrappers :: !(Map Text FilePath),
-    -- | Where a builder's output goes, a line at a time as each line
-    -- completes ("Nix.Builder.Log").  Upstream's default logger prints
-    -- every build-log line to standard error, which is where
-    -- 'defaultBuildConfig' points this.
-    bcBuildLog :: !System.IO.Handle,
     -- | Whether, and how, a spawned builder runs in a sandbox
     -- ("Nix.Builder.Sandbox").
     bcSandbox :: !SandboxConfig,
@@ -397,7 +392,6 @@ defaultBuildConfig dir =
       bcExecWrappers = Map.empty,
       bcUnpackLimits = defaultUnpackLimits,
       bcFetchRetry = defaultFetchRetryPolicy,
-      bcBuildLog = System.IO.stderr,
       bcSandbox = defaultSandboxConfig,
       bcFailedBuilds = RemoveFailed
     }
@@ -574,7 +568,7 @@ withOutputLocks config store drv act = do
     locked = do
       heldLocks <- newIORef []
       let takeLock sp = do
-            lock <- acquirePathLock (bcStoreDir config) sp
+            lock <- acquirePathLock (stLogger store) (bcStoreDir config) sp
             atomicModifyIORef' heldLocks (\locks -> (lock : locks, ()))
       ( do
           mapM_ takeLock (lockOrder id (map doPath (drvOutputs drv)))
@@ -676,7 +670,7 @@ buildUnderLock config store drvPath drv redirected succeeded finish = runExceptT
   -- 4. Create the build directory, empty, and remove it however the
   --    build ends, unless it failed and keeps it ('failedBuildsFor').
   ExceptT $
-    withBuildDir (bcStoreDir config) (doPath firstOutput) (runWorkDir run) (failedBuildsFor config drv) (either (const BuildFailed) succeeded) $ \buildDir ->
+    withBuildDir (stLogger store) (bcStoreDir config) (doPath firstOutput) (runWorkDir run) (failedBuildsFor config drv) (either (const BuildFailed) succeeded) $ \buildDir ->
       runPlannedBuild config context drv run buildDir plans (finish inputPaths plans)
   where
     stopped reason = BuildStop reason 1
@@ -717,9 +711,9 @@ data Placement
 builderRunFor :: BuildConfig -> BuildContext -> Derivation -> IO (Either Text BuilderRun)
 builderRunFor config context drv = case drvBuilder drv of
   b
-    | b == builtinFetchurlBuilder -> builtin (runBuiltinFetchurl (bcFetchRetry config) (stCaseSensitivity (bxStore context)) drv)
+    | b == builtinFetchurlBuilder -> builtin (runBuiltinFetchurl (buildLogger context) (bcFetchRetry config) (stCaseSensitivity (bxStore context)) drv)
     | b == builtinUnpackBuilder -> builtin (runBuiltinUnpack (bcStoreDir config) (bcUnpackLimits config) drv)
-    | b == builtinBuildenvBuilder -> builtin (runBuiltinBuildenv (bcStoreDir config) drv)
+    | b == builtinBuildenvBuilder -> builtin (runBuiltinBuildenv (buildLogger context) (bcStoreDir config) drv)
   _ -> fmap RunsSpawned <$> placementFor config context drv
   where
     builtin = pure . Right . RunsBuiltin
@@ -859,6 +853,10 @@ data BuildContext = BuildContext
     bxInputs :: !(Set StorePath)
   }
 
+-- | Where a build reports: its store's logger.
+buildLogger :: BuildContext -> Logger
+buildLogger = stLogger . bxStore
+
 -- | The build, once every output knows where it is written and where it
 -- belongs and the builder where it runs: run the builder, then @finish@
 -- with where each output it wrote is now.
@@ -963,7 +961,7 @@ placementFor config context drv =
           case (available, backendFallback hostSandboxBackend (scFallback sandbox)) of
             (Right (LinuxBackend, helper), _) -> pure (Right (PlacedInLinuxSandbox helper network))
             (Right (DarwinBackend, helper), _) -> pure (Right (PlacedInDarwinSandbox helper network))
-            (Left cause, FallBackUnsandboxed) -> Right PlacedUnsandboxed <$ warnFallback cause
+            (Left cause, FallBackUnsandboxed) -> Right PlacedUnsandboxed <$ warnFallback (buildLogger context) cause
             (Left cause, RefuseUnsandboxed) -> pure (Left (unavailableMessage hostSandboxBackend cause))
   where
     sandbox = bcSandbox config
@@ -983,7 +981,7 @@ runSpawnedBuilder config context drv placement buildDir plans continue = case pl
       Left reason -> pure (Left (BuilderRefused 1 reason))
       Right invocation -> do
         for_ (invFiles invocation) (uncurry BS.writeFile)
-        ran <- runBuilder (bcBuildLog config) invocation
+        ran <- runBuilder (buildLogger context) invocation
         traverse (\() -> continue (Written (scratchPathOf config) (writableByOthers . scratchPathOf config))) ran
 
 -- | Run a builder in the sandbox, in a chroot beside its build directory
@@ -1018,7 +1016,7 @@ runSandboxedBuild config context drv outerBuildDir plans helper network continue
       -- out of the chroot, as upstream keeps every known output path out
       -- (@startBuilder@ in local-derivation-goal.cc at 2.24.9).
       outputBytes <- traverse filePathBytes (Set.toAscList (Set.fromList (concat [[storeFile (opFinal p), scratchPathOf config p] | p <- plans])))
-      chrooted <- withChroot outerBuildDir (chrootSkeleton storeBytes (scBuildDir sandbox) network paths) $ \root -> do
+      chrooted <- withChroot (buildLogger context) outerBuildDir (chrootSkeleton storeBytes (scBuildDir sandbox) network paths) $ \root -> do
         rootBytes <- filePathBytes root
         let seenLayout = BuildLayout (BuildPlace seenBuildDir buildDir) [(opName p, BuildPlace (scratchPathOf config p) (root <> scratchPathOf config p)) | p <- plans] sandboxHome
             planInputs environment =
@@ -1045,7 +1043,7 @@ runSandboxedBuild config context drv outerBuildDir plans helper network continue
               Left reason -> pure (Left (BuilderSandboxFailed reason))
               Right plan -> do
                 for_ (invFiles invocation) (uncurry BS.writeFile)
-                ran <- runSandboxedBuilder (bcBuildLog config) helper (renderPlan plan) (helperOutcome setupStageName . setupFailureMessage plan) invocation
+                ran <- runSandboxedBuilder (buildLogger context) helper (renderPlan plan) (helperOutcome setupStageName . setupFailureMessage plan) invocation
                 case ran of
                   Left failure -> pure (Left failure)
                   Right () -> do
@@ -1140,7 +1138,7 @@ runDarwinSandboxedBuild config context drv buildDir plans helper network continu
   environment <- liftIO (builderEnvironment invocation)
   let plan = DarwinPlan realBuild profile (darwinParameters realBuild (doLocalNetworking options)) (map TE.encodeUtf8 environment)
   liftIO (for_ (invFiles invocation) (uncurry BS.writeFile))
-  ExceptT (runSandboxedBuilder (bcBuildLog config) helper (renderDarwinPlan plan) (helperOutcome darwinStageName . darwinSetupFailureMessage plan) invocation)
+  ExceptT (runSandboxedBuilder (buildLogger context) helper (renderDarwinPlan plan) (helperOutcome darwinStageName . darwinSetupFailureMessage plan) invocation)
   liftIO (continue (Written (scratchPathOf config) (writableByOthers . scratchPathOf config)))
 
 -- | Why the builder step of a build failed, with the exit code the
@@ -1659,8 +1657,8 @@ homeEnvVar =
 -- Process execution
 -- ---------------------------------------------------------------------------
 
--- | Run the builder process, copying what it writes to @buildLog@, and
--- report how it exited.
+-- | Run the builder process, handing what it writes to the logger a line
+-- at a time ('streamBuildLog'), and report how it exited.
 --
 -- Its standard output and standard error are one pipe ('openLogPipe'),
 -- so the log holds both in the order the builder wrote them, as
@@ -1679,8 +1677,8 @@ homeEnvVar =
 -- absent, not omitted, matching upstream's @getEnv(i).value_or("")@.
 -- Upstream writes these last in initEnv, so they win even over the
 -- derivation's own values.  Names match exactly, as upstream's do.
-runBuilder :: System.IO.Handle -> BuilderInvocation -> IO (Either BuilderFailure ())
-runBuilder buildLog invocation = do
+runBuilder :: Logger -> BuilderInvocation -> IO (Either BuilderFailure ())
+runBuilder logger invocation = do
   envList <- builderProcessEnv invocation
   let spawnWith toLog =
         (mkBuilderProcess (invProgram invocation) (invArgs invocation))
@@ -1711,7 +1709,7 @@ runBuilder buildLog invocation = do
     bracket openLogPipe closePipe $ \(fromBuilder, toLog) ->
       Proc.withCreateProcess (spawnWith toLog) $ \stdinEnd _ _ process -> do
         for_ stdinEnd System.IO.hClose
-        streamBuildLog fromBuilder buildLog
+        streamBuildLog fromBuilder logger
         Proc.waitForProcess process
   pure $ case exitCode of
     ExitSuccess -> Right ()
@@ -1754,13 +1752,13 @@ builderProcessEnv invocation = mapMaybe asPair <$> builderEnvironment invocation
       _ -> Nothing
 
 -- | Run a builder through the sandbox helper ('runHelper'), given the
--- plan as the helper reads it, with the builder's environment in it
--- ('builderEnvironment'), and how a run is read for the program it
--- executes ('helperOutcome').
-runSandboxedBuilder :: System.IO.Handle -> FilePath -> BS.ByteString -> (BS.ByteString -> Either Text () -> ExitCode -> BS.ByteString -> HelperOutcome) -> BuilderInvocation -> IO (Either BuilderFailure ())
-runSandboxedBuilder buildLog helper plan outcomeOf invocation = do
+-- logger its lines go to, the plan as the helper reads it, with the
+-- builder's environment in it ('builderEnvironment'), and how a run is
+-- read for the program it executes ('helperOutcome').
+runSandboxedBuilder :: Logger -> FilePath -> BS.ByteString -> (BS.ByteString -> Either Text () -> ExitCode -> BS.ByteString -> HelperOutcome) -> BuilderInvocation -> IO (Either BuilderFailure ())
+runSandboxedBuilder logger helper plan outcomeOf invocation = do
   program <- filePathBytes (invProgram invocation)
-  run <- runHelper buildLog helper plan (invWorkDir invocation) (invProgram invocation : invArgs invocation)
+  run <- runHelper logger helper plan (invWorkDir invocation) (invProgram invocation : invArgs invocation)
   pure $ case outcomeOf program (hrDelivered run) (hrExit run) (hrStatus run) of
     SetupIncomplete reason -> Left (BuilderSandboxFailed reason)
     BuilderRan ExitSuccess -> Right ()
@@ -1829,8 +1827,8 @@ isWindows = System.Info.os == "mingw32"
 -- the output's NAR.  @\<nix\/fetchurl.nix\>@ declares a recursive hash
 -- for either attribute.  The store's volume decides how a NAR's names
 -- are written and read back.
-runBuiltinFetchurl :: FetchRetryPolicy -> CaseSensitivity -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
-runBuiltinFetchurl policy sensitivity drv outputDirs =
+runBuiltinFetchurl :: Logger -> FetchRetryPolicy -> CaseSensitivity -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
+runBuiltinFetchurl logger policy sensitivity drv outputDirs =
   case (fetchUrlsFromEnv env, lookup envOut outputDirs, hashedOutput) of
     (Left err, _, _) -> pure (Left (1, "builtin:fetchurl: " <> err))
     (_, Nothing, _) -> pure (Left (1, "builtin:fetchurl: derivation defines no 'out' output"))
@@ -1863,7 +1861,7 @@ runBuiltinFetchurl policy sensitivity drv outputDirs =
       (out : _) | not (T.null (doHashAlgo out)) -> Just out
       _ -> Nothing
     fetchWithRetry outPath out ctx url =
-      first attemptFailureMessage <$> retryTransient policy ioRetryEffects (fetchAndVerify outPath out ctx url)
+      first attemptFailureMessage <$> retryTransient policy (ioRetryEffects logger) (fetchAndVerify outPath out ctx url)
     -- Every attempt makes the output from nothing (a restore creates each
     -- node exclusively, so what an earlier attempt left would refuse it)
     -- and hashes from the original context, so a retry never resumes a
@@ -2674,8 +2672,8 @@ buildRequests config store requests = do
 -- Nothing is written, and nothing is opened but the @.drv@ files it reads
 -- and what the validity answer reads, so a refusal of a substitution comes
 -- before the refusal of the store.
-realiseWithoutWriting :: BuildConfig -> (StorePath -> IO Bool) -> Text -> [(StorePath, Set Text)] -> IO (Either BuildStop ())
-realiseWithoutWriting config valid reason = realiseRequestsWith config effects
+realiseWithoutWriting :: Logger -> BuildConfig -> (StorePath -> IO Bool) -> Text -> [(StorePath, Set Text)] -> IO (Either BuildStop ())
+realiseWithoutWriting logger config valid reason = realiseRequestsWith config effects
   where
     refused = pure . QueryFailed . noWriteAccessMessage
     effects =
@@ -2689,7 +2687,7 @@ realiseWithoutWriting config valid reason = realiseRequestsWith config effects
               },
           reBuild = \_ _ _ -> pure (Left reason),
           reCheck = \_ _ -> pure (Left reason),
-          reReport = \status drv -> liftIO (logRealised status drv)
+          reReport = \status drv -> liftIO (logRealised logger status drv)
         }
 
 -- | Read each requested @.drv@ and every input it reaches from the store,
@@ -2759,7 +2757,7 @@ realiseEffects config store =
     { reSubst = substEffects config store,
       reBuild = \drv drvPath _ -> liftIO (buildReporting config store drv drvPath),
       reCheck = \drv drvPath -> liftIO (checkDerivation config store drv drvPath),
-      reReport = \status drv -> liftIO (logRealised status drv)
+      reReport = \status drv -> liftIO (logRealised (stLogger store) status drv)
     }
 
 -- | The store and caches a substitution uses: 'bcCaches' asked under
@@ -2774,9 +2772,9 @@ substEffects config store =
   SubstEffects
     { seValid = liftIO . isValid store,
       seReferences = case bcSubstitution config of
-        SubstituteFromCaches -> queryReferencesWith (bcFetchRetry config) ioRetryEffects (bcFallback config) (bcCaches config)
+        SubstituteFromCaches -> queryReferencesWith (stLogger store) (bcFetchRetry config) (ioRetryEffects (stLogger store)) (bcFallback config) (bcCaches config)
         RefuseSubstitution -> pure . QueryFailed . noWriteAccessMessage,
-      seNextOffer = const (queryNextOfferWith (bcFetchRetry config) ioRetryEffects (bcFallback config)),
+      seNextOffer = const (queryNextOfferWith (stLogger store) (bcFetchRetry config) (ioRetryEffects (stLogger store)) (bcFallback config)),
       seFetch = \registration -> liftIO . substitutePaths config store registration . fmap snd
     }
 
@@ -2809,10 +2807,10 @@ statusTag Substituted = "[subst] "
 statusTag Built = "[build] "
 statusTag Checked = "[check] "
 
--- | Log how a dependency was realised to stderr.
-logRealised :: Realised -> Derivation -> IO ()
-logRealised status drv =
-  TIO.hPutStrLn System.IO.stderr ("  " <> statusTag status <> " " <> formatDrvName drv)
+-- | Tell the logger how a dependency was realised.
+logRealised :: Logger -> Realised -> Derivation -> IO ()
+logRealised logger status drv =
+  logMessage logger ("  " <> statusTag status <> " " <> formatDrvName drv)
 
 -- | Substitute paths, each from the cache that offered it, every one of
 -- them or none ('FetchOutcome'), or under 'RegisterNone' fetch them and
@@ -2862,16 +2860,16 @@ substitutePaths config store registration offered = do
           case registered of
             Right () -> pure Fetched
             Left (e :: IOException) -> do
-              TIO.hPutStrLn System.IO.stderr ("  [subst] registration refused: " <> T.pack (displayException e))
+              logMessage (stLogger store) ("  [subst] registration refused: " <> T.pack (displayException e))
               pure (NotFetched (fmap (\substitute -> (substitutePath substitute, DeliveryFailed)) offered))
     -- Record a returned lock the moment it exists, so the enclosing
     -- finally owns it even when a later path's attempt fails or throws.
     substituteOne heldLocks substitute = do
       let sp = substitutePath substitute
-      result <- fetchSubstituteWith (bcFetchRetry config) ioRetryEffects store substitute
+      result <- fetchSubstituteWith (bcFetchRetry config) (ioRetryEffects (stLogger store)) store substitute
       case result of
         SubstSuccess _ lock -> atomicModifyIORef' heldLocks (\locks -> (lock : locks, ()))
-        SubstError err -> TIO.hPutStrLn System.IO.stderr ("  [subst] " <> spName sp <> ": " <> err)
+        SubstError err -> logMessage (stLogger store) ("  [subst] " <> spName sp <> ": " <> err)
         _ -> pure ()
       pure (sp, result)
 

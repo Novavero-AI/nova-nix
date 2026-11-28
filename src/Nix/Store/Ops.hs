@@ -48,6 +48,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Nix.Builder (BuildConfig (..), BuildStop (..), SubstitutionAccess (..), buildRequests, checkStored, realiseWithoutWriting)
+import Nix.Logger (Logger)
 import Nix.Store (Store (..), StoreDB, UpstreamHazard (..), addOutLinkRoot, addSourceTree, canonicalStoreDir, closeStore, closeStoreDB, dbFileName, isValidPath, materializeEvalSources, materializeEvalStoreWrites, metaDirName, openStore, openStoreDBReadOnly, queryReferences, storeTablesExist, upstreamManagedRefusal, writeDrvClosure)
 import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode, parseStorePath, storePathToFilePath)
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
@@ -124,7 +125,8 @@ data EvalObjects = EvalObjects
 -- asks nothing of the store never opens it, and one handle serves every
 -- operation ("Nix.Store.Handle" says why a process keeps one).  A build
 -- and a check run under the configuration ('buildRequests',
--- 'checkStored'), whatever its 'bcMode' says.
+-- 'checkStored'), whatever its 'bcMode' says.  The operations report
+-- through the logger given.
 --
 -- An add, a build or a check in a store upstream Nix's database may also
 -- manage is refused before the store is opened, since opening it would
@@ -135,8 +137,8 @@ data EvalObjects = EvalObjects
 -- are those of 'Nix.Store.materializeEvalSources',
 -- 'Nix.Store.materializeEvalStoreWrites' and 'Nix.Store.writeDrvClosure',
 -- which throw.
-withLocalStore :: BuildConfig -> (StoreOps IO -> IO a) -> IO a
-withLocalStore config action = withOpenedOnFirstUse (openStore dir) closeStore (action . localOps)
+withLocalStore :: Logger -> BuildConfig -> (StoreOps IO -> IO a) -> IO a
+withLocalStore logger config action = withOpenedOnFirstUse (openStore logger dir) closeStore (action . localOps)
   where
     dir = bcStoreDir config
     refusing = upstreamManagedRefusal ReplacesUpstreamPaths dir
@@ -153,7 +155,7 @@ withLocalStore config action = withOpenedOnFirstUse (openStore dir) closeStore (
               Nothing -> useStore >>= \store -> buildRequests config store requests
               Just reason -> case bcSubstitution config of
                 SubstituteFromCaches -> pure (Left (BuildStop reason 1))
-                RefuseSubstitution -> realiseWithoutWriting config (heldIn (localQueries dir)) reason requests,
+                RefuseSubstitution -> realiseWithoutWriting logger config (heldIn (localQueries dir)) reason requests,
           soCheck = \drvPath -> building (\store -> checkStored config store drvPath),
           soAddOutLinkRoot = \link path -> useStore >>= \store -> addOutLinkRoot store link path
         }

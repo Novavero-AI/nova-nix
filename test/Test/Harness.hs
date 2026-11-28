@@ -108,6 +108,7 @@ module Test.Harness
     restrictedPolicy,
     evalNixWith,
     withEnvVar,
+    testLogger,
   )
 where
 
@@ -147,6 +148,7 @@ import Nix.Expr.Resolve (staticGlobalNames, undefinedVariableMessage)
 import Nix.Expr.Types
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..))
 import Nix.Json (Json (..))
+import Nix.Logger (EscapeFilter (..), Logger, handleLogger)
 import Nix.Parser (SourceError (..), parseNix, parseNixWithScope, parsedExpr)
 import Nix.Push (storePathBasename)
 import Nix.Push.Directory (ed25519SeedBytes)
@@ -480,7 +482,7 @@ evalNixIO baseDir source = do
 -- interned in would otherwise depend on the machine; a test of
 -- @NIX_PATH@ itself uses 'evalNixIOWithNixPath'.
 testEvalState :: StoreDir -> FilePath -> IO EvalState
-testEvalState storeDir = newEvalStateWith unrestrictedPolicy [] (testSessionStore storeDir) storeDir
+testEvalState storeDir = newEvalStateWith testLogger unrestrictedPolicy [] (testSessionStore storeDir) storeDir
 
 -- | The store a test's evaluation realises contexts against: the local
 -- store in the directory, read-write as a build's session is, so what
@@ -497,14 +499,14 @@ eachOpening config =
   StoreOps
     { soQueries =
         StoreQueries
-          { sqValidPaths = \paths -> withLocalStore config (\ops -> sqValidPaths (soQueries ops) paths),
-            sqReferences = \path -> withLocalStore config (\ops -> sqReferences (soQueries ops) path)
+          { sqValidPaths = \paths -> withLocalStore testLogger config (\ops -> sqValidPaths (soQueries ops) paths),
+            sqReferences = \path -> withLocalStore testLogger config (\ops -> sqReferences (soQueries ops) path)
           },
-      soAddEvalObjects = \objects -> withLocalStore config (`soAddEvalObjects` objects),
-      soAddSourceTree = \name refs entry -> withLocalStore config (\ops -> soAddSourceTree ops name refs entry),
-      soBuild = \requests -> withLocalStore config (`soBuild` requests),
-      soCheck = \drvPath -> withLocalStore config (`soCheck` drvPath),
-      soAddOutLinkRoot = \link path -> withLocalStore config (\ops -> soAddOutLinkRoot ops link path)
+      soAddEvalObjects = \objects -> withLocalStore testLogger config (`soAddEvalObjects` objects),
+      soAddSourceTree = \name refs entry -> withLocalStore testLogger config (\ops -> soAddSourceTree ops name refs entry),
+      soBuild = \requests -> withLocalStore testLogger config (`soBuild` requests),
+      soCheck = \drvPath -> withLocalStore testLogger config (`soCheck` drvPath),
+      soAddOutLinkRoot = \link path -> withLocalStore testLogger config (\ops -> soAddOutLinkRoot ops link path)
     }
 
 -- | IO eval of a derivation expression to the 'Derivation' the session
@@ -696,7 +698,7 @@ withTempStore action = do
   let tmpStore = tmpBase </> "nova-nix-test-store-ops"
   forceRemoveIfExists tmpStore
   createDirectoryIfMissing True tmpStore
-  store <- openStore (StoreDir tmpStore)
+  store <- openStore testLogger (StoreDir tmpStore)
   results <- action store
   closeStore store
   forceRemoveIfExists tmpStore
@@ -870,7 +872,7 @@ narSpecFileVector =
 -- 'Subst.SubstError' with its message.
 offeredThenFetched :: FetchRetryPolicy -> RetryEffects IO -> Store -> [Subst.CacheConfig] -> StorePath -> IO Subst.SubstResult
 offeredThenFetched policy effects store caches sp = do
-  offer <- evalStateT (Subst.queryReferencesWith policy effects Realise.NoFallback caches sp) Subst.emptyNarInfoMemo
+  offer <- evalStateT (Subst.queryReferencesWith testLogger policy effects Realise.NoFallback caches sp) Subst.emptyNarInfoMemo
   case offer of
     Realise.Offered substitute _ -> Subst.fetchSubstituteWith policy effects store substitute
     Realise.NotOffered -> pure Subst.SubstNotFound
@@ -1116,7 +1118,7 @@ evalAndBuild storeDir source = do
         Left err -> pure (Left ("eval error: " <> err))
         Right Nothing -> pure (Left "result is not a derivation")
         Right (Just drv) -> do
-          store <- openStore storeDir
+          store <- openStore testLogger storeDir
           let config = defaultBuildConfig storeDir
           -- What the CLI driver does before building, in the same
           -- order: eval has no store DB handle, so anything it wrote
@@ -1184,7 +1186,7 @@ emits label source expected = runTestM label $ do
 inTestSession :: IO a -> IO a
 inTestSession action = do
   storeDir <- evalNixIOStoreDir
-  withEvalSession (SessionSettings unrestrictedPolicy (pure []) storeDir testBaseDir RegionsCollect (ReadOnlySession (localQueries storeDir) unexpectedOps)) (const action)
+  withEvalSession (SessionSettings unrestrictedPolicy (pure []) storeDir testBaseDir RegionsCollect (ReadOnlySession (localQueries storeDir) unexpectedOps) testLogger) (const action)
 
 -- ---------------------------------------------------------------------------
 -- Tests: store-path name validation at write sinks
@@ -1427,3 +1429,13 @@ withEnvVar name value action =
   bracket (lookupEnv name) restore (const (Blank.setEnv name value True >> action))
   where
     restore = maybe (unsetEnv name) (\saved -> Blank.setEnv name saved True)
+
+-- ---------------------------------------------------------------------------
+-- Logging
+-- ---------------------------------------------------------------------------
+
+-- | The logger the suite's stores, builds and evaluations report to:
+-- each message and each build line on stderr, as the command line
+-- writes them, with every escape sequence dropped from a build line.
+testLogger :: Logger
+testLogger = handleLogger DropEscapes stderr

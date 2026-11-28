@@ -46,13 +46,12 @@ import Control.Exception (Handler (..), IOException, SomeAsyncException (..), So
 import qualified Data.ByteString.Char8 as BS8
 import Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
 import qualified Network.HTTP.Client as HTTP
 import Network.HTTP.Types.Header (hUserAgent)
 import qualified Network.HTTP.Types.Status as HTTP
+import Nix.Logger (Logger, logWarning)
 import Paths_nova_nix (version)
-import System.IO (stderr)
 import System.Random (randomRIO)
 
 -- ---------------------------------------------------------------------------
@@ -169,14 +168,14 @@ data RetryEffects m = RetryEffects
     reWarn :: !(Text -> m ())
   }
 
--- | The real effects: a sleep, a uniform jitter, and a warning on stderr
--- in the shape of upstream's @warn("%s; retrying in %d ms", ...)@.
-ioRetryEffects :: RetryEffects IO
-ioRetryEffects =
+-- | The real effects: a sleep, a uniform jitter, and a warning to the
+-- logger in the shape of upstream's @warn("%s; retrying in %d ms", ...)@.
+ioRetryEffects :: Logger -> RetryEffects IO
+ioRetryEffects logger =
   RetryEffects
     { reSleepMs = threadDelay . (* microsPerMilli),
       reJitter = randomRIO (0, retryJitterCeiling),
-      reWarn = TIO.hPutStrLn stderr . ("warning: " <>)
+      reWarn = logWarning logger
     }
 
 -- | Run one download's attempt under the retry policy: a

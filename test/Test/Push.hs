@@ -44,7 +44,7 @@ import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getTempor
 import qualified System.Directory as Dir
 import System.FilePath ((</>))
 import qualified System.Info as SI
-import Test.Harness (TestResult (..), andThen, assertEqual, assertRight, findTestShell, forceRemoveIfExists, runTest, runTestM, throwawayKey, withTempStore)
+import Test.Harness (TestResult (..), andThen, assertEqual, assertRight, findTestShell, forceRemoveIfExists, runTest, runTestM, testLogger, throwawayKey, withTempStore)
 import qualified Test.QuickCheck as QC
 
 -- ---------------------------------------------------------------------------
@@ -496,7 +496,7 @@ testPushDirectory = do
     withSourceStore root label action = do
       let base = root </> label
       createDirectoryIfMissing True base
-      bracket (openStore (StoreDir (base </> "store"))) closeStore $ \store -> do
+      bracket (openStore testLogger (StoreDir (base </> "store"))) closeStore $ \store -> do
         forM_ [(leaf, []), (top, [leaf])] $ \(sp, references) -> do
           let source = base </> T.unpack (spName sp)
           createDirectoryIfMissing True source
@@ -522,7 +522,7 @@ testPushDirectory = do
                 drvEnv = Map.singleton "name" "top"
               }
           config = (defaultBuildConfig dest) {bcCaches = [Subst.CacheConfig base [Signing.renderPublicKey publicKey] 40]}
-      bracket (openStore dest) closeStore $ \store -> do
+      bracket (openStore testLogger dest) closeStore $ \store -> do
         writeDrv store drv drvSP
         result <- buildWithDeps config store drv drvSP
         held <- mapM (\sp -> readMaybeFile (storePathToFilePath (stDir store) sp </> "data")) [leaf, top]

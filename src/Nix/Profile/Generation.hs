@@ -90,10 +90,10 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.IO as TIO
 import Data.Word (Word64)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.HostPath (hostPathBytes, hostPathFromBytes, hostPathText)
+import Nix.Logger (Logger (..), logWarning)
 import Nix.Profile.Manifest (Conflict, Manifest, ManifestError, attributeConflict, emptyManifest, manifestPackages, manifestReferences, parseManifest, renderManifest)
 import Nix.Profile.Tree (BuildEnvFailure (..), Built (..), Node (..), Package (..), Tree, buildProfile, storeTreeReader, warningText)
 import Nix.Store.Handle (canonicalStoreDir)
@@ -102,7 +102,6 @@ import Nix.Store.Ops (StoreOps (..))
 import Nix.Store.Path (StoreDir (..), StorePath, parseStorePathPrefix, storePathToFilePath)
 import qualified NovaCache.NAR as NAR
 import qualified System.Directory.OsPath as OsDir
-import System.IO (stderr)
 import System.IO.Error (isAlreadyExistsError, isDoesNotExistError)
 import qualified System.Info
 import System.OsPath (OsPath, (</>))
@@ -200,14 +199,15 @@ absolutePath base path = OP.joinPath (reverse (foldl' step [] (OP.splitDirectori
 -- | Read where this user's profiles are from the environment, as upstream
 -- does: @NIX_STATE_HOME@, then on Unix @XDG_STATE_HOME@ and on Windows
 -- the Local AppData known folder, which is asked only when
--- @NIX_STATE_HOME@ is unset; and the home.
-readProfileEnvironment :: IO (Either Text ProfileEnvironment)
-readProfileEnvironment = runExceptT $ do
+-- @NIX_STATE_HOME@ is unset; and the home, with any warning finding it
+-- gives told to the logger.
+readProfileEnvironment :: Logger -> IO (Either Text ProfileEnvironment)
+readProfileEnvironment logger = runExceptT $ do
   nixStateHome <- ExceptT (variablePath "NIX_STATE_HOME")
   stateHome <- case nixStateHome of
     Just dir -> pure (NixStateHome dir)
     Nothing -> ExceptT hostStateHome
-  ProfileEnvironment stateHome <$> ExceptT readHome
+  ProfileEnvironment stateHome <$> ExceptT (readHome logger)
 
 -- | A variable's value as a host path, 'Nothing' when it is unset.
 variablePath :: ByteString -> IO (Either Text (Maybe OsPath))
@@ -237,12 +237,13 @@ hostStateHome = do
 hostStateHome = fmap XdgStateHome <$> variablePath "XDG_STATE_HOME"
 #endif
 
--- | The user's home, as upstream's @getHome@ finds it.
-readHome :: IO (Either Text OsPath)
+-- | The user's home, as upstream's @getHome@ finds it, any warning told
+-- to the logger.
+readHome :: Logger -> IO (Either Text OsPath)
 #if defined(mingw32_HOST_OS)
 -- @USERPROFILE@, else the default user's profile, collapsed
 -- (@getHome@ in windows/users.cc).
-readHome = do
+readHome _ = do
   found <- variablePath "USERPROFILE"
   cwd <- OsDir.getCurrentDirectory
   pure (absolutePath cwd . fromMaybe defaultUserProfile <$> found)
@@ -254,7 +255,7 @@ readHome = do
 -- @ENOENT@ and @ENOTDIR@ are (@maybeStat@ in file-system.cc), when the
 -- password database's home is used, with upstream's warning (@getHome@ in
 -- unix/users.cc).
-readHome = do
+readHome logger = do
   found <- lookupEnvBytes "HOME"
   case found of
     EnvValue bytes -> do
@@ -267,7 +268,7 @@ readHome = do
         Left (failure :: IOException)
           | isDoesNotExistError failure || fmap Errno (ioe_errno failure) == Just eNOTDIR -> pure (homePath bytes)
           | otherwise -> do
-              TIO.hPutStrLn stderr ("warning: couldn't stat $HOME ('" <> shown bytes <> "') for reason other than not existing, falling back to the one defined in the 'passwd' file: " <> T.pack (show failure))
+              logWarning logger ("couldn't stat $HOME ('" <> shown bytes <> "') for reason other than not existing, falling back to the one defined in the 'passwd' file: " <> T.pack (show failure))
               passwordHome Nothing
     _ -> passwordHome Nothing
   where
@@ -282,7 +283,7 @@ readHome = do
               case unowned of
                 Just given
                   | given /= home ->
-                      TIO.hPutStrLn stderr ("warning: $HOME ('" <> shown given <> "') is not owned by you, falling back to the one defined in the 'passwd' file ('" <> shown home <> "')")
+                      logWarning logger ("$HOME ('" <> shown given <> "') is not owned by you, falling back to the one defined in the 'passwd' file ('" <> shown home <> "')")
                 _ -> pure ()
               pure (homePath home)
         _ -> pure (Left "cannot determine user's home directory")
@@ -529,9 +530,10 @@ readManifest profile = do
 -- another store read against this one would name paths it does not hold.  The
 -- store directory is taken in the spelling the store's handle keys it by
 -- ('canonicalStoreDir'), which the tree's links and the generations' targets
--- are written in.
-updateProfile :: StoreOps IO -> StoreDir -> OsPath -> (Manifest -> IO Change) -> IO (Either ProfileFailure Updated)
-updateProfile ops givenStoreDir profile change = canonicalStoreDir givenStoreDir >>= attempting
+-- are written in.  The line, the tree's warnings and a wait on the
+-- profile's lock go to the logger.
+updateProfile :: Logger -> StoreOps IO -> StoreDir -> OsPath -> (Manifest -> IO Change) -> IO (Either ProfileFailure Updated)
+updateProfile logger ops givenStoreDir profile change = canonicalStoreDir givenStoreDir >>= attempting
   where
     attempting storeDir = do
       attempted <- runExceptT (attempt storeDir)
@@ -539,7 +541,7 @@ updateProfile ops givenStoreDir profile change = canonicalStoreDir givenStoreDir
         Left failure -> pure (Left failure)
         Right (Finished updated) -> pure (Right updated)
         Right Restart -> do
-          TIO.hPutStrLn stderr ("profile \"" <> hostPathText profile <> "\" changed while we were busy; restarting")
+          logMessage logger ("profile \"" <> hostPathText profile <> "\" changed while we were busy; restarting")
           attempting storeDir
     attempt storeDir = do
       token <- ExceptT (profileToken profile)
@@ -549,8 +551,8 @@ updateProfile ops givenStoreDir profile change = canonicalStoreDir givenStoreDir
       case changed of
         Unchanged -> pure (Finished NothingChanged)
         Changed next -> do
-          path <- makeGeneration ops storeDir profile next
-          ExceptT . withProfileLock profile . runExceptT $ do
+          path <- makeGeneration logger ops storeDir profile next
+          ExceptT . withProfileLock logger profile . runExceptT $ do
             now <- ExceptT (profileToken profile)
             if now /= token
               then pure Restart
@@ -600,16 +602,16 @@ resolvedStoreDir :: StoreDir -> IO StoreDir
 resolvedStoreDir storeDir = StoreDir . fromRight (unStoreDir storeDir) <$> tryIO (OP.encodeFS (unStoreDir storeDir) >>= OsDir.canonicalizePath >>= OP.decodeFS)
 
 -- | Make a generation's store path from its manifest: the tree of its
--- active elements' paths, with the warnings the tree gives printed, and
+-- active elements' paths, with the warnings the tree gives logged, and
 -- @manifest.json@, added as 'generationStoreName' with every element's
 -- paths as its references (@ProfileManifest::build@ in profile.cc).  The
 -- tree's warnings name entries under the profile's path.  A conflict is
 -- attributed under the store directory as given and as the tree resolves it.
-makeGeneration :: StoreOps IO -> StoreDir -> OsPath -> Manifest -> ExceptT ProfileFailure IO StorePath
-makeGeneration ops storeDir profile manifest = do
+makeGeneration :: Logger -> StoreOps IO -> StoreDir -> OsPath -> Manifest -> ExceptT ProfileFailure IO StorePath
+makeGeneration logger ops storeDir profile manifest = do
   packages <- liftIO (traverse package (manifestPackages manifest))
   Built warnings built <- liftIO (buildProfile (storeTreeReader storeDir) profile packages)
-  liftIO (mapM_ (TIO.hPutStrLn stderr . ("warning: " <>) . warningText) warnings)
+  liftIO (mapM_ (logWarning logger . warningText) warnings)
   tree <- case built of
     Right tree -> pure tree
     Left (FileConflict existing incoming priority) -> do
@@ -648,12 +650,12 @@ createGeneration ops storeDir profile path = do
 -- (@PathLocks::lockPaths@ in unix\/pathlocks.cc), with upstream's line
 -- when another holds it (@lockProfile@ in profiles.cc).  A lock file that
 -- cannot be opened, as in a directory that is not there, is the failure.
-withProfileLock :: OsPath -> IO (Either ProfileFailure a) -> IO (Either ProfileFailure a)
-withProfileLock profile action = do
+withProfileLock :: Logger -> OsPath -> IO (Either ProfileFailure a) -> IO (Either ProfileFailure a)
+withProfileLock logger profile action = do
   lockPath <- OP.decodeFS (profile <> ascii lockFileSuffix)
-  bracket (tryIO (acquireLockFileWith LockExclusive waiting lockPath)) (traverse_ releasePathLock) (either (pure . Left . opening lockPath) (const action))
+  bracket (tryIO (acquireLockFileWith logger LockExclusive waiting lockPath)) (traverse_ releasePathLock) (either (pure . Left . opening lockPath) (const action))
   where
-    waiting = "waiting for lock on profile \"" <> T.unpack (hostPathText profile) <> "\""
+    waiting = "waiting for lock on profile \"" <> hostPathText profile <> "\""
     opening lockPath failure = ProfileIOFailed ("opening lock file \"" <> T.pack lockPath <> "\": " <> T.pack (show failure))
 
 -- ---------------------------------------------------------------------------

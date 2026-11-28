@@ -50,6 +50,7 @@ import Nix.Eval.IO (SessionSettings (..), SessionStore (ReadOnlySession), withEv
 import Nix.Eval.Policy (unrestrictedPolicy)
 import Nix.Eval.SourcePos (PosIdx (..))
 import Nix.Eval.Symbol (Symbol (..))
+import Nix.Logger (EscapeFilter (DropEscapes), handleLogger)
 import Nix.Store.Ops (StoreOps (..), StoreQueries (..))
 import Nix.Store.Path (defaultStoreDir)
 import System.Environment (getArgs)
@@ -110,7 +111,7 @@ main = do
 inSession :: IO a -> IO a
 inSession action = withEvalSession settings (const action)
   where
-    settings = SessionSettings unrestrictedPolicy (pure []) defaultStoreDir "/" RegionsOff (ReadOnlySession queries ops)
+    settings = SessionSettings unrestrictedPolicy (pure []) defaultStoreDir "/" RegionsOff (ReadOnlySession queries ops) (handleLogger DropEscapes stderr)
     queries = StoreQueries {sqValidPaths = const (pure mempty), sqReferences = const (pure (Right mempty))}
     ops =
       StoreOps
