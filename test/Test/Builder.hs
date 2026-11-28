@@ -3839,6 +3839,11 @@ testUnpackBuildIO = do
       manyEntriesResult <- buildDerivation (tinyBudget 1000000 4) store (mkUnpackDrv manyEntriesOut [archiveManyEntries]) testDrvPath
       bigFileResult <- buildDerivation (tinyBudget 64 1000) store (mkUnpackDrv bigFileOut [archiveBigFile]) testDrvPath
       amplifyResult <- buildDerivation (tinyBudget 100 1000) store (mkUnpackDrv amplifyOut [archiveAmplify]) testDrvPath
+      -- This process's own read of the archive, were it still open, would
+      -- lock it against a write; on Windows it keeps the file from being
+      -- deleted too.  Opened at once, before a collection could finalize
+      -- such a read.
+      amplifyClosed <- try (withBinaryFile archiveAmplify ReadWriteMode (const (pure ())))
       gitHubResult <- buildDerivation config store (mkUnpackDrv gitHubOut [archiveGitHub]) testDrvPath
       seedChecks <- case seedResult of
         BuildFailure msg code ->
@@ -3954,7 +3959,9 @@ testUnpackBuildIO = do
             runTest "unpack: size budget breach fails loudly" $
               rejectedWith "size budget" bigFileResult,
             runTest "unpack: directory link copies charge the budget" $
-              rejectedWith "size budget" amplifyResult
+              rejectedWith "size budget" amplifyResult,
+            runTest "unpack: an archive the unpack stopped partway through is closed, so it can be written at once" $
+              either (\err -> Fail ("the archive is still open: " <> T.pack (show (err :: IOException)))) (const Pass) amplifyClosed
           ]
       -- Unit: the rooted (drive-relative) case is the Blocker-4 Windows vuln.
       -- tar's toLinkTarget refuses an absolute payload on POSIX, so exercise the

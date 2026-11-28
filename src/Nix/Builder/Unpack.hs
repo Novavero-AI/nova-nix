@@ -213,12 +213,15 @@ unpackAll outDir budget (archive : rest) = do
 -- | Unpack one archive into @outDir@, returning the budget left for the
 -- archives after it.  The decompressor is chosen by file extension; the
 -- tar stream is decoded (GNU + pax long names) and extracted entry by
--- entry.  The archive is read lazily and decoded as the entries are
--- forced, so a failure surfaces mid-extraction as an exception, and the
--- whole extraction is wrapped to turn each kind into a clean failure: an
--- 'IOException' reading the archive or writing the tree, or the
--- 'GZip.DecompressError' the gzip decoder throws for a corrupt or
--- truncated stream.
+-- entry.  The archive is read whole, and its file closed, before any of
+-- it is decoded, so no handle on it outlives the extraction, whichever
+-- entry stops it: a lazy read would hold the file open until a
+-- collection, and an open file on Windows cannot be deleted.  It is
+-- decompressed and decoded as the entries are forced, so a failure
+-- surfaces mid-extraction as an exception, and the whole extraction is
+-- wrapped to turn each kind into a clean failure: an 'IOException'
+-- reading the archive or writing the tree, or the 'GZip.DecompressError'
+-- the gzip decoder throws for a corrupt or truncated stream.
 unpackArchive :: FilePath -> UnpackLimits -> FilePath -> IO (Either Text UnpackLimits)
 unpackArchive outDir budget archivePath =
   run
@@ -230,7 +233,7 @@ unpackArchive outDir budget archivePath =
     run = case decoderFor archivePath of
       Nothing -> pure (Left ("unsupported archive format: " <> T.pack archivePath))
       Just decoder -> do
-        raw <- BL.readFile archivePath
+        raw <- BL.fromStrict <$> BS.readFile archivePath
         extractEntries outDir budget (Tar.decodeLongNames (Tar.read (decoder raw)))
 
 -- | Choose a decompressor from the archive file name: @.tar.gz@ (GitHub's
