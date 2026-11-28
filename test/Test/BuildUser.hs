@@ -87,9 +87,9 @@ testBuildUsersPure = do
           `andThen` assertEqual "root with a group" supported (buildUsersFor RunsAsRoot pool "nixbld" /= NoBuildUsers)
           `andThen` assertEqual "root with none" NoBuildUsers (buildUsersFor RunsAsRoot pool "")
           `andThen` assertEqual "another with a group" NoBuildUsers (buildUsersFor RunsUnprivileged pool "nixbld"),
-      runTest "the user pool is in upstream's state directory, or the one NIX_STATE_DIR names" $
+      runTest "the user pool is in upstream's state directory, or the one NIX_STATE_DIR names, a POSIX path on every system" $
         assertEqual "default" "/nix/var/nix/userpool" (userPoolDir Nothing)
-          `andThen` assertEqual "named" ("/s" </> "userpool") (userPoolDir (Just "/s")),
+          `andThen` assertEqual "named" "/s/userpool" (userPoolDir (Just "/s")),
       runTest "a peer whose primary group is the build users' is refused, and no other" $
         assertEqual "build user" True (peerInBuildUsersGroup "nixbld" (Just "nixbld"))
           `andThen` assertEqual "another group" False (peerInBuildUsersGroup "nixbld" (Just "users"))
