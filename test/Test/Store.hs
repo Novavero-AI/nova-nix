@@ -10,6 +10,7 @@ module Test.Store
     testCaseSensitiveVolumeIO,
     testFoldingVolumeIO,
     testStoreDB,
+    testPathInfo,
     testParseStorePath,
     testStoreAccessIO,
     testStoreOpsIO,
@@ -53,19 +54,21 @@ import GHC.IO.Exception (IOErrorType (..), IOException (..))
 import HttpFixture (Reply (..), httpResponse, withHttpServer)
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuildStop (..), buildDerivation, buildWithDeps, checkDerivation, defaultBuildConfig, verifyFetchHash)
 import Nix.Builder.BuildDir (createBuildDir)
+import qualified Nix.Daemon.Protocol as Proto
 import Nix.Derivation (Derivation (..), DerivationOutput (..), currentPlatform, toATerm)
 import Nix.Eval (NixValue (..))
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.IO (EvalState (..), sourceCopies)
 import Nix.Hash (FileIngestionMethod (..), compressHash, makeFixedOutputPath, makeTextPath, sha256Digest)
 import qualified Nix.Hash as Hash
+import Nix.HostPath (hostPathBytes, hostPathFromBytes)
 import Nix.Http (defaultFetchRetryPolicy, ioRetryEffects)
 import Nix.Push (computeClosure)
 import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv)
 import Nix.Store.Access (AclEntry (..), DirAccess (..), DirSecurity (..), Distrust (..), accessSddl, descriptorDistrust, distrustMessage, parseSecurityDescriptor, securityDistrust, sidFromText, stateDirectories, storeDirectories)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack)
-import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
+import Nix.Store.DB (PathInfo (..), PathRegistration (..), Ultimate (..), UnregisterResult (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathFromHashPart, queryPathInfo, queryReferences, queryReferrers, queryValidDerivers, registerPath, registerPaths, unregisterPathRow)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (MetadataChange (..), NodeKind (..), NodeMetadata (..), Ownership (..), canonicalPermissions, executablePermissions, metadataChanges, readOnlyPermissions, storeModificationTime)
@@ -90,7 +93,7 @@ import qualified System.Info as SI
 import qualified System.OsPath as OP
 import qualified System.Process as Proc
 import System.Timeout (timeout)
-import Test.Harness (TestResult (..), andThen, assertEqual, assertEvalErrorIO, bytesText, canonicalAs, chunkReader, deleteNamed, evalAndBuild, evalNix, evalNixIOIn, evalNixIOStore, findTestShell, forceRemoveIfExists, genDrvName, genFixturePath, mkTestBuildDrv, narInfoRequest, narSpecFileVector, narSpecVector, offeredThenFetched, parseErrorTag, posixOnlyEntries, quotedAsCxx, removeIfExists, runTest, runTestM, servedPaths, sigTestKeyText, simpleTestDrv, symlinksAvailable, testDrvPath, testEvalState, testLogger, walkWatchdogMicros, withTempStore)
+import Test.Harness (TestResult (..), andThen, assertEqual, assertEvalErrorIO, bytesText, canonicalAs, chunkReader, deleteNamed, evalAndBuild, evalNix, evalNixIOIn, evalNixIOStore, findTestShell, forceRemoveIfExists, genContentAddress, genDrvName, genFixturePath, genSignatures, mkTestBuildDrv, narInfoRequest, narSpecFileVector, narSpecVector, offeredThenFetched, parseErrorTag, posixOnlyEntries, quotedAsCxx, removeIfExists, runTest, runTestM, servedPaths, sigTestKeyText, simpleTestDrv, symlinksAvailable, testDrvPath, testEvalState, testLogger, walkWatchdogMicros, withTempStore)
 import qualified Test.QuickCheck as QC
 import Text.Read (readMaybe)
 
@@ -1083,7 +1086,7 @@ testStoreDB = do
         runTestM "db register + isValid" $ do
           db <- openStoreDB storeDir
           let sp = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2" "hello"
-              reg = PathRegistration sp "sha256:abc" 100 Nothing []
+              reg = PathRegistration sp "sha256:abc" 100 Nothing [] NotUltimate Set.empty Nothing
           registerPath db reg
           result <- isValidPath db sp
           closeStoreDB db
@@ -1105,7 +1108,7 @@ testStoreDB = do
             SQL.close peer
             putMVar released ()
           let sp = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3" "busywait"
-          registerPath db (PathRegistration sp "sha256:busy" 10 Nothing [])
+          registerPath db (PathRegistration sp "sha256:busy" 10 Nothing [] NotUltimate Set.empty Nothing)
           takeMVar released
           result <- isValidPath db sp
           closeStoreDB db
@@ -1116,9 +1119,9 @@ testStoreDB = do
           let ref1 = StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "dep1"
               ref2 = StorePath "cccccccccccccccccccccccccccccccc" "dep2"
               mainSp = StorePath "dddddddddddddddddddddddddddddddd" "mainpkg"
-          registerPath db (PathRegistration ref1 "sha256:r1" 50 Nothing [])
-          registerPath db (PathRegistration ref2 "sha256:r2" 60 Nothing [])
-          registerPath db (PathRegistration mainSp "sha256:m1" 200 Nothing [ref1, ref2])
+          registerPath db (PathRegistration ref1 "sha256:r1" 50 Nothing [] NotUltimate Set.empty Nothing)
+          registerPath db (PathRegistration ref2 "sha256:r2" 60 Nothing [] NotUltimate Set.empty Nothing)
+          registerPath db (PathRegistration mainSp "sha256:m1" 200 Nothing [ref1, ref2] NotUltimate Set.empty Nothing)
           refs <- queryReferences db mainSp
           closeStoreDB db
           let ref1Path = T.pack (storePathToFilePath storeDir ref1)
@@ -1139,11 +1142,11 @@ testStoreDB = do
               sp = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii" "refresh-main"
           registerPaths
             db
-            [ PathRegistration refA "sha256:ra" 10 Nothing [],
-              PathRegistration refB "sha256:rb" 11 Nothing [],
-              PathRegistration sp "sha256:rm" 12 Nothing [refA, refB]
+            [ PathRegistration refA "sha256:ra" 10 Nothing [] NotUltimate Set.empty Nothing,
+              PathRegistration refB "sha256:rb" 11 Nothing [] NotUltimate Set.empty Nothing,
+              PathRegistration sp "sha256:rm" 12 Nothing [refA, refB] NotUltimate Set.empty Nothing
             ]
-          registerPath db (PathRegistration sp "sha256:rm" 12 Nothing [refA])
+          registerPath db (PathRegistration sp "sha256:rm" 12 Nothing [refA] NotUltimate Set.empty Nothing)
           refs <- queryReferences db sp
           closeStoreDB db
           let refAPath = T.pack (storePathToFilePath storeDir refA)
@@ -1162,7 +1165,7 @@ testStoreDB = do
           db <- openStoreDB storeDir
           let ghost = StorePath "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj" "ghost"
               sp = StorePath "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk" "orphan-edge"
-          outcome <- try (registerPath db (PathRegistration sp "sha256:oe" 13 Nothing [ghost]))
+          outcome <- try (registerPath db (PathRegistration sp "sha256:oe" 13 Nothing [ghost] NotUltimate Set.empty Nothing))
           recorded <- isValidPath db sp
           closeStoreDB db
           pure $ case outcome of
@@ -1187,8 +1190,8 @@ testStoreDB = do
             try
               ( registerPaths
                   db
-                  [ PathRegistration late "sha256:lt" 14 Nothing [ghostA],
-                    PathRegistration early "sha256:er" 15 Nothing [ghostC, ghostB]
+                  [ PathRegistration late "sha256:lt" 14 Nothing [ghostA] NotUltimate Set.empty Nothing,
+                    PathRegistration early "sha256:er" 15 Nothing [ghostC, ghostB] NotUltimate Set.empty Nothing
                   ]
               )
           closeStoreDB db
@@ -1203,7 +1206,7 @@ testStoreDB = do
         runTestM "db queryDeriver nothing" $ do
           db <- openStoreDB storeDir
           let sp = StorePath "cccccccccccccccccccccccccccccccc" "noderiver"
-          registerPath db (PathRegistration sp "sha256:nd" 80 Nothing [])
+          registerPath db (PathRegistration sp "sha256:nd" 80 Nothing [] NotUltimate Set.empty Nothing)
           result <- queryDeriver db sp
           closeStoreDB db
           pure (assertEqual "no deriver" Nothing result),
@@ -1211,7 +1214,7 @@ testStoreDB = do
         runTestM "db queryDeriver just" $ do
           db <- openStoreDB storeDir
           let sp = StorePath "ffffffffffffffffffffffffffffffff" "hasdrv"
-          registerPath db (PathRegistration sp "sha256:hd" 90 (Just "/nix/store/xxx.drv") [])
+          registerPath db (PathRegistration sp "sha256:hd" 90 (Just "/nix/store/xxx.drv") [] NotUltimate Set.empty Nothing)
           result <- queryDeriver db sp
           closeStoreDB db
           pure (assertEqual "has deriver" (Just "/nix/store/xxx.drv") result),
@@ -1219,7 +1222,7 @@ testStoreDB = do
         runTestM "db queryPathInfo" $ do
           db <- openStoreDB storeDir
           let sp = StorePath "gggggggggggggggggggggggggggggggg" "infotest"
-          registerPath db (PathRegistration sp "sha256:info" 150 (Just "/drv") [])
+          registerPath db (PathRegistration sp "sha256:info" 150 (Just "/drv") [] NotUltimate Set.empty Nothing)
           minfo <- queryPathInfo db sp
           closeStoreDB db
           pure $ case minfo of
@@ -1240,7 +1243,7 @@ testStoreDB = do
         runTestM "db double register idempotent" $ do
           db <- openStoreDB storeDir
           let sp = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii" "double"
-              reg = PathRegistration sp "sha256:dup" 120 Nothing []
+              reg = PathRegistration sp "sha256:dup" 120 Nothing [] NotUltimate Set.empty Nothing
           registerPath db reg
           registerPath db reg
           result <- isValidPath db sp
@@ -1252,9 +1255,9 @@ testStoreDB = do
           let spA = StorePath "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj" "a"
               spB = StorePath "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk" "b"
               spC = StorePath "llllllllllllllllllllllllllllllll" "c"
-          registerPath db (PathRegistration spA "sha256:a" 10 Nothing [])
-          registerPath db (PathRegistration spB "sha256:b" 20 Nothing [spA])
-          registerPath db (PathRegistration spC "sha256:c" 30 Nothing [spA, spB])
+          registerPath db (PathRegistration spA "sha256:a" 10 Nothing [] NotUltimate Set.empty Nothing)
+          registerPath db (PathRegistration spB "sha256:b" 20 Nothing [spA] NotUltimate Set.empty Nothing)
+          registerPath db (PathRegistration spC "sha256:c" 30 Nothing [spA, spB] NotUltimate Set.empty Nothing)
           refsC <- queryReferences db spC
           refsA <- queryReferences db spA
           closeStoreDB db
@@ -1265,6 +1268,230 @@ testStoreDB = do
               then Pass
               else Fail ("bad ref graph: c refs=" <> T.pack (show refsC) <> " a refs=" <> T.pack (show refsA))
       ]
+
+-- | What a path's info records beyond its NAR, whether this store built
+-- it, its signatures and its content address, in the columns upstream's
+-- schema has; the queries that read the references, the derivations'
+-- outputs and the hash parts back; and a database an earlier nova-nix
+-- made, which opens with the new fields absent.
+testPathInfo :: IO [Bool]
+testPathInfo = do
+  putStrLn "store/path-info"
+  tmpBase <- getTemporaryDirectory
+  shell <- findTestShell
+  let root = tmpBase </> "nova-nix-test-path-info"
+      dir = StoreDir (root </> "store")
+      dbPath = unStoreDir dir </> metaDirName </> dbFileName
+      at hash = StorePath (T.replicate 32 hash)
+      pathText = T.pack . storePathToFilePath dir
+      registration sp refs = PathRegistration sp "sha256:x" 1 Nothing refs NotUltimate Set.empty Nothing
+      trustOf info = (piUltimate info, piSignatures info, piContentAddress info)
+      signature name bytes = maybe Set.empty Set.singleton (Proto.signatureFromParts name bytes)
+      zeroAddress = Proto.contentAddressFromParts (Proto.FixedMethod NarIngestion) "sha256" (BS.replicate 32 0)
+      inFreshStore action = do
+        forceRemoveIfExists root
+        createDirectoryIfMissing True (unStoreDir dir)
+        bracket (openStoreDB dir) closeStoreDB action `finally` forceRemoveIfExists root
+      -- A derivation's file at its path, with outputs at the paths given.
+      writeDerivation drvPath outputs =
+        BS.writeFile (storePathToFilePath dir drvPath) (toATerm (mkTestBuildDrv shell (at "0" "unused") "true") {drvOutputs = [DerivationOutput name out "" "" | (name, out) <- outputs]})
+  sequence
+    [ runTestM "registration round-trips whether this store built a path, its signatures and its content address" $ do
+        counter <- newIORef (0 :: Int)
+        inFreshStore $ \db -> do
+          result <-
+            QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+              QC.forAll ((,,) <$> QC.elements [Ultimate, NotUltimate] <*> genSignatures <*> QC.oneof [pure Nothing, Just <$> genContentAddress]) $ \trust@(ultimate, sigs, ca) ->
+                QC.ioProperty $ do
+                  number <- atomicModifyIORef' counter (\n -> (n + 1, n))
+                  let sp = StorePath (T.justifyRight 32 '0' (T.pack (show number))) "trust"
+                  registerPath db (registration sp []) {prUltimate = ultimate, prSignatures = sigs, prContentAddress = ca}
+                  info <- queryPathInfo db sp
+                  pure (fmap trustOf info QC.=== Just trust)
+          pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      -- Upstream writes 1 or NULL, the signatures separated by spaces or
+      -- NULL, and the address as it renders one or NULL.
+      runTestM "the trust columns hold what upstream's schema holds" $ do
+        let trusted = at "a" "trusted"
+            plain = at "b" "plain"
+            sigs = signature "cache.example.org-1" "\x01\x02" <> signature "other-1" "\x03"
+        inFreshStore $ \db -> do
+          registerPath db (registration trusted []) {prUltimate = Ultimate, prSignatures = sigs, prContentAddress = zeroAddress}
+          registerPath db (registration plain [])
+          rows <- bracket (SQL.open dbPath) SQL.close $ \conn ->
+            SQL.query_ conn "SELECT ultimate, sigs, ca FROM ValidPaths ORDER BY path" :: IO [(Maybe Int, Maybe Text, Maybe Text)]
+          pure $
+            assertEqual
+              "columns"
+              [ (Just 1, Just "cache.example.org-1:AQI= other-1:Aw==", Just ("fixed:r:sha256:" <> T.replicate 52 "0")),
+                (Nothing, Nothing, Nothing)
+              ]
+              rows,
+      -- A derivation written again must not drop the signatures it was
+      -- substituted with.
+      runTestM "re-registration keeps the trust fields it leaves absent and replaces those it states" $ do
+        let sp = at "c" "again"
+            first = signature "first-1" "\x01"
+            second = signature "second-1" "\x02"
+        inFreshStore $ \db -> do
+          registerPath db (registration sp []) {prUltimate = Ultimate, prSignatures = first, prContentAddress = zeroAddress}
+          registerPath db (registration sp [])
+          kept <- fmap trustOf <$> queryPathInfo db sp
+          registerPath db (registration sp []) {prSignatures = second}
+          replaced <- fmap trustOf <$> queryPathInfo db sp
+          pure $
+            assertEqual "kept" (Just (Ultimate, first, zeroAddress)) kept
+              `andThen` assertEqual "replaced" (Just (Ultimate, second, zeroAddress)) replaced,
+      runTestM "a database an earlier nova-nix made opens with its paths not ultimate, unsigned and unaddressed, and its derivations' outputs listed" $ do
+        let old = at "d" "old"
+            drvPath = at "f" "old.drv"
+            out = at "g" "old-out"
+        forceRemoveIfExists root
+        createDirectoryIfMissing True (unStoreDir dir </> metaDirName)
+        writeDerivation drvPath [("out", out)]
+        bracket (SQL.open dbPath) SQL.close $ \conn -> do
+          mapM_ (SQL.execute_ conn) earlierSchema
+          mapM_ (SQL.execute conn "INSERT INTO ValidPaths (path, hash, registrationTime, deriver, narSize) VALUES (?, 'sha256:x', 1, NULL, 1)" . SQL.Only . pathText) [old, drvPath]
+        (info, derivers, updated) <-
+          bracket
+            (openStoreDB dir)
+            closeStoreDB
+            ( \db -> do
+                info <- queryPathInfo db old
+                derivers <- queryValidDerivers db out
+                registerPath db (registration old []) {prUltimate = Ultimate}
+                updated <- queryPathInfo db old
+                pure (info, derivers, updated)
+            )
+            `finally` forceRemoveIfExists root
+        pure $
+          assertEqual "the old path" (Just (NotUltimate, Set.empty, Nothing)) (trustOf <$> info)
+            `andThen` assertEqual "the derivation's output" [pathText drvPath] derivers
+            `andThen` assertEqual "registered again" (Just Ultimate) (piUltimate <$> updated),
+      -- Upstream lists a path that references itself among its referrers.
+      runTestM "a path's referrers are the valid paths that reference it, itself included" $ do
+        let target = at "h" "target"
+            user = at "i" "user"
+            selfish = at "j" "selfish"
+            other = at "k" "other"
+        inFreshStore $ \db -> do
+          registerPaths db [registration target [target], registration user [target], registration selfish [selfish, target], registration other []]
+          referrers <- queryReferrers db target
+          self <- queryReferrers db selfish
+          none <- queryReferrers db other
+          pure $
+            assertEqual "the target's" (map pathText [target, user, selfish]) referrers
+              `andThen` assertEqual "a self-referrer's" [pathText selfish] self
+              `andThen` assertEqual "an unreferenced path's" [] none,
+      runTestM "a path's valid derivers are the valid derivations listing it as an output, until one is unregistered" $ do
+        let out = at "l" "shared"
+            firstDrv = at "m" "first.drv"
+            secondDrv = at "n" "second.drv"
+            elsewhere = at "p" "elsewhere"
+        inFreshStore $ \db -> do
+          writeDerivation firstDrv [("out", out)]
+          writeDerivation secondDrv [("dev", elsewhere), ("out", out)]
+          registerPaths db [registration firstDrv [], registration secondDrv []]
+          both <- queryValidDerivers db out
+          dev <- queryValidDerivers db elsewhere
+          unregistered <- unregisterPathRow db (pathText firstDrv)
+          remaining <- queryValidDerivers db out
+          pure $
+            assertEqual "both" (map pathText [firstDrv, secondDrv]) both
+              `andThen` assertEqual "the other output's" [pathText secondDrv] dev
+              `andThen` assertEqual "unregistered" RowUnregistered unregistered
+              `andThen` assertEqual "remaining" [pathText secondDrv] remaining,
+      runTestM "a derivation whose file does not parse is refused with upstream's message, and nothing is registered" $ do
+        let drvPath = at "q" "broken.drv"
+        inFreshStore $ \db -> do
+          BS.writeFile (storePathToFilePath dir drvPath) "not a derivation"
+          outcome <- try (registerPath db (registration drvPath []))
+          valid <- isValidPath db drvPath
+          pure $ case outcome of
+            Left (err :: IOException)
+              | ("error parsing derivation '" <> T.unpack (storePathToText defaultStoreDir drvPath) <> "': ") `isPrefixOf` ioeGetErrorString err,
+                not valid ->
+                  Pass
+            other -> Fail ("expected the refusal, got: " <> T.pack (show (other, valid))),
+      runTestM "a hash part finds the valid path it begins, and only that one" $ do
+        let found = at "r" "found"
+            later = at "s" "later"
+        inFreshStore $ \db -> do
+          registerPaths db [registration found [], registration later []]
+          hit <- queryPathFromHashPart db (T.replicate 32 "r")
+          between <- queryPathFromHashPart db (T.replicate 31 "r" <> "s")
+          short <- queryPathFromHashPart db (T.replicate 31 "r")
+          pure $
+            assertEqual "the path it begins" (Right (Just (pathText found))) hit
+              `andThen` assertEqual "a hash no path begins with" (Right Nothing) between
+              `andThen` assertEqual "a hash part of another length" (Left "invalid hash part") short,
+      runTestM "a written derivation records the text address its path is made from" $ do
+        forceRemoveIfExists root
+        let drv = mkTestBuildDrv shell (at "x" "written-out") "true"
+            drvPath = at "v" "written.drv"
+        info <-
+          bracket (openStore testLogger dir) closeStore (\store -> writeDrv store drv drvPath >> queryPathInfo (stDB store) drvPath)
+            `finally` forceRemoveIfExists root
+        let expected = Proto.contentAddressFromParts Proto.TextMethod "sha256" (sha256Digest (toATerm drv))
+        pure (assertEqual "address" (Just expected) (piContentAddress <$> info)),
+      -- APFS and Windows take only names with a UTF-8 form, so there the
+      -- name with no UTF-8 reading cannot be made and the test passes over.
+      runTestM "an out-link's record holds the link's bytes, a name no text spells included, and the root is found under that name" $ do
+        forceRemoveIfExists root
+        let links = root </> "links"
+            top = at "w" "rooted"
+        createDirectoryIfMissing True links
+        linksPath <- OP.encodeFS links
+        let named = hostPathBytes linksPath >>= \bytes -> (,) (bytes <> "/result-\xff") <$> hostPathFromBytes (bytes <> "/result-\xff")
+        outcome <- case named of
+          Nothing -> pure Nothing
+          Just (linkBytes, linkPath) -> do
+            link <- OP.decodeFS linkPath
+            probe <- try (BS.writeFile link "") :: IO (Either IOException ())
+            case probe of
+              Left _ -> pure Nothing
+              Right () -> do
+                Dir.removeFile link
+                rooted <-
+                  bracket
+                    (openStore testLogger dir)
+                    closeStore
+                    ( \store -> do
+                        registerPath (stDB store) (registration top [])
+                        rooted <- addOutLinkRoot store link top
+                        recorded <- try (BS.readFile (autoRootsDir (stDir store) </> indirectRootRecordName linkBytes)) :: IO (Either IOException BS.ByteString)
+                        roots <- findRoots store
+                        pure (rooted, either (const Nothing) Just recorded, roots)
+                    )
+                pure (Just (link, linkBytes, rooted))
+        forceRemoveIfExists root
+        case outcome of
+          Nothing -> Pass <$ putStrLn "  SKIP  this platform names no file with a byte that has no UTF-8 reading"
+          Just (link, linkBytes, (rooted, recorded, roots)) ->
+            pure $
+              assertEqual "the link" (Right link) rooted
+                `andThen` assertEqual "the record" (Just linkBytes) recorded
+                `andThen` assertEqual "the roots" [GcRoot link (pathText top)] roots
+    ]
+
+-- | The schema an earlier nova-nix made a store's database with, before it
+-- held the trust columns and DerivationOutputs.
+earlierSchema :: [SQL.Query]
+earlierSchema =
+  [ "CREATE TABLE IF NOT EXISTS ValidPaths (\
+    \  id               INTEGER PRIMARY KEY AUTOINCREMENT,\
+    \  path             TEXT UNIQUE NOT NULL,\
+    \  hash             TEXT NOT NULL,\
+    \  registrationTime INTEGER NOT NULL,\
+    \  deriver          TEXT,\
+    \  narSize          INTEGER NOT NULL\
+    \)",
+    "CREATE TABLE IF NOT EXISTS Refs (\
+    \  referrer  INTEGER NOT NULL REFERENCES ValidPaths(id),\
+    \  reference INTEGER NOT NULL REFERENCES ValidPaths(id),\
+    \  PRIMARY KEY (referrer, reference)\
+    \)"
+  ]
 
 -- ---------------------------------------------------------------------------
 -- Tests: Store Operations + parseStorePath (Phase 2, Batch 2)
@@ -2251,8 +2478,8 @@ testStoreDelete = do
       [ runTestM "referenced path is refused with its referrers listed" $ do
           registerPaths
             (stDB store)
-            [ PathRegistration dep "sha256:d" 1 Nothing [],
-              PathRegistration user "sha256:u" 1 Nothing [dep]
+            [ PathRegistration dep "sha256:d" 1 Nothing [] NotUltimate Set.empty Nothing,
+              PathRegistration user "sha256:u" 1 Nothing [dep] NotUltimate Set.empty Nothing
             ]
           outcome <- deleteNamed store (basenameOf dep)
           stillValid <- isValid store dep
@@ -2293,9 +2520,9 @@ testStoreDelete = do
           mapM_ plant batchPaths
           registerPaths
             (stDB store)
-            [ PathRegistration batchDep "sha256:bd" 1 Nothing [],
-              PathRegistration batchUser "sha256:bu" 1 Nothing [batchDep],
-              PathRegistration batchAfter "sha256:ba" 1 Nothing []
+            [ PathRegistration batchDep "sha256:bd" 1 Nothing [] NotUltimate Set.empty Nothing,
+              PathRegistration batchUser "sha256:bu" 1 Nothing [batchDep] NotUltimate Set.empty Nothing,
+              PathRegistration batchAfter "sha256:ba" 1 Nothing [] NotUltimate Set.empty Nothing
             ]
           reports <- newIORef []
           let report name removed = do
@@ -2322,7 +2549,7 @@ testStoreDelete = do
             other -> Fail ("wrong batch: " <> T.pack (show (other, reported, afterKept))),
         runTestM "a registered row without a tree deletes (repair case)" $ do
           let ghost = StorePath (T.replicate 32 "c") "del-ghost"
-          registerPath (stDB store) (PathRegistration ghost "sha256:g" 1 Nothing [])
+          registerPath (stDB store) (PathRegistration ghost "sha256:g" 1 Nothing [] NotUltimate Set.empty Nothing)
           outcome <- deleteNamed store (basenameOf ghost)
           pure $ case outcome of
             Right removed
@@ -2344,7 +2571,7 @@ testStoreDelete = do
         runTestM "a read-only registered tree deletes fully" $ do
           let solid = StorePath (T.replicate 32 "e") "del-solid"
               treePath = storePathToFilePath sd solid
-          registerPath (stDB store) (PathRegistration solid "sha256:s" 1 Nothing [])
+          registerPath (stDB store) (PathRegistration solid "sha256:s" 1 Nothing [] NotUltimate Set.empty Nothing)
           createDirectoryIfMissing True treePath
           TIO.writeFile (treePath </> "data.txt") "content"
           canonicalizeMetadata treePath
@@ -2358,7 +2585,7 @@ testStoreDelete = do
             Left err -> Fail err,
         runTestM "a self-referencing path deletes" $ do
           let selfp = StorePath (T.replicate 32 "f") "del-self"
-          registerPath (stDB store) (PathRegistration selfp "sha256:f" 1 Nothing [selfp])
+          registerPath (stDB store) (PathRegistration selfp "sha256:f" 1 Nothing [selfp] NotUltimate Set.empty Nothing)
           outcome <- deleteNamed store (basenameOf selfp)
           pure (assertEqual "self delete" (Right (DeleteOutcome True False)) outcome),
         runTestM "a target with neither row nor tree is an error" $ do
@@ -2509,7 +2736,7 @@ testStoreDelete = do
         runTestM "delete removes a registered store object named like a lock file" $ do
           let object = StorePath (T.replicate 32 "k") "flake.lock"
               objectPath = storePathToFilePath sd object
-          registerPath (stDB store) (PathRegistration object "sha256:m" 1 Nothing [])
+          registerPath (stDB store) (PathRegistration object "sha256:m" 1 Nothing [] NotUltimate Set.empty Nothing)
           TIO.writeFile objectPath "pinned inputs"
           outcome <- deleteNamed store (basenameOf object)
           gone <- not <$> Dir.doesPathExist objectPath
@@ -2537,7 +2764,7 @@ testStoreDelete = do
         runTestM "delete waits for a held path lock and proceeds on release" $ do
           let guarded = StorePath (T.replicate 32 "i") "del-locked"
               treePath = storePathToFilePath sd guarded
-          registerPath (stDB store) (PathRegistration guarded "sha256:l" 1 Nothing [])
+          registerPath (stDB store) (PathRegistration guarded "sha256:l" 1 Nothing [] NotUltimate Set.empty Nothing)
           createDirectoryIfMissing True treePath
           TIO.writeFile (treePath </> "data.txt") "guarded"
           holder <- acquirePathLock testLogger sd guarded
@@ -2711,9 +2938,9 @@ testStoreGC = do
           mapM_ (uncurry plant) [(dep, "dep"), (top, "top!"), (orphan, "orphan bytes")]
           registerPaths
             (stDB store)
-            [ PathRegistration dep "sha256:d" 1 Nothing [],
-              PathRegistration top "sha256:t" 1 Nothing [dep],
-              PathRegistration orphan "sha256:o" 1 Nothing []
+            [ PathRegistration dep "sha256:d" 1 Nothing [] NotUltimate Set.empty Nothing,
+              PathRegistration top "sha256:t" 1 Nothing [dep] NotUltimate Set.empty Nothing,
+              PathRegistration orphan "sha256:o" 1 Nothing [] NotUltimate Set.empty Nothing
             ]
         -- A refused collection is a failure of the test, not a result.
         collect = collectGarbage store >>= either (throwIO . userError . T.unpack) pure
@@ -2830,8 +3057,8 @@ testStoreGC = do
             mapM_ (uncurry plant) [(out, "o"), (dev, "d")]
             registerPaths
               (stDB store)
-              [ PathRegistration out "sha256:x" 1 Nothing [dev],
-                PathRegistration dev "sha256:y" 1 Nothing [out]
+              [ PathRegistration out "sha256:x" 1 Nothing [dev] NotUltimate Set.empty Nothing,
+                PathRegistration dev "sha256:y" 1 Nothing [out] NotUltimate Set.empty Nothing
               ]
             results <- collect
             remaining <- queryAllValidPaths (stDB store)
@@ -2933,7 +3160,7 @@ testStoreGC = do
                 case rooted of
                   Left err -> pure (Fail err)
                   Right link -> do
-                    let record = autoRootsDir sd </> indirectRootRecordName link
+                    let record = autoRootsDir sd </> indirectRootRecordName (TE.encodeUtf8 (T.pack link))
                     recordThere <- Dir.doesFileExist record
                     roots <- findRoots store
                     first <- collect
@@ -2955,7 +3182,7 @@ testStoreGC = do
               -- trailing separator, roots the path.
               runTestM "a symlink root into a store path's subtree or with a trailing separator roots the path" $ do
                 plant top "top"
-                registerPath (stDB store) (PathRegistration top "sha256:t" 1 Nothing [])
+                registerPath (stDB store) (PathRegistration top "sha256:t" 1 Nothing [] NotUltimate Set.empty Nothing)
                 let subLink = gcRootsDir sd </> "sub"
                     slashLink = gcRootsDir sd </> "slash"
                 Dir.createFileLink (storePathToFilePath sd top </> "data") subLink
@@ -2985,7 +3212,7 @@ testStoreGC = do
                     insideViaDotDot = takeDirectory (unStoreDir sd) </> takeFileName linkDir </> ".." </> takeFileName (unStoreDir sd) </> "result"
                 collapsed <- addOutLinkRoot store dotted top
                 target <- Dir.getSymbolicLinkTarget expectedLink
-                recorded <- BS.readFile (autoRootsDir sd </> indirectRootRecordName expectedLink)
+                recorded <- BS.readFile (autoRootsDir sd </> indirectRootRecordName (TE.encodeUtf8 (T.pack expectedLink)))
                 inside <- addOutLinkRoot store insideViaDotDot top
                 pure $ case (collapsed, inside) of
                   (Right link, Left insideErr)
@@ -3411,9 +3638,9 @@ testStoreOps = do
               p2 = StorePath "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn" "cl-p2"
           registerPaths
             (stDB store)
-            [ PathRegistration dep "sha256:cd" 1 Nothing [],
-              PathRegistration p1 "sha256:c1" 2 Nothing [dep],
-              PathRegistration p2 "sha256:c2" 3 Nothing [dep]
+            [ PathRegistration dep "sha256:cd" 1 Nothing [] NotUltimate Set.empty Nothing,
+              PathRegistration p1 "sha256:c1" 2 Nothing [dep] NotUltimate Set.empty Nothing,
+              PathRegistration p2 "sha256:c2" 3 Nothing [dep] NotUltimate Set.empty Nothing
             ]
           result <- computeClosure store [p1, p2]
           pure (assertEqual "closure order" (Right [dep, p1, p2]) result),

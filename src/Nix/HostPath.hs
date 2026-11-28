@@ -25,13 +25,14 @@ module Nix.HostPath
   ( hostPathFromBytes,
     hostPathBytes,
     hostPathText,
+    absolutePath,
   )
 where
 
 import Data.ByteString (ByteString)
 import Data.Text (Text)
 import qualified Data.Text.Encoding as TE
-import System.OsPath (OsPath)
+import System.OsPath (OsPath, (</>))
 import qualified System.OsPath as OP
 #if defined(mingw32_HOST_OS)
 import qualified Data.Text as T
@@ -74,3 +75,26 @@ hostPathText path = maybe (T.pack (map OP.toChar (OP.unpack path))) T.pack (OP.d
 #else
 hostPathText = TE.decodeUtf8Lenient . BS8.pack . map OP.toChar . OP.unpack
 #endif
+
+-- | A path made absolute against a directory and collapsed, @.@ dropped
+-- and @..@ taking off what precedes it, without reading a link, as
+-- upstream's @absPath@ makes one.  It works on the path's own units, so
+-- a path no text can spell comes back as the same bytes.
+absolutePath :: OsPath -> OsPath -> OsPath
+absolutePath base path = OP.joinPath (reverse (foldl' step [] (OP.splitDirectories joined)))
+  where
+    joined
+      | OP.isAbsolute path = path
+      | otherwise = base </> path
+    -- The components kept so far, last first.  A @..@ at the root stays
+    -- at the root.
+    step kept component
+      | component == dot = kept
+      | component == dotDot, parent : rest <- kept, not (OP.isAbsolute parent), parent /= component = rest
+      | component == dotDot, root : _ <- kept, OP.isAbsolute root = kept
+      | otherwise = component : kept
+
+-- | The components naming a directory itself and its parent.
+dot, dotDot :: OsPath
+dot = OP.pack [OP.unsafeFromChar '.']
+dotDot = OP.pack (replicate 2 (OP.unsafeFromChar '.'))
