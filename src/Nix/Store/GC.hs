@@ -252,26 +252,28 @@ findingRootsMessage = "finding garbage collector roots..."
 deletingGarbageMessage :: Text
 deletingGarbageMessage = "deleting garbage..."
 
--- | Upstream's per-path line of the sweep.
+-- | Upstream's per-path line of the sweep, the path in single quotes,
+-- since upstream formats this store path as a string, not as a path.
 deletingPathMessage :: Text -> Text
 deletingPathMessage path = "deleting '" <> path <> "'"
 
 -- | Upstream's line for an indirect-root record whose out-link is gone.
 removingStaleLinkMessage :: FilePath -> FilePath -> Text
 removingStaleLinkMessage record outLink =
-  "removing stale link from '" <> T.pack record <> "' to '" <> T.pack outLink <> "'"
+  "removing stale link from " <> quotedPath record <> " to " <> quotedPath outLink
 
 -- | Upstream's line for a symlink root naming a path the database does
 -- not hold, with the target as the link spells it.
 skippingInvalidRootMessage :: FilePath -> FilePath -> Text
 skippingInvalidRootMessage link target =
-  "skipping invalid root from '" <> T.pack link <> "' to '" <> T.pack target <> "'"
+  "skipping invalid root from " <> quotedPath link <> " to " <> quotedPath target
 
 -- | Upstream's line for a roots-directory entry it cannot read.
 unreadableRootMessage :: FilePath -> Text
-unreadableRootMessage path = "cannot read potential root '" <> T.pack path <> "'"
+unreadableRootMessage path = "cannot read potential root " <> quotedPath path
 
--- | Upstream's refusal to delete a path a root keeps alive.  Upstream's
+-- | Upstream's refusal to delete a path a root keeps alive, the path in
+-- single quotes, since upstream formats it as a string.  Upstream's
 -- hint names @nix-store --query --roots@ and @--query --referrers@;
 -- this tool has @store gc --print-roots@ for the first and lists
 -- referrers in its own refusal for the second, so the hint names what
@@ -287,12 +289,17 @@ stillAliveMessage path =
 rootInsideStoreMessage :: FilePath -> Text
 rootInsideStoreMessage link =
   "creating a garbage collector root ("
-    <> T.pack link
+    <> quotedPath link
     <> ") in the Nix store is forbidden (are you running nova-nix build inside the store?)"
 
 -- | Upstream's refusal to clobber something that is not a store link.
 alreadyExistsMessage :: FilePath -> Text
-alreadyExistsMessage link = "cannot create symlink '" <> T.pack link <> "'; already exists"
+alreadyExistsMessage link = "cannot create symlink " <> quotedPath link <> "; already exists"
+
+-- | A path as upstream's messages show one: between double quotes, with
+-- nothing inside escaped.
+quotedPath :: FilePath -> Text
+quotedPath path = "\"" <> T.pack path <> "\""
 
 -- | The refusal of a collection or a checked delete over a database
 -- keyed under another spelling of the store directory.

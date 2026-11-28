@@ -60,6 +60,7 @@ import Nix.Eval.IO (EvalState (..), sourceCopies)
 import Nix.Hash (FileIngestionMethod (..), compressHash, makeFixedOutputPath, makeTextPath, sha256Digest)
 import qualified Nix.Hash as Hash
 import Nix.Http (defaultFetchRetryPolicy, ioRetryEffects)
+import Nix.Logger (Logger (..))
 import Nix.Push (computeClosure)
 import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv)
@@ -2670,6 +2671,19 @@ testGcPure = do
           (map (fmap splitDirectories . upstreamDatabasePath) ["/nix/store", "/home/u/nix/store/", "/nix/nova-store", "/home/u/store"])
     ]
 
+-- | Run a store operation with the store's messages recorded rather than
+-- written, and return them in order with its result.
+withLogged :: Store -> (Store -> IO a) -> IO (a, [Text])
+withLogged store act = do
+  recorded <- newIORef []
+  let recording =
+        Logger
+          { logMessage = \message -> modifyIORef' recorded (message :),
+            logBuildLine = const (pure ())
+          }
+  result <- act store {stLogger = recording}
+  (,) result . reverse <$> readIORef recorded
+
 -- | The descriptors this process holds open, where the system lists them
 -- under @/dev/fd@, or 'Nothing' where it does not (Windows).
 openDescriptors :: IO (Maybe [FilePath])
@@ -2738,7 +2752,7 @@ testStoreGC = do
             stillValid <- isValid store top
             pure $ case outcome of
               Left err
-                | "since it is still alive" `T.isInfixOf` err, pathText top `T.isInfixOf` err, stillValid -> Pass
+                | ("Cannot delete path '" <> pathText top <> "' since it is still alive") `T.isInfixOf` err, stillValid -> Pass
                 | otherwise -> Fail ("wrong refusal: " <> err)
               Right removed -> Fail ("deleted a rooted path: " <> T.pack (show removed)),
           runTestM "delete refuses a path the root reaches through references" $ do
@@ -2808,10 +2822,16 @@ testStoreGC = do
             -- Restored on every exit: a walk that throws here would
             -- otherwise leave the directory unreadable for every later
             -- root walk in the group.
-            roots <- findRoots store `finally` unlock
+            (roots, logged) <- withLogged store findRoots `finally` unlock
             case readable of
               Right _ -> Pass <$ putStrLn "  SKIP  an empty-permission directory is readable here"
-              Left _ -> pure (assertEqual "roots" [GcRoot rootFile (pathText top)] roots),
+              Left _ ->
+                pure
+                  ( assertEqual
+                      "roots and lines"
+                      ([GcRoot rootFile (pathText top)], ["cannot read potential root \"" <> T.pack locked <> "\""])
+                      (roots, logged)
+                  ),
           runTestM "removing the root lets the closure go in one sweep" $ do
             Dir.removeFile rootFile
             results <- collect
@@ -2950,6 +2970,40 @@ testStoreGC = do
                         && null remaining
                         then Pass
                         else Fail ("out-link root misbehaved: " <> T.pack (show (roots, recordThere, first, second, recordGone, remaining))),
+              -- Upstream writes a record, a link and a target as paths,
+              -- between double quotes, and a store path it deletes as a
+              -- string, between single ones.
+              runTestM "a collection logs a stale record in double quotes and each path it deletes in single ones" $ do
+                registerTrio
+                rooted <- addOutLinkRoot store outLink top
+                case rooted of
+                  Left err -> pure (Fail err)
+                  Right link -> do
+                    let record = autoRootsDir sd </> indirectRootRecordName link
+                        expected =
+                          [ "removing stale link from \"" <> T.pack record <> "\" to \"" <> T.pack link <> "\"",
+                            "deleting '" <> pathText orphan <> "'"
+                          ]
+                    Dir.removePathForcibly link
+                    (collected, logged) <- withLogged store collectGarbage
+                    pure $
+                      if isRight collected && all (`elem` logged) expected
+                        then Pass
+                        else Fail ("wrong lines: " <> T.pack (show (collected, logged))),
+              runTestM "a root naming a path the store does not hold is logged in double quotes" $ do
+                let ghost = StorePath (T.replicate 32 "g") "gc-ghost"
+                    ghostLink = gcRootsDir sd </> "ghost"
+                createDirectoryIfMissing True (gcRootsDir sd)
+                Dir.createFileLink (storePathToFilePath sd ghost) ghostLink
+                target <- Dir.getSymbolicLinkTarget ghostLink
+                (roots, logged) <- withLogged store findRoots
+                Dir.removePathForcibly ghostLink
+                pure
+                  ( assertEqual
+                      "roots and lines"
+                      ([], ["skipping invalid root from \"" <> T.pack ghostLink <> "\" to \"" <> T.pack target <> "\""])
+                      (roots, logged)
+                  ),
               -- upstream's findRoots takes toStorePath of the target, so a
               -- link into a store path's subtree, or to the path with a
               -- trailing separator, roots the path.
@@ -3007,11 +3061,16 @@ testStoreGC = do
                 BS.writeFile plainFile "not a link"
                 clobber <- addOutLinkRoot store plainFile top
                 inside <- addOutLinkRoot store (unStoreDir sd </> "result") top
+                plainShown <- canonPath . T.pack <$> Dir.makeAbsolute plainFile
+                insideShown <- canonPath . T.pack <$> Dir.makeAbsolute (unStoreDir sd </> "result")
                 pure $ case (replaced, clobber, inside) of
                   (Right _, Left clobberErr, Left insideErr)
                     | target == storePathToFilePath sd top,
-                      "already exists" `T.isInfixOf` clobberErr,
-                      "in the Nix store is forbidden" `T.isInfixOf` insideErr ->
+                      clobberErr == "cannot create symlink \"" <> plainShown <> "\"; already exists",
+                      insideErr
+                        == "creating a garbage collector root (\""
+                          <> insideShown
+                          <> "\") in the Nix store is forbidden (are you running nova-nix build inside the store?)" ->
                         Pass
                   other -> Fail ("wrong outcomes: " <> T.pack (show (other, target)))
             ]

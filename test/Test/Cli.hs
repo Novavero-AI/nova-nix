@@ -362,7 +362,7 @@ testProfileCLI = do
                 "  beta: 2.0 -> \x2205"
               ]
             reset escape = if T.null escape then "" else "\ESC[0m"
-            staleRecordOf n line = "removing stale link from '" `isPrefixOf` line && "hist" `isInfixOf` line && ("profile-" <> show n <> "-link'") `isSuffixOf` line
+            staleRecordOf n line = "removing stale link from \"" `isPrefixOf` line && "hist" `isInfixOf` line && ("profile-" <> show n <> "-link\"") `isSuffixOf` line
         (++ xdgCases)
           <$> sequence
             [ runTest "profile list of a profile that is not there prints nothing and makes ~/.nix-profile" $
