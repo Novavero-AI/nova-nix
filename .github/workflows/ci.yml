@@ -655,6 +655,53 @@ jobs:
           Assert-AclEntry 'the state directory' @(icacls (Join-Path $store '.nova-nix')) $storeEntries
           Assert-AclEntry 'the build directory' @(Get-Content -LiteralPath $out) @("${user}:(OI)(CI)(F)")
 
+      # nova-nix refuses a store under a directory another account could
+      # change, naming the directory, before it makes anything in it.  A
+      # folder made at the drive root, as another user can make C:\nix
+      # before nova-nix runs, takes the root's access control list, which
+      # lets other users change what is made in it.  The parent the step
+      # above made for its store, given to LOCAL SERVICE, stands for a
+      # C:\nix another account owns.
+      - name: A store under a directory another account could change is refused (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = cabal list-bin exe:nova-nix
+          $drv = Join-Path $env:RUNNER_TEMP 'acl.nix'
+          $log = Join-Path $env:RUNNER_TEMP 'refused.log'
+          function Assert-Refused([string]$Directory, [string]$Store) {
+            & $exe --store $Store build --no-out-link $drv 2> $log | Out-Null
+            $code = $LASTEXITCODE
+            $said = Get-Content -Raw -LiteralPath $log
+            Write-Output $said
+            # The runner ends the step with the last native command's exit
+            # status, and this refusal is the outcome the step wants.
+            $global:LASTEXITCODE = 0
+            if ($code -eq 0) {
+              Write-Output "::error::a build in $Store ran"
+              exit 1
+            }
+            if (-not $said.Contains("error: $Directory ") -or -not $said.Contains("so the store in $Store cannot be trusted; move $Directory aside")) {
+              Write-Output "::error::the build in $Store failed, but not with a refusal naming $Directory"
+              exit 1
+            }
+            Write-Output "ok    a store in $Store is refused, naming $Directory"
+          }
+
+          $inherited = Join-Path $env:SystemDrive 'nova-nix-inherited'
+          New-Item -ItemType Directory -Path $inherited | Out-Null
+          Assert-Refused $inherited (Join-Path $inherited 'store')
+          if (@(Get-ChildItem -Force -LiteralPath $inherited).Count -ne 0) {
+            Write-Output "::error::nova-nix made something in $inherited before refusing it"
+            exit 1
+          }
+
+          $parent = Join-Path $env:SystemDrive 'nova-nix-acl'
+          icacls $parent /setowner '*S-1-5-19'
+          if ($LASTEXITCODE -ne 0) { throw "icacls exited $LASTEXITCODE" }
+          Assert-Refused $parent (Join-Path $parent 'store')
+
       # An installed nova-nix finds the helper beside it, and no profile
       # names that copy, so with the restriction on, which the step asserts,
       # a sandboxed build runs unsandboxed after one warning naming the

@@ -75,7 +75,7 @@ import Database.SQLite.Simple
     withTransaction,
   )
 import qualified Database.SQLite3 as SQLite3
-import Nix.Store.Access (createStateDirectory)
+import Nix.Store.Access (checkStateDirectory, createStateDirectory)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, storePathToFilePath, storePathToText)
 import System.FilePath ((</>))
 
@@ -174,7 +174,8 @@ openStoreDB dir = do
 -- 'createStateDirectory' creates them: on Windows the two are open to
 -- whom 'Nix.Store.Access.StoreAccess' says, and a parent this creates
 -- to whom 'Nix.Store.Access.ParentAccess' says.  A directory already
--- there keeps the access it has.
+-- there keeps the access it has, and on Windows one another account
+-- could change is refused before anything is created in it.
 createStoreDirectories :: StoreDir -> IO ()
 createStoreDirectories dir = createStateDirectory (unStoreDir dir </> metaDirName)
 
@@ -215,9 +216,14 @@ waitWhileBusy conn = execute_ conn "PRAGMA busy_timeout=3600000"
 -- immutable open creates neither, and it reads with no locks, so a
 -- concurrent writer can give it wrong answers or corruption errors;
 -- upstream opens immutably only a store it is told is read-only
--- (@LocalStore::openDB@ in local-store.cc).
+-- (@LocalStore::openDB@ in local-store.cc).  Before the database is
+-- opened, on Windows the directories on the way to it are checked as
+-- 'checkStateDirectory' checks them, and a store another account could
+-- change is refused.
 openStoreDBReadOnly :: StoreDir -> IO StoreDB
-openStoreDBReadOnly dir = bracketOnError opened close (\conn -> StoreDB dir conn <$ waitWhileBusy conn)
+openStoreDBReadOnly dir = do
+  checkStateDirectory (unStoreDir dir </> metaDirName)
+  bracketOnError opened close (\conn -> StoreDB dir conn <$ waitWhileBusy conn)
   where
     dbPath = unStoreDir dir </> metaDirName </> dbFileName
     opened = Connection <$> SQLite3.open2 (T.pack dbPath) [SQLite3.SQLOpenReadOnly] SQLite3.SQLVFSDefault <*> newIORef 0

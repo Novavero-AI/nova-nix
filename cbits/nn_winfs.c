@@ -3,6 +3,7 @@
 #ifdef _WIN32
 
 #include <windows.h>
+#include <aclapi.h>
 #include <sddl.h>
 #include <winternl.h>
 
@@ -103,6 +104,42 @@ unsigned long nn_dir_create_sddl(const wchar_t *path, const wchar_t *sddl) {
   }
   LocalFree(descriptor);
   return error;
+}
+
+unsigned long nn_entry_security(const wchar_t *path, void **descriptor,
+                                unsigned long *length, const char **failed) {
+  HANDLE entry;
+  PSECURITY_DESCRIPTOR read = NULL;
+  DWORD error;
+
+  *descriptor = NULL;
+  *length = 0;
+  *failed = NULL;
+  /* READ_CONTROL is the one right reading an owner and a DACL takes.
+   * FILE_FLAG_BACKUP_SEMANTICS lets a directory be opened at all, and
+   * FILE_FLAG_OPEN_REPARSE_POINT opens a link itself, not what it leads
+   * to. */
+  entry = CreateFileW(path, READ_CONTROL,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      NULL, OPEN_EXISTING,
+                      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                      NULL);
+  if (entry == INVALID_HANDLE_VALUE) {
+    *failed = "CreateFileW";
+    return GetLastError();
+  }
+  error =
+      GetSecurityInfo(entry, SE_FILE_OBJECT,
+                      OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                      NULL, NULL, NULL, NULL, &read);
+  CloseHandle(entry);
+  if (error != ERROR_SUCCESS) {
+    *failed = "GetSecurityInfo";
+    return error;
+  }
+  *descriptor = read;
+  *length = GetSecurityDescriptorLength(read);
+  return ERROR_SUCCESS;
 }
 
 #else /* !_WIN32 */
