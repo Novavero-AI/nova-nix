@@ -73,8 +73,9 @@ import Data.Word (Word32)
 
 #if defined(mingw32_HOST_OS)
 
-import Control.Exception (bracket)
-import Data.Bits (testBit, (.|.))
+import Control.Exception (bracket, tryJust)
+import Control.Monad (guard)
+import Data.Bits (testBit, (.&.), (.|.))
 import Data.Foldable (traverse_)
 import Nix.Store.Access (ValidNode (..), withValidPathAccess)
 import qualified Nix.Store.ExecBit as ExecBit
@@ -82,7 +83,7 @@ import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
 import Nix.Store.Win32Path (win32FilePath)
 import qualified System.Directory as Dir
 import System.FilePath ((</>))
-import System.IO.Error (doesNotExistErrorType, mkIOError)
+import System.IO.Error (doesNotExistErrorType, ioeSetFileName, isDoesNotExistError, mkIOError, modifyIOError)
 import System.Win32.File
   ( FileAttributeOrFlag,
     closeHandle,
@@ -91,7 +92,9 @@ import System.Win32.File
     fILE_SHARE_DELETE,
     fILE_SHARE_READ,
     fILE_SHARE_WRITE,
+    fILE_ATTRIBUTE_DIRECTORY,
     fILE_WRITE_ATTRIBUTES,
+    getFileAttributes,
     gENERIC_READ,
     oPEN_EXISTING,
   )
@@ -228,7 +231,8 @@ storeModificationTime = 1
 -- following a symlink.  On POSIX a node that cannot be read or changed
 -- fails with the 'Control.Exception.IOException' the system call raised,
 -- and one of a type a store path cannot hold fails too; on Windows a node
--- the walk finds absent, or cannot probe, is passed over.
+-- the walk finds absent is passed over, and one whose attributes it
+-- cannot read fails, naming it.
 canonicalizeMetadata :: FilePath -> IO ()
 
 -- | Whether a node is a regular file its owner may not execute, read
@@ -294,7 +298,7 @@ canonicalizeMetadata path = withValidPathAccess (`canonicalizeNode` path)
 -- protected, is set after theirs, so none of it is passed to them.
 canonicalizeNode :: (ValidNode -> FilePath -> IO ()) -> FilePath -> IO ()
 canonicalizeNode giveAccess path = do
-  node <- classifyWalkNode path
+  node <- registeredNode path
   case node of
     WalkSymlink -> setStoreTime path *> giveAccess ValidLeaf path
     WalkDirectory -> do
@@ -302,6 +306,28 @@ canonicalizeNode giveAccess path = do
       sealNode (giveAccess ValidDirectory) path
     WalkRegular -> sealNode (giveAccess ValidLeaf) path
     WalkAbsent -> pure ()
+
+-- | The kind of a node the walk registers, read from its own attributes,
+-- a link not followed: any reparse point is a leaf, never descended into.
+-- It is 'WalkAbsent' only where nothing has the name.  Any other failure
+-- to read them, a refusal among them, fails naming the node, since a node
+-- the walk passed over would keep whatever access its build gave it.
+registeredNode :: FilePath -> IO WalkNode
+registeredNode path =
+  modifyIOError (`ioeSetFileName` path) $ do
+    target <- win32FilePath path
+    found <- tryJust (guard . isDoesNotExistError) (getFileAttributes target)
+    pure $ case found of
+      Left () -> WalkAbsent
+      Right attributes
+        | attributes .&. fileAttributeReparsePoint /= 0 -> WalkSymlink
+        | attributes .&. fILE_ATTRIBUTE_DIRECTORY /= 0 -> WalkDirectory
+        | otherwise -> WalkRegular
+
+-- | @FILE_ATTRIBUTE_REPARSE_POINT@ (winnt.h): a link, or another reparse
+-- point.
+fileAttributeReparsePoint :: FileAttributeOrFlag
+fileAttributeReparsePoint = 0x400
 
 -- | Set a file's or directory's time, give it the read-only attribute,
 -- then a valid path's owner and DACL.

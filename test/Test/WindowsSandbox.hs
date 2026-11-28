@@ -430,8 +430,8 @@ withAccount :: Text -> (SlotAccount -> IO a) -> IO a
 withAccount name use = (makeAccount name >>= joined >>= use) `finally` removeAccount name
   where
     joined account = do
-      withCWString buildersGroupName $ \group -> withCWString (T.unpack name) $ \member ->
-        succeeded ("adding " <> T.unpack name <> " to the group " <> buildersGroupName) =<< c_group_add group member
+      withCWString buildersGroupName $ \group ->
+        withCWString (T.unpack name) (succeeded ("adding " <> T.unpack name <> " to the group " <> buildersGroupName) <=< c_group_add group)
       pure account
 
 -- | The build accounts' local group, the one the store names
