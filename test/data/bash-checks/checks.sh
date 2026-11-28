@@ -7,7 +7,8 @@
 #
 # PATH is two store directories spelled as the builder spells them, with
 # drive letters, joined with `:': probe's, a program, and scripts', a #!
-# script whose interpreter is this bash.
+# script whose interpreter is this bash and one whose interpreter is
+# probe.
 
 # The builder's environment sets out, probe and scripts.
 # shellcheck disable=SC2154
@@ -67,6 +68,13 @@ greet > greet.out || status=$?
 read -r line < greet.out
 echo "greet printed: $line"
 echo "greet exited $status"
+
+# A #! script whose interpreter is another program, which reads the
+# script's standard input: `probe cat SCRIPT'.
+relay < lines.txt > relay.out
+while IFS= read -r line; do
+  echo "relay copied $line"
+done < relay.out
 
 # A command PATH does not hold.
 status=0

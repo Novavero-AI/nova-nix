@@ -3690,20 +3690,22 @@ testBashWindows = do
               ),
           runTest "bash is configured as a builder's shell, with the port's cache answers" $
             assertEqual "configureFlags" configureFlags (wordsOf "configureFlags" bash),
-          runTest "the checks run bash itself as the builder, with probe and the #! script, whose interpreter is bash" $
+          runTest "the checks run bash itself as the builder, with probe and the #! scripts, whose interpreters are bash and probe" $
             assertEqual
-              "the builder, the script, probe's and scripts' outputs, and the interpreter"
+              "the builder, the script, probe's and scripts' outputs, and the interpreters"
               ( Just (maybe "" outputOf bash <> "/bin/bash.exe"),
                 ["checks.sh"],
                 fmap outputOf (named "bash-probe"),
                 fmap outputOf scripts,
-                Just (maybe "" outputOf bash <> "/bin/bash")
+                Just (maybe "" outputOf bash <> "/bin/bash"),
+                fmap ((<> "/bin/probe") . outputOf) (named "bash-probe")
               )
               ( bytesText . drvBuilder <$> checks,
                 [name | drv <- maybeToList checks, path <- drvArgs drv, Just sp <- [parseStorePath defaultStoreDir (bytesText path)], let name = spName sp, name == "checks.sh"],
                 variableOf "probe" <$> checks,
                 variableOf "scripts" <$> checks,
-                variableOf "interpreter" <$> scripts
+                variableOf "interpreter" <$> scripts,
+                variableOf "relayInterpreter" <$> scripts
               )
         ]
   where
@@ -3739,7 +3741,8 @@ testBashWindows = do
         "bash_cv_getcwd_malloc=yes",
         "bash_cv_getenv_redef=no",
         "ac_cv_func_strdup=no",
-        "ac_cv_func_wcsdup=no"
+        "ac_cv_func_wcsdup=no",
+        "ac_cv_sys_interpreter=no"
       ]
 
 -- | @pkgs\/windows\/sources.nix@ against the package set whose sources it

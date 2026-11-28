@@ -2,7 +2,7 @@
 # a build whose builder is bash itself, running bash-checks/checks.sh,
 # which writes what it checked to $out for CI to compare with
 # bash-checks-answer.txt; probe, which the stdenv builds, is the program
-# it runs, and scripts holds the #! script it runs.  Each forbids
+# it runs, and scripts holds the #! scripts it runs.  Each forbids
 # substitutes, as the checks kaem builds do (see check.nix), so CI builds
 # them on every run.
 let
@@ -22,7 +22,9 @@ let
   };
 
   # greet: a script whose #! line names bash by its store path with no
-  # .exe, as a script nixpkgs patches names its interpreter.
+  # .exe, as a script nixpkgs patches names its interpreter.  relay: one
+  # whose #! line names probe, with an argument, which bash starts itself,
+  # as Windows starts no #! script.
   scripts = derivation {
     name = "bash-scripts";
     system = "x86_64-windows";
@@ -33,9 +35,11 @@ let
       (builtins.toFile "bash-scripts.sh" ''
         mkdir -p "$out/bin"
         printf '#!%s\necho hello from a script\nexit 4\n' "$interpreter" > "$out/bin/greet"
+        printf '#!%s cat\n' "$relayInterpreter" > "$out/bin/relay"
       '')
     ];
     interpreter = "${bash}/bin/bash";
+    relayInterpreter = "${probe}/bin/probe";
     allowSubstitutes = false;
   };
 in

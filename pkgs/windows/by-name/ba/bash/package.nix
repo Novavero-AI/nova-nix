@@ -30,7 +30,9 @@
 # and getenv left to msvcrt, whose declaration differs from the one bash
 # would redefine.  strdup and wcsdup are bash's own: msvcrt's allocate from
 # msvcrt's heap, and bash frees what they return with its own malloc's
-# free.
+# free.  A #! line is bash's to read: Windows starts no #! script, and
+# configure's check that the system does passes only because busybox-w32's
+# sh, which runs configure, reads the line itself.
 #
 # GNU publishes the patches as context diffs, which busybox's patch does
 # not read, so a derivation writes each as the unified diff it is
@@ -140,6 +142,7 @@ stdenv.mkDerivation {
     "bash_cv_getenv_redef=no"
     "ac_cv_func_strdup=no"
     "ac_cv_func_wcsdup=no"
+    "ac_cv_sys_interpreter=no"
   ];
 
   enableParallelBuilding = true;

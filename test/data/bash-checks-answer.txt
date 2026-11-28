@@ -13,4 +13,6 @@ probe cat copied [second]
 /dev/null took probe's output
 greet printed: hello from a script
 greet exited 4
+relay copied [first]
+relay copied [second]
 no-such-command exited 127
