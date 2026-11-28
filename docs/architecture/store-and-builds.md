@@ -215,7 +215,8 @@ unless its derivation is fixed-output. Its root holds the closure of its
 inputs, the paths `sandbox-paths` binds and its build directory at
 `sandbox-build-dir`, and the builder writes its outputs at their store
 paths inside it. It runs as uid 1000 and gid 100 in its user namespace,
-with `HOME` at `/homeless-shelter`, which does not exist.
+which map to the invoking user or to a build user, with `HOME` at
+`/homeless-shelter`, which does not exist.
 
 On macOS a sandboxed build runs under a profile of macOS's sandbox. It
 sees its build directory and its outputs where they are on disk, with
@@ -224,15 +225,17 @@ paths `sandbox-paths` names, write only its outputs and its build
 directory, and reach the network only when its derivation is
 fixed-output. There `sandbox-paths` defaults to upstream's system
 frameworks, libraries and shells. The builder runs as the invoking user,
-so the profile grants nothing that would reach that user's own files,
-sockets, terminals or shared memory, and when the build ends the helper
-stops and kills every process that carries the build's mark, a name only
-that build's profile allows, including one that left the builder's
-process group, and reports the build as it ended only once a listing of
-the user's processes finds none of them left. The builder writes its
-output to a pipe the helper copies into the build log. A build can still read the command lines of the user's
-other processes and create System V IPC objects it cannot remove; both
-need builds to run as build users.
+or as a build user, so the profile grants nothing that would reach that
+user's own files, sockets, terminals or shared memory, and when the build
+ends the helper stops and kills every process of the builder's user that
+carries the build's mark, a name only that build's profile allows,
+including one that left the builder's process group, and reports the
+build as it ended only once a listing of that user's processes finds
+none of them left. The builder writes its output to a pipe the helper
+copies into the build log. A build run as the invoking user can still
+read the command lines of the user's other processes, and any build can
+create System V IPC objects that outlive it, which upstream removes for a
+build user.
 
 The work is split three ways:
 
@@ -259,8 +262,33 @@ directory. The Linux release archive also carries a shell,
 default. A Linux system that cannot make the namespaces builds
 unsandboxed after a warning, or fails the build with `sandbox-fallback`
 off; on macOS a sandbox that cannot be made fails the build, as
-upstream's does. A sandboxed build as root is refused, whatever
-`sandbox-fallback` says, since nova-nix has no build users to run it as.
+upstream's does. A sandboxed build as root with `build-users-group`
+empty is refused, whatever `sandbox-fallback` says.
+
+## Build users
+
+nova-nix running as root on Linux or macOS builds as the members of
+`build-users-group`, `nixbld` by default, as upstream does
+([`src/Nix/Builder/BuildUser.hs`]); anyone else builds as themselves.
+
+- **The pool.** Each build takes the first member whose lock is free in
+  `/nix/var/nix/userpool` (or `$NIX_STATE_DIR/userpool`), the pool
+  upstream's daemon locks too, and waits while every member is taken. A
+  group that is missing or empty, a member that names no user, and a
+  member that is the user nova-nix runs as fail the build in upstream's
+  words.
+- **The build.** Every process of the member is killed before the build
+  and once its builder ends. The store directory is root's and the
+  group's with mode 1775, the directory the builder works in and the
+  files nova-nix writes there are the member's, and the directory holding
+  builds must not be below one every user may write. In the Linux sandbox
+  the namespace's uid 1000 and gid 100 map to the member and the group;
+  on macOS and outside the sandbox the builder takes the member's uid,
+  the group and, on Linux, the member's supplementary groups, set between
+  the fork and the exec.
+- **The outputs.** An output whose root is not the member's, or that
+  holds a node another user owns, fails the build. A passing output is
+  made root's and read-only.
 
 Differences from upstream's Linux sandbox are open issues, among them its
 seccomp filter ([#678]) and the personality it sets for the derivation's
@@ -364,6 +392,7 @@ its pieces are in the library.
 [`src/Nix/Builder.hs`]: ../../src/Nix/Builder.hs
 [`src/Nix/Builder/BuildDir.hs`]: ../../src/Nix/Builder/BuildDir.hs
 [`src/Nix/Builder/Buildenv.hs`]: ../../src/Nix/Builder/Buildenv.hs
+[`src/Nix/Builder/BuildUser.hs`]: ../../src/Nix/Builder/BuildUser.hs
 [`src/Nix/Builder/Log.hs`]: ../../src/Nix/Builder/Log.hs
 [`src/Nix/Builder/Sandbox.hs`]: ../../src/Nix/Builder/Sandbox.hs
 [`src/Nix/Builder/Sandbox/Spawn.hs`]: ../../src/Nix/Builder/Sandbox/Spawn.hs

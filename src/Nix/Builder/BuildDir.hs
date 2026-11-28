@@ -30,7 +30,9 @@
 -- answers to the name, so a build never runs in a directory it did not
 -- create.  It is open to the user nova-nix runs as alone
 -- ('OwnerAccess'), so other users can neither read what the build
--- unpacks nor change it while it runs.  On POSIX it is created with mode
+-- unpacks nor change it while it runs; a build that runs as a build user
+-- gives the directory its builder works in to that user
+-- ("Nix.Builder.BuildUser").  On POSIX it is created with mode
 -- 0700, as upstream's @createTempDir@ makes its build directories
 -- (file-system.cc).  On Windows it is created with a protected access control
 -- list granting that user alone full control, which what the build makes in
@@ -48,10 +50,10 @@
 -- every build that does not succeed.
 --
 -- Three things differ from upstream.  The directory keeps mode 0700, where
--- upstream opens it, and the directory its builder worked in, with 0755:
--- upstream's builder ran as a build user, so the directory is that user's
--- and the user who asked for it could not otherwise read it, while here
--- the builder ran as the user nova-nix runs as, who can.  A kept directory
+-- upstream opens it, and the directory its builder worked in, with 0755,
+-- so that the user who asked for the build can read what a build user
+-- wrote there: here the build runs as the user nova-nix runs as, who can
+-- read it, or as a build user for root, who can read anything.  A kept directory
 -- stays until the next build of the same derivation, which removes it as
 -- it removes any directory an earlier build left at the name
 -- ('clearLeftover'), where upstream's stays until it is removed by hand,

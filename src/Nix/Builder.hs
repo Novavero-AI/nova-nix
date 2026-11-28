@@ -39,6 +39,15 @@
 -- to the store as any build does: an output that is not valid is
 -- substituted first, and the inputs are substituted or built.
 --
+-- == Build users
+--
+-- When nova-nix runs as root with build users ('bcBuildUsers'), a spawned
+-- builder runs as a member of their group, taken for the build
+-- ('asBuilder'), and every process the member has is killed before the
+-- build and once its builder ends ('endingBuildUser'), as upstream's
+-- are.  An output must belong to the member before it is made root's
+-- ("Nix.Builder.BuildUser").
+--
 -- == On Windows
 --
 -- The key difference is process creation.  Upstream on Linux uses
@@ -120,16 +129,18 @@ import Data.Word (Word32)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
-import Nix.Builder.BuildDir (BuildEnding (..), FailedBuilds (..), WorkDir (..), sandboxedBuildDir, withBuildDir)
+import Nix.Builder.BuildDir (BuildEnding (..), FailedBuilds (..), WorkDir (..), buildDirFor, sandboxedBuildDir, withBuildDir, workDirIn)
+import Nix.Builder.BuildUser (BuildUser (..), BuildUsers (..), giveToBuildUser, invokingUserIds, killBuildUser, openStoreToBuildUsers, runAsBuildUser, withBuildUser, worldWritableAncestor, worldWritableMessage)
 import Nix.Builder.Buildenv (builtinBuildenvBuilder, runBuiltinBuildenv)
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
-import Nix.Builder.Sandbox (DarwinOptions (..), DarwinPathInputs (..), DarwinPaths (..), DarwinPlan (..), DarwinProfile (..), HelperOutcome (..), Network, PathPresence (..), PlanInputs (..), SandboxBackend (..), SandboxConfig (..), SandboxFallback (..), SandboxPath (..), SandboxUse (..), backendFallback, chrootSkeleton, darwinOptions, darwinParameters, darwinPathsInSandbox, darwinProfile, darwinSetupFailureMessage, darwinStageName, defaultSandboxConfig, helperOutcome, hostSandboxBackend, renderDarwinPlan, renderPlan, rootRefusal, sandboxHome, sandboxPlan, sandboxUse, setupFailureMessage, setupStageName, unavailableMessage)
+import Nix.Builder.Sandbox (BuilderIds (..), DarwinOptions (..), DarwinPathInputs (..), DarwinPaths (..), DarwinPlan (..), DarwinProfile (..), HelperOutcome (..), Network, PathPresence (..), PlanInputs (..), SandboxBackend (..), SandboxConfig (..), SandboxFallback (..), SandboxPath (..), SandboxUse (..), backendFallback, chrootSkeleton, darwinOptions, darwinParameters, darwinPathsInSandbox, darwinProfile, darwinSetupFailureMessage, darwinStageName, defaultSandboxConfig, helperOutcome, hostSandboxBackend, renderDarwinPlan, renderPlan, rootRefusal, sandboxHome, sandboxPlan, sandboxUse, setupFailureMessage, setupStageName, unavailableMessage)
 import Nix.Builder.Sandbox.Spawn (HelperRun (..), bytesFilePath, filePathBytes, processIsRoot, profileFilters, resolvedPath, runHelper, sandboxAvailability, sealChroot, warnFallback, withChroot)
 import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimits, runBuiltinUnpack)
 import Nix.Daemon.Protocol (ContentAddress, ContentAddressMethod (..), contentAddressFromParts)
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, buildDepGraphFrom, topoSort)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fixedOutput, fromATerm, platformToText)
 import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, renderAttrsShell, stringsAttr, structuredAttrsKey, withOutputPlaceholders)
+import Nix.Environment (EnvLookup (..), lookupEnvBytes)
 import Nix.Hash (FileIngestionMethod (..), IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Logger (Logger (..))
@@ -137,7 +148,7 @@ import Nix.Push (narHashMatches)
 import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, DifferingRebuild (..), Fallback (..), FetchOutcome (..), Offer (QueryFailed), RealiseEffects (..), RealiseSettings (..), Realised (..), Registration (..), SubstEffects (..), SubstitutesSetting (..), Undelivered (..), checkedOutputPath, noWriteAccessMessage, realise, realiseFailureMessage, realiseFailureStatus, realiseRequests, requestsFailureMessage, requestsFailureStatus, substituteClosure)
 import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration (..), Store (..), Ultimate (..), UpstreamHazard (..), acquirePathLock, canonicalizeMetadata, finishNarUnpack, freshCopyPath, isValid, moveOutput, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, replaceWithCopy, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
-import Nix.Store.Metadata (foreignOwnedNode, isPlainFile, writableByOthers)
+import Nix.Store.Metadata (OutputOwner (..), foreignOwnedNode, isPlainFile, ownedByAnother, writableByOthers)
 import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathPrefix, storePathToFilePath, storePathToText, unStoreDir)
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
 import Nix.Substituter (CacheConfig, CacheMemo, SubstResult (..), Substitute, emptyCacheMemo, fetchSubstituteWith, narStreamFailure, queryNextOfferWith, queryReferencesWith, substitutePath, withXzAttempt)
@@ -145,7 +156,7 @@ import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.Xz as Xz
-import System.Directory (removePathForcibly)
+import System.Directory (createDirectoryIfMissing, removePathForcibly)
 import qualified System.Environment
 import System.Exit (ExitCode (..))
 import System.FilePath (isAbsolute, isPathSeparator, takeDirectory, takeFileName, (</>))
@@ -351,6 +362,11 @@ data BuildConfig = BuildConfig
     -- | Whether, and how, a spawned builder runs in a sandbox
     -- ("Nix.Builder.Sandbox").
     bcSandbox :: !SandboxConfig,
+    -- | Whom a spawned builder runs as: a build user, upstream's for a
+    -- process that runs as root with @build-users-group@ set, or the user
+    -- nova-nix runs as ("Nix.Builder.BuildUser").  A builtin runs in this
+    -- process, as that user, whatever it says.
+    bcBuildUsers :: !BuildUsers,
     -- | What a build that does not succeed leaves, upstream's
     -- @keep-failed@: its directory ("Nix.Builder.BuildDir"), unless its
     -- builder is a builtin, and for a check that found an output
@@ -378,8 +394,10 @@ data SubstitutionAccess
 -- process's cgroup on Linux, otherwise the machine's count, which takes
 -- IO to find ("Nix.Builder.Cores"), and runs unsandboxed
 -- ('defaultSandboxConfig'), where upstream sandboxes on Linux, since
--- finding the sandbox's helper takes IO too.  A build that fails keeps
--- nothing, as upstream's @keep-failed@ defaults off.
+-- finding the sandbox's helper takes IO too.  It builds as the user
+-- nova-nix runs as, where upstream builds as a build user for root, since
+-- whether this process is root takes IO to find.  A build that fails
+-- keeps nothing, as upstream's @keep-failed@ defaults off.
 defaultBuildConfig :: StoreDir -> BuildConfig
 defaultBuildConfig dir =
   BuildConfig
@@ -394,6 +412,7 @@ defaultBuildConfig dir =
       bcUnpackLimits = defaultUnpackLimits,
       bcFetchRetry = defaultFetchRetryPolicy,
       bcSandbox = defaultSandboxConfig,
+      bcBuildUsers = NoBuildUsers,
       bcFailedBuilds = RemoveFailed
     }
 
@@ -617,14 +636,35 @@ type Commit = IO () -> IO ()
 
 -- | What a build's builder left: where each output is on disk once it has
 -- ended, at its scratch path in the store, or for a Linux sandboxed build
--- at that path in the chroot, where it stays until it is registered; and
+-- at that path in the chroot, where it stays until it is registered;
 -- whether the builder left an output writable by its group or anyone else
 -- ('writableByOthers'), read for a Linux sandboxed build before the
--- chroot's seal changes the mode ('sealChroot').
+-- chroot's seal changes the mode ('sealChroot'); and whom every node of an
+-- output must belong to, the user the builder ran as.
 data Written = Written
   { writtenPath :: OutputPlan -> FilePath,
-    writtenOpen :: OutputPlan -> IO Bool
+    writtenOpen :: OutputPlan -> IO Bool,
+    writtenOwner :: !OutputOwner
   }
+
+-- | Whom a build's builder runs as.
+data BuilderIdentity
+  = -- | The user nova-nix runs as.
+    AsInvoker
+  | -- | A build user, held for the build.
+    AsBuildUser !BuildUser
+
+-- | The build user a builder runs as, if it runs as one.
+buildUserOf :: BuilderIdentity -> Maybe BuildUser
+buildUserOf identity = case identity of
+  AsInvoker -> Nothing
+  AsBuildUser user -> Just user
+
+-- | Whom a builder's outputs belong to while it writes them.
+outputOwnerOf :: BuilderIdentity -> OutputOwner
+outputOwnerOf identity = case identity of
+  AsInvoker -> OwnedByInvoker
+  AsBuildUser user -> OwnedByBuildUser (buUid user)
 
 -- | Which outputs the builder is handed a scratch path for
 -- ('outputPlan').
@@ -668,11 +708,38 @@ buildUnderLock config store drvPath drv redirected succeeded finish = runExceptT
   --    own.
   let context = BuildContext store drvPath inputPaths
   run <- withExceptT stopped (ExceptT (builderRunFor config context drv))
-  -- 4. Create the build directory, empty, and remove it however the
-  --    build ends, unless it failed and keeps it ('failedBuildsFor').
+  -- 4. Take the build user the builder runs as, if it runs as one
+  --    ('asBuilder'), then create the build directory, empty, the
+  --    directory the builder works in that user's, and remove it however
+  --    the build ends, unless it failed and keeps it ('failedBuildsFor').
   ExceptT $
-    withBuildDir (stLogger store) (bcStoreDir config) (doPath firstOutput) (runWorkDir run) (failedBuildsFor config drv) (either (const BuildFailed) succeeded) $ \buildDir ->
-      runPlannedBuild config context drv run buildDir plans (finish inputPaths plans)
+    asBuilder config context run (takeDirectory (buildDirFor (bcStoreDir config) (doPath firstOutput))) $ \identity ->
+      withBuildDir (stLogger store) (bcStoreDir config) (doPath firstOutput) (runWorkDir run) (failedBuildsFor config drv) (either (const BuildFailed) succeeded) $ \buildDir -> do
+        for_ (buildUserOf identity) (\user -> giveToBuildUser user (workDirIn (runWorkDir run) buildDir))
+        runPlannedBuild config context drv run identity buildDir plans (finish inputPaths plans)
+  where
+    stopped reason = BuildStop reason 1
+
+-- | Run a build as whom its builder runs as, given the directory that
+-- holds build directories: for a spawned builder under build users, a build
+-- user taken for the build ('withBuildUser'), as upstream takes one, with
+-- every process the user has killed first ('killBuildUser'), the store's
+-- directory opened to the build users ('openStoreToBuildUsers'), and the
+-- directory holding builds made and refused when it or an ancestor is one
+-- every user may write ('worldWritableAncestor'); otherwise the user
+-- nova-nix runs as, who runs every builtin.
+asBuilder :: BuildConfig -> BuildContext -> BuilderRun -> FilePath -> (BuilderIdentity -> IO (Either BuildStop a)) -> IO (Either BuildStop a)
+asBuilder config context run buildsDir action = case (run, bcBuildUsers config) of
+  (RunsSpawned _, BuildUsersOf group pool) -> do
+    taken <- withBuildUser (buildLogger context) group pool (storePathToText defaultStoreDir (bxDrvPath context)) $ \user -> runExceptT $ do
+      ExceptT (first stopped <$> killBuildUser user)
+      liftIO (openStoreToBuildUsers (unStoreDir (bcStoreDir config)) user)
+      liftIO (createDirectoryIfMissing True buildsDir)
+      writable <- liftIO (worldWritableAncestor buildsDir)
+      for_ writable (throwError . stopped . worldWritableMessage)
+      ExceptT (action (AsBuildUser user))
+    pure (either (Left . stopped) id taken)
+  _ -> action AsInvoker
   where
     stopped reason = BuildStop reason 1
 
@@ -861,8 +928,8 @@ buildLogger = stLogger . bxStore
 -- | The build, once every output knows where it is written and where it
 -- belongs and the builder where it runs: run the builder, then @finish@
 -- with where each output it wrote is now.
-runPlannedBuild :: BuildConfig -> BuildContext -> Derivation -> BuilderRun -> FilePath -> [OutputPlan] -> (Written -> Commit -> IO (Either BuildStop a)) -> IO (Either BuildStop a)
-runPlannedBuild config context drv run buildDir plans finish = do
+runPlannedBuild :: BuildConfig -> BuildContext -> Derivation -> BuilderRun -> BuilderIdentity -> FilePath -> [OutputPlan] -> (Written -> Commit -> IO (Either BuildStop a)) -> IO (Either BuildStop a)
+runPlannedBuild config context drv run identity buildDir plans finish = do
   let scratchDir = scratchPathOf config
       outputDirs = [(opName p, scratchDir p) | p <- plans]
       -- Every scratch path is the build's to use: the ones that are final
@@ -914,7 +981,7 @@ runPlannedBuild config context drv run buildDir plans finish = do
                 for_ [p | p <- plans, opValid p] (removePathForcibly . scratchDir)
               Left _ -> clearScratch
             pure finished
-      inStore = Written scratchDir (writableByOthers . scratchDir)
+      inStore = Written scratchDir (writableByOthers . scratchDir) OwnedByInvoker
   ( do
       -- 5. Run the builder.  A builtin builder runs in this process and
       --    writes the outputs where they are on disk; a spawned one runs
@@ -922,7 +989,7 @@ runPlannedBuild config context drv run buildDir plans finish = do
       --    its outputs are where it left them.
       ran <- case run of
         RunsBuiltin builtin -> builtin outputDirs >>= either (pure . Left . uncurry BuilderRefused) (\() -> Right <$> afterBuilder inStore)
-        RunsSpawned placement -> runSpawnedBuilder config context drv placement buildDir plans afterBuilder
+        RunsSpawned placement -> runSpawnedBuilder config context drv identity placement buildDir plans afterBuilder
       case ran of
         Left failure -> do
           -- Whatever the builder wrote is in the store now, so failure has
@@ -946,6 +1013,8 @@ scratchPathOf config p = storePathToFilePath (bcStoreDir config) (opScratch p)
 -- refuses it otherwise, as upstream does; on macOS it refuses the build
 -- whatever @sandbox-fallback@ says ('backendFallback'), as upstream does
 -- too.  'Left' is the refusal, in upstream's words ("Nix.Builder.Sandbox").
+-- A sandboxed build as root with no build users is refused
+-- ('rootRefusal').
 placementFor :: BuildConfig -> BuildContext -> Derivation -> IO (Either Text Placement)
 placementFor config context drv =
   case sandboxUse hostSandboxBackend (scMode sandbox) (bxDrvPath context) drv of
@@ -954,7 +1023,7 @@ placementFor config context drv =
     Right (Sandboxed network) -> do
       root <- processIsRoot
       -- Before anything is made, and whatever sandbox-fallback says.
-      if root
+      if root && bcBuildUsers config == NoBuildUsers
         then pure (Left rootRefusal)
         else do
           available <- sandboxAvailability (scHelper sandbox)
@@ -966,13 +1035,14 @@ placementFor config context drv =
   where
     sandbox = bcSandbox config
 
--- | Run a derivation's spawned builder where 'placementFor' put it.  Once
--- the builder has succeeded, @continue@ runs with where its outputs are.
-runSpawnedBuilder :: BuildConfig -> BuildContext -> Derivation -> Placement -> FilePath -> [OutputPlan] -> (Written -> IO r) -> IO (Either BuilderFailure r)
-runSpawnedBuilder config context drv placement buildDir plans continue = case placement of
+-- | Run a derivation's spawned builder where 'placementFor' put it, as
+-- whom it runs as.  Once the builder has succeeded, @continue@ runs with
+-- where its outputs are.
+runSpawnedBuilder :: BuildConfig -> BuildContext -> Derivation -> BuilderIdentity -> Placement -> FilePath -> [OutputPlan] -> (Written -> IO r) -> IO (Either BuilderFailure r)
+runSpawnedBuilder config context drv identity placement buildDir plans continue = case placement of
   PlacedUnsandboxed -> unsandboxed
-  PlacedInLinuxSandbox helper network -> runSandboxedBuild config context drv buildDir plans helper network continue
-  PlacedInDarwinSandbox helper network -> runDarwinSandboxedBuild config context drv buildDir plans helper network continue
+  PlacedInLinuxSandbox helper network -> runSandboxedBuild config context drv identity buildDir plans helper network continue
+  PlacedInDarwinSandbox helper network -> runDarwinSandboxedBuild config context drv identity buildDir plans helper network continue
   where
     -- The builder runs where its directory and outputs are, so it is told
     -- of each where it is on disk.
@@ -980,9 +1050,50 @@ runSpawnedBuilder config context drv placement buildDir plans continue = case pl
     unsandboxed = case builderInvocation config drv layout of
       Left reason -> pure (Left (BuilderRefused 1 reason))
       Right invocation -> do
-        for_ (invFiles invocation) (uncurry BS.writeFile)
-        ran <- runBuilder (buildLogger context) invocation
-        traverse (\() -> continue (Written (scratchPathOf config) (writableByOthers . scratchPathOf config))) ran
+        writeBuilderFiles identity invocation
+        ran <- endingBuildUser identity (runBuilderAs (buildLogger context) identity invocation)
+        traverse (\() -> continue (Written (scratchPathOf config) (writableByOthers . scratchPathOf config) (outputOwnerOf identity))) ran
+
+-- | Write the files a builder reads from its build directory, each given to
+-- the build user the builder runs as, if it runs as one, as upstream gives
+-- them.
+writeBuilderFiles :: BuilderIdentity -> BuilderInvocation -> IO ()
+writeBuilderFiles identity invocation = for_ (invFiles invocation) $ \(path, contents) -> do
+  BS.writeFile path contents
+  for_ (buildUserOf identity) (`giveToBuildUser` path)
+
+-- | Run a builder's process, and for a build user kill every process the
+-- user has once it ends, however it ends, as upstream kills them before it
+-- reads an output, so that nothing the builder left behind changes an
+-- output while it is read or outlives the build.  A kill that fails fails
+-- the build, whatever the builder did, as upstream's does.
+endingBuildUser :: BuilderIdentity -> IO (Either BuilderFailure a) -> IO (Either BuilderFailure a)
+endingBuildUser identity run = case identity of
+  AsInvoker -> run
+  AsBuildUser user -> do
+    ran <- run `onException` killBuildUser user
+    killed <- killBuildUser user
+    pure (either (Left . BuilderNotEnded) (const ran) killed)
+
+-- | Run an unsandboxed builder as whom it runs as: through the process
+-- library as the user nova-nix runs as ('runBuilder'), or as a build user
+-- ('runAsBuildUser').
+runBuilderAs :: Logger -> BuilderIdentity -> BuilderInvocation -> IO (Either BuilderFailure ())
+runBuilderAs logger identity invocation = case identity of
+  AsInvoker -> runBuilder logger invocation
+  AsBuildUser user -> do
+    environment <- builderEnvironment invocation
+    ran <- runAsBuildUser logger user (invProgram invocation) (invArgs invocation) (map TE.encodeUtf8 environment) (invWorkDir invocation)
+    pure $ case ran of
+      Left reason -> Left (BuilderRefused 1 reason)
+      Right ExitSuccess -> Right ()
+      Right (ExitFailure code) -> Left (BuilderExited code)
+
+-- | The ids a builder runs as outside its sandbox.
+builderIdsOf :: BuilderIdentity -> IO BuilderIds
+builderIdsOf identity = case identity of
+  AsInvoker -> uncurry BuilderIds <$> invokingUserIds
+  AsBuildUser user -> pure (BuilderIds (buUid user) (buGid user))
 
 -- | Run a builder in the sandbox, in a chroot beside its build directory
 -- ("Nix.Builder.Sandbox.Spawn") through the helper, then @continue@ with
@@ -999,8 +1110,8 @@ runSpawnedBuilder config context drv placement buildDir plans continue = case pl
 -- the build directory, made with it ('sandboxedBuildDir').  An
 -- @--exec-wrapper@ launcher is bound into the chroot as a @sandbox-paths@
 -- entry naming itself.
-runSandboxedBuild :: BuildConfig -> BuildContext -> Derivation -> FilePath -> [OutputPlan] -> FilePath -> Network -> (Written -> IO r) -> IO (Either BuilderFailure r)
-runSandboxedBuild config context drv outerBuildDir plans helper network continue = do
+runSandboxedBuild :: BuildConfig -> BuildContext -> Derivation -> BuilderIdentity -> FilePath -> [OutputPlan] -> FilePath -> Network -> (Written -> IO r) -> IO (Either BuilderFailure r)
+runSandboxedBuild config context drv identity outerBuildDir plans helper network continue = do
   paths <- buildSandboxPaths config drv
   closure <- sandboxPathsClosure config context paths
   case closure of
@@ -1016,7 +1127,8 @@ runSandboxedBuild config context drv outerBuildDir plans helper network continue
       -- out of the chroot, as upstream keeps every known output path out
       -- (@startBuilder@ in local-derivation-goal.cc at 2.24.9).
       outputBytes <- traverse filePathBytes (Set.toAscList (Set.fromList (concat [[storeFile (opFinal p), scratchPathOf config p] | p <- plans])))
-      chrooted <- withChroot (buildLogger context) outerBuildDir (chrootSkeleton storeBytes (scBuildDir sandbox) network paths) $ \root -> do
+      builderIds <- builderIdsOf identity
+      chrooted <- withChroot (buildLogger context) outerBuildDir (buGid <$> buildUserOf identity) (chrootSkeleton storeBytes (scBuildDir sandbox) network paths) $ \root -> do
         rootBytes <- filePathBytes root
         let seenLayout = BuildLayout (BuildPlace seenBuildDir buildDir) [(opName p, BuildPlace (scratchPathOf config p) (root <> scratchPathOf config p)) | p <- plans] sandboxHome
             planInputs environment =
@@ -1033,7 +1145,8 @@ runSandboxedBuild config context drv outerBuildDir plans helper network continue
                   piNetwork = network,
                   piCaFile = scCaFile sandbox,
                   piDevShmSize = scDevShmSize sandbox,
-                  piDropGroups = scDropGroups sandbox
+                  piDropGroups = scDropGroups sandbox,
+                  piBuilderIds = builderIds
                 }
         case builderInvocation config drv seenLayout of
           Left reason -> pure (Left (BuilderRefused 1 reason))
@@ -1042,8 +1155,8 @@ runSandboxedBuild config context drv outerBuildDir plans helper network continue
             case sandboxPlan (planInputs (map TE.encodeUtf8 environment)) of
               Left reason -> pure (Left (BuilderSandboxFailed reason))
               Right plan -> do
-                for_ (invFiles invocation) (uncurry BS.writeFile)
-                ran <- runSandboxedBuilder (buildLogger context) helper (renderPlan plan) (helperOutcome setupStageName . setupFailureMessage plan) invocation
+                writeBuilderFiles identity invocation
+                ran <- endingBuildUser identity (runSandboxedBuilder (buildLogger context) helper (renderPlan plan) (helperOutcome setupStageName . setupFailureMessage plan) invocation)
                 case ran of
                   Left failure -> pure (Left failure)
                   Right () -> do
@@ -1055,7 +1168,7 @@ runSandboxedBuild config context drv outerBuildDir plans helper network continue
                     sealed <- sealChroot root (unStoreDir (bcStoreDir config))
                     case sealed of
                       Left reason -> pure (Left (BuilderSandboxFailed reason))
-                      Right open -> Right <$> continue (Written (\p -> root <> scratchPathOf config p) (pure . (`Set.member` open) . takeFileName . scratchPathOf config))
+                      Right open -> Right <$> continue (Written (\p -> root <> scratchPathOf config p) (pure . (`Set.member` open) . takeFileName . scratchPathOf config) (outputOwnerOf identity))
       pure (either (Left . BuilderSandboxFailed) id chrooted)
   where
     sandbox = bcSandbox config
@@ -1081,6 +1194,14 @@ sandboxPathsClosure config context paths = do
   let inStore = [sp | entry <- paths, Right source <- [TE.decodeUtf8' (spSource entry)], Just sp <- [parseStorePathPrefix (bcStoreDir config) source]]
   fmap Set.toAscList <$> inputClosure (bxStore context) inStore
 
+-- | The temporary directory a process takes from @TMPDIR@, as upstream
+-- takes its own: the variable's value when it is set and not empty,
+-- otherwise @\/tmp@.
+temporaryDirIn :: EnvLookup -> BS.ByteString
+temporaryDirIn found = case found of
+  EnvValue value | not (BS.null value) -> value
+  _ -> "/tmp"
+
 -- | Run a builder under the macOS sandbox's profile, through the helper,
 -- then @continue@ with each output where the builder wrote it.  macOS's
 -- sandbox has no chroot: the builder sees its build directory and its
@@ -1092,8 +1213,8 @@ sandboxPathsClosure config context paths = do
 -- its resolved path.  A derivation's impure host paths, and the refusals
 -- of a path the profile cannot name, are upstream's
 -- ('darwinPathsInSandbox', 'profileFilters').
-runDarwinSandboxedBuild :: BuildConfig -> BuildContext -> Derivation -> FilePath -> [OutputPlan] -> FilePath -> Network -> (Written -> IO r) -> IO (Either BuilderFailure r)
-runDarwinSandboxedBuild config context drv buildDir plans helper network continue = runExceptT $ do
+runDarwinSandboxedBuild :: BuildConfig -> BuildContext -> Derivation -> BuilderIdentity -> FilePath -> [OutputPlan] -> FilePath -> Network -> (Written -> IO r) -> IO (Either BuilderFailure r)
+runDarwinSandboxedBuild config context drv identity buildDir plans helper network continue = runExceptT $ do
   options <- liftEither (first BuilderSandboxFailed (darwinOptions (bxDrvPath context) drv))
   paths <- liftIO (buildSandboxPaths config drv)
   closurePaths <- ExceptT (first BuilderSandboxFailed <$> sandboxPathsClosure config context paths)
@@ -1136,10 +1257,14 @@ runDarwinSandboxedBuild config context drv buildDir plans helper network continu
             }
   invocation <- liftEither (first (BuilderRefused 1) (builderInvocation config drv layout))
   environment <- liftIO (builderEnvironment invocation)
-  let plan = DarwinPlan realBuild profile (darwinParameters realBuild (doLocalNetworking options)) (map TE.encodeUtf8 environment)
-  liftIO (for_ (invFiles invocation) (uncurry BS.writeFile))
-  ExceptT (runSandboxedBuilder (buildLogger context) helper (renderDarwinPlan plan) (helperOutcome darwinStageName . darwinSetupFailureMessage plan) invocation)
-  liftIO (continue (Written (scratchPathOf config) (writableByOthers . scratchPathOf config)))
+  tmpDir <- liftIO $ case identity of
+    AsInvoker -> pure realBuild
+    AsBuildUser _ -> lookupEnvBytes (TE.encodeUtf8 envTmpDir) >>= resolvedPath . temporaryDirIn
+  let buildUser = (\user -> BuilderIds (buUid user) (buGid user)) <$> buildUserOf identity
+      plan = DarwinPlan realBuild profile buildUser (darwinParameters realBuild tmpDir (doLocalNetworking options)) (map TE.encodeUtf8 environment)
+  liftIO (writeBuilderFiles identity invocation)
+  ExceptT (endingBuildUser identity (runSandboxedBuilder (buildLogger context) helper (renderDarwinPlan plan) (helperOutcome darwinStageName . darwinSetupFailureMessage plan) invocation))
+  liftIO (continue (Written (scratchPathOf config) (writableByOthers . scratchPathOf config) (outputOwnerOf identity)))
 
 -- | Why the builder step of a build failed, with the exit code the
 -- build reports.
@@ -1156,6 +1281,9 @@ data BuilderFailure
   | -- | The sandbox could not be made, for the reason given, in upstream's
     -- words ("Nix.Builder.Sandbox").
     BuilderSandboxFailed !Text
+  | -- | The build user's processes could not all be killed once the
+    -- builder ended, for the reason given ('killBuildUser').
+    BuilderNotEnded !Text
 
 -- | The stop a failed builder step reports.
 builderStop :: BuilderFailure -> BuildStop
@@ -1163,6 +1291,7 @@ builderStop failure = case failure of
   BuilderExited code -> BuildStop "builder failed" code
   BuilderRefused code reason -> BuildStop ("builder failed: " <> reason) code
   BuilderSandboxFailed reason -> BuildStop reason 1
+  BuilderNotEnded reason -> BuildStop reason 1
 
 -- | Decode a derivation's builder path and arguments from their identity
 -- bytes to the 'Text' the process-spawn boundary needs.  @Left@ names the
@@ -2189,7 +2318,7 @@ compareOutputs failedBuilds store drv drvPath recordedHashes inputPaths plans wr
     rebuilt (output, plan, recorded) = do
       outDir <- writtenOutput (writtenPath written plan)
       open <- liftIO (writtenOpen written plan)
-      scanned <- preparedOutput scan output outDir open
+      scanned <- preparedOutput scan output outDir open (writtenOwner written)
       pure (doName output, (scanned, recorded))
 
 -- | The stop a failed scan or placement reports.
@@ -2302,14 +2431,14 @@ scanOutput store scan written (output, plan) = do
       then pure AlreadyRegistered
       else do
         open <- liftIO (writtenOpen written plan)
-        NeedsRegistering <$> preparedOutput scan output outDir open
+        NeedsRegistering <$> preparedOutput scan output outDir open (writtenOwner written)
   pure (doName output, scanned)
 
 -- | An output the builder wrote, made ready where it is to be placed or
 -- compared, in upstream Nix's order: one that lets its group or anyone
--- else write it is refused, since someone other than the build may have
--- changed it, and so is one holding a node another
--- user owns; it is made canonical, so nothing in it is setuid or writable by
+-- else write it, or a build user's that another user owns, is refused,
+-- since someone other than the build may have changed it, and so is one
+-- holding a node a user other than the builder's owns; it is made canonical, so nothing in it is setuid or writable by
 -- another user, before it is read or changed; a fixed output is replaced with
 -- a fresh copy of itself, made canonical again, so a descriptor the builder
 -- passed out names an inode that is not registered; and its hashes are
@@ -2318,10 +2447,11 @@ scanOutput store scan written (output, plan) = do
 -- sandboxed build's seal changed its mode.  Its chroot is closed to
 -- other users before this ('Nix.Builder.Sandbox.Spawn.sealChroot'); a process
 -- of the same user can still change an output while it is read.
-preparedOutput :: OutputScan -> DerivationOutput -> FilePath -> Bool -> ExceptT Text IO BuiltOutput
-preparedOutput scan output outDir open = do
-  when open (throwError ("suspicious ownership or permission on '" <> T.pack outDir <> "' for output '" <> doName output <> "'; rejecting this build output"))
-  othersNode <- liftIO (foreignOwnedNode outDir)
+preparedOutput :: OutputScan -> DerivationOutput -> FilePath -> Bool -> OutputOwner -> ExceptT Text IO BuiltOutput
+preparedOutput scan output outDir open owner = do
+  foreignRoot <- liftIO (ownedByAnother owner outDir)
+  when (open || foreignRoot) (throwError ("suspicious ownership or permission on '" <> T.pack outDir <> "' for output '" <> doName output <> "'; rejecting this build output"))
+  othersNode <- liftIO (foreignOwnedNode owner outDir)
   for_ othersNode (\node -> throwError ("invalid ownership on file '" <> T.pack node <> "'"))
   liftIO (canonicalizeMetadata outDir)
   -- The copy is made canonical in its turn, and it is the copy that is

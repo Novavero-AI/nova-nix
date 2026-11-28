@@ -839,6 +839,11 @@
         "name": "require-drop-supplementary-groups"
       },
       {
+        "description": "The group whose members builds run as, one build to a member at a time, when nova-nix runs as root on Linux or macOS; with it empty a build runs as the user nova-nix runs as (default: `nixbld` for root, empty otherwise)",
+        "flag": null,
+        "name": "build-users-group"
+      },
+      {
         "description": "Link the default profile from `profile` in the state directory in place of `~/.nix-profile` (default `false`)",
         "flag": null,
         "name": "use-xdg-base-directories"

@@ -350,7 +350,8 @@ Ubuntu lets the sandbox in only under an AppArmor profile for
 On macOS `sandbox = true` runs a build under a profile of macOS's sandbox, off
 by default as upstream's is, where it reads only its inputs and the paths
 `sandbox-paths` names and, unless it is fixed-output, reaches no network. As
-root a sandboxed build is refused, since nova-nix has no build users yet.
+root a build runs as a member of `build-users-group`, `nixbld` by default, as
+upstream's does.
 Builds on Windows, and on macOS by default, are not sandboxed: a builder there
 can read and write outside its build directory and reach the network.
 

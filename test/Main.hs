@@ -15,6 +15,7 @@ import System.Exit (exitFailure, exitSuccess)
 import System.FilePath ((</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 import qualified System.Process as Proc
+import Test.BuildUser (buildUsersRootChild, buildUsersRootFlag, testBuildUsersPure)
 import Test.Builder (sandboxBuildChild, sandboxBuildChildFlag, sandboxEscapeChild, sandboxEscapeChildFlag, sandboxFallbackChild, sandboxFallbackChildFlag, sandboxForkerChild, sandboxForkerChildFlag, sandboxThawChild, sandboxThawChildFlag, testBuildCheckIO, testBuildCores, testBuildCoresIO, testBuildDirIO, testBuildLogIO, testBuildOrchestrator, testBuildenvBuildIO, testBuildenvDerivations, testBuilder, testBuilderLayout, testDarwinSandboxIO, testDependentBuildIO, testExecWrapper, testFetchMirrors, testFetchurlUnpack, testFlatOutputFormIO, testLinuxSandboxIO, testOutputCycleBuildIO, testOutputOrderIO, testPassAsFile, testProfileGenerations, testProfileManifest, testProfileTree, testProfileUpdateIO, testReferenceClosureIO, testSandboxFallbackIO, testSandboxPure, testSandboxSpawnIO, testScrubbedBuildEnvIO, testSourceDateEpochIO, testSubstituteFromCaches, testTrivialBuildIO, testUnpackBuildIO, testWantedOutputsIO)
 import Test.CData (arenaGuardChild, arenaGuardChildFlag, testArenaGuard, testBytecodeCompile, testBytecodeCorrupt, testBytecodeCountSpill, testBytecodePerElement, testBytecodeTags, testCAttrSet, testCThunk, testLambdaShape, testSymbol, testUnknownTags, testValueCountWidths)
 import Test.Cli (cliJsonPath, testBuildCoresCLI, testBuildUmaskCLI, testCheckCLI, testCliReference, testClosedStdoutCLI, testConfigBytesCLI, testDevelopCLI, testE2E, testEvalPolicyCLI, testExecWrapperCLI, testImportFromDerivationCLI, testNixConfig, testOutLinkCLI, testProfileCLI, testResultPrinterCLI, testSandboxSessionsCLI, testSubstituterListingsCLI, testTargetArgsCLI, testTrustCLI, testUncaughtIOFailureCLI, writeCliJsonFlag)
@@ -55,6 +56,7 @@ main = do
     flag : rest | flag == windowsSandboxInstallFlag -> windowsSandboxInstall rest
     flag : rest | flag == windowsSandboxServiceFlag -> windowsSandboxService rest
     flag : rest | flag == windowsSandboxAccountsFlag -> windowsSandboxAccounts rest
+    flag : rest | flag == buildUsersRootFlag -> buildUsersRootChild rest
     flag : rest | flag == windowsSandboxBuilderFlag -> windowsSandboxBuilder rest
     _ -> withRunTempRoot (inTestSession runSuite)
 
@@ -285,6 +287,7 @@ runSuite = do
           testPassAsFile,
           testBuilderLayout,
           testSandboxPure,
+          testBuildUsersPure,
           testSandboxSpawnIO,
           testSandboxFallbackIO,
           testLinuxSandboxIO,

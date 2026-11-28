@@ -207,7 +207,7 @@ jobs:
       # builds here as the stubs it holds for every other OS.
       - name: Compile C99 with strict warnings
         run: |
-          for f in cbits/*.c sandbox/*.c test/cbits/sandbox_check.c test/cbits/keyring.c test/cbits/nn_test_sandbox_windows.c; do
+          for f in cbits/*.c sandbox/*.c test/cbits/sandbox_check.c test/cbits/keyring.c test/cbits/process_wait.c test/cbits/nn_test_sandbox_windows.c; do
             case "$f" in sandbox/darwin.c | sandbox/windows.c) continue ;; esac
             echo "Checking $f ..."
             gcc -std=c99 -Wall -Wextra -pedantic -Werror -fsyntax-only -Icbits -Isandbox "$f"
@@ -789,8 +789,8 @@ jobs:
       # names that copy, so with the restriction on, which the step asserts,
       # a sandboxed build runs unsandboxed after one warning naming the
       # cause, or with sandbox-fallback off fails in upstream's words.  As
-      # root, which the restriction does not reach, a sandboxed build is
-      # refused, since nova-nix has no build users to run it as.
+      # root, which the restriction does not reach, a sandboxed build with
+      # build-users-group empty is refused, since it would build as root.
       - name: Without a profile, a sandboxed build falls back, or fails with sandbox-fallback off, and as root is refused (Linux)
         if: runner.os == 'Linux'
         shell: bash
@@ -813,12 +813,37 @@ jobs:
           fi
           cat refused.txt
           grep -qF "this system does not support the kernel namespaces that are required for sandboxing; use '--no-sandbox' to disable sandboxing" refused.txt
-          if sudo "$bin/nova-nix" --store "$(mktemp -d)" build --sandbox --no-out-link --expr "$expr" 2>root.txt; then
+          if sudo env NIX_CONFIG='build-users-group =' "$bin/nova-nix" --store "$(mktemp -d)" build --sandbox --no-out-link --expr "$expr" 2>root.txt; then
             echo "::error::a sandboxed build ran as root"
             exit 1
           fi
           cat root.txt
-          grep -qF "a sandboxed build as root needs build users, which nova-nix does not have yet" root.txt
+          grep -qF "a sandboxed build as root needs build users: set 'build-users-group' to a group of build users" root.txt
+
+      # As root a build runs as a member of build-users-group, as
+      # upstream's does.  The step makes the group, nixbld, and two members
+      # with no home and no login shell, as upstream's installer makes
+      # them, then runs the suite's checks as root, given the helper and
+      # busybox the suite's sandbox group uses and a directory beneath /,
+      # whose ancestors every user may search and none every user may
+      # write, which the checks remove.  They build unsandboxed and in the
+      # sandbox, and hold whom each build ran as, with which groups and in
+      # which session, its output's owner and mode, the refusal of an output
+      # holding another user's file and of a build below a directory every
+      # user may write, the end of a process a build left, and a build's
+      # wait for a free member.
+      - name: Builds as root run as build users (Linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo groupadd --system nixbld
+          for n in 1 2; do
+            sudo useradd --system --no-create-home --home-dir /var/empty --shell /usr/sbin/nologin --gid nixbld --groups nixbld "nixbld$n"
+          done
+          suite=$(cabal list-bin test:nova-nix-test)
+          sudo "$suite" --build-users-root "$NOVA_NIX_TEST_SANDBOX_HELPER" "$NOVA_NIX_TEST_BUSYBOX" /nova-nix-build-users nixbld
 
       # SIGINT mid-evaluation is upstream's error, exit 1, where it once
       # ended the process by the signal with nothing said.  POSIX only:

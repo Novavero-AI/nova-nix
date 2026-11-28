@@ -88,7 +88,9 @@ static int render_linux(struct buffer *buffer, const struct plan *plan)
           && append_token(buffer, plan->build_dir) && append_token(buffer, "dev-shm-size")
           && append_token(buffer, plan->dev_shm_size) && append_token(buffer, "sandbox-uid")
           && append_number(buffer, plan->sandbox_uid) && append_token(buffer, "sandbox-gid")
-          && append_number(buffer, plan->sandbox_gid) && append_token(buffer, "network")
+          && append_number(buffer, plan->sandbox_gid) && append_token(buffer, "host-uid")
+          && append_number(buffer, plan->host_uid) && append_token(buffer, "host-gid")
+          && append_number(buffer, plan->host_gid) && append_token(buffer, "network")
           && append_token(buffer, plan->private_network ? "private" : "host") && append_token(buffer, "drop-groups")
           && append_token(buffer, plan->require_drop_groups ? "require" : "tolerate")))
         return 0;
@@ -105,6 +107,14 @@ static int render_darwin(struct buffer *buffer, const struct plan *plan)
           && append_token(buffer, plan->build_dir) && append_token(buffer, "profile")
           && append_token(buffer, plan->profile)))
         return 0;
+    if (plan->as_build_user) {
+        if (!(append_token(buffer, "build-uid") && append_number(buffer, plan->build_uid)
+              && append_token(buffer, "build-gid") && append_number(buffer, plan->build_gid)))
+            return 0;
+    } else if (!(append_token(buffer, "build-uid") && append_token(buffer, "-") && append_token(buffer, "build-gid")
+                 && append_token(buffer, "-"))) {
+        return 0;
+    }
     for (i = 0; i < plan->parameter_count; i++)
         if (!(append_token(buffer, "param") && append_token(buffer, plan->parameters[2 * i])
               && append_token(buffer, plan->parameters[2 * i + 1])))
