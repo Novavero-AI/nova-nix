@@ -1,10 +1,11 @@
-/* Platform filesystem capabilities the store layer uses on Windows.
+/* Platform calls the library makes on Windows: the filesystem
+ * capabilities the store layer uses, and the limits of a builder's job.
  * The cabal c-sources entry is unconditional and the C99 strict job
  * lints every C file under cbits on Linux, so every other platform
  * compiles a constant 0 stub of the case-sensitivity call; the Haskell
  * side picks the platform's answer at compile time and never calls it.
- * The access-control calls are declared and defined on Windows alone,
- * the only platform that calls them. */
+ * The access-control and job calls are declared and defined on Windows
+ * alone, the only platform that calls them. */
 #ifndef NN_WINFS_H
 #define NN_WINFS_H
 
@@ -66,6 +67,14 @@ unsigned long nn_descriptor_from_sddl(const wchar_t *sddl, void **descriptor);
  * call (a static string). */
 unsigned long nn_entry_set_owner_dacl(const wchar_t *path, void *descriptor,
                                       const char **failed);
+
+/* Add JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION to the limits of the
+ * job whose handle is given, keeping the others, so that a process of
+ * the job that meets an unhandled exception ends with the exception's
+ * code as its exit code, and Windows Error Reporting is not invoked.
+ * Returns 0, or the Win32 error code of the call that failed, with
+ * *failed naming that call (a static string). */
+unsigned long nn_job_die_on_unhandled_exception(void *job, const char **failed);
 
 #endif
 

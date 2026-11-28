@@ -24,6 +24,9 @@ module Test.Builder
     sandboxThawChildFlag,
     sandboxThawChild,
     testTrivialBuildIO,
+    testBuilderJobIO,
+    builderJobChildFlag,
+    builderJobChild,
     testBuildDirIO,
     testBuildLogIO,
     testSourceDateEpochIO,
@@ -95,7 +98,7 @@ import Data.Tuple (swap)
 import Data.Word (Word32, Word64, Word8)
 import Foreign.C.Error (Errno (..), eACCES, eAGAIN, eINVAL, eIO, eMFILE, eNOENT, eNOTDIR, getErrno)
 import Foreign.C.String (withCString)
-import Foreign.C.Types (CChar, CInt (..), CLong (..), CSize (..))
+import Foreign.C.Types (CChar, CInt (..), CLong (..), CSize (..), CULong (..))
 import Foreign.Marshal.Alloc (alloca, free)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (peek)
@@ -2945,6 +2948,78 @@ testTrivialBuildIO = do
           [ runTest "trivial build succeeds" $
               Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
           ]
+
+-- | @JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE@ (winnt.h): the process library's
+-- job ends its processes when its last handle closes.
+killOnJobClose :: CULong
+killOnJobClose = 0x2000
+
+-- | @JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION@ (winnt.h): a process
+-- of the job ends at an unhandled exception without Windows Error
+-- Reporting.
+dieOnUnhandledExceptionLimit :: CULong
+dieOnUnhandledExceptionLimit = 0x400
+
+-- | The flag that makes the test binary a builder that, once its standard
+-- input ends, writes to @$out@ what reading its job's limits answered and
+-- the limit flags read.
+builderJobChildFlag :: String
+builderJobChildFlag = "--builder-job-child"
+
+-- | Read standard input to its end, then write the job's limits to
+-- @$out@.
+builderJobChild :: IO ()
+builderJobChild = do
+  _ <- BS.getContents
+  out <- lookupEnv "out"
+  alloca $ \flagsOut -> do
+    code <- c_job_limits flagsOut
+    flags <- peek flagsOut
+    maybe exitFailure (\path -> BS.writeFile path (BS8.pack (unwords [show code, show flags]))) out
+
+foreign import ccall unsafe "nova_test_job_limits"
+  c_job_limits :: Ptr CULong -> IO CULong
+
+-- | An unsandboxed Windows builder runs in a job that ends a process at an
+-- unhandled exception, so Windows Error Reporting starts no WerFault.exe
+-- in the build, and that still ends its processes when it closes.  The
+-- builder reads the limits once its standard input ends, which the build
+-- ends once the limit is set.
+testBuilderJobIO :: IO [Bool]
+testBuilderJobIO = do
+  putStrLn "builder/job"
+  if SI.os /= "mingw32"
+    then do
+      putStrLn "  SKIP  Windows only"
+      pure []
+    else withTempStore $ \store -> do
+      self <- getExecutablePath >>= Spawn.filePathBytes
+      let outPath = StorePath (T.replicate 31 "j" <> "1") "builder-job"
+          drv =
+            Derivation
+              { drvOutputs = [DerivationOutput {doName = "out", doPath = outPath, doHashAlgo = "", doHash = ""}],
+                drvInputDrvs = Map.empty,
+                drvInputSrcs = [],
+                drvPlatform = currentPlatform,
+                drvBuilder = self,
+                drvArgs = [BS8.pack builderJobChildFlag],
+                drvEnv = Map.empty
+              }
+      result <- buildDerivation (defaultBuildConfig (stDir store)) store drv testDrvPath
+      written <- case result of
+        BuildSuccess sp -> Right <$> BS.readFile (storePathToFilePath (stDir store) sp)
+        BuildFailure msg code -> pure (Left ("build failed (exit " <> T.pack (show code) <> "): " <> msg))
+      let limits = case BS8.words <$> written of
+            Right [code, flags] -> maybe (Left ("unreadable limits: " <> bytesText (BS8.unwords [code, flags]))) Right ((,) <$> readMaybe (BS8.unpack code) <*> readMaybe (BS8.unpack flags))
+            Right other -> Left ("unreadable limits: " <> bytesText (BS8.unwords other))
+            Left failure -> Left failure
+          held flag = (\(code, flags) -> (code, flags .&. flag == flag)) <$> limits
+      sequence
+        [ runTest "a builder's job has the limit that ends a process at an unhandled exception without the crash reporter" $
+            assertEqual "read, and the limit held" (Right (0 :: CULong, True)) (held dieOnUnhandledExceptionLimit),
+          runTest "a builder's job keeps the limit that ends its processes when it closes" $
+            assertEqual "read, and the limit held" (Right (0 :: CULong, True)) (held killOnJobClose)
+        ]
 
 -- | Where a build runs ("Nix.Builder.BuildDir"): in a directory under the
 -- store's state directory, named by the first output, that the build

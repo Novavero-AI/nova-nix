@@ -6,9 +6,11 @@
  * service's own dispatch, the slots' logons, the directories and files
  * the tests lay out, and a process started as a slot.  In a builder, run
  * as a slot's account: what the builder is, and what it may reach.  Each
- * answers 0 or the Win32 error code of the call that failed.  The suite
- * compiles this file on every OS; off Windows each call answers
- * NOT_ON_WINDOWS, and the tests never make one there.
+ * answers 0 or the Win32 error code of the call that failed.  An
+ * unsandboxed builder's test (test/Test/Builder.hs) reads the limits of
+ * the job it runs in here too.  The suite compiles this file on every OS;
+ * off Windows each call answers NOT_ON_WINDOWS, and the tests never make
+ * one there.
  */
 
 #include <stddef.h>
@@ -910,6 +912,17 @@ int nova_test_in_job(void)
     return in_job ? 1 : 0;
 }
 
+/* The limit flags of the job this process is in, the innermost when jobs
+ * nest, in *flags. */
+unsigned long nova_test_job_limits(unsigned long *flags)
+{
+    JOBOBJECT_BASIC_LIMIT_INFORMATION limits;
+    if (!QueryInformationJobObject(NULL, JobObjectBasicLimitInformation, &limits, sizeof limits, NULL))
+        return GetLastError();
+    *flags = limits.LimitFlags;
+    return 0;
+}
+
 /* Whether this process has a console to write: CONOUT$ opens, which
  * libiberty asks of gcc's console before it lets gcc's subprograms share
  * it. */
@@ -1324,6 +1337,12 @@ unsigned long nova_test_hold_handle(unsigned long pid, unsigned long value)
 int nova_test_in_job(void)
 {
     return -1;
+}
+
+unsigned long nova_test_job_limits(unsigned long *flags)
+{
+    *flags = 0;
+    return NOT_ON_WINDOWS;
 }
 
 unsigned long nova_test_console(void)

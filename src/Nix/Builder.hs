@@ -132,6 +132,7 @@ import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder.BuildDir (BuildEnding (..), FailedBuilds (..), WorkDir (..), buildDirFor, sandboxedBuildDir, withBuildDir, workDirIn)
 import Nix.Builder.BuildUser (BuildUser, BuildUsers (NoBuildUsers), buGid, buUid, giveToBuildUser, invokingUserIds, killBuildUser, openStoreToBuildUsers, runAsBuildUser, withBuildUser, worldWritableAncestor, worldWritableMessage)
 import Nix.Builder.Buildenv (builtinBuildenvBuilder, runBuiltinBuildenv)
+import Nix.Builder.Job (dieOnUnhandledException)
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
 import Nix.Builder.Sandbox (BuilderIds (..), DarwinOptions (..), DarwinPathInputs (..), DarwinPaths (..), DarwinPlan (..), DarwinProfile (..), HelperOutcome (..), Network, PathPresence (..), PlanInputs (..), SandboxBackend (..), SandboxConfig (..), SandboxFallback (..), SandboxPath (..), SandboxUse (..), backendFallback, chrootSkeleton, darwinOptions, darwinParameters, darwinPathsInSandbox, darwinProfile, darwinSetupFailureMessage, darwinStageName, defaultSandboxConfig, helperOutcome, hostSandboxBackend, renderDarwinPlan, renderPlan, rootRefusal, sandboxHome, sandboxPlan, sandboxUse, setupFailureMessage, setupStageName, unavailableMessage)
 import Nix.Builder.Sandbox.Spawn (HelperRun (..), bytesFilePath, filePathBytes, processIsRoot, profileFilters, resolvedPath, runHelper, sandboxAvailability, sealChroot, warnFallback, withChroot)
@@ -1831,13 +1832,18 @@ runBuilder logger invocation = do
             -- leaves its descendants running.
             -- A deliberately daemonizing grandchild changes from leaking
             -- to blocking the build until it exits; that is the correct
-            -- trade for a build, which owns everything it spawned.
+            -- trade for a build, which owns everything it spawned.  The
+            -- job also ends a process at an unhandled exception without
+            -- Windows Error Reporting ("Nix.Builder.Job").
             Proc.use_process_jobs = True
           }
       closePipe (fromBuilder, toLog) = System.IO.hClose fromBuilder *> System.IO.hClose toLog
   exitCode <-
     bracket openLogPipe closePipe $ \(fromBuilder, toLog) ->
       Proc.withCreateProcess (spawnWith toLog) $ \stdinEnd _ _ process -> do
+        -- Before the builder's input ends, so a builder that reads it to
+        -- the end runs on in a job with the limit in place.
+        dieOnUnhandledException process
         for_ stdinEnd System.IO.hClose
         streamBuildLog fromBuilder logger
         Proc.waitForProcess process
