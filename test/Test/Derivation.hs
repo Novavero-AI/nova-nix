@@ -346,12 +346,12 @@ testStructuredAttrs = do
         assertEvalError
           "sa-system-ctx"
           (dependency <> "(derivation { name = \"sa\"; builder = \"/bin/sh\"; __structuredAttrs = true; system = \"${d}\"; }).drvPath")
-          "the string '/nix/store/74ii7m3ms7x609g9mcy8j52jfvpdizcp-d' is not allowed to refer to a store path (such as '!out!nzvhjdd45mdh8mkqm4vz4hdqsjrvkm8j-d.drv')",
+          "the string '/nix/store/74ii7m3ms7x609g9mcy8j52jfvpdizcp-d' is not allowed to refer to a store path (such as '/nix/store/nzvhjdd45mdh8mkqm4vz4hdqsjrvkm8j-d.drv^out')",
       runTest "a structured output name may not refer to a store path" $
         assertEvalError
           "sa-output-ctx"
           (dependency <> structured "outputs = [ \"out\" \"${d}\" ];" <> ".drvPath")
-          "the string '/nix/store/74ii7m3ms7x609g9mcy8j52jfvpdizcp-d' is not allowed to refer to a store path (such as '!out!nzvhjdd45mdh8mkqm4vz4hdqsjrvkm8j-d.drv')",
+          "the string '/nix/store/74ii7m3ms7x609g9mcy8j52jfvpdizcp-d' is not allowed to refer to a store path (such as '/nix/store/nzvhjdd45mdh8mkqm4vz4hdqsjrvkm8j-d.drv^out')",
       runTest "a structured builder must be a string, not a value coerced to one" $
         assertEvalError
           "sa-builder"

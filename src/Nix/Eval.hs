@@ -147,7 +147,7 @@ import Nix.Eval.CList (CList, clistDrop, clistIndex)
 import Nix.Eval.CStr (cstrText)
 import Nix.Eval.CanonPath (canonBaseName, canonDirName, canonPathValue)
 import Nix.Eval.Compile (BcBinding (..), BcBindingCounts (..), BcBindings (..), BcCaptureInfo (..), BcInheritedName (..), BcShares (..), decodeBcBindings, decodeBcCaptureInfo, decodeBcFormals, decodeBinaryOp, decodeUnaryOp, foldBcBindings, foldBcInheritedNames, foldBcShares, reassembleDouble, reassembleInt64)
-import Nix.Eval.Context (contextIsEmpty, encodedElement, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextEncoded, inUpstreamOrder, plainContext)
+import Nix.Eval.Context (contextIsEmpty, encodedElement, extractAllOutputRefs, extractInputDrvs, extractInputSrcs, firstContextDisplayed, inUpstreamOrder, plainContext)
 import Nix.Eval.EvalFormals (FormalDefault (..), LambdaName, hasDefault, lambdaNameText)
 import Nix.Eval.Operator (addToFloat, addToInteger, evalBinary, evalUnary, evalUpdateChain, expectInt, expectedFailure, nixCompare, nixEqual, primAdd, primDiv, primMul, primSub)
 import Nix.Eval.Policy (fileUrlPrefix, hostPathRules, isAbsolutePath)
@@ -5185,11 +5185,12 @@ data StringContextRule = AllowContext | RefuseContext
 -- | A string as upstream's @forceString@ reads it: a string, never a
 -- value coerced to one.  Under 'RefuseContext' it is read as
 -- @forceStringNoCtx@ reads it, and a string with context is refused in
--- that function's words, which name the first element of the context.
+-- that function's words, which name the first element of the context as
+-- 2.36.0 displays it.
 structuredStringValue :: (MonadEval m) => StringContextRule -> NixValue -> m BS.ByteString
 structuredStringValue rule val = case (val, rule) of
   (VStr s ctx, RefuseContext)
-    | Just shown <- firstContextEncoded ctx ->
+    | Just shown <- firstContextDisplayed ctx ->
         throwEvalError ("the string '" <> bytesToTextLossy s <> "' is not allowed to refer to a store path (such as '" <> shown <> "')")
   (VStr s _, _) -> pure s
   (other, _) ->
