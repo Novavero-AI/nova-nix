@@ -56,7 +56,7 @@ module Nix.Eval.IO
   )
 where
 
-import Control.Exception (Exception, IOException, SomeAsyncException, SomeException, bracket, bracket_, catch, catchJust, displayException, fromException, onException, throwIO, try, tryJust)
+import Control.Exception (Exception, Handler (..), IOException, SomeAsyncException, SomeException, bracket, bracket_, catch, catchJust, catches, displayException, fromException, onException, throwIO, try, tryJust)
 import Control.Monad (mfilter, unless, void, when)
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Control.Monad.IO.Class (liftIO)
@@ -100,21 +100,26 @@ import Nix.Eval.CThunk (CThunkPtr, cthunkMarkBlackhole, cthunkMarkPending, cthun
 import Nix.Eval.CallDepth (CallDepth, defaultMaxCallDepth, enterCallFrame, topLevelCallDepth)
 import Nix.Eval.CanonPath (canonBaseName, canonPath, canonPathValue)
 import Nix.Eval.Context (contextRequest)
-import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), SymlinkResolution (..), WalkStop (..), allowPathIn, forbiddenPathMessage, hostPathRules, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, linkTarget, noAllowedPaths, pathComponents, pathsRestricted, storeRootPrefix, uriAccess, walkPath)
+import Nix.Eval.Policy (AllowedPaths, EvalPolicy (..), SymlinkResolution (..), WalkStop (..), allowPathIn, fileUrlPrefix, forbiddenPathMessage, hostPathRules, isAbsolutePath, isAllowedPath, isAllowedPrefix, joinComponents, linkTarget, noAllowedPaths, pathComponents, pathsRestricted, storeRootPrefix, uriAccess, walkPath)
 import Nix.Eval.RealiseContext (ContextRefusal (..), ContextRequest (..), PendingOrigin (..), Plan (..), SessionMode (..), firstInvalidPath, planRealisation, readableIn, referenceClosure)
 import Nix.Eval.SourceError (SourceAccess (..), sourceErrorMessage)
 import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), PathExistence (..), PrimopCell (..), StringCell (..), Thunk (..), attrSetKeys, bytesToTextLossy, evaluated, marshalLambda, pathCell, primopCell, readComputed, readPending, storePathOrThrow, stringCell, warnMessage, pattern ThunkBlackhole, pattern ThunkComputed, pattern ThunkPending)
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
+import Nix.Fetch.Archive (FetchFailure (..), UnpackedArchive (..), unpackArchive)
+import Nix.Fetch.Download (DownloadSource (..), downloadBytes, unescapeUrlPath, withUrlBody)
+import Nix.Fetch.Tree (Blob, Tree, treeNarHash, withTreeNarSource)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
+import Nix.Http (defaultFetchRetryPolicy)
 import Nix.Logger (Logger (..))
 import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
-import Nix.Store (UpstreamHazard (..), canonicalizeMetadata, unpackNarEntry, upstreamManagedRefusal)
+import Nix.Store (ArchiveEnd (..), NarStreamFailure (..), UpstreamHazard (..), abortNarUnpack, canonicalizeMetadata, finishNarUnpack, newNarUnpackSink, sinkNarStream, unpackNarEntry, upstreamManagedRefusal)
 import Nix.Store.Access (createStoreDirectory)
 import Nix.Store.CaseSensitive (pathCaseHack, probeCaseSensitivity, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Ops (BuildStop (..), EvalObjects (..), StoreOps (..), StoreQueries (..), nothingToAdd)
 import qualified Nix.Store.Path as SP
+import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
 import System.Exit (ExitCode (..))
@@ -826,16 +831,7 @@ instance MonadEval EvalIO where
     pure (code, T.pack stdoutStr, T.pack stderrStr)
 
   createScratchDir prefix = do
-    dir <- wrapIO $ do
-      tmpBase <- Dir.getTemporaryDirectory
-      suffix <- getRandomBytes scratchSuffixBytes
-      -- Forward-slash join: the scratch path feeds sh pipelines (tar -C)
-      -- and store copies, both of which accept '/' on every host.
-      let dir = tmpBase <> "/" <> T.unpack (prefix <> bytesToHexText suffix)
-      -- createDirectory is exclusive: an already-existing path fails the
-      -- fetch rather than being silently adopted.
-      Dir.createDirectory dir
-      pure (T.pack dir)
+    dir <- T.pack <$> wrapIO (newScratchDirectory prefix)
     -- The evaluator's own scratch area, not ambient filesystem: what a
     -- fetch lands there is read back under the same rule that makes a
     -- fetched store path readable afterwards.  Allowed under its resolved
@@ -998,6 +994,25 @@ instance MonadEval EvalIO where
     recordStoreWrite origin storePath [] SP.WriteFlat
     allowPath storePath
     pure storePath
+
+  fetchUrlBytes url = do
+    source <- downloadSourceOf url
+    logger <- EvalIO (asks esLogger)
+    wrapIO (downloadBytes logger defaultFetchRetryPolicy url source)
+
+  fetchArchiveToStore url name pin = do
+    source <- downloadSourceOf url
+    logger <- EvalIO (asks esLogger)
+    refusal <- wrapIO (localArchiveRefusal url source)
+    case refusal of
+      Just failure -> pure (Left failure)
+      Nothing -> withScratchDirectory tarballScratchPrefix $ \scratch -> do
+        downloaded <- wrapIO (withUrlBody logger defaultFetchRetryPolicy url source (unpackArchive scratch))
+        case downloaded of
+          Left message -> pure (Left (FetchFailure [] message))
+          Right (warnings, unpacked) -> do
+            mapM_ warnMessage warnings
+            either (pure . Left) (storeArchive name pin . unpackedTree) unpacked
 
   traceMessage msg = do
     logger <- EvalIO (asks esLogger)
@@ -1708,6 +1723,118 @@ runEvalIOTraced st (EvalIO action) = do
 -- ---------------------------------------------------------------------------
 -- Store copy helpers
 -- ---------------------------------------------------------------------------
+
+-- | Where a fetch reads a URL from: a @file:\/\/@ URL's path, decoded as
+-- curl decodes one and named on the drive the evaluator reads it on
+-- ('qualifyPath'), and any other URL through the HTTP client.  A path
+-- that decodes to bytes with no UTF-8 reading is read as written.
+downloadSourceOf :: Text -> EvalIO DownloadSource
+downloadSourceOf url = case T.stripPrefix fileUrlPrefix url of
+  Just path ->
+    LocalFile . T.unpack
+      <$> qualifyPath (fromRight path (TE.decodeUtf8' (unescapeUrlPath (TE.encodeUtf8 path))))
+  Nothing -> pure (RemoteUrl url)
+
+-- | Upstream's refusals of a @file:\/\/@ tarball before it is read
+-- (@downloadTarball_@ in tarball.cc at 2.36.0): a relative path, a path
+-- with nothing there, and a directory, named as a repository when it
+-- holds Git's or Mercurial's metadata.
+localArchiveRefusal :: Text -> DownloadSource -> IO (Maybe FetchFailure)
+localArchiveRefusal url source = case source of
+  RemoteUrl _ -> pure Nothing
+  LocalFile path
+    | isRelative path -> pure (refused ("tarball '" <> url <> "' must use an absolute path. The 'file' scheme does not support relative paths."))
+    | otherwise -> do
+        there <- Dir.doesPathExist path
+        directory <- Dir.doesDirectoryExist path
+        git <- Dir.doesPathExist (path </> ".git")
+        hg <- Dir.doesPathExist (path </> ".hg")
+        let quoted = "\"" <> T.pack path <> "\""
+            repository scheme = refused ("tarball " <> quoted <> " is a repository, not a tarball. Please use `" <> scheme <> "` as the scheme.")
+        pure $ case (there, directory) of
+          (False, _) -> refused ("tarball " <> quoted <> " does not exist.")
+          (True, True)
+            | git -> repository "git+file"
+            | hg -> repository "hg+file"
+            | otherwise -> refused ("tarball " <> quoted <> " is a directory, not a file.")
+          (True, False) -> Nothing
+  where
+    refused = Just . FetchFailure []
+
+-- | A new scratch directory under the system temp dir: the prefix and an
+-- unpredictable suffix, created exclusively, so an existing path fails the
+-- fetch rather than being adopted.  The join is a forward slash, which git
+-- and the store's copies accept on every host.
+newScratchDirectory :: Text -> IO FilePath
+newScratchDirectory prefix = do
+  tmpBase <- Dir.getTemporaryDirectory
+  suffix <- getRandomBytes scratchSuffixBytes
+  let dir = tmpBase <> "/" <> T.unpack (prefix <> bytesToHexText suffix)
+  dir <$ Dir.createDirectory dir
+
+-- | The prefix of a tarball fetch's scratch directory.
+tarballScratchPrefix :: Text
+tarballScratchPrefix = "nova-nix-tarball-"
+
+-- | Run an action with a scratch directory of its own ('newScratchDirectory'),
+-- removed however the action ends.
+withScratchDirectory :: Text -> (FilePath -> EvalIO a) -> EvalIO a
+withScratchDirectory prefix use = EvalIO $ do
+  st <- ask
+  liftIO (bracket (newScratchDirectory prefix) Dir.removePathForcibly (\dir -> let EvalIO action = use dir in runReaderT action st))
+
+-- | Hash a fetched tree's NAR, hold it to the pin, and restore it at the
+-- store path its name and hash give, as a fetch result.
+storeArchive :: Text -> Maybe (BS.ByteString, BS.ByteString -> Text) -> Tree Blob -> EvalIO (Either FetchFailure Text)
+storeArchive name pin tree = do
+  Hash.NixHash digest <- wrapIO (treeNarHash tree)
+  case pin of
+    Just (expected, mismatch) | expected /= digest -> pure (Left (FetchFailure [] (mismatch digest)))
+    _ -> do
+      sp <- storePathOrThrow (makeFixedOutputPath name "sha256" NarIngestion digest)
+      let destPath = canonicalStorePathText sp
+      writtenFor Fetched $ do
+        dest <- evalFilePath sp
+        wrapIO (restoreFetchedTree dest tree (Hash.NixHash digest)) >>= either throwEvalError pure
+      recordStoreWrite Fetched destPath [] SP.WriteRecursive
+      allowPath destPath
+      pure (Right destPath)
+
+-- | Restore a fetched tree at its content-addressed destination from its
+-- NAR, streamed into the store's unpack sink so its names are spelled for
+-- the volume, and make its metadata canonical.  A tree already there whose
+-- NAR is the one the address names is kept, as 'unpackToStoreVerified'
+-- keeps one; anything else there is cleared first, and a restore that
+-- fails leaves nothing.
+restoreFetchedTree :: FilePath -> Tree Blob -> Hash.NixHash -> IO (Either Text ())
+restoreFetchedTree dest tree digest = do
+  sensitivity <- probeCaseSensitivity (takeDirectory dest)
+  held <- heldTree (volumeCaseHack sensitivity)
+  if held
+    then Right () <$ canonicalizeMetadata dest
+    else do
+      Dir.removePathForcibly dest
+      outcome <- restore sensitivity `onException` Dir.removePathForcibly dest
+      either (\reason -> Left reason <$ Dir.removePathForcibly dest) (\() -> Right () <$ canonicalizeMetadata dest) outcome
+  where
+    heldTree caseHack = do
+      there <- Dir.doesPathExist dest
+      if not there
+        then pure False
+        else
+          ((== digest) <$> ExecBit.narHashOfPath caseHack dest)
+            `catches` [Handler (\(_ :: IOException) -> pure False), Handler (\(_ :: NAR.NarWalkError) -> pure False)]
+    restore sensitivity = do
+      sink <- newNarUnpackSink sensitivity dest
+      streamed <- withTreeNarSource tree (sinkNarStream AtEndOfInput sink)
+      case streamed of
+        Left (NarStreamRefused reason) -> pure (Left reason)
+        Left (NarStreamMalformed reason) -> pure (Left ("the fetched tree's NAR does not parse: " <> reason))
+        Right (written, _)
+          | written /= digest -> do
+              abortNarUnpack sink
+              pure (Left "the fetched tree changed while it was written to the store")
+          | otherwise -> finishNarUnpack sink
 
 -- | Unpack a NAR entry at its content-addressed destination and make the
 -- tree's metadata canonical ('canonicalizeMetadata'), as upstream's

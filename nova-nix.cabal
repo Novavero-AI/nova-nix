@@ -129,13 +129,18 @@ library
     Nix.Builder.Unpack
     Nix.CacheDirectory
     Nix.Compression
+    Nix.Compression.Stream
     Nix.Config
     Nix.Daemon.Protocol
     Nix.Daemon.Wire
     Nix.Environment
     Nix.ExperimentalFeature
+    Nix.Fetch.Archive
     Nix.Fetch.Attrs
+    Nix.Fetch.Download
     Nix.Fetch.Input
+    Nix.Fetch.Tar
+    Nix.Fetch.Tree
     Nix.Fetch.Url
     Nix.Flake.Ref
     Nix.HostPath
@@ -374,6 +379,7 @@ test-suite nova-nix-test
     DirDacl
     HttpFixture
     NodeStatus
+    Test.Archive
     Test.Builder
     Test.CData
     Test.Cli

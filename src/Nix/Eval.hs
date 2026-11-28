@@ -240,8 +240,9 @@ import Nix.Expr.Types
     Expr (..),
     UnaryOp (..),
   )
+import Nix.Fetch.Archive (FetchFailure (..))
 import Nix.Fetch.Attrs (AttrValue (..))
-import Nix.Fetch.Input (InputContext (..))
+import Nix.Fetch.Input (InputContext (..), inputFromAttrs, inputToUrlString)
 import Nix.Fetch.Url (Checked, runChecked)
 import Nix.Flake.Ref (flakeRefAttrs, flakeRefFromAttrs, flakeRefToString, parseFlakeRef)
 import Nix.Hash (FileIngestionMethod (..), base64ToBytes, bytesToHexText, fileIngestionPrefix, hashAlgoBytes, hashPlaceholder, makeFixedOutputPath, parseAnyHash, parseHashAlgo, parseNarHash, sha256Digest, unknownHashAlgo)
@@ -3833,50 +3834,47 @@ builtinFetchTarball other =
 tarballSourceName :: Text
 tarballSourceName = "source"
 
--- | Download a tarball, extract it, verify the optional sha256 pin, and
--- copy the tree to its content-addressed store path.  The pin is the
--- recursive NAR hash of the EXTRACTED tree, as upstream.  Download and
--- extraction share one shell pipeline to avoid binary-as-text encoding
--- issues.  The scratch dir is exclusively created with an unpredictable
--- name ('createScratchDir') and removed once the tree reaches the store.
+-- | Upstream's @fetchTarball@ (@fetch@ in fetchTree.cc at 2.36.0): the
+-- URI gate, pure mode's hash requirement, and the path a pin names when
+-- the store holds it already; then a @tarball@ input of the URL, the name
+-- and the pin as its @narHash@, fetched and unpacked as upstream unpacks
+-- one, with its NAR held to the pin before anything is written.  A
+-- failure of the fetch carries upstream's line naming the input.
 fetchAndExtractTarball :: (MonadEval m) => Text -> Maybe BS.ByteString -> Text -> m NixValue
 fetchAndExtractTarball url pin name = do
   checkUri url
   requireFetchPin "fetchTarball" pin
   held <- heldPinnedPath name NarIngestion pin
-  maybe (downloadAndExtractTarball url pin name) (pure . storePathString) held
+  maybe (fetchTarballInput url pin name) (pure . storePathString) held
 
--- | The download and copy of 'fetchAndExtractTarball', for a fetch the
--- store does not hold already.
-downloadAndExtractTarball :: (MonadEval m) => Text -> Maybe BS.ByteString -> Text -> m NixValue
-downloadAndExtractTarball url pin name = do
-  toolUrl <- localFileUrl url
-  extractDir <- createScratchDir "nova-nix-tarball-"
-  -- The -- separator prevents argument injection from the URL.
-  (code, _, errOut) <-
-    runProcess
-      "sh"
-      [ "-c",
-        "curl -sSfL -- \"$1\" | tar -xz -C \"$2\" --strip-components=1",
-        "--",
-        toolUrl,
-        extractDir
-      ]
-      ""
-  case code of
-    0 -> do
-      storePath <-
-        copyPathToStore
-          Fetched
-          extractDir
-          name
-          (fmap (\expected -> (expected, fetchHashMismatch url expected)) pin)
-          `onEvalError` removeScratchDir extractDir
-      removeScratchDir extractDir
-      pure (storePathString storePath)
-    _ -> do
-      removeScratchDir extractDir
-      throwEvalError ("builtins.fetchTarball: " <> errOut)
+-- | The fetch of 'fetchAndExtractTarball', for a tarball the store does
+-- not hold already.  Upstream names the input by its URL, as its parser
+-- reads and renders it with the pin as a parameter; a URL that parser
+-- refuses, such as the @file:\/\/C:\/@ form a Windows path takes here,
+-- is named as it was given.
+fetchTarballInput :: (MonadEval m) => Text -> Maybe BS.ByteString -> Text -> m NixValue
+fetchTarballInput url pin name = do
+  policy <- evalPolicy
+  let (rendered, warnings) = runChecked (inputFromAttrs (InputContext (epExperimentalFeatures policy) hostPathRules) attrs >>= inputToUrlString hostPathRules [])
+      shown = either (const url) bytesToTextLossy rendered
+      inputLine = "while fetching the input '" <> shown <> "'"
+      mismatch expected got =
+        "NAR hash mismatch in input '" <> shown <> "', expected '" <> sri expected <> "' but got '" <> sri got <> "'"
+  mapM_ warnMessage warnings
+  fetched <- fetchArchiveToStore url name ((\expected -> (expected, mismatch expected)) <$> pin)
+  case fetched of
+    Right storePath -> pure (storePathString storePath)
+    Left (FetchFailure traces message) -> foldr addErrorTrace (throwEvalError message) (inputLine : traces)
+  where
+    attrs =
+      Map.fromList
+        ( [ ("type", AttrString "tarball"),
+            ("url", AttrString (TE.encodeUtf8 url)),
+            ("name", AttrString (TE.encodeUtf8 name))
+          ]
+            ++ [("narHash", AttrString (TE.encodeUtf8 (sri digest))) | Just digest <- [pin]]
+        )
+    sri digest = "sha256-" <> bytesToBase64 digest
 
 -- | Transports 'builtinFetchGit' accepts.  Also spelled into the
 -- clone's @protocol.*.allow@ config, so git enforces the same set
@@ -4516,14 +4514,10 @@ fetchUrlSimple url pin given = do
   case held of
     Just storePath -> pure (storePathString storePath)
     Nothing -> do
-      -- Download to a file, not through the text-mode stdout pipe (which
-      -- mangles binary), read the raw bytes, verify the pin if one was
-      -- given, then store at the canonical fixed-output path.  The file
-      -- lives in an exclusively created scratch directory
-      -- ('createScratchDir'), removed once read.
-      scratch <- createScratchDir "nova-nix-fetchurl-"
-      bytes <- downloadInto scratch url `onEvalError` removeScratchDir scratch
-      removeScratchDir scratch
+      -- The body is read whole, as upstream's downloadFile reads it,
+      -- then held to the pin and stored at the canonical fixed-output
+      -- path.
+      bytes <- fetchUrlBytes url >>= either throwEvalError pure
       forM_ pin $ \expected ->
         let got = sha256Digest bytes
          in when (expected /= got) $ throwEvalError (fetchHashMismatch url expected got)
@@ -4547,23 +4541,9 @@ heldPinnedPath name method (Just pin) = do
   held <- pinnedFetchHeld sp
   pure (if held then Just (storePathToText defaultStoreDir sp) else Nothing)
 
--- | Fetch a URL into the scratch directory and hand back its bytes.
-downloadInto :: (MonadEval m) => Text -> Text -> m BS.ByteString
-downloadInto scratch url = do
-  let tmpFile = scratch <> "/" <> downloadFileName
-  toolUrl <- localFileUrl url
-  (code, _, stderr) <- runProcess "curl" ["-sSfL", "-o", tmpFile, "--", toolUrl] ""
-  if code /= 0
-    then throwEvalError ("builtins.fetchurl: fetch failed: " <> stderr)
-    else readFileBytes tmpFile
-
--- | The downloaded file's name inside its scratch directory.
-downloadFileName :: Text
-downloadFileName = "download"
-
--- | The URL a fetch hands its tool: a @file://@ URL's path named on the
--- drive the evaluator reads it on ('qualifyPath'), so the tool reads the
--- file 'checkUri' checked rather than one on its own current drive.  A
+-- | The URL @fetchGit@ hands @git@: a @file://@ URL's path named on the
+-- drive the evaluator reads it on ('qualifyPath'), so @git@ reads the
+-- repository 'checkUri' checked rather than one on its own current drive.  A
 -- drive it gains is spelled @file://C:/...@, the form 'checkUri' reads as
 -- that drive's path.  Any other URL is handed over as given.
 localFileUrl :: (MonadEval m) => Text -> m Text

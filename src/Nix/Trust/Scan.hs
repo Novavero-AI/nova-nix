@@ -38,6 +38,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word64)
 import Nix.Builder.Unpack (UnpackLimits (..), defaultUnpackLimits)
+import Nix.Compression.Stream (Compression (..), bzip2Reason, compressionOf, xzReason)
 import Nix.Trust (CodePlace (..), ContentFacts (..), FoundCode (..), UnreadFile (..), prebuiltKind)
 import qualified NovaCache.Bzip2 as Bzip2
 import qualified NovaCache.Xz as Xz
@@ -48,65 +49,14 @@ import System.FilePath ((</>))
 -- Formats
 -- ---------------------------------------------------------------------------
 
--- | A compressed stream the scan decodes, or none.
-data Codec = Gzip | Zstd | Xz | Bzip2 | Uncompressed
-
 -- | How a failure names a stream.
-codecName :: Codec -> Text
+codecName :: Compression -> Text
 codecName codec = case codec of
   Gzip -> "gzip"
   Zstd -> "zstd"
   Xz -> "xz"
   Bzip2 -> "bzip2"
   Uncompressed -> "file"
-
--- | The stream a file's bytes start, told by its magic.
-codecOf :: BS.ByteString -> Codec
-codecOf bytes
-  | gzipMagic `BS.isPrefixOf` bytes = Gzip
-  | zstdMagic `BS.isPrefixOf` bytes || startsSkippableFrame bytes = Zstd
-  | xzMagic `BS.isPrefixOf` bytes = Xz
-  | startsBzip2 bytes = Bzip2
-  | otherwise = Uncompressed
-
--- | A gzip member's first bytes: the magic and the deflate method, the
--- only one gzip defines.
-gzipMagic :: BS.ByteString
-gzipMagic = BS.pack [0x1F, 0x8B, 0x08]
-
--- | A zstd frame's magic number, as a file starts with it.
-zstdMagic :: BS.ByteString
-zstdMagic = BS.pack [0x28, 0xB5, 0x2F, 0xFD]
-
--- | Whether bytes start a zstd skippable frame, as @pzstd@'s output does:
--- a magic number whose low four bits are free, then the rest of its
--- little-endian word.
-startsSkippableFrame :: BS.ByteString -> Bool
-startsSkippableFrame bytes = case BS.uncons bytes of
-  Just (lead, rest) -> lead >= skippableLow && lead <= skippableHigh && skippableTail `BS.isPrefixOf` rest
-  Nothing -> False
-  where
-    skippableLow = 0x50
-    skippableHigh = 0x5F
-    skippableTail = BS.pack [0x2A, 0x4D, 0x18]
-
--- | An xz stream's header magic.
-xzMagic :: BS.ByteString
-xzMagic = BS.pack [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]
-
--- | A bzip2 stream's magic, which a block size digit follows.
-bzip2Magic :: BS.ByteString
-bzip2Magic = "BZh"
-
--- | Whether bytes start a bzip2 stream: the magic, then the block size in
--- hundreds of kilobytes, a digit from one to nine.
-startsBzip2 :: BS.ByteString -> Bool
-startsBzip2 bytes = case BS.stripPrefix bzip2Magic bytes >>= BS.uncons of
-  Just (size, _) -> size >= smallestBlockSize && size <= largestBlockSize
-  Nothing -> False
-  where
-    smallestBlockSize = 0x31
-    largestBlockSize = 0x39
 
 -- | Archive and compression formats the scan recognises and does not
 -- open, each as the report names a file of it and by the bytes such a
@@ -195,7 +145,7 @@ scanFile path inTree = do
   case attempt of
     Left (failure :: IOException) -> pure [unreadBecause (T.pack (displayException failure))]
     Right bytes -> do
-      let codec = codecOf bytes
+      let codec = compressionOf bytes
           streamError detail = Left (codecName codec <> " stream error: " <> T.pack detail)
       decoded <- decode codec bytes
       walked <- case decoded of
@@ -214,7 +164,7 @@ scanFile path inTree = do
 -- | A file's bytes as the scan reads them: decompressed as their codec
 -- says, otherwise as they are.  Nothing is decoded here for gzip and
 -- zstd, which decode as their output is read.
-decode :: Codec -> BS.ByteString -> IO (Either Text BL.ByteString)
+decode :: Compression -> BS.ByteString -> IO (Either Text BL.ByteString)
 decode codec bytes = case codec of
   Gzip -> pure (Right (GZip.decompress whole))
   Zstd -> pure (Right (Zstd.decompress whole))
@@ -225,19 +175,6 @@ decode codec bytes = case codec of
     whole = BL.fromStrict bytes
     xzLimits = Xz.XzLimits {Xz.xzMaxOutputBytes = decompressedBudget, Xz.xzMaxDecoderMemoryBytes = Xz.defaultXzDecoderMemoryBytes}
     bzip2Limits = Bzip2.Bzip2Limits {Bzip2.bzip2MaxOutputBytes = decompressedBudget}
-
--- | An xz decoding failure as the report gives it.
-xzReason :: Xz.XzError -> Text
-xzReason failure = case failure of
-  Xz.XzStreamError message -> "xz stream error: " <> T.pack message
-  Xz.XzOutputOverBound bound -> "xz stream decompresses to more than " <> T.pack (show bound) <> " bytes"
-  Xz.XzMemoryOverBound bound -> "xz stream needs more than " <> T.pack (show bound) <> " bytes of decoder memory"
-
--- | A bzip2 decoding failure as the report gives it.
-bzip2Reason :: Bzip2.Bzip2Error -> Text
-bzip2Reason failure = case failure of
-  Bzip2.Bzip2StreamError message -> "bzip2 stream error: " <> T.pack message
-  Bzip2.Bzip2OutputOverBound bound -> "bzip2 stream decompresses to more than " <> T.pack (show bound) <> " bytes"
 
 -- | What reading a file's decoded bytes found: the prebuilt code, and why
 -- the reading stopped short, if it did.  Its constructor is built only

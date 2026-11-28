@@ -357,8 +357,7 @@ can read and write outside its build directory and reach the network.
 A target is a file, a directory or a `<NAME>` the search path finds, not a
 URL, and `build` builds one derivation, where `nix-build` builds each one in a
 list or set.
-`builtins.fetchurl` runs `curl`, `builtins.fetchTarball` runs `sh`, `curl` and
-`tar`, and `builtins.fetchGit` runs `git`, each from `PATH`.
+`builtins.fetchGit` runs `git` from `PATH`.
 
 ## Where to read more
 

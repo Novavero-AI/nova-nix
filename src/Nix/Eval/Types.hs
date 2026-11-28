@@ -181,6 +181,7 @@ import Nix.Eval.RealiseContext (ContextRefusal, PendingOrigin)
 import Nix.Eval.SourcePos (PosIdx, noPos)
 import Nix.Eval.Symbol (Symbol (..), invalidSymbolId, symbolIntern, symbolText)
 import Nix.Expr.Types (CaptureInfo (..), Expr (..), NixAtom (..))
+import Nix.Fetch.Archive (FetchFailure)
 import Nix.Parser (ParsedSource)
 import Nix.Store.Path (BadStorePath, StorePath, badStorePathText)
 import Nix.Store.Path.Internal (StorePath (StorePath))
@@ -1628,6 +1629,18 @@ class (MonadCData m) => MonadEval m where
   -- wrote them.
   addFixedOutputFile :: PendingOrigin -> Text -> ByteString -> m Text
 
+  -- | A URL's body, whole: a @file:\/\/@ URL's file as it is on disk, any
+  -- other URL through nova-nix's HTTP client under upstream's retries, or
+  -- why it could not be read.
+  fetchUrlBytes :: Text -> m (Either Text ByteString)
+
+  -- | The archive a URL serves, unpacked as upstream's tarball fetcher
+  -- unpacks one and added to the store under the name, as its store
+  -- path.  The tree's NAR is held to the pin, when there is one, before
+  -- anything is written; one that differs fails with the message the
+  -- given function makes of the digest it has.
+  fetchArchiveToStore :: Text -> Text -> Maybe (ByteString, ByteString -> Text) -> m (Either FetchFailure Text)
+
   -- | Report a trace/warning message.
   -- IO evaluators tell their session's logger; pure evaluators silently
   -- discard.
@@ -1846,6 +1859,8 @@ instance MonadEval PureEval where
   readSymlinkTarget _ = throwEvalError "builtins.path: not available in pure evaluation"
   addSourceNar _ _ = throwEvalError "builtins.path: not available in pure evaluation"
   addFixedOutputFile _ _ _ = throwEvalError "builtins.fetchurl: not available in pure evaluation"
+  fetchUrlBytes _ = throwEvalError "builtins.fetchurl: not available in pure evaluation"
+  fetchArchiveToStore _ _ _ = throwEvalError "builtins.fetchTarball: not available in pure evaluation"
   traceMessage _ = pure ()
   lookupDrvHash _ = pure Nothing
   cacheDrvHash _ _ = pure ()

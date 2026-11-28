@@ -139,6 +139,9 @@ module Test.Eval
   )
 where
 
+import qualified Codec.Archive.Tar as Tar
+import qualified Codec.Archive.Tar.Entry as TarEntry
+import qualified Codec.Compression.GZip as GZip
 import Control.Exception (IOException, bracket, bracket_, displayException, evaluate, finally, try)
 import Control.Monad (filterM, foldM, forM_, replicateM, replicateM_, void, when, zipWithM)
 import Data.Bits (shiftL, shiftR, (.|.))
@@ -7957,7 +7960,6 @@ testRealiseContextIO :: IO [Bool]
 testRealiseContextIO = do
   putStrLn "eval/realise-context-io"
   tmpBase <- getTemporaryDirectory
-  environment <- getEnvironment
   let root = tmpBase </> "nova-nix-test-realise-context"
       storeDir = StoreDir (root </> "store")
       twoOutputs = "(derivation { name = \"two\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [ \"out\" \"dev\" ]; })"
@@ -8031,20 +8033,15 @@ testRealiseContextIO = do
           ("builtins.filterSource", "builtins.filterSource (p: t: true) " <> outOfTwo)
         ]
       emptyDatabaseStore = StoreDir (root </> "empty-database-store")
-      stage = root </> "stage"
       tarball = root </> "fetched.tar.gz"
       fetchedFile = root </> "fetched.txt"
       repo = root </> "repo"
       gitFetch rev = "builtins.fetchGit { url = " <> nixString (T.pack repo) <> ";" <> maybe "" (\pinned -> " rev = \"" <> pinned <> "\";") rev <> " }"
-      tarProcess =
-        (Proc.proc "tar" ["-czf", tarball, "-C", stage, "top"])
-          { Proc.env = Just (("COPYFILE_DISABLE", "1") : environment)
-          }
   forceRemoveIfExists root
-  createDirectoryIfMissing True (stage </> "top")
   createDirectoryIfMissing True (root </> "filtered")
   BS.writeFile (root </> "filtered" </> "child") "child\n"
-  BS.writeFile (stage </> "top" </> "default.nix") "{ v = \"from a tarball\"; }\n"
+  BL.writeFile tarball . GZip.compress . Tar.write
+    =<< either (ioError . userError) (\path -> pure [TarEntry.fileEntry path "{ v = \"from a tarball\"; }\n"]) (TarEntry.toTarPath False "top/default.nix")
   BS.writeFile fetchedFile "fetched bytes\n"
   createDirectoryIfMissing True (unStoreDir emptyDatabaseStore </> metaDirName)
   BS.writeFile (unStoreDir emptyDatabaseStore </> metaDirName </> dbFileName) ""
@@ -8184,13 +8181,8 @@ testRealiseContextIO = do
           -- (fetch in fetchTree.cc, downloadFile in tarball.cc and
           -- Input::fetchToStore in fetchers.cc at 2.24.9), so a read-only
           -- evaluation reads it through its context.
-          if SI.os == "mingw32"
-            then runTest "a read-only session imports a fetchTarball result through its context (skipped: fetchTarball extracts through sh, which nova-nix does not assume on Windows)" Pass
-            else runTestM "a read-only session imports a fetchTarball result through its context" $ do
-              (tarCode, _, tarErr) <- Proc.readCreateProcessWithExitCode tarProcess ""
-              case tarCode of
-                ExitFailure n -> pure (Fail ("tar exited " <> T.pack (show n) <> ": " <> T.pack tarErr))
-                ExitSuccess -> readsAs "from a tarball" ("(import \"${builtins.fetchTarball " <> nixString (fileUrl tarball) <> "}/default.nix\").v"),
+          runTestM "a read-only session imports a fetchTarball result through its context" $
+            readsAs "from a tarball" ("(import \"${builtins.fetchTarball " <> nixString (fileUrl tarball) <> "}/default.nix\").v"),
           -- nix-instantiate --eval computes these paths without writing
           -- them (prim_toFile and addPath in primops.cc).
           runTestM "a read-only session computes the path of a toFile result and writes nothing" $
@@ -9686,12 +9678,12 @@ testFirstArgumentOrderIO = do
 -- the sha256 pin of fetchurl, fetchTarball and builtins.path, whose
 -- copy then fails as upstream's does on a pin it does not match
 -- (@fetch@ in fetchTree.cc, @addPath@ in primops.cc).  Each expected
--- stream is read from upstream's source at 2.24.9.
+-- stream is read from upstream's source at 2.24.9, the tarball's at
+-- 2.36.0.
 testEmptyHashIO :: IO [Bool]
 testEmptyHashIO = do
   putStrLn "eval/empty-hash-io"
   tmpBase <- getTemporaryDirectory >>= Dir.canonicalizePath
-  environment <- getEnvironment
   let root = tmpBase </> "nova-nix-test-empty-hash"
       file = root </> "data.txt"
       tree = root </> "tree"
@@ -9708,32 +9700,30 @@ testEmptyHashIO = do
           "  got:       sha256:" <> Nix32.encode got
         ]
       pathMismatch = "error: store path mismatch in (possibly filtered) path added from '" <> pathText tree <> "'"
-      tarballLabel = "an empty fetchTarball pin warns, then the extracted tree's hash is reported"
-      -- Written from the fixture root, so tar is given no drive letter.
-      tarProcess =
-        (Proc.proc "tar" ["-czf", "tree.tar.gz", "-C", "stage", "top"])
-          { Proc.cwd = Just root,
-            Proc.env = Just (("COPYFILE_DISABLE", "1") : environment)
-          }
-      tarballCase
-        | SI.os == "mingw32" = runTest (tarballLabel <> " (skipped: fetchTarball extracts through sh, which nova-nix does not assume on Windows)") Pass
-        | otherwise = do
-            (code, _, err) <- Proc.readCreateProcessWithExitCode tarProcess ""
-            case code of
-              ExitFailure n -> runTest tarballLabel (Fail ("tar exited " <> T.pack (show n) <> ": " <> T.pack err))
-              ExitSuccess ->
-                emits
-                  tarballLabel
-                  ("builtins.fetchTarball { url = \"" <> fileUrl (root </> "tree.tar.gz") <> "\"; sha256 = \"\"; }")
-                  (sha256Warning : fetchMismatch (fileUrl (root </> "tree.tar.gz")) (sha256Digest (NAR.serialise (NAR.NarDirectory [("data", NAR.NarRegular False tarballData)]))))
+      tarballUrl = fileUrl (root </> "tree.tar.gz")
+      tarballOf topDir topData = GZip.compress (Tar.write [TarEntry.directoryEntry topDir, TarEntry.fileEntry topData (BL.fromStrict tarballData)])
+      zeroSri = "sha256-" <> T.replicate 43 "A" <> "="
+      -- Upstream names the input by its URL with the pin as a parameter,
+      -- the parameter's "=" percent-encoded; a Windows path's URL, which
+      -- its parser refuses, is named as it was given.
+      tarballInput
+        | SI.os == "mingw32" = tarballUrl
+        | otherwise = tarballUrl <> "?narHash=sha256-" <> T.replicate 43 "A" <> "%3D"
+      tarballCase =
+        emits
+          "an empty fetchTarball pin warns, then the unpacked tree's hash is reported in 2.36.0's words"
+          ("builtins.fetchTarball { url = \"" <> tarballUrl <> "\"; sha256 = \"\"; }")
+          [ sha256Warning,
+            "error: NAR hash mismatch in input '" <> tarballInput <> "', expected '" <> zeroSri <> "' but got 'sha256-" <> B64.encode (sha256Digest (NAR.serialise (NAR.NarDirectory [("data", NAR.NarRegular False tarballData)]))) <> "'"
+          ]
   bracket_
     ( do
         forceRemoveIfExists root
         createDirectoryIfMissing True tree
-        createDirectoryIfMissing True (root </> "stage" </> "top")
         BS.writeFile file payload
         BS.writeFile (tree </> "f") "tree\n"
-        BS.writeFile (root </> "stage" </> "top" </> "data") tarballData
+        archive <- either (ioError . userError) pure (tarballOf <$> TarEntry.toTarPath True "top" <*> TarEntry.toTarPath False "top/data")
+        BL.writeFile (root </> "tree.tar.gz") archive
     )
     (forceRemoveIfExists root)
     $ sequence
@@ -9899,6 +9889,8 @@ instance MonadEval StubStoreEval where
   resolveSymlinks = pure
   addSourceNar _ _ = throwEvalError "builtins.path: not available in the stub evaluator"
   addFixedOutputFile _ _ _ = throwEvalError "builtins.fetchurl: not available in the stub evaluator"
+  fetchUrlBytes _ = throwEvalError "builtins.fetchurl: not available in the stub evaluator"
+  fetchArchiveToStore _ _ _ = throwEvalError "builtins.fetchTarball: not available in the stub evaluator"
   pinnedFetchHeld _ = pure False
   traceMessage _ = pure ()
   lookupDrvHash _ = pure Nothing

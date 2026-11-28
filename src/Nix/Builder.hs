@@ -94,7 +94,7 @@ module Nix.Builder
   )
 where
 
-import Control.Exception (IOException, bracket, catches, displayException, finally, onException, try, uninterruptibleMask_)
+import Control.Exception (IOException, bracket, displayException, finally, onException, try, uninterruptibleMask_)
 import Control.Monad (filterM, foldM, unless, when)
 import Control.Monad.Except (ExceptT (..), liftEither, runExceptT, throwError, withExceptT)
 import Control.Monad.IO.Class (liftIO)
@@ -118,8 +118,6 @@ import qualified Data.Text.Encoding as TE
 import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word32)
 import qualified Network.HTTP.Client as HTTP
-import qualified Network.HTTP.Client.TLS as HTTPS
-import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder.BuildDir (BuildEnding (..), FailedBuilds (..), WorkDir (..), sandboxedBuildDir, withBuildDir)
 import Nix.Builder.Buildenv (builtinBuildenvBuilder, runBuiltinBuildenv)
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
@@ -130,7 +128,7 @@ import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, buildDepGr
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fixedOutput, fromATerm, platformToText)
 import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, renderAttrsShell, stringsAttr, structuredAttrsKey, withOutputPlaceholders)
 import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
-import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
+import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, downloadUrlWith, ioRetryEffects, retryTransient)
 import Nix.Logger (Logger (..))
 import Nix.Push (narHashMatches)
 import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, DifferingRebuild (..), Fallback (..), FetchOutcome (..), Offer (QueryFailed), RealiseEffects (..), RealiseSettings (..), Realised (..), Registration (..), SubstEffects (..), SubstitutesSetting (..), Undelivered (..), checkedOutputPath, noWriteAccessMessage, realise, realiseFailureMessage, realiseFailureStatus, realiseRequests, requestsFailureMessage, requestsFailureStatus, substituteClosure)
@@ -253,10 +251,6 @@ envTrue = "1"
 -- xz-compressed (@builtinFetchurl@ in fetchurl.cc).
 xzUrlSuffix :: Text
 xzUrlSuffix = ".xz"
-
--- | HTTP success status code.
-httpStatusOk :: Int
-httpStatusOk = 200
 
 -- | Environment variable for the reproducible-builds.org build timestamp.
 envSourceDateEpoch :: Text
@@ -1984,26 +1978,6 @@ tryFetchUrlsWith attempt = go []
 -- ---------------------------------------------------------------------------
 -- Download
 -- ---------------------------------------------------------------------------
-
--- | Request a URL with nova-nix's own linked HTTP client (the same
--- 'Network.HTTP.Client' the substituter uses) - no external @curl@,
--- which is what makes this a genuine builtin - and hand the body of a
--- success to the consumer.  A status other than 200, or a failure of
--- the transfer or of the consumer's writes, becomes a 'Left' carrying
--- its retry class ('transferFailureHandlers'); cancellation propagates
--- through the shared build cleanup.
-downloadUrlWith :: Text -> (HTTP.BodyReader -> IO (Either AttemptFailure a)) -> IO (Either AttemptFailure a)
-downloadUrlWith url consume =
-  fetch `catches` transferFailureHandlers url
-  where
-    fetch = do
-      manager <- HTTPS.getGlobalManager
-      request <- withUserAgent <$> HTTP.parseRequest (T.unpack url)
-      withTransfer request manager $ \response -> do
-        let status = HTTP.responseStatus response
-        if HTTP.statusCode status /= httpStatusOk
-          then pure (Left (fetchStatusFailure url status))
-          else consume (HTTP.responseBody response)
 
 -- | Write a response body to the output file as it streams, through the
 -- incremental hash chunk by chunk, so memory stays at chunk size no

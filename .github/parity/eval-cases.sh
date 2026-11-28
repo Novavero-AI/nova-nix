@@ -666,6 +666,66 @@ withNovaStore checkValue "fetchGit's outPath" "$fetchedRepo"
 withNovaStore checkValue "the type of fetchGit's outPath" "builtins.typeOf $fetchedRepo"
 echo
 
+echo "== tarballs unpacked as upstream unpacks them =="
+# The tree is the archive's own: a lone top-level directory is its root,
+# and anything else at the top stays (dereferenceSingletonDirectory in
+# git-utils.cc).  A macOS archive's AppleDouble entries are files, as
+# libarchive reads them with its mac-ext option off (tarfile.cc).  GNU
+# tar writes a long name as a long-name entry.  Each row compares the
+# value alone, as the fetcher rows above do.
+tarballs="$fixture/tarballs"
+mkdir -p "$tarballs/two/a" "$tarballs/two/b" "$tarballs/mac/pkg" "$tarballs/kinds/top/bin" "$tarballs/kinds/top/$(printf 'n%.0s' $(seq 1 120))"
+printf 'f\n' >"$tarballs/two/a/f"
+printf 'g\n' >"$tarballs/two/b/g"
+tar -C "$tarballs/two" -czf "$tarballs/two.tar.gz" a b
+printf 'appledouble\n' >"$tarballs/mac/._pkg"
+printf 'appledouble\n' >"$tarballs/mac/pkg/._run"
+printf 'appledouble\n' >"$tarballs/mac/pkg/._data"
+printf '#!/bin/sh\n' >"$tarballs/mac/pkg/run"
+chmod +x "$tarballs/mac/pkg/run"
+printf 'data\n' >"$tarballs/mac/pkg/data"
+tar -C "$tarballs/mac" -czf "$tarballs/mac.tar.gz" ._pkg pkg
+printf '#!/bin/sh\n' >"$tarballs/kinds/top/bin/run"
+chmod +x "$tarballs/kinds/top/bin/run"
+printf 'long\n' >"$tarballs/kinds/top/$(printf 'n%.0s' $(seq 1 120))/f"
+ln -s bin/run "$tarballs/kinds/top/link"
+tar -C "$tarballs/kinds" -cJf "$tarballs/kinds.tar.xz" top
+tar -C "$tarballs/kinds" -cjf "$tarballs/kinds.tar.bz2" top
+tar -C "$tarballs/kinds" -cf "$tarballs/kinds.tar" top
+fetchTarballOf() {
+  printf 'builtins.fetchTarball "file://%s"' "$tarballs/$1"
+}
+withNovaStore checkValue "a tarball with two top-level directories keeps both" "$(fetchTarballOf two.tar.gz)"
+withNovaStore checkValue "a macOS tarball's AppleDouble entries are files" "$(fetchTarballOf mac.tar.gz)"
+withNovaStore checkValue "an xz tarball's executable, symlink and long name" "$(fetchTarballOf kinds.tar.xz)"
+withNovaStore checkValue "a bzip2 tarball is the same tree" "$(fetchTarballOf kinds.tar.bz2)"
+withNovaStore checkValue "an uncompressed tarball is the same tree" "$(fetchTarballOf kinds.tar)"
+withNovaStore checkValue "what a tarball holds, read through its store path" "builtins.readDir (builtins.fetchTarball \"file://$tarballs/mac.tar.gz\")"
+# 2.36.0 unpacks into a Git tree, which keeps an empty directory; a hard
+# link names what its target is where the link is in the archive, so a
+# target appended again later leaves the link as it was, with a warning on
+# stderr (merkle-tar-adapter.cc).  It refuses a local tarball that is
+# missing or a directory before reading it, and a pin the tree does not
+# match in its NAR hash words (tarball.cc, fetchers.cc).
+if upstreamAtLeast 2.36.0; then
+  mkdir -p "$tarballs/hollow/top/empty" "$tarballs/linked/top" "$tarballs/plain-directory"
+  printf 'kept\n' >"$tarballs/hollow/top/f"
+  tar -C "$tarballs/hollow" -czf "$tarballs/hollow.tar.gz" top
+  printf 'before\n' >"$tarballs/linked/top/target"
+  ln "$tarballs/linked/top/target" "$tarballs/linked/top/link"
+  tar -C "$tarballs/linked" -cf "$tarballs/linked.tar" top/target top/link
+  rm "$tarballs/linked/top/target"
+  printf 'after\n' >"$tarballs/linked/top/target"
+  tar -C "$tarballs/linked" -rf "$tarballs/linked.tar" top/target
+  withNovaStore checkValue "an empty directory in a tarball is kept" "$(fetchTarballOf hollow.tar.gz)"
+  withNovaStore checkValue "a hard link keeps what its target was when the target is appended again" "$(fetchTarballOf linked.tar)"
+  withNovaStore checkValue "the hard link's contents" "builtins.readFile \"\${$(fetchTarballOf linked.tar)}/link\""
+  refused "a tarball that is not there" "$(fetchTarballOf absent.tar.gz)"
+  refused "a directory given as a tarball" "$(fetchTarballOf plain-directory)"
+  refused "a tarball whose tree is not its pin" "builtins.fetchTarball { url = \"file://$tarballs/two.tar.gz\"; sha256 = \"0000000000000000000000000000000000000000000000000000\"; }"
+fi
+echo
+
 echo "== a pinned fetch the store holds already =="
 # A pinned fetch whose path is valid returns it without downloading or
 # writing anything (the pinned early exit of fetch in fetchTree.cc).  2.34.9

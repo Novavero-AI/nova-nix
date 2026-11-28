@@ -1,15 +1,16 @@
 -- | The HTTP transfer layer nova-nix's own HTTP client goes through
--- (@builtin:fetchurl@, the substituter and push; the evaluator's
--- @builtins.fetchurl@ and @builtins.fetchTarball@ run @curl@ instead):
--- the User-Agent each request carries, and upstream's retry policy with
--- the classification that decides what a retry can outlive.
+-- (@builtin:fetchurl@, the evaluator's fetchers, the substituter and
+-- push): the User-Agent each request carries, a download's request, and
+-- upstream's retry policy with the classification that decides what a
+-- retry can outlive.
 --
 -- Upstream serves every download, a fetcher's and a substituter's alike,
 -- through one @FileTransfer@ (@libstore/filetransfer.cc@ at 2.24.9), with
 -- one @download-attempts@ setting, one backoff and one table of the
--- failures that are never retried.  @builtin:fetchurl@ ("Nix.Builder")
--- and the substituter ("Nix.Substituter") share this module for the same
--- reason: a source tarball, a narinfo and a NAR fail and retry alike.
+-- failures that are never retried.  @builtin:fetchurl@ ("Nix.Builder"),
+-- the evaluator's fetchers ("Nix.Fetch.Download") and the substituter
+-- ("Nix.Substituter") share this module for the same reason: a source
+-- tarball, a narinfo and a NAR fail and retry alike.
 module Nix.Http
   ( -- * Identity
     userAgent,
@@ -38,16 +39,20 @@ module Nix.Http
     fetchExceptionFailure,
     exceptionFailure,
     fetchWriteFailure,
+
+    -- * Downloads
+    downloadUrlWith,
   )
 where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (Handler (..), IOException, SomeAsyncException (..), SomeException, catch, displayException, fromException, throwIO)
+import Control.Exception (Handler (..), IOException, SomeAsyncException (..), SomeException, catch, catches, displayException, fromException, throwIO)
 import qualified Data.ByteString.Char8 as BS8
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Version (showVersion)
 import qualified Network.HTTP.Client as HTTP
+import qualified Network.HTTP.Client.TLS as HTTPS
 import Network.HTTP.Types.Header (hUserAgent)
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Logger (Logger, logWarning)
@@ -321,3 +326,29 @@ fetchWriteFailure url err = FatalFailure (describeFailure url (displayException 
 
 describeFailure :: Text -> String -> Text
 describeFailure url detail = "download error fetching " <> url <> ": " <> T.pack detail
+
+-- ---------------------------------------------------------------------------
+-- Downloads
+-- ---------------------------------------------------------------------------
+
+-- | Request a URL with nova-nix's own linked HTTP client, with no
+-- external @curl@, and hand the body of a success to the consumer.  A
+-- status other than 200, or a failure of the transfer or of the
+-- consumer's writes, becomes a 'Left' carrying its retry class
+-- ('transferFailureHandlers'); cancellation propagates.
+downloadUrlWith :: Text -> (HTTP.BodyReader -> IO (Either AttemptFailure a)) -> IO (Either AttemptFailure a)
+downloadUrlWith url consume =
+  fetch `catches` transferFailureHandlers url
+  where
+    fetch = do
+      manager <- HTTPS.getGlobalManager
+      request <- withUserAgent <$> HTTP.parseRequest (T.unpack url)
+      withTransfer request manager $ \response -> do
+        let status = HTTP.responseStatus response
+        if HTTP.statusCode status /= httpStatusOk
+          then pure (Left (fetchStatusFailure url status))
+          else consume (HTTP.responseBody response)
+
+-- | HTTP's success status.
+httpStatusOk :: Int
+httpStatusOk = 200
