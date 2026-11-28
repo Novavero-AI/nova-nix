@@ -74,6 +74,7 @@ module Nix.Hash
     makeOutputPath,
     compressHash,
     sha256Digest,
+    sha256LazyHex,
     bytesToHexText,
 
     -- * Re-exports from nova-cache
@@ -87,6 +88,7 @@ import qualified Crypto.Hash as CH
 import Data.Bits (shiftL, shiftR, xor, (.|.))
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BL
 import Data.Char (digitToInt, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, ord)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -162,6 +164,11 @@ storePathHashBytes = 20
 -- | Raw 32-byte SHA-256 digest of a ByteString (not hex-encoded).
 sha256Digest :: BS.ByteString -> BS.ByteString
 sha256Digest bs = BA.convert (CH.hash bs :: CH.Digest CH.SHA256)
+
+-- | The SHA-256 of lazy bytes in lowercase base-16, hashed a chunk at a
+-- time, so no more of them is held than a chunk.
+sha256LazyHex :: BL.ByteString -> Text
+sha256LazyHex bytes = bytesToHexText (BA.convert (CH.hashlazy bytes :: CH.Digest CH.SHA256))
 
 -- | Lowercase base-16 of raw bytes (two hex characters per byte).
 bytesToHexText :: BS.ByteString -> Text

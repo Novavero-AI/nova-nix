@@ -17,6 +17,7 @@ module Nix.Cli.Args
     outLinkFor,
     DevelopArgs (..),
     DevEnvFormat (..),
+    TrustFormat (..),
     PushArgs (..),
     ProfileSelection (..),
     RemoveSelection (..),
@@ -101,8 +102,9 @@ data Command
     -- the layout says.
     CmdPrintDevEnv !Target !(Maybe T.Text) !DevEnvFormat !JsonLayout
   | -- | @trust@: report what the closure of the target's derivation, at
-    -- the attribute path when one is given, relies on.
-    CmdTrust !Target !(Maybe T.Text)
+    -- the attribute path when one is given, relies on, in the format
+    -- given, with JSON laid out as the layout says.
+    CmdTrust !Target !(Maybe T.Text) !TrustFormat !JsonLayout
   | CmdPush !PushArgs
   | CmdStoreDelete ![String]
   | -- | @store gc@: collect, or with the flag only list the roots.
@@ -245,9 +247,10 @@ data ListFormat
     ListJson !JsonLayout
   deriving (Eq, Show)
 
--- | How @profile list --json@ and @print-dev-env --json@ lay out their
--- JSON, as upstream's @MixPrintJSON@ chooses (common-args.hh, from 2.34.9):
--- @--pretty@ and @--no-pretty@ set it, the last one given winning.
+-- | How @profile list --json@, @print-dev-env --json@ and @trust --json@
+-- lay out their JSON, as upstream's @MixPrintJSON@ chooses (common-args.hh,
+-- from 2.34.9): @--pretty@ and @--no-pretty@ set it, the last one given
+-- winning.
 data JsonLayout
   = -- | Indented when stdout is a terminal, on one line otherwise:
     -- upstream's default.
@@ -320,6 +323,14 @@ data DevEnvFormat
     DevEnvJson
   deriving (Eq, Show)
 
+-- | What @trust@ prints.
+data TrustFormat
+  = -- | The report's lines.
+    TrustLines
+  | -- | @--json@: the report as one JSON document.
+    TrustJson
+  deriving (Eq, Show)
+
 -- | A command that evaluates one target to a derivation.
 data TargetCommand
   = -- | @build@, which builds it.
@@ -384,14 +395,16 @@ data BuildArgs = BuildArgs
     -- | What @print-dev-env@ prints.  Only @print-dev-env@ takes a flag
     -- that sets it.
     baFormat :: !DevEnvFormat,
-    -- | How @print-dev-env@ lays out its JSON.  Only @print-dev-env@
-    -- takes a flag that sets it.
+    -- | What @trust@ prints.  Only @trust@ takes a flag that sets it.
+    baTrustFormat :: !TrustFormat,
+    -- | How @print-dev-env@ and @trust@ lay out their JSON.  Only they
+    -- take a flag that sets it.
     baJsonLayout :: !JsonLayout
   }
 
 -- | Target command arguments before any flag is parsed.
 emptyBuildArgs :: BuildArgs
-emptyBuildArgs = BuildArgs Nothing Nothing defaultOutLink DefaultProfile Nothing emptyDevelopArgs DevEnvScript IndentedOnTerminal
+emptyBuildArgs = BuildArgs Nothing Nothing defaultOutLink DefaultProfile Nothing emptyDevelopArgs DevEnvScript TrustLines IndentedOnTerminal
 
 -- | Arguments to the push command.
 data PushArgs = PushArgs
@@ -602,6 +615,12 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       goTarget PrintsDevEnv opts (targetArgs {baJsonLayout = Indented}) rest
     goTarget PrintsDevEnv opts targetArgs ("--no-pretty" : rest) =
       goTarget PrintsDevEnv opts (targetArgs {baJsonLayout = Compact}) rest
+    goTarget TrustsTarget opts targetArgs ("--json" : rest) =
+      goTarget TrustsTarget opts (targetArgs {baTrustFormat = TrustJson}) rest
+    goTarget TrustsTarget opts targetArgs ("--pretty" : rest) =
+      goTarget TrustsTarget opts (targetArgs {baJsonLayout = Indented}) rest
+    goTarget TrustsTarget opts targetArgs ("--no-pretty" : rest) =
+      goTarget TrustsTarget opts (targetArgs {baJsonLayout = Compact}) rest
     goTarget _ _ _ [flag]
       | flag `elem` valueFlags = Left (flag ++ " requires a value")
     goTarget _ _ _ (flag : _)
@@ -619,7 +638,7 @@ parseArgs = go (CliOpts [] Map.empty False False Nothing Nothing Nothing [] Fals
       (Just target, BuildsTarget) -> Right opts {optCommand = CmdBuild target (baAttrPath targetArgs) (baOutLink targetArgs)}
       (Just target, DevelopsTarget) -> Right opts {optCommand = CmdDevelop target (baAttrPath targetArgs) (baDevelop targetArgs)}
       (Just target, PrintsDevEnv) -> Right opts {optCommand = CmdPrintDevEnv target (baAttrPath targetArgs) (baFormat targetArgs) (baJsonLayout targetArgs)}
-      (Just target, TrustsTarget) -> Right opts {optCommand = CmdTrust target (baAttrPath targetArgs)}
+      (Just target, TrustsTarget) -> Right opts {optCommand = CmdTrust target (baAttrPath targetArgs) (baTrustFormat targetArgs) (baJsonLayout targetArgs)}
       (Just target, AddsToProfile) -> Right opts {optCommand = CmdProfileAdd target (baAttrPath targetArgs) (baProfile targetArgs) (baPriority targetArgs)}
     -- Sub-parser for push: flags and explicit store paths in any order.
     goPush opts pushArgs [] = Right opts {optCommand = CmdPush pushArgs}

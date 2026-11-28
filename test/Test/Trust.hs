@@ -34,6 +34,7 @@ import Nix.Eval (MonadEval (..), NixValue (..), evalParsed, typeName, unrestrict
 import Nix.Eval.IO (evalBaseEnv, newEvalStateWith, runEvalIO)
 import Nix.Hash (sha256Digest)
 import qualified Nix.Hash as Hash
+import Nix.Json (Json (..))
 import Nix.Parser (parseNix)
 import Nix.Store.Path (StorePath, defaultStoreDir, parseStorePath, storePathHashLen, storePathToText)
 import Nix.Store.Path.Internal (StorePath (..))
@@ -178,9 +179,55 @@ trustRunAsBuilders report = [Trust.inputDrvPath input | input <- Trust.trInputs 
 codeOnly :: [Trust.FoundCode] -> Trust.ContentFacts
 codeOnly code = Trust.ContentFacts code []
 
--- | One file of prebuilt code a scan found, and nothing unread.
+-- | A member of a JSON object, or 'Nothing' for a missing member or a
+-- value that is not an object.
+jsonMember :: Text -> Json -> Maybe Json
+jsonMember name value = case value of
+  JsonObject members -> Map.lookup name members
+  _ -> Nothing
+
+-- | A @prebuiltCode@ entry of the JSON form, for a member of a fetched
+-- archive: its kind's key, its member, its digest and the outputs it is
+-- the bytes of.
+codeJson :: Text -> Text -> Text -> [StorePath] -> Json
+codeJson kind member digest copies =
+  JsonObject
+    ( Map.fromList
+        [ ("kind", JsonString kind),
+          ("file", JsonNull),
+          ("member", JsonString member),
+          ("sha256", JsonString digest),
+          ("sameBytesAs", JsonArray (map (JsonString . storePathToText defaultStoreDir) copies))
+        ]
+    )
+
+-- | How the JSON form names each class, which a reader of it keys on.
+classJson :: Trust.InputClass -> Text
+classJson inputClassValue = case inputClassValue of
+  Trust.RunAsBuilder -> "runAsBuilder"
+  Trust.HoldsPrebuiltCode -> "holdsPrebuiltCode"
+  Trust.NotFullyRead -> "notFullyRead"
+  Trust.HoldsNoPrebuiltCode -> "holdsNoPrebuiltCode"
+
+-- | A file of prebuilt code of these bytes, at this place.
+codeOf :: Trust.CodeKind -> Trust.CodePlace -> BS.ByteString -> Trust.FoundCode
+codeOf kind place bytes = Trust.FoundCode kind place (Hash.sha256Hex bytes)
+
+-- | A file of prebuilt code that a hand-built report's facts name, its
+-- bytes its place's text, so that no two places and no fixed-output
+-- hash share them.
+codeAt :: Trust.CodeKind -> Trust.CodePlace -> Trust.FoundCode
+codeAt kind place = codeOf kind place (TE.encodeUtf8 (T.pack (show place)))
+
+-- | One file of prebuilt code of these bytes a scan found, and nothing
+-- unread.
+oneCodeOf :: Trust.CodeKind -> Trust.CodePlace -> BS.ByteString -> Trust.ContentFacts
+oneCodeOf kind place bytes = codeOnly [codeOf kind place bytes]
+
+-- | One file of prebuilt code a hand-built report's facts name, and
+-- nothing unread.
 oneCode :: Trust.CodeKind -> Trust.CodePlace -> Trust.ContentFacts
-oneCode kind place = codeOnly [Trust.FoundCode kind place]
+oneCode kind place = codeOnly [codeAt kind place]
 
 -- | A scan that read everything and found no prebuilt code.
 noCode :: Trust.ContentFacts
@@ -255,7 +302,7 @@ testTrust = do
             (stage0ArchiveOut, oneCode Trust.PeImage (Trust.ArchiveMember "stage0-pe32-a81c8374592e8e897c0863d31c6480ea69669009/bootstrap-seeds/PE32/i386/hex0-seed.exe")),
             (bashOut, oneCode Trust.PeImage (Trust.ArchiveMember "bin/bash.exe")),
             (runtimeOut, oneCode Trust.PeImage (Trust.ArchiveMember "bin/runtime.dll")),
-            (gccOut, Trust.ContentFacts [Trust.FoundCode Trust.PeImage (Trust.ArchiveMember "bin/gcc.exe")] [Trust.UnreadFile Nothing "tar archive stops reading: truncated"]),
+            (gccOut, Trust.ContentFacts [codeAt Trust.PeImage (Trust.ArchiveMember "bin/gcc.exe")] [Trust.UnreadFile Nothing "tar archive stops reading: truncated"]),
             (helloSrcOut, noCode)
           ]
       report = Trust.trustReport facts graph root
@@ -264,7 +311,36 @@ testTrust = do
       user = trustPath 'b' "user.drv"
       foreignBuilder = trustText (trustPath 'c' "foreign") <> "/bin/sh"
       nonUtf8Builder = trustText builtOut <> "/bin/\xFF"
-      provenanceOf path = [(Trust.inputProvenance input, Trust.inputSameHash input) | input <- Trust.trInputs report, Trust.inputDrvPath input == path]
+      provenanceOf drvPath = [(Trust.inputProvenance input, Trust.inputSameHash input) | input <- Trust.trInputs report, Trust.inputDrvPath input == drvPath]
+      shell = trustPath 'f' "shell.drv"
+      script = trustPath 'g' "script.drv"
+      small =
+        trustGraph
+          [ (seed, fetched seedOut),
+            (hex0, hex0Drv),
+            (hex1, trustDrv hex1Out Nothing (trustText hex0Out) [hex0] []),
+            (stage0Archive, fetched stage0ArchiveOut),
+            (helloSrc, fetched helloSrcOut),
+            (bash, fetched bashOut),
+            (tools, unpacked toolsOut [bash]),
+            (shell, trustDrv greetingOut Nothing bashExe [tools] []),
+            (script, trustDrv helloOut Nothing (trustText setup) [] [setup]),
+            (root, trustDrv rootOut Nothing "/bin/sh" [hex1, helloSrc, shell, script] [setup])
+          ]
+      smallFacts =
+        Map.fromList
+          [ (seedOut, oneCode Trust.PeImage Trust.FetchedFile),
+            (stage0ArchiveOut, codeOnly [seedCopy, codeAt Trust.ArArchive (Trust.ArchiveMember "stage0-pe32/lib/libc.a")]),
+            (helloSrcOut, Trust.ContentFacts [] [Trust.UnreadFile Nothing "gzip stream error: truncated"]),
+            (bashOut, oneCode Trust.PeImage (Trust.ArchiveMember "bin/bash.exe"))
+          ]
+      path = storePathToText defaultStoreDir
+      -- stage0-pe32's archive holds a copy of the seed, by its bytes.
+      seedCopy = Trust.FoundCode Trust.PeImage (Trust.ArchiveMember "stage0-pe32/bootstrap-seeds/PE32/i386/hex0-seed.exe") (trustHashOf seedOut)
+      smallReport = Trust.trustReport smallFacts small root
+      smallJson = Trust.trustReportJson smallReport
+      -- A member of an input of the small report's JSON form.
+      inputField name out = jsonMember "fixedOutputInputs" smallJson >>= jsonMember (path out) >>= jsonMember name
   sequence
     [ runTest "a Portable Executable is an MZ header whose e_lfanew points at a PE signature" $
         assertEqual "PE" (Just Trust.PeImage) (headerOf trustPe),
@@ -312,8 +388,11 @@ testTrust = do
       runTest "a script is not prebuilt code, whatever its #! line runs" $
         assertEqual "script" Nothing (headerOf "#!/nix/store/hash-bash/bin/bash\necho hello\n")
           `andThen` assertEqual "empty" Nothing (headerOf ""),
-      runTest "trust takes a target and -A, and refuses the flags only build takes" $
-        assertEqual "target" (Right (Cli.CmdTrust (Cli.TargetExpr "1") (Just "a.b"))) (Cli.optCommand <$> Cli.parseArgs ["trust", "--expr", "1", "-A", "a.b"])
+      runTest "trust takes a target, -A, --json and its layout, and refuses the flags only build takes" $
+        assertEqual "target" (Right (Cli.CmdTrust (Cli.TargetExpr "1") (Just "a.b") Cli.TrustLines Cli.IndentedOnTerminal)) (Cli.optCommand <$> Cli.parseArgs ["trust", "--expr", "1", "-A", "a.b"])
+          `andThen` assertEqual "json" (Right (Cli.CmdTrust (Cli.TargetExpr "1") Nothing Cli.TrustJson Cli.IndentedOnTerminal)) (Cli.optCommand <$> Cli.parseArgs ["trust", "--json", "--expr", "1"])
+          `andThen` assertEqual "pretty" (Right (Cli.CmdTrust (Cli.TargetExpr "1") Nothing Cli.TrustJson Cli.Indented)) (Cli.optCommand <$> Cli.parseArgs ["trust", "--no-pretty", "--expr", "1", "--json", "--pretty"])
+          `andThen` assertEqual "no-pretty" (Right (Cli.CmdTrust (Cli.TargetExpr "1") Nothing Cli.TrustJson Cli.Compact)) (Cli.optCommand <$> Cli.parseArgs ["trust", "--pretty", "--json", "--no-pretty", "--expr", "1"])
           `andThen` assertEqual "check" (Left "unknown trust flag: --check") (Cli.optCommand <$> Cli.parseArgs ["trust", "--check", "--expr", "1"])
           `andThen` assertEqual "out-link" (Left "unknown trust flag: -o") (Cli.optCommand <$> Cli.parseArgs ["trust", "-o", "result", "--expr", "1"])
           `andThen` assertEqual "no-out-link" (Left "unknown trust flag: --no-out-link") (Cli.optCommand <$> Cli.parseArgs ["trust", "--no-out-link", "--expr", "1"])
@@ -383,67 +462,88 @@ testTrust = do
           [True, False, False, False]
           (map Trust.fetchedByBuiltin [fetched seedOut, hex0Drv, unpacked stage0TreeOut [stage0Archive], trustDrv seedOut (Just (trustHashOf seedOut)) "builtin:fetchurl" [] [setup]]),
       runTest "the report lists the opaque inputs first, each with how it came to be, then the counts, then what it does not say" $
-        let shell = trustPath 'f' "shell.drv"
-            script = trustPath 'g' "script.drv"
-            small =
-              trustGraph
-                [ (seed, fetched seedOut),
-                  (hex0, hex0Drv),
-                  (hex1, trustDrv hex1Out Nothing (trustText hex0Out) [hex0] []),
-                  (stage0Archive, fetched stage0ArchiveOut),
-                  (helloSrc, fetched helloSrcOut),
-                  (bash, fetched bashOut),
-                  (tools, unpacked toolsOut [bash]),
-                  (shell, trustDrv greetingOut Nothing bashExe [tools] []),
-                  (script, trustDrv helloOut Nothing (trustText setup) [] [setup]),
-                  (root, trustDrv rootOut Nothing "/bin/sh" [hex1, helloSrc, shell, script] [setup])
-                ]
-            smallFacts =
-              Map.fromList
-                [ (seedOut, oneCode Trust.PeImage Trust.FetchedFile),
-                  (stage0ArchiveOut, codeOnly [Trust.FoundCode Trust.PeImage (Trust.ArchiveMember "stage0-pe32/bootstrap-seeds/PE32/i386/hex0-seed.exe"), Trust.FoundCode Trust.ArArchive (Trust.ArchiveMember "stage0-pe32/lib/libc.a")]),
-                  (helloSrcOut, Trust.ContentFacts [] [Trust.UnreadFile Nothing "gzip stream error: truncated"]),
-                  (bashOut, oneCode Trust.PeImage (Trust.ArchiveMember "bin/bash.exe"))
-                ]
-            path = storePathToText defaultStoreDir
-         in assertEqual
-              "lines"
-              [ "Fixed-output inputs run as builders: 3",
-                "  " <> path bashOut,
-                "    fetched by builtin:fetchurl",
-                "    in the tree of the builder of 1 derivation: " <> bytesText bashExe,
-                "    PE image: bin/bash.exe",
-                "  " <> path seedOut,
-                "    fetched by builtin:fetchurl",
-                "    same hash as " <> path hex0Out,
-                "    builder of 1 derivation: " <> path seedOut,
-                "    PE image: the fetched file",
-                "  " <> path hex0Out,
-                "    built in the closure by " <> path seedOut <> ", its bytes pinned by its hash",
-                "    same hash as " <> path seedOut,
-                "    builder of 1 derivation: " <> path hex0Out,
-                "    not read: the store does not hold it",
-                "Fixed-output inputs holding prebuilt code: 1",
-                "  " <> path stage0ArchiveOut,
-                "    fetched by builtin:fetchurl",
-                "    PE image: stage0-pe32/bootstrap-seeds/PE32/i386/hex0-seed.exe",
-                "    ar archive: stage0-pe32/lib/libc.a",
-                "Fixed-output inputs not fully read: 1",
-                "  " <> path helloSrcOut,
-                "    fetched by builtin:fetchurl",
-                "    not read: gzip stream error: truncated",
-                "Fixed-output inputs holding no prebuilt code: 0",
-                "Builders outside the closure: 1",
-                "  /bin/sh, for 1 derivation",
-                "Builders in input sources: 1",
-                "  " <> path setup <> ", for 1 derivation",
-                "Builtin builders: 2",
-                "  builtin:fetchurl, for 4 derivations",
-                "  builtin:unpack, for 1 derivation",
-                "Input sources: 1",
-                "This reports what the closure relies on, not whether any of it is safe."
-              ]
-              (Trust.renderTrustReport (Trust.trustReport smallFacts small root)),
+        assertEqual
+          "lines"
+          [ "Fixed-output inputs run as builders: 3",
+            "  " <> path bashOut,
+            "    fetched by builtin:fetchurl",
+            "    in the tree of the builder of 1 derivation: " <> bytesText bashExe,
+            "    PE image: bin/bash.exe",
+            "  " <> path seedOut,
+            "    fetched by builtin:fetchurl",
+            "    same hash as " <> path hex0Out,
+            "    builder of 1 derivation: " <> path seedOut,
+            "    PE image: the fetched file",
+            "  " <> path hex0Out,
+            "    built in the closure by " <> path seedOut <> ", its bytes pinned by its hash",
+            "    same hash as " <> path seedOut,
+            "    builder of 1 derivation: " <> path hex0Out,
+            "    not read: the store does not hold it",
+            "Fixed-output inputs holding prebuilt code: 1",
+            "  " <> path stage0ArchiveOut,
+            "    fetched by builtin:fetchurl",
+            "    PE image: stage0-pe32/bootstrap-seeds/PE32/i386/hex0-seed.exe, the bytes of " <> path seedOut <> " and " <> path hex0Out,
+            "    ar archive: stage0-pe32/lib/libc.a",
+            "Fixed-output inputs not fully read: 1",
+            "  " <> path helloSrcOut,
+            "    fetched by builtin:fetchurl",
+            "    not read: gzip stream error: truncated",
+            "Fixed-output inputs holding no prebuilt code: 0",
+            "Builders outside the closure: 1",
+            "  /bin/sh, for 1 derivation",
+            "Builders in input sources: 1",
+            "  " <> path setup <> ", for 1 derivation",
+            "Builtin builders: 2",
+            "  builtin:fetchurl, for 4 derivations",
+            "  builtin:unpack, for 1 derivation",
+            "Input sources: 1",
+            "This reports what the closure relies on, not whether any of it is safe."
+          ]
+          (Trust.renderTrustReport smallReport),
+      runTest "the JSON form gives each input's class, how it comes to be and what its scan found, the seed's copy as the seed, and the builders and sources" $
+        assertEqual "version" (Just (JsonInt Trust.trustReportJsonVersion)) (jsonMember "version" smallJson)
+          `andThen` assertEqual
+            "seed"
+            (Just (JsonString "runAsBuilder"), Just (JsonString "builtin:fetchurl"), Just (JsonArray [JsonString (path hex0Out)]), Just (JsonObject (Map.singleton (path seedOut) (JsonInt 1))))
+            (inputField "class" seedOut, inputField "fetchedBy" seedOut, inputField "sameHash" seedOut, inputField "builderOf" seedOut)
+          `andThen` assertEqual
+            "hex0"
+            (Just (JsonString (path seedOut)), Nothing, Just (JsonBool False), Just (JsonArray []))
+            (inputField "builtBy" hex0Out, inputField "fetchedBy" hex0Out, inputField "inStore" hex0Out, inputField "prebuiltCode" hex0Out)
+          `andThen` assertEqual
+            "archive"
+            ( Just (JsonString "holdsPrebuiltCode"),
+              Just
+                ( JsonArray
+                    [ codeJson "peImage" "stage0-pe32/bootstrap-seeds/PE32/i386/hex0-seed.exe" (trustHashOf seedOut) [seedOut, hex0Out],
+                      codeJson "arArchive" "stage0-pe32/lib/libc.a" (Trust.fcSha256 (codeAt Trust.ArArchive (Trust.ArchiveMember "stage0-pe32/lib/libc.a"))) []
+                    ]
+                )
+            )
+            (inputField "class" stage0ArchiveOut, inputField "prebuiltCode" stage0ArchiveOut)
+          `andThen` assertEqual
+            "unread"
+            (Just (JsonArray [JsonObject (Map.fromList [("file", JsonNull), ("reason", JsonString "gzip stream error: truncated")])]))
+            (inputField "notRead" helloSrcOut)
+          `andThen` assertEqual
+            "builders and sources"
+            ( Just (JsonObject (Map.singleton "/bin/sh" (JsonInt 1))),
+              Just (JsonObject (Map.singleton (path setup) (JsonInt 1))),
+              Just (JsonObject (Map.fromList [("builtin:fetchurl", JsonInt 4), ("builtin:unpack", JsonInt 1)])),
+              Just (JsonArray [JsonString (path setup)])
+            )
+            (jsonMember "buildersOutsideClosure" smallJson, jsonMember "buildersInInputSources" smallJson, jsonMember "builtinBuilders" smallJson, jsonMember "inputSources" smallJson),
+      runTestM "the JSON form names every fixed-output input once, under its output, in the class the lines give it" $ do
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll genTrustCase $ \(nodes, _, rootPath, caseFacts) ->
+              QC.within 2000000 $
+                let caseReport = Trust.trustReport caseFacts (trustGraph nodes) rootPath
+                    named = case jsonMember "fixedOutputInputs" (Trust.trustReportJson caseReport) of
+                      Just (JsonObject inputs) -> Map.map (jsonMember "class") inputs
+                      _ -> Map.empty
+                 in named QC.=== Map.fromList [(path (Trust.inputOutput input), Just (JsonString (classJson (Trust.inputClass input)))) | input <- Trust.trInputs caseReport]
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
       runTestM "every fixed-output derivation of a closure is in the report once, in one class, cycles and all" $ do
         result <-
           QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
@@ -513,7 +613,7 @@ genTrustCase = do
         sources <- QC.elements [[], [source]]
         pure ((drvPathOf letter, (trustDrv (outOf letter) Nothing builder (map drvPathOf inputs) sources) {drvOutputs = [outputFor letter kind]}), kind)
       factFor = do
-        code <- QC.sublistOf [Trust.FoundCode Trust.PeImage Trust.FetchedFile, Trust.FoundCode Trust.ElfImage (Trust.TreeFile "bin/tool")]
+        code <- QC.sublistOf [codeAt Trust.PeImage Trust.FetchedFile, codeAt Trust.ElfImage (Trust.TreeFile "bin/tool")]
         unread <- QC.sublistOf [Trust.UnreadFile Nothing "unreadable"]
         pure (Trust.ContentFacts code unread)
   generated <- traverse nodeFor ids
@@ -589,27 +689,27 @@ testTrustScanIO = do
         [seedFacts, scriptFacts, sourceFacts, zstdFacts, skippableFacts, xzFacts, bzip2Facts, plainFacts, crtFacts, libraryFacts, nestedFacts, corruptFacts, notesFacts, zipFacts, treeFacts, linkedFacts] ->
           sequence
             [ runTest "a fetched file that is a Portable Executable is one, whatever its name" $
-                assertEqual "seed" (oneCode Trust.PeImage Trust.FetchedFile) seedFacts,
+                assertEqual "seed" (oneCodeOf Trust.PeImage Trust.FetchedFile trustPe) seedFacts,
               runTest "a script holds no prebuilt code, whatever its name" $
                 assertEqual "script" noCode scriptFacts,
               runTest "a gzip tar archive is opened, and only its prebuilt code is reported" $
-                assertEqual "source" (oneCode Trust.PeImage (member "pkg/bin/tool.exe")) sourceFacts,
+                assertEqual "source" (oneCodeOf Trust.PeImage (member "pkg/bin/tool.exe") trustPe) sourceFacts,
               runTest "a zstd tar archive is opened, whatever its name, and so is one a skippable frame starts" $
-                assertEqual "zstd" (oneCode Trust.ElfImage (member "usr/bin/tool")) zstdFacts
-                  `andThen` assertEqual "skippable" (oneCode Trust.ElfImage (member "usr/bin/tool")) skippableFacts,
+                assertEqual "zstd" (oneCodeOf Trust.ElfImage (member "usr/bin/tool") elf) zstdFacts
+                  `andThen` assertEqual "skippable" (oneCodeOf Trust.ElfImage (member "usr/bin/tool") elf) skippableFacts,
               runTest "xz and bzip2 tar archives are opened" $
-                assertEqual "xz" (oneCode Trust.PeImage (member "pkg/tool.exe")) xzFacts
-                  `andThen` assertEqual "bzip2" (oneCode Trust.PeImage (member "pkg/tool.exe")) bzip2Facts,
+                assertEqual "xz" (oneCodeOf Trust.PeImage (member "pkg/tool.exe") trustPe) xzFacts
+                  `andThen` assertEqual "bzip2" (oneCodeOf Trust.PeImage (member "pkg/tool.exe") trustPe) bzip2Facts,
               runTest "an uncompressed tar archive is opened" $
-                assertEqual "plain" (oneCode Trust.PeImage (member "pkg/bin/tool.exe")) plainFacts,
+                assertEqual "plain" (oneCodeOf Trust.PeImage (member "pkg/bin/tool.exe") trustPe) plainFacts,
               runTest "a package of an object and a static library holds prebuilt code, both named" $
-                assertEqual "crt" (codeOnly [Trust.FoundCode Trust.CoffObject (member "lib/crt2.o"), Trust.FoundCode Trust.ArArchive (member "lib/libmingw32.a")]) crtFacts
+                assertEqual "crt" (codeOnly [codeOf Trust.CoffObject (member "lib/crt2.o") (trustCoff 0x8664), codeOf Trust.ArArchive (member "lib/libmingw32.a") trustAr]) crtFacts
                   `andThen` assertEqual
                     "class"
                     [Trust.HoldsPrebuiltCode]
                     (map Trust.inputClass (Trust.trInputs (Trust.trustReport (Map.singleton crtOut crtFacts) crtGraph crtDrv))),
               runTest "a fetched ar archive is one file of prebuilt code, whatever its name" $
-                assertEqual "library" (oneCode Trust.ArArchive Trust.FetchedFile) libraryFacts,
+                assertEqual "library" (oneCodeOf Trust.ArArchive Trust.FetchedFile trustAr) libraryFacts,
               runTest "an archive inside an archive is not opened" $
                 assertEqual "nested" noCode nestedFacts,
               runTest "a stream that does not decode is not read, with why" $
@@ -624,7 +724,7 @@ testTrustScanIO = do
                 case treeFacts of
                   Trust.ContentFacts code [Trust.UnreadFile (Just "tests/broken.xz") reason]
                     | "xz stream error: " `T.isPrefixOf` reason ->
-                        assertEqual "code" [Trust.FoundCode Trust.MachO (Trust.TreeFile "bin/tool"), Trust.FoundCode Trust.PeImage (Trust.TreeArchiveMember "vendor/blob" "inner/x.exe")] code
+                        assertEqual "code" [codeOf Trust.MachO (Trust.TreeFile "bin/tool") machO, codeOf Trust.PeImage (Trust.TreeArchiveMember "vendor/blob" "inner/x.exe") trustPe] code
                   other -> Fail (T.pack (show other)),
               runTest "a symbolic link in a tree is not followed" $
                 if canLink then assertEqual "linked" noCode linkedFacts else Pass

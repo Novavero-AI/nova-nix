@@ -2138,6 +2138,9 @@ testOutLinkCLI = do
 -- trust must not build: one the server holds as a binary cache, which is
 -- substituted and scanned, and one it does not, which is not read.  Each
 -- host program fails if it runs, and a failed build stops the command.
+-- The archive's program is the seed's bytes, so the report names it as
+-- the seed.  The report is read as lines and, from a second run, as
+-- JSON.
 testTrustCLI :: IO [Bool]
 testTrustCLI = do
   putStrLn "cli/trust"
@@ -2180,14 +2183,17 @@ testTrustCLI = do
         | target == narInfoTarget madeOut = Send (httpResponse "200 OK" (TE.encodeUtf8 madeNarInfo))
         | target == "/nar/made.nar" = Send (httpResponse "200 OK" madeNar)
         | otherwise = Send (httpResponse "404 Not Found" "missing")
-  (code, out, err, seen) <-
+  (code, out, err, seen, (jsonCode, jsonOut, jsonErr)) <-
     bracket_ (forceRemoveIfExists root >> createDirectoryIfMissing True root) (forceRemoveIfExists root) $
       withHttpServer route $ \base requests _ -> do
-        (code, out, err) <-
-          Proc.readCreateProcessWithExitCode
-            ((Proc.proc "cabal" ["run", "-v0", "exe:nova-nix", "--", "trust", "--store", root </> "store", "--substituter", T.unpack base, "--trusted-key", T.unpack trustedKey, "--expr", T.unpack (expression base)]) {Proc.env = Just isolatedEnv})
-            ""
-        (,,,) code out err <$> requests
+        let trustRun flags =
+              Proc.readCreateProcessWithExitCode
+                ((Proc.proc "cabal" (["run", "-v0", "exe:nova-nix", "--", "trust", "--store", root </> "store", "--substituter", T.unpack base, "--trusted-key", T.unpack trustedKey, "--expr", T.unpack (expression base)] ++ flags)) {Proc.env = Just isolatedEnv})
+                ""
+        (code, out, err) <- trustRun []
+        seen <- requests
+        jsonRun <- trustRun ["--json", "--no-pretty"]
+        pure (code, out, err, seen, jsonRun)
   let path = storePathToText defaultStoreDir
       asked = [narInfoTarget madeOut, "/nar/made.nar", narInfoTarget unheldOut]
   sequence
@@ -2204,7 +2210,7 @@ testTrustCLI = do
                 "Fixed-output inputs holding prebuilt code: 1",
                 "  " <> path archiveOut,
                 "    fetched by builtin:fetchurl",
-                "    PE image: tool/bin/tool.exe",
+                "    PE image: tool/bin/tool.exe, the bytes of " <> path seedOut,
                 "Fixed-output inputs not fully read: 1",
                 "  " <> path unheldOut,
                 "    built in the closure by /bin/sh, its bytes pinned by its hash",
@@ -2221,8 +2227,54 @@ testTrustCLI = do
               (map (T.filter (/= '\r')) (T.lines (T.pack out)))
           _ -> Fail ("exited " <> T.pack (show code) <> ": " <> T.pack err),
       runTest "trust asks the caches for each input no builtin fetches before it reports one as not read" $
-        assertEqual "requests" (sort asked) (sort (nub (filter (`elem` asked) seen)))
+        assertEqual "requests" (sort asked) (sort (nub (filter (`elem` asked) seen))),
+      runTest "trust --json prints the same report as one JSON document on one line" $
+        case (jsonCode, parseJson (T.strip (T.pack jsonOut))) of
+          (ExitSuccess, Right report) ->
+            let input output = member "fixedOutputInputs" report >>= member (path output)
+                field name output = input output >>= member name
+                classes = case member "fixedOutputInputs" report of
+                  Just (JsonObject inputs) -> Map.map (member "class") inputs
+                  _ -> Map.empty
+             in assertEqual "one line" 1 (length (T.lines (T.strip (T.pack jsonOut))))
+                  `andThen` assertEqual
+                    "classes"
+                    ( Map.fromList
+                        [ (path seedOut, Just (JsonString "runAsBuilder")),
+                          (path archiveOut, Just (JsonString "holdsPrebuiltCode")),
+                          (path madeOut, Just (JsonString "holdsNoPrebuiltCode")),
+                          (path unheldOut, Just (JsonString "notFullyRead"))
+                        ]
+                    )
+                    classes
+                  `andThen` assertEqual
+                    "the archive's program, the seed's bytes"
+                    ( Just
+                        ( JsonArray
+                            [ JsonObject
+                                ( Map.fromList
+                                    [ ("kind", JsonString "peImage"),
+                                      ("file", JsonNull),
+                                      ("member", JsonString "tool/bin/tool.exe"),
+                                      ("sha256", JsonString (Hash.bytesToHexText (sha256Digest trustPe))),
+                                      ("sameBytesAs", JsonArray [JsonString (path seedOut)])
+                                    ]
+                                )
+                            ]
+                        )
+                    )
+                    (field "prebuiltCode" archiveOut)
+                  `andThen` assertEqual
+                    "builders"
+                    (Just (JsonObject (Map.singleton "/bin/sh" (JsonInt 2))), Just (JsonObject (Map.singleton "builtin:fetchurl" (JsonInt 2))))
+                    (member "buildersOutsideClosure" report, member "builtinBuilders" report)
+          (ExitSuccess, Left failure) -> Fail ("not JSON: " <> failure)
+          _ -> Fail ("exited " <> T.pack (show jsonCode) <> ": " <> T.pack jsonErr)
     ]
+  where
+    member name value = case value of
+      JsonObject members -> Map.lookup name members
+      _ -> Nothing
 
 -- ---------------------------------------------------------------------------
 -- Tests: the CLI reference

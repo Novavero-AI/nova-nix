@@ -42,7 +42,7 @@ import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Sandbox (DropGroups (..), SandboxConfig (..), SandboxFallback (..), SandboxMode (..), ViolationLog (..), darwinImpureHostPrefixes, darwinSandboxPaths, parseSandboxPaths)
 import Nix.Builder.Sandbox.Spawn (filePathBytes, processIsRoot)
 import Nix.Builtins (isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
-import Nix.Cli.Args (AutoArg (..), CliOpts (..), Command (..), DevEnvFormat (..), DevelopArgs (..), JsonLayout (..), ListFormat (..), OutLink, ProfileSelection (..), PushArgs (..), RemoveMatcher (..), RemoveSelection (..), Target (..), outLinkFor, parseArgs)
+import Nix.Cli.Args (AutoArg (..), CliOpts (..), Command (..), DevEnvFormat (..), DevelopArgs (..), JsonLayout (..), ListFormat (..), OutLink, ProfileSelection (..), PushArgs (..), RemoveMatcher (..), RemoveSelection (..), Target (..), TrustFormat (..), outLinkFor, parseArgs)
 import Nix.Cli.Reference (Host (..), SystemConfDirSource (..), currentHost, helpLines, renderIndentedJson, systemConfDirSource)
 import Nix.Config (DefaultUse (..), NixConfig (..), PathSetValue (..))
 import qualified Nix.Config as Config
@@ -81,7 +81,7 @@ import Nix.Store (DeleteOutcome (..), GcRoot (..), Store (..), UpstreamHazard (.
 import Nix.Store.Ops (EvalObjects (..), StoreOps (..), StoreQueries (..), localQueries, withLocalStore)
 import Nix.Store.Path (StoreDir (..), StorePath (spName), badStorePathText, defaultStoreDir, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, qualifyPathText, storePathToFilePath, storePathToText)
 import Nix.Substituter (CacheConfig (..))
-import Nix.Trust (ContentFacts, fetchedByBuiltin, fixedOutputInputs, renderTrustReport, trustReport)
+import Nix.Trust (ContentFacts, fetchedByBuiltin, fixedOutputInputs, renderTrustReport, trustReport, trustReportJson)
 import Nix.Trust.Scan (scanFetched)
 import qualified NovaCache.NAR as NAR
 import Paths_nova_nix (getBinDir, getDataDir, version)
@@ -213,7 +213,7 @@ main = do
     CmdBuild target attrPath outLink -> buildCommand config opts storeDir dataDir target attrPath outLink
     CmdDevelop target attrPath developArgs -> developCommand config opts storeDir dataDir target attrPath developArgs
     CmdPrintDevEnv target attrPath format layout -> printDevEnvCommand config opts storeDir dataDir target attrPath format layout
-    CmdTrust target attrPath -> trustCommand config opts storeDir dataDir target attrPath
+    CmdTrust target attrPath format layout -> trustCommand config opts storeDir dataDir target attrPath format layout
     CmdPush pushArgs -> pushCommand storeDir pushArgs
     CmdStoreDelete paths -> storeDeleteCommand storeDir paths
     CmdStoreGc printRoots -> storeGcCommand storeDir printRoots
@@ -809,7 +809,8 @@ data BuildCommandStop
 -- | Evaluate the target, find the fixed-output derivations of its
 -- derivation's closure, fetch each one nova-nix's builtins fetch alone,
 -- substitute the others from the configured caches, scan the outputs the
--- store holds, and print what the closure relies on ("Nix.Trust").  The
+-- store holds, and print what the closure relies on ("Nix.Trust"), as
+-- lines or, with @--json@, as one JSON document.  The
 -- graph is read from the recipes evaluation recorded.  The evaluation is
 -- read-only ('withReadOnlySession'), so it writes only what a fetcher
 -- fetches and what a context's realisation builds, and otherwise only the
@@ -818,8 +819,8 @@ data BuildCommandStop
 -- A store directory upstream Nix's database
 -- also manages is refused before those are made, as a build refuses one
 -- ("Nix.Store.Upstream").
-trustCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> IO ()
-trustCommand config opts storeDir dataDir target attrPath = do
+trustCommand :: NixConfig -> CliOpts -> StoreDir -> FilePath -> Target -> Maybe T.Text -> TrustFormat -> JsonLayout -> IO ()
+trustCommand config opts storeDir dataDir target attrPath format layout = do
   (drvSP, drvClosure) <- withReadOnlySession config opts storeDir $ \session -> evalTarget config opts storeDir session dataDir target attrPath $ \st val ->
     (,) <$> derivationPath val <*> readIORef (esDrvClosure st)
   drv <- recordedDerivation drvClosure drvSP
@@ -830,7 +831,10 @@ trustCommand config opts storeDir dataDir target attrPath = do
       upstreamManagedRefusal ReplacesUpstreamPaths storeDir >>= mapM_ (failWith . ("trust: " <>))
       logger <- cliLogger
       bracket (openStore logger storeDir) closeStore (\store -> fetchAndScan config opts store inputs)
-  toStdout (mapM_ TIO.putStrLn (renderTrustReport (trustReport facts graph drvSP)))
+  let report = trustReport facts graph drvSP
+  case format of
+    TrustLines -> toStdout (mapM_ TIO.putStrLn (renderTrustReport report))
+    TrustJson -> printJson layout (trustReportJson report)
 
 -- | Make each fixed-output input's output valid in a way that runs
 -- nothing from the closure, then scan every one the store holds.  An

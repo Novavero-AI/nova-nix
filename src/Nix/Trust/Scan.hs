@@ -19,7 +19,9 @@
 -- scan goes on with the rest.  A fetched file is read whole; what it
 -- decompresses to is read as it streams, and of each member only as far
 -- as its header needs, except that xz and bzip2 decode a stream whole,
--- within 'decompressedBudget'.
+-- within 'decompressedBudget'.  A file of prebuilt code is read whole,
+-- for the SHA-256 that names it as a fixed-output input of the same bytes
+-- ("Nix.Trust").
 module Nix.Trust.Scan
   ( scanFetched,
   )
@@ -38,6 +40,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word64)
 import Nix.Builder.Unpack (UnpackLimits (..), defaultUnpackLimits)
+import Nix.Hash (sha256LazyHex)
 import Nix.Trust (CodePlace (..), ContentFacts (..), FoundCode (..), UnreadFile (..), prebuiltKind)
 import qualified NovaCache.Bzip2 as Bzip2
 import qualified NovaCache.Xz as Xz
@@ -254,14 +257,14 @@ codeIn inTree contents
   | Just (format, _) <- find ((`BL.isPrefixOf` contents) . BL.fromStrict . snd) unopenedFormats =
       Walked [] (Just (format <> ", which the scan does not open"))
   | otherwise = case prebuiltKind contents of
-      Just kind -> Walked [FoundCode kind (maybe FetchedFile TreeFile inTree)] Nothing
+      Just kind -> Walked [FoundCode kind (maybe FetchedFile TreeFile inTree) (sha256LazyHex contents)] Nothing
       Nothing -> Walked [] Nothing
 
 -- | The prebuilt code among a tar archive's regular members, in archive
 -- order, and why the archive stops reading, if it does before its end.
--- Each member is read only as far as its header needs, and what it is
--- is forced before the next member is read, so the walk holds no
--- member's bytes past its own.
+-- Each member is read only as far as its header needs, or whole when it
+-- is prebuilt code, and what it is is forced before the next member is
+-- read, so the walk holds no member's bytes past its own.
 membersIn ::
   Maybe Text ->
   Tar.GenEntries BL.ByteString FilePath FilePath (Either Tar.FormatError Tar.DecodeLongNamesError) ->
@@ -275,6 +278,6 @@ membersIn inTree = go []
         Nothing -> go found rest
         Just !code -> go (code : found) rest
     memberCode entry = case TarEntry.entryContent entry of
-      Tar.NormalFile content _ -> (\kind -> FoundCode kind (placed (T.pack (TarEntry.entryTarPath entry)))) <$> prebuiltKind content
+      Tar.NormalFile content _ -> (\kind -> FoundCode kind (placed (T.pack (TarEntry.entryTarPath entry))) (sha256LazyHex content)) <$> prebuiltKind content
       _ -> Nothing
     placed member = maybe (ArchiveMember member) (`TreeArchiveMember` member) inTree
