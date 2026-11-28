@@ -31,7 +31,7 @@ import Nix.Derivation (Derivation (..), DerivationOutput (..), currentPlatform)
 import Nix.Hash (moduloHashFinalize, moduloHashInit, moduloHashUpdate, rawHashWithAlgo)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), defaultFetchRetryPolicy, ioRetryEffects)
 import qualified Nix.Realise as Realise
-import Nix.Store (Store (..), caseHackDiskNames, closeStore, onDiskNameKey, openStore, releasePathLock, tryAcquirePathLock, unpackNarEntry, writeDrv)
+import Nix.Store (ArchiveEnd (..), Store (..), caseHackDiskNames, closeStore, newNarUnpackSink, onDiskNameKey, openStore, releasePathLock, sinkNarStream, tryAcquirePathLock, unpackNarEntry, writeDrv)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, trySetCaseSensitiveDir, volumeCaseHack)
 import Nix.Store.DB (PathRegistration (..), Ultimate (..))
 import qualified Nix.Store.ExecBit as ExecBit
@@ -355,6 +355,26 @@ testSubstituter = do
             ]
         forceRemoveIfExists tmpDir
         pure (foldr andThen Pass results),
+      -- Streamed to its root node's close, the archive's digest and size
+      -- are of the archive alone, whatever follows it and wherever the
+      -- chunks fall, since the input after that close is left unread.
+      runTestM "a NAR streamed to its root's close is hashed and counted alone, whatever follows it" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpDir = tmpBase </> "nova-nix-test-stream-root-close"
+            expected = Right (CHash.hashBytes streamTestNar, BS.length streamTestNar)
+            genTrailing = BS.pack <$> QC.listOf QC.arbitrary
+            streamedWith (trailing, chunkLen) = QC.ioProperty $ do
+              forceRemoveIfExists tmpDir
+              createDirectoryIfMissing True tmpDir
+              sink <- newNarUnpackSink tmpSensitivity (tmpDir </> "out")
+              source <- chunkReader (streamChunks chunkLen (streamTestNar <> trailing))
+              streamed <- sinkNarStream AtRootClose sink source
+              pure (streamed QC.=== expected)
+        result <-
+          QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+            QC.forAll ((,) <$> genTrailing <*> QC.choose (1, BS.length streamTestNar)) streamedWith
+        forceRemoveIfExists tmpDir
+        pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
       -- A narinfo lying about NarSize in either direction is refused
       -- at NarDone - the grammar completed, so the mismatch is the
       -- narinfo misdeclaring, and fatal.

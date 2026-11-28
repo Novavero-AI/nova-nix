@@ -168,7 +168,7 @@ import Nix.Hash (FileIngestionMethod (..), ModuloHash, moduloHashFinalize, modul
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, fetchStatusFailure, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Logger (Logger (..), logWarning)
 import Nix.Realise (Fallback (..), Offer (..))
-import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), UpstreamHazard (..), abortNarUnpack, acquirePathLock, canonicalizeMetadata, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, sinkNarStream, unpackNarEntry, upstreamManagedRefusal, volumeCaseHack)
+import Nix.Store (ArchiveEnd (..), CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), UpstreamHazard (..), abortNarUnpack, acquirePathLock, canonicalizeMetadata, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, sinkNarStream, unpackNarEntry, upstreamManagedRefusal, volumeCaseHack)
 import Nix.Store.DB (PathRegistration (..), Ultimate (..))
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Path (StoreDir, StorePath (spHash, spName), parseStorePathBaseName, storePathHashLen, storePathToFilePath, storePathToText)
@@ -1163,7 +1163,7 @@ materializeNarFromSource store sp narInfo declaredDigest refs deriver source =
 consumeNarStream :: CaseSensitivity -> FilePath -> NarInfo.NarInfo -> Hash.NixHash -> IO BS.ByteString -> IO (Either AttemptFailure Int)
 consumeNarStream sensitivity destPath narInfo declaredDigest narSource = do
   sink <- newNarUnpackSink sensitivity destPath
-  streamed <- sinkNarStream sink narSource
+  streamed <- sinkNarStream AtEndOfInput sink narSource
   case streamed of
     Left failure -> pure (Left (narStreamFailure failure))
     Right (digest, narBytes)
