@@ -5011,6 +5011,12 @@ testSourceReadErrorsBody = do
   Dir.createDirectoryLink "real" (dir </> "link")
   createDirectoryIfMissing True (dir </> "withpipe")
   Proc.callProcess "mkfifo" [dir </> "withpipe" </> "pipe", dir </> "pipe"]
+  -- An entry at depth 64 below the root, the root at 0, and one at 63.
+  let chainUnder top n = foldl (</>) (dir </> top) (replicate n "d")
+  createDirectoryIfMissing True (chainUnder "deep" 63)
+  BS.writeFile (chainUnder "deep" 63 </> "f") "f"
+  createDirectoryIfMissing True (chainUnder "shallow" 62)
+  BS.writeFile (chainUnder "shallow" 62 </> "f") "f"
   let resolved = T.pack dir
       given = T.pack dir
       at name = "/. + " <> nixQuotedPath (dir </> name)
@@ -5038,7 +5044,18 @@ testSourceReadErrorsBody = do
         -- upstream's words, as a refusal of its own rather than a failed
         -- read, whether the entry is below the source or is the source.
         fails "interpolating a tree holding a FIFO refuses it as upstream's dump does" ("\"${" <> at "withpipe" <> "}\"") ("file '" <> resolved <> "/withpipe/pipe' has an unsupported type"),
-        fails "interpolating a FIFO refuses it as upstream's dump does" ("\"${" <> at "pipe" <> "}\"") ("file '" <> resolved <> "/pipe' has an unsupported type")
+        fails "interpolating a FIFO refuses it as upstream's dump does" ("\"${" <> at "pipe" <> "}\"") ("file '" <> resolved <> "/pipe' has an unsupported type"),
+        -- Upstream's dump of a filtered tree refuses an entry as deep as
+        -- its dump of any tree does, once the filter has kept it.
+        fails
+          "a filtered copy refuses an entry 64 levels below the root as upstream's dump does"
+          ("builtins.path { path = " <> at "deep" <> "; filter = p: t: true; }")
+          ("path '" <> resolved <> "/deep" <> T.concat (replicate 63 "/d") <> "/f' exceeds maximum NAR directory depth of 64"),
+        runTestM "a filtered copy takes an entry 63 levels below the root" $ do
+          copied <- evalNixIO dir ("builtins.path { path = " <> at "shallow" <> "; filter = p: t: true; }")
+          pure $ case copied of
+            Right (VStr _ _) -> Pass
+            other -> Fail ("expected the copy's store path, got: " <> T.pack (show other))
       ]
   Dir.removePathForcibly dir
   pure results
