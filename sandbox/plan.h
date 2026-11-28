@@ -10,11 +10,11 @@
  * rest are that backend's:
  *
  *   linux: root, build-dir, dev-shm-size, sandbox-uid, sandbox-gid,
- *   network and drop-groups, each once and in that order, then any number
- *   of binds;
+ *   host-uid, host-gid, network and drop-groups, each once and in that
+ *   order, then any number of binds;
  *
- *   darwin: build-dir and profile, each once and in that order, then any
- *   number of params, each a name and its value;
+ *   darwin: build-dir, profile, build-uid and build-gid, each once and in
+ *   that order, then any number of params, each a name and its value;
  *
  *   windows: build-dir, token, slot-sid and memory-cap, each once and in
  *   that order;
@@ -28,7 +28,7 @@
 #include <stddef.h>
 
 /* The first line of every plan; a plan of another version is refused. */
-#define PLAN_VERSION_LINE "nova-nix-sandbox-plan 4\n"
+#define PLAN_VERSION_LINE "nova-nix-sandbox-plan 5\n"
 
 /* The backend a plan is for, named as the OS that backend runs on. */
 enum plan_backend {
@@ -49,20 +49,29 @@ struct plan {
     enum plan_backend backend;
     const char *build_dir;
 
-    /* Linux's. */
+    /* Linux's.  The builder runs as SANDBOX_UID and SANDBOX_GID in its
+     * user namespace, which map to HOST_UID and HOST_GID outside it: a
+     * build user's ids, or the invoking user's. */
     const char *root;
     const char *dev_shm_size;
     unsigned long sandbox_uid;
     unsigned long sandbox_gid;
+    unsigned long host_uid;
+    unsigned long host_gid;
     int private_network;
     int require_drop_groups;
     struct bind *binds;
     size_t bind_count;
 
-    /* Darwin's: the profile's text, and its parameters as
+    /* Darwin's: the profile's text; the build user the builder runs as,
+     * when AS_BUILD_USER is set, which a plan gives as "-" for both ids
+     * otherwise; and the profile's parameters as
      * sandbox_init_with_parameters takes them, each name followed by its
      * value, the whole NULL-terminated. */
     const char *profile;
+    int as_build_user;
+    unsigned long build_uid;
+    unsigned long build_gid;
     const char **parameters;
     size_t parameter_count;
 

@@ -741,8 +741,9 @@ static int child_main(const struct child_context *context)
     mount_filesystems(plan);
 
     /* Upstream's mode for /etc once its files are in place (runChild in LDG).
-     * Upstream's /etc belongs to root (startBuilder in LDG); this one belongs
-     * to the user who made the chroot, as whom the builder runs, so the
+     * /etc belongs to the user who made the chroot.  That is root for a
+     * build as a build user, as upstream's /etc is; for a build as the
+     * invoking user it is that user, as whom the builder runs, so the
      * builder can make it writable again.  It is the build's own copy,
      * removed with the chroot, and its host files are read-only binds. */
     etc = joined(plan->root, "/etc");
@@ -764,7 +765,8 @@ static int child_main(const struct child_context *context)
     if (rmdir("real-root") < 0)
         status_fail("rmdir", errno, NO_INDEX);
 
-    /* The sandbox's ids, which map to the invoking user (runChild in LDG). */
+    /* The sandbox's ids, which map to the plan's host ids (runChild in
+     * LDG). */
     if (setgid((gid_t)plan->sandbox_gid) < 0)
         status_fail("setgid", errno, NO_INDEX);
     if (setuid((uid_t)plan->sandbox_uid) < 0)
@@ -780,10 +782,11 @@ static int child_main(const struct child_context *context)
 
     /* A session keyring of the builder's own, anonymous and empty, which
      * upstream does not make: its builder runs as a build user, with no
-     * keys of the invoking user's.  This one runs as that user, and would
-     * otherwise inherit the user's session keyring through the
-     * namespaces, and with it possession of every key linked from it.
-     * The join stops that inheritance and nothing more (security/keys at
+     * keys of the invoking user's.  A builder run as the invoking user
+     * would otherwise inherit the user's session keyring through the
+     * namespaces, and with it possession of every key linked from it, and
+     * one run as a build user loses nothing by the join.  The join stops
+     * that inheritance and nothing more (security/keys at
      * Linux 6.8): /proc/keys lists the keys of every uid the namespace
      * maps, the builder's own among them (key_serial_next in proc.c); the
      * user keyring gives its owner's uid every permission
@@ -975,13 +978,15 @@ int backend_run(const struct plan *plan, char **argv)
     if (signals_fd < 0)
         fail_after_clone(child, "signals", errno);
 
-    /* The sandbox's ids map to the invoking user's (startBuilder in LDG). */
-    snprintf(map, sizeof map, "%lu %lu 1", (unsigned long)plan->sandbox_uid, (unsigned long)getuid());
+    /* The sandbox's ids map to the host ids the plan names: a build user's,
+     * which only root may map to, or the invoking user's (startBuilder in
+     * LDG). */
+    snprintf(map, sizeof map, "%lu %lu 1", plan->sandbox_uid, plan->host_uid);
     if ((error = write_proc_file(child, "uid_map", map)) != 0)
         fail_after_clone(child, "uid-map", error);
     if ((error = write_proc_file(child, "setgroups", "deny")) != 0)
         fail_after_clone(child, "setgroups-deny", error);
-    snprintf(map, sizeof map, "%lu %lu 1", (unsigned long)plan->sandbox_gid, (unsigned long)getgid());
+    snprintf(map, sizeof map, "%lu %lu 1", plan->sandbox_gid, plan->host_gid);
     if ((error = write_proc_file(child, "gid_map", map)) != 0)
         fail_after_clone(child, "gid-map", error);
 

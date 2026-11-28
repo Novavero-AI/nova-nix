@@ -22,19 +22,17 @@
  * reaped, as upstream kills the group before it waits.
  *
  * macOS has no PID namespace, and a process of the build can leave the
- * group by a session of its own; upstream's builder runs as a build user,
- * and upstream kills every process of that user once the build ends
- * (UnixDerivationBuilderImpl::killSandbox in unix-derivation-builder.cc,
- * which calls killUser in processes.cc).  nova-nix's builder runs as the
- * invoking user, whose other processes must live, so before it ends the
- * helper stops and then kills every process that carries the build's
- * mark (sweep_build): a Mach service name, random and made by the helper
- * for this build alone, that the build's profile allows, beside a second
- * that it refuses.  It does so whichever way the build ends: the
+ * group by a session of its own.  A builder runs as the invoking user,
+ * whose other processes must live, or, when the plan names one, as a build
+ * user, whose every process nova-nix kills once the build ends, as
+ * upstream kills its build user's.  Either way, before it ends the helper
+ * stops and then kills every process of the builder's user that carries
+ * the build's mark (sweep_build): a Mach service name, random and made by
+ * the helper for this build alone, that the build's profile allows, beside
+ * a second that it refuses.  It does so whichever way the build ends: the
  * builder's own end, the lifeline's, or any terminating signal the helper
  * can catch; only SIGKILL, which no process can catch, ends the helper
- * before it has.  Undo the sweep when builds run as build users of their
- * own, under a daemon, and kill that user's processes as upstream does.
+ * before it has.
  *
  * The builder writes its output to a pipe the helper holds the reading
  * end of and copies to its own standard error, the build log.  Upstream
@@ -56,6 +54,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <libproc.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -474,6 +473,21 @@ static void child_main(const struct plan *plan, const char *const *parameters, i
         setrlimit(RLIMIT_CORE, &core);
     }
 
+    /* The build user's ids, with no supplementary group, before the
+     * profile, as upstream's setUser drops to the build user before it
+     * applies one; upstream gives a macOS build user no supplementary
+     * groups. */
+    if (plan->as_build_user) {
+        if (setgroups(0, NULL) < 0)
+            status_fail("setgroups", errno, NO_INDEX);
+        if (setgid((gid_t)plan->build_gid) < 0 || getgid() != (gid_t)plan->build_gid
+            || getegid() != (gid_t)plan->build_gid)
+            status_fail("setgid", errno, NO_INDEX);
+        if (setuid((uid_t)plan->build_uid) < 0 || getuid() != (uid_t)plan->build_uid
+            || geteuid() != (uid_t)plan->build_uid)
+            status_fail("setuid", errno, NO_INDEX);
+    }
+
     /* Last before the exec, as upstream's runChild calls setUser. */
     apply_profile(plan, parameters);
 
@@ -577,13 +591,13 @@ enum listing_outcome {
     LISTING_OUTRUN
 };
 
-/* The user's processes, in *LISTED, a buffer for the caller to free, and
- * their count in *COUNT. */
-static enum listing_outcome user_processes(struct listed_process **listed, size_t *count)
+/* The processes whose effective user is USER, in *LISTED, a buffer for the
+ * caller to free, and their count in *COUNT. */
+static enum listing_outcome user_processes(uid_t user, struct listed_process **listed, size_t *count)
 {
     int request[4] = {CTL_KERN, KERN_PROC, KERN_PROC_UID, 0};
     int attempt;
-    request[3] = (int)getuid();
+    request[3] = (int)user;
     for (attempt = 0; attempt < LISTING_ATTEMPTS_MAX; attempt++) {
         size_t bytes = 0;
         size_t found;
@@ -799,7 +813,8 @@ static void end_still_marked(const struct pid_set *stopped, const struct build_m
     free(still.pids);
 }
 
-/* End every process of the build.  Each listing stops every process of the
+/* End every process of the build, whose processes are USER's.  Each
+ * listing stops every process of the
  * build it finds, those it has stopped before included, since one of them
  * may continue another (SIGCONT, which the profile lets a build send its
  * own processes), and a process stopped while it forks still starts its
@@ -810,7 +825,7 @@ static void end_still_marked(const struct pid_set *stopped, const struct build_m
  * processes of the build that listing found are killed and waited for,
  * and the listing starts over.  A PID stopped before and absent from that
  * listing is not killed: the listing holds every process whose effective
- * user is this one, so that PID now names none of the user's, the process
+ * user is USER, so that PID now names none of the user's, the process
  * having ended, or another having taken its PID; a process of the build
  * cannot become another user, as macOS refuses a process in a sandbox the
  * exec of a setuid program.  The sweep is done only when a listing, taken
@@ -823,7 +838,7 @@ static void end_still_marked(const struct pid_set *stopped, const struct build_m
  * stopped that is still the build's is killed (end_still_marked, which
  * says which few it leaves).  *ERROR receives the errno value behind
  * SWEEP_UNLISTED or SWEEP_UNWATCHED. */
-static enum sweep_outcome sweep_build(const struct build_mark *mark, int *error)
+static enum sweep_outcome sweep_build(const struct build_mark *mark, uid_t user, int *error)
 {
     struct pid_set stopped = {NULL, 0, 0};
     struct pid_set present = {NULL, 0, 0};
@@ -836,7 +851,7 @@ static enum sweep_outcome sweep_build(const struct build_mark *mark, int *error)
         size_t unknown = 0;
         size_t i;
         struct listed_process *listed = NULL;
-        switch (user_processes(&listed, &count)) {
+        switch (user_processes(user, &listed, &count)) {
         case LISTED:
             break;
         case LISTING_FAILED:
@@ -1159,7 +1174,7 @@ int backend_run(const struct plan *plan, char **argv)
      * last messages wait on the log only while the build is not to end. */
     error = wait_for_builder(child, &watch, &copy, &wait_status);
     reported = relay_report(report_pipe[0]);
-    sweep = sweep_build(&mark, &sweep_error);
+    sweep = sweep_build(&mark, plan->as_build_user ? (uid_t)plan->build_uid : getuid(), &sweep_error);
     drain = log_drain(&watch, &copy);
     if (copy.unwatched != 0 && !reported)
         status_fail("logwatch", copy.unwatched, NO_INDEX);

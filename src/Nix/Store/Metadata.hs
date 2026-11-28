@@ -25,9 +25,9 @@
 -- nova-nix does not read as a setting: a default ACL would otherwise leave
 -- what is made beneath a directory writable by others whatever its mode says.
 -- Upstream also clears a node's file flags on macOS (@lchflags@), which
--- nova-nix does not.  Upstream's remaining check needs build users, which
--- nova-nix does not have: it runs a build as a user from a range and fails
--- one whose output holds a node that user does not own.
+-- nova-nix does not.  A build's output is checked before it is made
+-- canonical: every node of it must belong to the user who wrote it, a build
+-- user or the user nova-nix runs as ('foreignOwnedNode').
 --
 -- On Windows, where upstream sets no times and has no modes, every file
 -- and directory is given the read-only attribute and the same
@@ -47,7 +47,9 @@ module Nix.Store.Metadata
     -- * Reading a node
     isPlainFile,
     writableByOthers,
+    OutputOwner (..),
     foreignOwnedNode,
+    ownedByAnother,
     nodeModificationTime,
 
     -- * The canonical form
@@ -244,21 +246,37 @@ isPlainFile :: FilePath -> IO Bool
 -- node there is.
 writableByOthers :: FilePath -> IO Bool
 
--- | The first node of a tree that the process's effective user does not
--- own, read without following a symlink, the root first and a directory
--- before its entries, or nothing when the user owns them all.  Upstream
--- refuses such a node in a build's output, @invalid ownership on file@
--- (@canonicalisePathMetaData_@ in posix-fs-canonicalise.cc), where it builds
--- as a build user: it may be a hard link to a file the output has no business
--- changing, which making the output canonical would change.  A directory the
--- user owns is given read and search for its owner before it is listed, so
--- one a builder closed is read rather than refused.  That is a divergence:
--- upstream makes such a directory canonical first, at 0444 for one its owner
--- may not search, and a single-user build of it, not run as root, then fails
--- to read beneath it; here it ends at 0555, since a process that is not root
--- can read a directory only with search on it.  Windows has no owner to
+-- | Whom a build's output belongs to while its builder writes it.
+data OutputOwner
+  = -- | The user nova-nix runs as, as whom the builder ran.
+    OwnedByInvoker
+  | -- | The build user, by uid, as whom the builder ran.
+    OwnedByBuildUser !Word32
+  deriving (Eq, Show)
+
+-- | The first node of a tree that does not belong to the output's owner,
+-- read without following a symlink, the root first and a directory before
+-- its entries, or nothing when the owner owns them all.  Upstream refuses
+-- such a node in a build's output, @invalid ownership on file@, where it
+-- builds as a build user: it may be a hard link to a file the output has
+-- no business changing, which making the output canonical would change.
+-- Where the owner is the user nova-nix runs as, a directory is given read
+-- and search for its owner before it is listed, so one a builder closed is
+-- read rather than refused.  That is a divergence: upstream makes such a
+-- directory canonical first, at 0444 for one its owner may not search, and
+-- a single-user build of it, not run as root, then fails to read beneath
+-- it; here it ends at 0555, since a process that is not root can read a
+-- directory only with search on it.  A build user's output is read by
+-- root, who needs no mode to list a directory.  Windows has no owner to
 -- compare, and finds none.
-foreignOwnedNode :: FilePath -> IO (Maybe FilePath)
+foreignOwnedNode :: OutputOwner -> FilePath -> IO (Maybe FilePath)
+
+-- | Whether a node, read without following a symlink, belongs to a user
+-- other than the build user who wrote it, upstream's other reason to
+-- refuse an output as of suspicious ownership.  An output the user nova-nix
+-- runs as wrote is never refused for its owner, as upstream checks the
+-- owner only of a build user's.  Windows has no owner to compare.
+ownedByAnother :: OutputOwner -> FilePath -> IO Bool
 
 -- | A node's own modification time, in whole seconds since the epoch: a
 -- symlink's own rather than its target's, as @lstat@ reads it.  A node
@@ -270,7 +288,9 @@ nodeModificationTime :: FilePath -> IO Int64
 
 writableByOthers _ = pure False
 
-foreignOwnedNode _ = pure Nothing
+foreignOwnedNode _ _ = pure Nothing
+
+ownedByAnother _ _ = pure False
 
 isPlainFile path = do
   node <- classifyWalkNode path
@@ -369,21 +389,33 @@ nodeModificationTime path = do
   let CTime seconds = modificationTime status
   pure seconds
 
-foreignOwnedNode root = do
-  user <- getEffectiveUserID
+foreignOwnedNode owner root = do
+  user <- ownerID owner
   let walk path = getSymbolicLinkStatus path >>= visit path
       visit path status
         | fileOwner status /= user = pure (Just path)
         | isDirectory status = do
-            let mode = fileMode status
-                openable = mode .|. ownerReadMode .|. ownerExecuteMode
-            when (openable /= mode) (setFileMode path openable)
+            when (owner == OwnedByInvoker) (openForOwner path status)
             listDirectory path >>= firstFound . map (walk . (path </>))
         | otherwise = pure Nothing
   walk root
   where
     firstFound [] = pure Nothing
     firstFound (look : rest) = look >>= maybe (firstFound rest) (pure . Just)
+    openForOwner path status = do
+      let mode = fileMode status
+          openable = mode .|. ownerReadMode .|. ownerExecuteMode
+      when (openable /= mode) (setFileMode path openable)
+
+ownedByAnother owner path = case owner of
+  OwnedByInvoker -> pure False
+  OwnedByBuildUser uid -> (/= fromIntegral uid) . fileOwner <$> getSymbolicLinkStatus path
+
+-- | The uid an output's owner has.
+ownerID :: OutputOwner -> IO UserID
+ownerID owner = case owner of
+  OwnedByInvoker -> getEffectiveUserID
+  OwnedByBuildUser uid -> pure (fromIntegral uid)
 
 -- | Remove a node's extended attributes, read without following a link,
 -- but for those upstream ignores by default, as

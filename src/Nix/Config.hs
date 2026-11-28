@@ -10,8 +10,9 @@
 -- (@allow-import-from-derivation@, @trace-import-from-derivation@), how
 -- builds are sandboxed (@sandbox@ and the settings beside it, macOS's
 -- @allowed-impure-host-deps@ and @darwin-log-sandbox-violations@ among
--- them), what a build that fails leaves (@keep-failed@), where the link to
--- the default profile is
+-- them), whom builds run as when nova-nix runs as root
+-- (@build-users-group@), what a build that fails leaves (@keep-failed@),
+-- where the link to the default profile is
 -- (@use-xdg-base-directories@), the prompt of a @develop@ shell
 -- (@bash-prompt@ and its prefix and suffix), and which experimental
 -- features are on (@experimental-features@).
@@ -209,6 +210,10 @@ data NixConfig = NixConfig
     -- comes from the environment and the files there are, which only IO
     -- can find.
     ncSslCertFile :: !(Maybe ByteString),
+    -- | Upstream's @build-users-group@, when a source sets it.  Its default
+    -- is @nixbld@ for root and empty otherwise, which only IO can tell
+    -- apart ("Nix.Builder.BuildUser").
+    ncBuildUsersGroup :: !(Maybe ByteString),
     -- | Upstream @use-xdg-base-directories@: the link to the default
     -- profile is in the state directory, not the home.
     ncUseXdgBaseDirectories :: !Bool,
@@ -284,6 +289,7 @@ defaultNixConfig =
       ncSandboxDevShmSize = "50%",
       ncRequireDropSupplementaryGroups = Nothing,
       ncSslCertFile = Nothing,
+      ncBuildUsersGroup = Nothing,
       ncUseXdgBaseDirectories = False,
       ncBashPrompt = "",
       ncBashPromptPrefix = "",
@@ -748,6 +754,7 @@ resolveName name =
       | n == sandboxDevShmSizeKey = Just (BytesSetting SandboxDevShmSizeField)
       | n == requireDropGroupsKey = Just (BoolSetting RequireDropGroupsField)
       | n == sslCertFileKey = Just (BytesSetting SslCertFileField)
+      | n == buildUsersGroupKey = Just (BytesSetting BuildUsersGroupField)
       | n == useXdgBaseDirectoriesKey = Just (BoolSetting UseXdgBaseDirectoriesField)
       | n == bashPromptKey = Just (BytesSetting BashPromptField)
       | n == bashPromptPrefixKey = Just (BytesSetting BashPromptPrefixField)
@@ -797,6 +804,7 @@ data BytesField
   = SandboxBuildDirField
   | SandboxDevShmSizeField
   | SslCertFileField
+  | BuildUsersGroupField
   | BashPromptField
   | BashPromptPrefixField
   | BashPromptSuffixField
@@ -875,6 +883,7 @@ setBytes :: BytesField -> ByteString -> NixConfig -> NixConfig
 setBytes SandboxBuildDirField v config = config {ncSandboxBuildDir = v}
 setBytes SandboxDevShmSizeField v config = config {ncSandboxDevShmSize = v}
 setBytes SslCertFileField v config = config {ncSslCertFile = Just v}
+setBytes BuildUsersGroupField v config = config {ncBuildUsersGroup = Just v}
 setBytes BashPromptField v config = config {ncBashPrompt = v}
 setBytes BashPromptPrefixField v config = config {ncBashPromptPrefix = v}
 setBytes BashPromptSuffixField v config = config {ncBashPromptSuffix = v}
@@ -956,6 +965,10 @@ sslCertFileKey = "ssl-cert-file"
 
 useXdgBaseDirectoriesKey :: ByteString
 useXdgBaseDirectoriesKey = "use-xdg-base-directories"
+
+-- | Upstream's name for the group whose members builds run as.
+buildUsersGroupKey :: ByteString
+buildUsersGroupKey = "build-users-group"
 
 -- | The settings of a @develop@ shell's prompt (@DevelopSettings@ in
 -- develop.cc).

@@ -76,6 +76,7 @@ import Data.Set (Set)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Data.Word (Word32)
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
 import Nix.Logger (Logger (..))
 import System.Exit (ExitCode (..))
@@ -95,7 +96,7 @@ import GHC.IO.Encoding (getFileSystemEncoding)
 import System.Directory (canonicalizePath, createDirectoryIfMissing, listDirectory, removePathForcibly)
 import System.FilePath (splitDirectories, (</>))
 import System.Posix.Directory (createDirectory)
-import System.Posix.Files (createSymbolicLink, fileOwner, getSymbolicLinkStatus, isDirectory, setFileMode)
+import System.Posix.Files (createSymbolicLink, fileOwner, getSymbolicLinkStatus, isDirectory, setFileMode, setOwnerAndGroup)
 import Nix.Builder.BuildDir (clearLeftover)
 import Nix.Store.Metadata (writableByOthers)
 import System.Posix.Types (FileMode)
@@ -312,8 +313,10 @@ mountPointsWithin mountinfo dir =
 -- moved into the store.  A directory is changed by its path, read without following a
 -- link, and only once its parent is sealed, so no other user can point
 -- that path elsewhere in between; the root's parent is no build's to
--- reach.  A directory another user owns is not entered, and an output
--- holding one is refused ('Nix.Builder').  Nothing outside the store
+-- reach.  A directory another user owns is not entered: the build user's,
+-- for a build that ran as one, whose processes are all killed before
+-- anything reads an output, and any other's, which an output may not hold
+-- ('Nix.Builder').  Nothing outside the store
 -- directory's subtree is read, since registration reads nothing else and
 -- the chroot's removal is descriptor-relative.
 --
@@ -366,7 +369,12 @@ sealChroot root storeDir = do
 -- | Run a sandboxed build's action in its chroot, made empty and filled
 -- with the skeleton: what an earlier build left at the name is removed
 -- first, or moved aside where it cannot be ('clearLeftover'), and the
--- chroot is removed when the action ends, however it ends.
+-- chroot is removed when the action ends, however it ends.  For a build
+-- that runs as a build user, the group given is the build users': the
+-- root and the store directory inside it are given to it, as upstream
+-- gives them, so the builder can enter the one and write its outputs in
+-- the other, while the directory holding the root stays closed to every
+-- user but the one nova-nix runs as.
 -- The action is given the chroot's root.  'Left' is why the chroot could
 -- not be made.
 --
@@ -375,11 +383,11 @@ sealChroot root storeDir = do
 -- so a directory the build swapped for a link is unlinked, not entered.
 -- It is refused while anything is mounted in the chroot
 -- ('mountPointsWithin').
-withChroot :: Logger -> FilePath -> [SkeletonEntry] -> (FilePath -> IO a) -> IO (Either Text a)
+withChroot :: Logger -> FilePath -> Maybe Word32 -> [SkeletonEntry] -> (FilePath -> IO a) -> IO (Either Text a)
 #if defined(mingw32_HOST_OS)
-withChroot _ _ _ _ = pure (Left (unavailabilityCause PlatformUnsupported))
+withChroot _ _ _ _ _ = pure (Left (unavailabilityCause PlatformUnsupported))
 #else
-withChroot logger buildDir skeleton action = do
+withChroot logger buildDir buildGroup skeleton action = do
   leftover <- removeChroot (clearLeftover logger) parent
   case leftover of
     Left reason -> pure (Left reason)
@@ -397,7 +405,8 @@ withChroot logger buildDir skeleton action = do
       createDirectory parent privateDir
       createDirectory root rootDir
       setFileMode root rootDir
-      for_ skeleton (materialize root)
+      for_ buildGroup (toBuildGroup root)
+      for_ skeleton (materialize root buildGroup)
     -- The removal runs as the build ends, where a chroot that will not
     -- go must not replace the build's own outcome; what it leaves is
     -- removed, or refused, by the next build of the derivation.
@@ -420,13 +429,19 @@ removeChroot remove parent = do
     [] -> Right <$> remove parent
     point : _ -> pure (Left ("refusing to remove '" <> T.pack parent <> "', since '" <> TE.decodeUtf8Lenient point <> "' is mounted in it"))
 
--- | Make one skeleton entry beneath the root.
-materialize :: FilePath -> SkeletonEntry -> IO ()
-materialize root entry = case entry of
+-- | Make one skeleton entry beneath the root, given the build users'
+-- group for a build that runs as a build user.
+materialize :: FilePath -> Maybe Word32 -> SkeletonEntry -> IO ()
+materialize root buildGroup entry = case entry of
   SkeletonDir path mode -> do
     at <- inRoot path
     createDirectoryIfMissing True at
     setFileMode at (fromIntegral mode :: FileMode)
+  SkeletonStoreDir path -> do
+    at <- inRoot path
+    createDirectoryIfMissing True at
+    setFileMode at storeDirMode
+    for_ buildGroup (toBuildGroup at)
   SkeletonFile path contents -> do
     at <- inRoot path
     BS.writeFile at contents
@@ -436,6 +451,14 @@ materialize root entry = case entry of
     createSymbolicLink targetPath at
   where
     inRoot path = (root <>) <$> bytesFilePath path
+    storeDirMode = 0o1775
+
+-- | Give a directory nova-nix made to the build users' group, keeping its
+-- owner.
+toBuildGroup :: FilePath -> Word32 -> IO ()
+toBuildGroup path group = do
+  owner <- getEffectiveUserID
+  setOwnerAndGroup path owner (fromIntegral group)
 #endif
 
 -- ---------------------------------------------------------------------------

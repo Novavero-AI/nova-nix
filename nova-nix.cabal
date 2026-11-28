@@ -123,6 +123,7 @@ library
     Nix.Develop.Shell
     Nix.Builder
     Nix.Builder.BuildDir
+    Nix.Builder.BuildUser
     Nix.Builder.Buildenv
     Nix.Builder.Cores
     Nix.Builder.Log
@@ -206,9 +207,10 @@ library
   -- close-on-exec on POSIX (Nix.Builder.Log), creating a store or build
   -- directory with its mode on POSIX, and on Windows raising a failure to
   -- create one as the IOError base raises (Nix.Store.Access), a
-  -- registered path's modes, times and owner (Nix.Store.Metadata), and on
+  -- registered path's modes, times and owner (Nix.Store.Metadata), on
   -- POSIX a develop shell's temporary files, environment and exec
-  -- (Nix.Develop.Shell).
+  -- (Nix.Develop.Shell), and a build user's lookup, lock file and files
+  -- (Nix.Builder.BuildUser).
   -- Win32 2.12 is the first whose setFileTime leaves a time it is not
   -- given as it is; unix 2.8 is the first whose openFd takes creat and
   -- cloexec in its flags.  advapi32 holds the token and
@@ -244,6 +246,7 @@ library
     cbits/nn_winfs.c
     cbits/nn_darwinfs.c
     cbits/nn_cpus.c
+    cbits/nn_buildusers.c
   include-dirs:     cbits
   -- -Werror deliberately NOT baked in: a future gcc/clang adding a new
   -- -Wall diagnostic must not retroactively break installing published
@@ -376,6 +379,7 @@ test-suite nova-nix-test
     HttpFixture
     NodeStatus
     Test.Builder
+    Test.BuildUser
     Test.CData
     Test.Cli
     Test.Daemon
@@ -402,12 +406,13 @@ test-suite nova-nix-test
   ghc-options:      -Wall -Wcompat -Wno-pattern-namespace-specifier -threaded
   -- The sandbox helper's parsers, which the suite holds to the plans the
   -- library renders and the mount tables it reads, the key the Linux
-  -- sandbox tests plant, and the Windows calls the Windows sandbox tests
-  -- make, which build elsewhere as stubs.  No -std or -pedantic: GHC
+  -- sandbox tests plant, the wait for a process the build user tests
+  -- expect killed, and the Windows calls the Windows sandbox tests make,
+  -- which build elsewhere as stubs.  No -std or -pedantic: GHC
   -- compiles the C it generates for the executable's link with these
   -- options too, and the RTS headers it includes are not strict C99; the
   -- C99-strict CI job compiles these sources that way.
-  c-sources:        sandbox/plan.c sandbox/mountinfo.c test/cbits/sandbox_check.c test/cbits/keyring.c test/cbits/nn_test_sandbox_windows.c
+  c-sources:        sandbox/plan.c sandbox/mountinfo.c test/cbits/sandbox_check.c test/cbits/keyring.c test/cbits/process_wait.c test/cbits/nn_test_sandbox_windows.c
   include-dirs:     sandbox
   cc-options:       -Wall -Wextra
 

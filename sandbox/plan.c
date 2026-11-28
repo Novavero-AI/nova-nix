@@ -167,21 +167,36 @@ static int parse_linux_singletons(struct tokens *cursor, struct plan *plan)
         return 0;
     if (!read_value(cursor, "sandbox-gid", &value) || !parse_id(value, &plan->sandbox_gid))
         return 0;
+    if (!read_value(cursor, "host-uid", &value) || !parse_id(value, &plan->host_uid))
+        return 0;
+    if (!read_value(cursor, "host-gid", &value) || !parse_id(value, &plan->host_gid))
+        return 0;
     if (!read_value(cursor, "network", &value) || !parse_choice(value, "private", "host", &plan->private_network))
         return 0;
     return read_value(cursor, "drop-groups", &value) && parse_choice(value, "require", "tolerate", &plan->require_drop_groups);
 }
 
+/* What a Darwin plan gives for each build user id when the builder runs
+ * as the invoking user. */
+#define NO_BUILD_USER "-"
+
 static int parse_darwin_singletons(struct tokens *cursor, struct plan *plan)
 {
     char *value;
+    char *uid;
+    char *gid;
     if (!read_value(cursor, "build-dir", &value) || value[0] != '/')
         return 0;
     plan->build_dir = value;
     if (!read_value(cursor, "profile", &value))
         return 0;
     plan->profile = value;
-    return 1;
+    if (!read_value(cursor, "build-uid", &uid) || !read_value(cursor, "build-gid", &gid))
+        return 0;
+    if (strcmp(uid, NO_BUILD_USER) == 0 && strcmp(gid, NO_BUILD_USER) == 0)
+        return 1;
+    plan->as_build_user = 1;
+    return parse_id(uid, &plan->build_uid) && parse_id(gid, &plan->build_gid);
 }
 
 /* A SID's string form, which starts S-1-, as the helper takes it: never

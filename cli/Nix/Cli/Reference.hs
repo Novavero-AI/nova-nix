@@ -831,6 +831,7 @@ configuration =
                Setting "allowed-impure-host-deps" "Host paths at or beneath which a derivation's `__impureHostDeps` may name one for a sandboxed build on macOS (default on macOS: `/System/Library`, `/usr/lib`, `/dev` and `/bin/sh`)" Nothing,
                Setting "darwin-log-sandbox-violations" "Send what a sandboxed build's profile refuses on macOS to the system log" Nothing,
                Setting "require-drop-supplementary-groups" "Fail a sandboxed build when the user's supplementary groups cannot be dropped (default: on for root)" Nothing,
+               Setting "build-users-group" "The group whose members builds run as, one build to a member at a time, when nova-nix runs as root on Linux or macOS; with it empty a build runs as the user nova-nix runs as (default: `nixbld` for root, empty otherwise)" Nothing,
                Setting "use-xdg-base-directories" "Link the default profile from `profile` in the state directory in place of `~/.nix-profile` (default `false`)" Nothing,
                Setting "ssl-cert-file" "The CA bundle a sandboxed fixed-output build sees (default: `$NIX_SSL_CERT_FILE`, `$SSL_CERT_FILE`, or the first that exists of `/etc/ssl/certs/ca-certificates.crt` and `etc/ssl/certs/ca-bundle.crt` under `/nix/var/nix/profiles/default`)" Nothing,
                Setting "bash-prompt" "The prompt (`PS1`) of an interactive `develop` shell, in place of the user's" Nothing,

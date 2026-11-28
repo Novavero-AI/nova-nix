@@ -52,6 +52,7 @@ module Test.Builder
 
     -- * What the Windows sandbox tests share
     sandboxHelperVar,
+    linuxSandboxConfig,
     processWaitMicros,
     startWaitMicros,
     waitUntil,
@@ -722,16 +723,17 @@ testSandboxPure = do
                           && and (zipWith (<) targets (drop 1 targets))
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
       runTest "a plan renders as the helper reads it: the version line, the length of the rest, then the backend, keys and values, each its length, a colon, its bytes and a NUL" $
-        let plan = Sandbox.SandboxPlan "/r" "/build" "50%" Sandbox.PrivateNetwork Sandbox.TolerateKeptGroups [Sandbox.Bind "/b" "/s" Sandbox.ReadOnlyBind Sandbox.OptionalPath Sandbox.SourceResolved, Sandbox.Bind "/t" "/u" Sandbox.ReadWriteBind Sandbox.RequiredPath Sandbox.SourceAsGiven] ["LD_PRELOAD=/x.so", "out=/nix/store/o"]
+        let plan = Sandbox.SandboxPlan "/r" "/build" "50%" Sandbox.PrivateNetwork Sandbox.TolerateKeptGroups (Sandbox.BuilderIds 30001 30000) [Sandbox.Bind "/b" "/s" Sandbox.ReadOnlyBind Sandbox.OptionalPath Sandbox.SourceResolved, Sandbox.Bind "/t" "/u" Sandbox.ReadWriteBind Sandbox.RequiredPath Sandbox.SourceAsGiven] ["LD_PRELOAD=/x.so", "out=/nix/store/o"]
             body =
               BS.concat
                 [ "7:backend\NUL5:linux\NUL",
                   "4:root\NUL2:/r\NUL9:build-dir\NUL6:/build\NUL12:dev-shm-size\NUL3:50%\NUL",
-                  "11:sandbox-uid\NUL4:1000\NUL11:sandbox-gid\NUL3:100\NUL7:network\NUL7:private\NUL11:drop-groups\NUL8:tolerate\NUL",
+                  "11:sandbox-uid\NUL4:1000\NUL11:sandbox-gid\NUL3:100\NUL8:host-uid\NUL5:30001\NUL8:host-gid\NUL5:30000\NUL",
+                  "7:network\NUL7:private\NUL11:drop-groups\NUL8:tolerate\NUL",
                   "4:bind\NUL2:/b\NUL2:/s\NUL3:roc\NUL4:bind\NUL2:/t\NUL2:/u\NUL1:-\NUL",
                   "3:env\NUL16:LD_PRELOAD=/x.so\NUL3:env\NUL16:out=/nix/store/o\NUL"
                 ]
-         in assertEqual "bytes" ("nova-nix-sandbox-plan 4\n" <> BS8.pack (show (BS.length body)) <> "\n" <> body) (Sandbox.renderPlan plan),
+         in assertEqual "bytes" ("nova-nix-sandbox-plan 5\n" <> BS8.pack (show (BS.length body)) <> "\n" <> body) (Sandbox.renderPlan plan),
       runTestM "a rendered plan reads back into exactly its fields, whatever bytes they hold" $ do
         result <-
           QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
@@ -752,7 +754,7 @@ testSandboxPure = do
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
       runTestM "the helper's parser takes the backend, each key once and in order, then binds, then entries, and nothing else" $ do
         let framed = BS.concat . map planToken
-            singletons = ["backend", "linux", "root", "/r", "build-dir", "/build", "dev-shm-size", "50%", "sandbox-uid", "1000", "sandbox-gid", "100", "network", "private", "drop-groups", "tolerate"]
+            singletons = ["backend", "linux", "root", "/r", "build-dir", "/build", "dev-shm-size", "50%", "sandbox-uid", "1000", "sandbox-gid", "100", "host-uid", "501", "host-gid", "20", "network", "private", "drop-groups", "tolerate"]
             bind = ["bind", "/t", "/s", "r"]
             entry value = ["env", value]
             -- Entries upstream's execve passes as they are: an empty name,
@@ -825,7 +827,7 @@ testSandboxPure = do
                 Right (Just record) -> QC.property (Sandbox.recordErrno record >= 0)
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
       runTest "a failed step is upstream's words, naming the paths a bind's index points at" $
-        let plan = Sandbox.SandboxPlan "/r" "/build" "50%" Sandbox.PrivateNetwork Sandbox.TolerateKeptGroups [Sandbox.Bind "/b" "/s" Sandbox.ReadOnlyBind Sandbox.RequiredPath Sandbox.SourceAsGiven, Sandbox.Bind "/build" "/state/builds/h" Sandbox.ReadWriteBind Sandbox.RequiredPath Sandbox.SourceAsGiven, Sandbox.Bind "/t" "/u" Sandbox.ReadWriteBind Sandbox.RequiredPath Sandbox.SourceAsGiven] []
+        let plan = Sandbox.SandboxPlan "/r" "/build" "50%" Sandbox.PrivateNetwork Sandbox.TolerateKeptGroups (Sandbox.BuilderIds 501 20) [Sandbox.Bind "/b" "/s" Sandbox.ReadOnlyBind Sandbox.RequiredPath Sandbox.SourceAsGiven, Sandbox.Bind "/build" "/state/builds/h" Sandbox.ReadWriteBind Sandbox.RequiredPath Sandbox.SourceAsGiven, Sandbox.Bind "/t" "/u" Sandbox.ReadWriteBind Sandbox.RequiredPath Sandbox.SourceAsGiven] []
             message stage number index = Sandbox.setupFailureMessage plan "/bin/sh" (Sandbox.StatusRecord stage number index)
          in assertEqual "bind" "while setting up the build environment: bind mount from '/u' to '/r/t' failed: No such file or directory" (message Sandbox.StageBind 2 (Just 2))
               `andThen` assertEqual "build directory" "while setting up the build environment: changing into '/state/builds/h': No such file or directory" (message Sandbox.StageChdir 2 Nothing)
@@ -835,7 +837,7 @@ testSandboxPure = do
               `andThen` assertEqual "clone" "while setting up the build environment: unable to start build process" (message Sandbox.StageClone 1 Nothing)
               `andThen` assertEqual "exec" "while setting up the build environment: executing '/bin/sh': No such file or directory" (message Sandbox.StageExec 2 Nothing),
       runTest "a run of the helper is a failed step when it reports one, else the builder's exit, unless the plan never reached it" $
-        let plan = Sandbox.SandboxPlan "/r" "/build" "50%" Sandbox.PrivateNetwork Sandbox.TolerateKeptGroups [] []
+        let plan = Sandbox.SandboxPlan "/r" "/build" "50%" Sandbox.PrivateNetwork Sandbox.TolerateKeptGroups (Sandbox.BuilderIds 501 20) [] []
             outcome = Sandbox.helperOutcome Sandbox.setupStageName (Sandbox.setupFailureMessage plan "/bin/sh")
          in assertEqual "record" (Sandbox.SetupIncomplete "while setting up the build environment: cannot set host name: Operation not permitted") (outcome (Right ()) (ExitFailure 1) "hostname 1 -1\n")
               `andThen` assertEqual "builder" (Sandbox.BuilderRan (ExitFailure 3)) (outcome (Right ()) (ExitFailure 3) "")
@@ -855,7 +857,7 @@ testSandboxPure = do
               `andThen` assertRight "a name that starts with two dots" (planWith (entry "/a/..b/c")) (const Pass),
       runTest "a sandboxed build is told upstream's HOME, and as root is refused for want of build users" $
         assertEqual "home" "/homeless-shelter" Sandbox.sandboxHome
-          `andThen` assertEqual "root" "a sandboxed build as root needs build users, which nova-nix does not have yet; run nova-nix as a user other than root, or pass '--no-sandbox' to build without the sandbox" Sandbox.rootRefusal,
+          `andThen` assertEqual "root" "a sandboxed build as root needs build users: set 'build-users-group' to a group of build users, run nova-nix as a user other than root, or pass '--no-sandbox' to build without the sandbox" Sandbox.rootRefusal,
       runTest "allowed-impure-host-deps keeps its default under extra- and replaces it otherwise, and darwin-log-sandbox-violations is a Boolean that defaults off" $
         assertEqual "plain" (Right (Config.PathSetValue Config.ReplacesDefault (Set.fromList ["/a", "/b"]))) (ncAllowedImpureHostDeps <$> Config.resolveConfig [Config.ConfigAssignment "allowed-impure-host-deps" "/b /a"])
           `andThen` assertEqual "extra" (Right (Config.PathSetValue Config.KeepsDefault (Set.fromList ["/c"]))) (ncAllowedImpureHostDeps <$> Config.resolveConfig [Config.ConfigAssignment "extra-allowed-impure-host-deps" "/c"])
@@ -982,18 +984,22 @@ testSandboxPure = do
             prefixes = [line | line <- renderedLines, "\t\t(prefix " `BS.isPrefixOf` line]
          in assertEqual "paths" ["\t(literal \"/bin/sh\")", "\t\t\t(subpath \"/nix/store/aaaa-one\")", "\t\t\t(subpath \"/nix/store/bbbb-two\")", "\t\t\t(subpath \"/nix/store/bbbb-three\")"] pathLines
               `andThen` assertEqual "guards" ["\t\t(prefix \"/nix/store/a\")", "\t\t(prefix \"/nix/store/b\")"] prefixes,
-      runTest "a macOS build's profile parameters are upstream's names, the temporary directory its own without trailing slashes" $
-        assertEqual "local networking" [("_NIX_BUILD_TOP", "/b//"), ("_GLOBAL_TMP_DIR", "/b"), ("_ALLOW_LOCAL_NETWORKING", "1")] (Sandbox.darwinParameters "/b//" Sandbox.LocalNetworkingAllowed)
-          `andThen` assertEqual "none" [("_NIX_BUILD_TOP", "/b"), ("_GLOBAL_TMP_DIR", "/b")] (Sandbox.darwinParameters "/b" Sandbox.LocalNetworkingDenied),
-      runTest "a macOS plan renders as the helper reads it: the backend, the build directory and the profile, each parameter's name and value, then entries" $
-        let plan = Sandbox.DarwinPlan "/b" "(version 1)" [("_NIX_BUILD_TOP", "/b")] ["out=/nix/store/o"]
-            body =
+      runTest "a macOS build's profile parameters are upstream's names, the temporary directory the one given without trailing slashes" $
+        assertEqual "local networking" [("_NIX_BUILD_TOP", "/b//"), ("_GLOBAL_TMP_DIR", "/b"), ("_ALLOW_LOCAL_NETWORKING", "1")] (Sandbox.darwinParameters "/b//" "/b//" Sandbox.LocalNetworkingAllowed)
+          `andThen` assertEqual "none" [("_NIX_BUILD_TOP", "/b"), ("_GLOBAL_TMP_DIR", "/b")] (Sandbox.darwinParameters "/b" "/b" Sandbox.LocalNetworkingDenied)
+          `andThen` assertEqual "a build user's" [("_NIX_BUILD_TOP", "/b"), ("_GLOBAL_TMP_DIR", "/private/tmp")] (Sandbox.darwinParameters "/b" "/private/tmp/" Sandbox.LocalNetworkingDenied),
+      runTest "a macOS plan renders as the helper reads it: the backend, the build directory, the profile and the build user, each parameter's name and value, then entries" $
+        let plan = Sandbox.DarwinPlan "/b" "(version 1)" Nothing [("_NIX_BUILD_TOP", "/b")] ["out=/nix/store/o"]
+            framedBody user =
               BS.concat
                 [ "7:backend\NUL6:darwin\NUL9:build-dir\NUL2:/b\NUL7:profile\NUL11:(version 1)\NUL",
+                  user,
                   "5:param\NUL14:_NIX_BUILD_TOP\NUL2:/b\NUL",
                   "3:env\NUL16:out=/nix/store/o\NUL"
                 ]
-         in assertEqual "bytes" ("nova-nix-sandbox-plan 4\n" <> BS8.pack (show (BS.length body)) <> "\n" <> body) (Sandbox.renderDarwinPlan plan),
+            rendered body = "nova-nix-sandbox-plan 5\n" <> BS8.pack (show (BS.length body)) <> "\n" <> body
+         in assertEqual "as the invoking user" (rendered (framedBody "9:build-uid\NUL1:-\NUL9:build-gid\NUL1:-\NUL")) (Sandbox.renderDarwinPlan plan)
+              `andThen` assertEqual "as a build user" (rendered (framedBody "9:build-uid\NUL3:301\NUL9:build-gid\NUL5:30000\NUL")) (Sandbox.renderDarwinPlan plan {Sandbox.darwinPlanBuildUser = Just (Sandbox.BuilderIds 301 30000)}),
       runTestM "the helper's parser reads a rendered macOS plan back into exactly its fields, and refuses one it cannot use" $ do
         result <-
           QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
@@ -1009,25 +1015,31 @@ testSandboxPure = do
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
       runTestM "the helper's parser takes a macOS plan's keys once and in order, then params, then entries, and nothing else" $ do
         let framed = BS.concat . map planToken
-            singletons = ["backend", "darwin", "build-dir", "/b", "profile", "(version 1)"]
+            withUser uid gid = ["backend", "darwin", "build-dir", "/b", "profile", "(version 1)", "build-uid", uid, "build-gid", gid]
+            singletons = withUser "-" "-"
             whole = singletons ++ ["param", "_A", "1", "param", "_B", ""] ++ ["env", "a=b"]
-        accepted <- helperPlanEcho (framed whole)
+        accepted <- traverse (helperPlanEcho . framed) [whole, withUser "301" "30000"]
         refused <-
           traverse
             (helperPlanEcho . framed)
             [ take 4 singletons,
+              take 6 singletons,
               singletons ++ ["bind", "/t", "/s", "r"],
               singletons ++ ["param", "", "1"],
               singletons ++ ["param", "_A"],
               singletons ++ ["env", "a=b", "param", "_A", "1"],
               ["backend", "darwin", "profile", "(version 1)", "build-dir", "/b"],
-              ["backend", "darwin", "build-dir", "b", "profile", "(version 1)"]
+              ["backend", "darwin", "build-dir", "b", "profile", "(version 1)"],
+              withUser "301" "-",
+              withUser "-" "30000",
+              withUser "x" "30000",
+              withUser "301" "2147483648"
             ]
         pure $
-          assertEqual "accepted" (Right (framed whole)) accepted
-            `andThen` assertEqual "refused" (replicate 7 (Left invalidPlan)) refused,
+          assertEqual "accepted" [Right (framed whole), Right (framed (withUser "301" "30000"))] accepted
+            `andThen` assertEqual "refused" (replicate 12 (Left invalidPlan)) refused,
       runTest "the macOS helper's records parse, and each failed step reads in upstream's words" $
-        let plan = Sandbox.DarwinPlan "/b" "" [] []
+        let plan = Sandbox.DarwinPlan "/b" "" Nothing [] []
             message stage number = Sandbox.darwinSetupFailureMessage plan "/bin/sh" (Sandbox.StatusRecord stage number Nothing)
             errno (Errno number) = fromIntegral number
             outcome = Sandbox.helperOutcome Sandbox.darwinStageName (Sandbox.darwinSetupFailureMessage plan "/bin/sh")
@@ -1053,7 +1065,7 @@ testSandboxPure = do
                       "10:memory-cap\NUL9:268435456\NUL",
                       "3:env\NUL15:PATH=C:\\Windows\NUL"
                     ]
-             in assertEqual "bytes" ("nova-nix-sandbox-plan 4\n" <> BS8.pack (show (BS.length body)) <> "\n" <> body) (Sandbox.renderWindowsPlan plan),
+             in assertEqual "bytes" ("nova-nix-sandbox-plan 5\n" <> BS8.pack (show (BS.length body)) <> "\n" <> body) (Sandbox.renderWindowsPlan plan),
       runTestM "the helper's parser reads a rendered Windows plan back into exactly its fields, and refuses one it cannot use" $ do
         result <-
           QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
@@ -1116,7 +1128,7 @@ testSandboxPure = do
         let rendered = Sandbox.darwinProfile sampleDarwinProfile {Sandbox.dprPaths = Sandbox.Subpath "/dev" : Sandbox.dprPaths sampleDarwinProfile}
             renderedLines = BS8.lines rendered
             position needle = listToMaybe [index | (index, line) <- zip [0 :: Int ..] renderedLines, needle `BS.isInfixOf` line]
-         in assertEqual "the temporary directory is the build's" [("_NIX_BUILD_TOP", "/b"), ("_GLOBAL_TMP_DIR", "/b")] (Sandbox.darwinParameters "/b" Sandbox.LocalNetworkingDenied)
+         in assertEqual "the temporary directory is the build's" [("_NIX_BUILD_TOP", "/b"), ("_GLOBAL_TMP_DIR", "/b")] (Sandbox.darwinParameters "/b" "/b" Sandbox.LocalNetworkingDenied)
               `andThen` assertEqual "no rule on TMPDIR's subpath" False ("(subpath TMPDIR)" `BS.isInfixOf` rendered)
               `andThen` assertEqual "no terminal allowed" False (any (`BS.isInfixOf` rendered) ["(allow file* (literal \"/dev/ptmx\")", "#\"^/dev/ttys[0-9]+\""])
               `andThen` assertEqual "terminals denied after /dev is allowed" (Just True) ((<) <$> position "(subpath \"/dev\")" <*> position "(deny file-read* file-write*")
@@ -1136,6 +1148,7 @@ testSandboxPure = do
     storeIn hash = "/nix/store/" <> BS.concat (replicate 8 hash) <> "-p"
     skeletonPath entry = case entry of
       Sandbox.SkeletonDir path _ -> path
+      Sandbox.SkeletonStoreDir path -> path
       Sandbox.SkeletonFile path _ -> path
       Sandbox.SkeletonLink path _ -> path
     genStatusBytes =
@@ -1243,6 +1256,7 @@ genDarwinPlan =
   Sandbox.DarwinPlan
     <$> genPath
     <*> genText
+    <*> QC.frequency [(4, pure Nothing), (4, Just <$> (Sandbox.BuilderIds <$> genId <*> genId)), (1, Just <$> (Sandbox.BuilderIds <$> QC.choose (idMax + 1, maxBound) <*> genId))]
     <*> few ((,) <$> genName <*> genText)
     <*> few genText
   where
@@ -1251,14 +1265,21 @@ genDarwinPlan =
     genPath = QC.frequency [(12, ("/" <>) <$> usable), (1, genPlanBytes)]
     genName = QC.frequency [(12, ("_" <>) <$> usable), (1, genPlanBytes)]
     genText = QC.frequency [(12, usable), (1, genPlanBytes)]
+    genId = QC.choose (0, idMax)
 
 -- | Whether the helper can use a macOS plan: no field holds a NUL, its
--- build directory is absolute, and every parameter has a name.
+-- build directory is absolute, every parameter has a name, and a build
+-- user's ids are ones an int holds.
 darwinPlanUsable :: Sandbox.DarwinPlan -> Bool
 darwinPlanUsable plan =
   all (BS.notElem 0) (Sandbox.darwinPlanBuildDir plan : Sandbox.darwinPlanProfile plan : concat [[name, value] | (name, value) <- Sandbox.darwinPlanParameters plan] ++ Sandbox.darwinPlanEnvironment plan)
     && "/" `BS.isPrefixOf` Sandbox.darwinPlanBuildDir plan
     && not (any (BS.null . fst) (Sandbox.darwinPlanParameters plan))
+    && all (\ids -> Sandbox.builderUid ids <= idMax && Sandbox.builderGid ids <= idMax) (Sandbox.darwinPlanBuildUser plan)
+
+-- | The largest id the helper takes, the largest an int holds.
+idMax :: Word32
+idMax = 2147483647
 
 -- | A Windows plan with any bytes in its byte fields, most often bytes the
 -- helper can use, and now and then a token or a memory cap it refuses.
@@ -1281,7 +1302,7 @@ genWindowsPlan =
 -- | The largest value of a handle the helper takes, the largest an int
 -- holds.
 handleValueMax :: Word32
-handleValueMax = 2147483647
+handleValueMax = idMax
 
 -- | Whether the helper can use a Windows plan: no field holds a NUL, its
 -- build directory is absolute, its token a value a handle has, and its
@@ -1315,7 +1336,8 @@ sandboxPlanInputs =
       Sandbox.piNetwork = Sandbox.PrivateNetwork,
       Sandbox.piCaFile = Nothing,
       Sandbox.piDevShmSize = "50%",
-      Sandbox.piDropGroups = Sandbox.TolerateKeptGroups
+      Sandbox.piDropGroups = Sandbox.TolerateKeptGroups,
+      Sandbox.piBuilderIds = Sandbox.BuilderIds 501 20
     }
 
 -- | Plan inputs drawn from a small pool of store paths, so inputs,
@@ -1352,12 +1374,13 @@ readRenderedPlan bytes = do
   guard (declared == BS.length body)
   tokens <- splitTokens body
   case tokens of
-    "backend" : "linux" : "root" : root : "build-dir" : buildDir : "dev-shm-size" : shm : "sandbox-uid" : uid : "sandbox-gid" : gid : "network" : network : "drop-groups" : groups : sections -> do
+    "backend" : "linux" : "root" : root : "build-dir" : buildDir : "dev-shm-size" : shm : "sandbox-uid" : uid : "sandbox-gid" : gid : "host-uid" : hostUid : "host-gid" : hostGid : "network" : network : "drop-groups" : groups : sections -> do
       guard (uid == BS8.pack (show Sandbox.sandboxUid) && gid == BS8.pack (show Sandbox.sandboxGid))
+      builderIds <- Sandbox.BuilderIds <$> readMaybe (BS8.unpack hostUid) <*> readMaybe (BS8.unpack hostGid)
       networkRead <- lookup network [("private", Sandbox.PrivateNetwork), ("host", Sandbox.HostNetwork)]
       groupsRead <- lookup groups [("require", Sandbox.RequireDropGroups), ("tolerate", Sandbox.TolerateKeptGroups)]
       (binds, entries) <- readSections sections
-      pure (Sandbox.SandboxPlan root buildDir shm networkRead groupsRead binds entries)
+      pure (Sandbox.SandboxPlan root buildDir shm networkRead groupsRead builderIds binds entries)
     _ -> Nothing
   where
     splitTokens remaining
@@ -1412,6 +1435,7 @@ genPlanAnyBytes =
     <*> genText
     <*> QC.elements [Sandbox.PrivateNetwork, Sandbox.HostNetwork]
     <*> QC.elements [Sandbox.RequireDropGroups, Sandbox.TolerateKeptGroups]
+    <*> (Sandbox.BuilderIds <$> QC.choose (0, idMax) <*> QC.choose (0, idMax))
     <*> few
       ( Sandbox.Bind
           <$> genPath
@@ -1569,7 +1593,7 @@ testSandboxSpawnIO = do
               [ runTestM "a chroot holds its skeleton while the build runs, and is gone after" $ do
                   createDirectoryIfMissing True buildDir
                   inside <-
-                    Spawn.withChroot testLogger buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) $ \chrootRoot -> do
+                    Spawn.withChroot testLogger buildDir Nothing (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) $ \chrootRoot -> do
                       passwd <- BS.readFile (chrootRoot </> "etc" </> "passwd")
                       tmpMode <- fmap nsPermissions <$> nodeStatus (chrootRoot </> "tmp")
                       storeMode <- fmap nsPermissions <$> nodeStatus (chrootRoot <> storeDirPath)
@@ -1592,7 +1616,7 @@ testSandboxSpawnIO = do
                   Dir.createDirectoryLink outside (Spawn.chrootDirFor buildDir </> "root" </> "linked")
                   BS.writeFile (leftover </> "stale") "x"
                   Dir.getPermissions leftover >>= Dir.setPermissions leftover . Dir.setOwnerWritable False
-                  made <- Spawn.withChroot testLogger buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.HostNetwork []) (\chrootRoot -> Dir.doesPathExist (chrootRoot </> "etc" </> "stale"))
+                  made <- Spawn.withChroot testLogger buildDir Nothing (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.HostNetwork []) (\chrootRoot -> Dir.doesPathExist (chrootRoot </> "etc" </> "stale"))
                   kept <- BS.readFile (outside </> "kept")
                   pure (assertEqual "stale file" (Right False) made `andThen` assertEqual "what the link named" "host" kept),
                 -- A real chroot's /dev/fd names /proc/self/fd; a read-only
@@ -1608,7 +1632,7 @@ testSandboxSpawnIO = do
                   Proc.callProcess "chmod" ["0555", sentinel]
                   Dir.createDirectoryLink sentinel (leftover </> "fd")
                   Dir.getPermissions leftover >>= Dir.setPermissions leftover . Dir.setOwnerWritable False
-                  made <- Spawn.withChroot testLogger buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) (\chrootRoot -> Dir.getSymbolicLinkTarget (chrootRoot </> "dev" </> "fd"))
+                  made <- Spawn.withChroot testLogger buildDir Nothing (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) (\chrootRoot -> Dir.getSymbolicLinkTarget (chrootRoot </> "dev" </> "fd"))
                   sentinelMode <- fmap nsPermissions <$> nodeStatus sentinel
                   kept <- BS.readFile (sentinel </> "kept")
                   pure $
@@ -1667,7 +1691,7 @@ testSandboxSpawnIO = do
                       -- left can be removed.
                       let release = for_ [Spawn.chrootDirFor buildDir, aside] $ \dir -> Proc.readProcessWithExitCode "chflags" ["-R", "nouchg", dir] ""
                       ( do
-                          made <- Spawn.withChroot testLogger buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) (\chrootRoot -> Dir.doesDirectoryExist (chrootRoot </> "etc"))
+                          made <- Spawn.withChroot testLogger buildDir Nothing (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) (\chrootRoot -> Dir.doesDirectoryExist (chrootRoot </> "etc"))
                           movedAside <- Dir.doesPathExist (aside </> "root" </> "stuck" </> "f")
                           pure (assertEqual "the chroot made" (Right True) made `andThen` assertEqual "moved aside" True movedAside)
                         )
@@ -2140,7 +2164,7 @@ testDarwinSandboxBody helper = do
                       Sandbox.dprAncestry = Set.toAscList (Set.fromList (concatMap ancestors ["/bin", "/usr", "/System/Library", realScratch])),
                       Sandbox.dprExtra = ""
                     }
-              plan = Sandbox.DarwinPlan realScratch profile (Sandbox.darwinParameters realScratch Sandbox.LocalNetworkingDenied) []
+              plan = Sandbox.DarwinPlan realScratch profile Nothing (Sandbox.darwinParameters realScratch realScratch Sandbox.LocalNetworkingDenied) []
           run <- withBinaryFile (root </> "large-profile.log") WriteMode $ \logHandle ->
             Spawn.runHelper (handleLogger DropEscapes logHandle) helper (Sandbox.renderDarwinPlan plan) scratch ["/bin/sh", "-c", "exit 7"]
           pure $
@@ -2321,7 +2345,7 @@ testDarwinSandboxBody helper = do
                       Sandbox.dprAncestry = Set.toAscList (Set.fromList (concatMap ancestors ["/bin", "/usr/bin", "/System/Library", realScratch])),
                       Sandbox.dprExtra = ""
                     }
-              plan = Sandbox.DarwinPlan realScratch profile (Sandbox.darwinParameters realScratch Sandbox.LocalNetworkingDenied) []
+              plan = Sandbox.DarwinPlan realScratch profile Nothing (Sandbox.darwinParameters realScratch realScratch Sandbox.LocalNetworkingDenied) []
               -- The builder says it runs, in the build directory it starts
               -- in, then becomes the writer.
               builder = ["/bin/sh", "-c", ": > " <> buildStartedName <> "; exec /usr/bin/yes " <> T.unpack marker]

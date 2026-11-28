@@ -38,10 +38,11 @@ import GHC.IO.Exception (IOException (..))
 import GHC.Profiling (requestHeapCensus)
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuildStop (..), SubstitutionAccess (..), buildWithDeps, defaultBuildConfig, execWrapperConfig, substituteFromCaches)
 import Nix.Builder.BuildDir (FailedBuilds (..))
+import Nix.Builder.BuildUser (BuildUsers, buildUsersFor, defaultBuildUsersGroup, processPrivilege, userPoolDir)
 import Nix.Builder.Buildenv (Activity (..))
 import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Sandbox (DropGroups (..), SandboxConfig (..), SandboxFallback (..), SandboxMode (..), ViolationLog (..), darwinImpureHostPrefixes, darwinSandboxPaths, parseSandboxPaths)
-import Nix.Builder.Sandbox.Spawn (filePathBytes, processIsRoot)
+import Nix.Builder.Sandbox.Spawn (bytesFilePath, filePathBytes, processIsRoot)
 import Nix.Builtins (isNixPathPseudoUrl, parseNixPath, rootScopeNames, searchPathRoots)
 import Nix.Cli.Args (AutoArg (..), CliOpts (..), Command (..), DevEnvFormat (..), DevelopArgs (..), JsonLayout (..), ListFormat (..), OutLink, ProfileSelection (..), PushArgs (..), RemoveMatcher (..), RemoveSelection (..), Target (..), TrustFormat (..), outLinkFor, parseArgs)
 import Nix.Cli.Reference (Host (..), SystemConfDirSource (..), currentHost, helpLines, renderIndentedJson, systemConfDirSource)
@@ -766,13 +767,14 @@ reportStop stop = case stop of
   LinkRefused err -> failWith ("build: " <> err)
 
 -- | The configuration a command's builds run under: the caches, fallback,
--- substitution setting, cores, launchers, sandbox and what a failed build
--- keeps that its options and nix.conf give.
+-- substitution setting, cores, launchers, sandbox, build users and what a
+-- failed build keeps that its options and nix.conf give.
 buildConfigFor :: NixConfig -> CliOpts -> StoreDir -> IO BuildConfig
 buildConfigFor config opts storeDir = do
   wrappers <- either failWith pure (execWrapperConfig (optExecWrappers opts)) >>= checkExecWrappers
   cores <- buildCoresFor config
   sandbox <- sandboxConfigFor config opts
+  buildUsers <- buildUsersConfigFor config
   pure
     (defaultBuildConfig storeDir)
       { bcCaches = resolveCaches config (optSubstituter opts) (optTrustedKey opts),
@@ -781,8 +783,22 @@ buildConfigFor config opts storeDir = do
         bcCores = cores,
         bcExecWrappers = wrappers,
         bcSandbox = sandbox,
+        bcBuildUsers = buildUsers,
         bcFailedBuilds = failedBuildsFor opts config
       }
+
+-- | Whom this run's builds run as: the members of @build-users-group@ for
+-- root, the setting defaulting to @nixbld@ there as upstream's does, with
+-- the user pool in upstream's state directory, @NIX_STATE_DIR@ when it is
+-- set and not empty; otherwise the user nova-nix runs as.
+buildUsersConfigFor :: NixConfig -> IO BuildUsers
+buildUsersConfigFor config = do
+  privilege <- processPrivilege
+  stateDir <- lookupEnvBytes "NIX_STATE_DIR"
+  pool <- case stateDir of
+    EnvValue bytes | not (BS.null bytes) -> userPoolDir . Just <$> bytesFilePath bytes
+    _ -> pure (userPoolDir Nothing)
+  pure (buildUsersFor privilege pool (fromMaybe (defaultBuildUsersGroup privilege) (ncBuildUsersGroup config)))
 
 -- | Run an action with a read-only session's store for the store in a
 -- directory, as @nix-instantiate --eval@ runs read-only

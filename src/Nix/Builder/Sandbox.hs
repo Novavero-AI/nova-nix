@@ -83,6 +83,7 @@ module Nix.Builder.Sandbox
     sandboxGid,
     sandboxHome,
     rootRefusal,
+    BuilderIds (..),
     PlanInputs (..),
     SandboxPlan (..),
     Bind (..),
@@ -136,6 +137,8 @@ module Nix.Builder.Sandbox
     setupFailureMessage,
     darwinSetupFailureMessage,
     fallbackWarning,
+    setupContext,
+    errnoSuffix,
     HelperOutcome (..),
     helperOutcome,
   )
@@ -481,13 +484,22 @@ sandboxGid = 100
 sandboxHome :: FilePath
 sandboxHome = "/homeless-shelter"
 
--- | Why a sandboxed build is refused when nova-nix runs as root.  Upstream
--- builds as root under build users, uids of their own; nova-nix has none
--- yet, so the builder would map to root on the host and own every file
--- root owns there.  A fallback to an unsandboxed build would be no answer
--- to that, so this refusal stands whatever @sandbox-fallback@ says.
+-- | Why a sandboxed build is refused when nova-nix runs as root with no
+-- build users ("Nix.Builder.BuildUser"): its builder would map to root on
+-- the host and own every file root owns there.  Upstream builds so; nova-nix
+-- refuses, and a fallback to an unsandboxed build would be no answer to
+-- that, so this refusal stands whatever @sandbox-fallback@ says.
 rootRefusal :: Text
-rootRefusal = "a sandboxed build as root needs build users, which nova-nix does not have yet; run nova-nix as a user other than root, or pass '--no-sandbox' to build without the sandbox"
+rootRefusal = "a sandboxed build as root needs build users: set 'build-users-group' to a group of build users, run nova-nix as a user other than root, or pass '--no-sandbox' to build without the sandbox"
+
+-- | The ids a builder runs as outside its sandbox: a build user's, or the
+-- invoking user's.  On Linux the sandbox's own ('sandboxUid',
+-- 'sandboxGid') map to them, as upstream maps them.
+data BuilderIds = BuilderIds
+  { builderUid :: !Word32,
+    builderGid :: !Word32
+  }
+  deriving (Eq, Show)
 
 -- | What a sandboxed build's plan is made from.  Paths are bytes; each
 -- input path is where the builder sees it, which is where it is on disk.
@@ -513,7 +525,9 @@ data PlanInputs = PlanInputs
     piNetwork :: !Network,
     piCaFile :: !(Maybe ByteString),
     piDevShmSize :: !ByteString,
-    piDropGroups :: !DropGroups
+    piDropGroups :: !DropGroups,
+    -- | Whom the builder runs as outside the sandbox.
+    piBuilderIds :: !BuilderIds
   }
   deriving (Eq, Show)
 
@@ -544,6 +558,7 @@ data SandboxPlan = SandboxPlan
     planDevShmSize :: !ByteString,
     planNetwork :: !Network,
     planDropGroups :: !DropGroups,
+    planBuilderIds :: !BuilderIds,
     -- | In the order they are made, which is the targets' sorted order,
     -- as upstream walks its @pathsInChroot@ map, so a directory is bound
     -- before anything bound beneath it.
@@ -608,6 +623,7 @@ sandboxPlan inputs
             planDevShmSize = piDevShmSize inputs,
             planNetwork = piNetwork inputs,
             planDropGroups = piDropGroups inputs,
+            planBuilderIds = piBuilderIds inputs,
             planBinds = [Bind target source access presence resolution | (target, Entry source access presence resolution) <- Map.toAscList withHostPaths],
             planEnvironment = piEnvironment inputs
           }
@@ -643,7 +659,7 @@ outsideSandboxMessage target = "the sandbox path '" <> TE.decodeUtf8Lenient targ
 -- | The first line of a plan, which names the format's version.  The
 -- helper refuses any other.
 planVersionLine :: ByteString
-planVersionLine = "nova-nix-sandbox-plan 4\n"
+planVersionLine = "nova-nix-sandbox-plan 5\n"
 
 -- | A plan as the helper reads it, given its tokens: the version line, a
 -- line holding the length in bytes of the rest, then each token, its
@@ -673,6 +689,8 @@ renderPlan plan =
           ["dev-shm-size", planDevShmSize plan],
           ["sandbox-uid", BS8.pack (show sandboxUid)],
           ["sandbox-gid", BS8.pack (show sandboxGid)],
+          ["host-uid", BS8.pack (show (builderUid (planBuilderIds plan)))],
+          ["host-gid", BS8.pack (show (builderGid (planBuilderIds plan)))],
           ["network", networkToken (planNetwork plan)],
           ["drop-groups", dropGroupsToken (planDropGroups plan)]
         ]
@@ -706,6 +724,10 @@ renderPlan plan =
 data SkeletonEntry
   = -- | A directory, and its mode.
     SkeletonDir !ByteString !Word32
+  | -- | The store directory, writable by its owner and its group and
+    -- sticky, whose group is the build users' when the build runs as one,
+    -- as upstream's is, so the builder can write its outputs there.
+    SkeletonStoreDir !ByteString
   | -- | A file, and its contents.
     SkeletonFile !ByteString !ByteString
   | -- | A symlink, and its target.
@@ -715,9 +737,9 @@ data SkeletonEntry
 -- | Upstream's chroot before the binds (@startBuilder@ in LDG): a
 -- writable @\/tmp@, @\/etc@ with the build user's @passwd@ and @group@ and,
 -- for a build with a network of its own, @hosts@, or for a fixed-output
--- one @nsswitch.conf@; the store directory, writable by its owner and
--- sticky; @\/proc@; and unless @\/dev@ is bound whole, @\/dev\/shm@,
--- @\/dev\/pts@ and the links into @\/proc\/self\/fd@ (@runChild@ in LDG).  A
+-- one @nsswitch.conf@; the store directory ('SkeletonStoreDir');
+-- @\/proc@; and unless @\/dev@ is bound whole, @\/dev\/shm@, @\/dev\/pts@
+-- and the links into @\/proc\/self\/fd@ (@runChild@ in LDG).  A
 -- directory above the store directory is created with the default mode.
 -- The helper gives @\/etc@ upstream's mode, 0555, once its binds are in
 -- place.
@@ -725,7 +747,7 @@ chrootSkeleton :: ByteString -> ByteString -> Network -> [SandboxPath] -> [Skele
 chrootSkeleton storeDir buildDirSeen network paths =
   [SkeletonDir "/tmp" stickyWritable, SkeletonDir "/etc" plainDir, SkeletonFile "/etc/passwd" (passwdFile buildDirSeen), SkeletonFile "/etc/group" groupFile]
     ++ networkFile
-    ++ [SkeletonDir storeDir stickyGroupWritable, SkeletonDir "/proc" plainDir]
+    ++ [SkeletonStoreDir storeDir, SkeletonDir "/proc" plainDir]
     ++ devEntries
   where
     networkFile = case network of
@@ -743,7 +765,6 @@ chrootSkeleton storeDir buildDirSeen network paths =
             SkeletonLink "/dev/stderr" "/proc/self/fd/2"
           ]
     stickyWritable = 0o1777
-    stickyGroupWritable = 0o1775
     plainDir = 0o755
 
 -- | Upstream's @\/etc\/passwd@ for a build (@startBuilder@ in LDG), whose
@@ -1258,6 +1279,9 @@ data DarwinPlan = DarwinPlan
     -- builder starts.
     darwinPlanBuildDir :: !ByteString,
     darwinPlanProfile :: !ByteString,
+    -- | The build user the builder runs as, or nothing for the invoking
+    -- user.
+    darwinPlanBuildUser :: !(Maybe BuilderIds),
     -- | The values of the parameters the profile reads, by name.
     darwinPlanParameters :: ![(ByteString, ByteString)],
     -- | The builder's environment, as @NAME=VALUE@ entries.
@@ -1266,37 +1290,42 @@ data DarwinPlan = DarwinPlan
   deriving (Eq, Show)
 
 -- | The parameters a macOS build's profile reads, as upstream names them
--- (@DarwinDerivationBuilder::setUser@), given the build directory,
--- resolved: @_NIX_BUILD_TOP@, the build directory; @_GLOBAL_TMP_DIR@, the
--- build directory too, without trailing slashes, which a subpath filter
+-- (@DarwinDerivationBuilder::setUser@), given the build directory and the
+-- directory the build may keep temporary files in, both resolved:
+-- @_NIX_BUILD_TOP@, the build directory; @_GLOBAL_TMP_DIR@, the
+-- temporary directory, without trailing slashes, which a subpath filter
 -- does not match through; and @_ALLOW_LOCAL_NETWORKING@ for a derivation
 -- that asks for it.
 --
--- Upstream's @_GLOBAL_TMP_DIR@ is the temporary directory Nix runs with,
--- @TMPDIR@ or @\/tmp@, where its build user owns nothing.  nova-nix's
--- builder runs as the invoking user, whose live Unix sockets and files are
--- there, so a build is given its own directory in its place, which its
--- @TMPDIR@ names already.  Undo when builds run as build users of their
--- own, under a daemon.
-darwinParameters :: ByteString -> LocalNetworking -> [(ByteString, ByteString)]
-darwinParameters buildDir local =
-  [("_NIX_BUILD_TOP", buildDir), ("_GLOBAL_TMP_DIR", BS8.dropWhileEnd (== '/') buildDir)]
+-- Upstream's temporary directory is the one Nix runs with, @TMPDIR@ or
+-- @\/tmp@, where its build user owns nothing, and so is a build's here
+-- when it runs as a build user.  A builder run as the invoking user,
+-- whose live Unix sockets and files are there, is given its build
+-- directory in its place, which its @TMPDIR@ names already.
+darwinParameters :: ByteString -> ByteString -> LocalNetworking -> [(ByteString, ByteString)]
+darwinParameters buildDir tmpDir local =
+  [("_NIX_BUILD_TOP", buildDir), ("_GLOBAL_TMP_DIR", BS8.dropWhileEnd (== '/') tmpDir)]
     ++ [("_ALLOW_LOCAL_NETWORKING", "1") | local == LocalNetworkingAllowed]
 
 -- | A macOS plan as the helper reads it ('framePlan'): the backend, the
--- build directory and the profile, then each parameter's name and value,
--- then the builder's environment.
+-- build directory, the profile and the build user's ids, @-@ for each when
+-- the builder runs as the invoking user, then each parameter's name and
+-- value, then the builder's environment.
 renderDarwinPlan :: DarwinPlan -> ByteString
 renderDarwinPlan plan =
   framePlan
     ( concat
         [ ["backend", "darwin"],
           ["build-dir", darwinPlanBuildDir plan],
-          ["profile", darwinPlanProfile plan]
+          ["profile", darwinPlanProfile plan],
+          ["build-uid", maybe noBuildUser (BS8.pack . show . builderUid) (darwinPlanBuildUser plan)],
+          ["build-gid", maybe noBuildUser (BS8.pack . show . builderGid) (darwinPlanBuildUser plan)]
         ]
         ++ concat [["param", name, value] | (name, value) <- darwinPlanParameters plan]
         ++ concatMap (\entry -> ["env", entry]) (darwinPlanEnvironment plan)
     )
+  where
+    noBuildUser = "-"
 
 -- ---------------------------------------------------------------------------
 -- The Windows plan
@@ -1723,6 +1752,9 @@ data DarwinStage
   | DarwinStageFork
   | DarwinStageSetsid
   | DarwinStageChdir
+  | DarwinStageSetgroups
+  | DarwinStageSetgid
+  | DarwinStageSetuid
   | DarwinStageSandbox
   | DarwinStageExec
   deriving (Eq, Show, Enum, Bounded)
@@ -1745,6 +1777,9 @@ darwinStageName stage = case stage of
   DarwinStageFork -> "fork"
   DarwinStageSetsid -> "setsid"
   DarwinStageChdir -> "chdir"
+  DarwinStageSetgroups -> "setgroups"
+  DarwinStageSetgid -> "setgid"
+  DarwinStageSetuid -> "setuid"
   DarwinStageSandbox -> "sandbox"
   DarwinStageExec -> "exec"
 
@@ -1780,6 +1815,9 @@ darwinSetupFailureMessage plan program record = case recordStage record of
   DarwinStageFork -> setup (sys "unable to fork")
   DarwinStageSetsid -> setup (sys "creating a new session")
   DarwinStageChdir -> setup (sys ("changing into \"" <> TE.decodeUtf8Lenient (darwinPlanBuildDir plan) <> "\""))
+  DarwinStageSetgroups -> setup (sys "cannot set supplementary groups of build user")
+  DarwinStageSetgid -> setup (sys "setgid failed")
+  DarwinStageSetuid -> setup (sys "setuid failed")
   DarwinStageSandbox -> setup "failed to configure sandbox"
   DarwinStageExec -> setup (sys ("executing '" <> TE.decodeUtf8Lenient program <> "'"))
   where
