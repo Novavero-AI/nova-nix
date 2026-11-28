@@ -17,6 +17,10 @@
 --
 -- * @srcs@ - whitespace-separated archive store paths, extracted in order
 --   into the single @out@ output.
+-- * @omit@ - optional, whitespace-separated paths of archive members left
+--   out of the tree, each as an archive names its entries, from its root.
+--   Each has to be in one of the archives: a path none holds fails the
+--   build, so a list of members to leave out cannot go stale unnoticed.
 -- * @out@ - the merged tree.
 --
 -- == Determinism
@@ -35,6 +39,7 @@ module Nix.Builder.Unpack
 
     -- * Derivation environment keys
     envSrcs,
+    envOmit,
 
     -- * Extraction budget
     UnpackLimits (..),
@@ -59,8 +64,10 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (toLower)
 import Data.Int (Int64)
-import Data.List (isSuffixOf)
+import Data.List (intercalate, isSuffixOf)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -94,6 +101,12 @@ builtinUnpackBuilder = "builtin:unpack"
 -- validation rejects it), so splitting on words is unambiguous.
 envSrcs :: Text
 envSrcs = "srcs"
+
+-- | Derivation environment key holding the whitespace-separated paths of
+-- archive members to leave out of the tree.  A member's path holds no
+-- whitespace where an archive this unpacks names it.
+envOmit :: Text
+envOmit = "omit"
 
 -- | Name of the output the merged tree is extracted into.
 unpackOutputName :: Text
@@ -183,47 +196,63 @@ runBuiltinUnpack storeDir limits drv outputDirs =
       Left _ -> failure "'srcs' contains invalid UTF-8"
       Right srcs
         | null (T.words srcs) -> failure "'srcs' is empty"
-        | otherwise -> case traverse resolveSrc (T.words srcs) of
-            Left bad -> failure ("'srcs' entry is not a store path: " <> bad)
-            Right archives -> case mOutDir of
+        | otherwise -> case (traverse resolveSrc (T.words srcs), omitted) of
+            (Left bad, _) -> failure ("'srcs' entry is not a store path: " <> bad)
+            (_, Left msg) -> failure msg
+            (Right archives, Right omit) -> case mOutDir of
               Nothing -> failure "derivation defines no 'out' output"
               Just outDir -> do
                 createDirectoryIfMissing True outDir
-                result <- unpackAll outDir limits archives
+                result <- unpackAll outDir omit limits archives
                 pure $ case result of
                   Left msg -> Left (1, "builtin:unpack: " <> msg)
-                  Right () -> Right ()
+                  Right seen -> case Set.toList (Set.difference omit seen) of
+                    [] -> Right ()
+                    missing : _ -> Left (1, "builtin:unpack: 'omit' names " <> T.pack (joinMember missing) <> ", which no archive in 'srcs' holds")
   where
     failure msg = pure (Left (1, "builtin:unpack: " <> msg))
     resolveSrc word = case parseStorePath defaultStoreDir word of
       Just sp -> Right (storePathToFilePath storeDir sp)
       Nothing -> Left word
+    omitted = case Map.lookup envOmit (drvEnv drv) of
+      Nothing -> Right Set.empty
+      Just bytes -> case TE.decodeUtf8' bytes of
+        Left _ -> Left "'omit' contains invalid UTF-8"
+        Right paths -> Set.fromList <$> traverse omittedMember (T.words paths)
+    omittedMember word = case entryComponents (T.unpack word) of
+      Left err -> Left ("'omit': " <> err)
+      Right [] -> Left ("'omit' names the archive root: " <> word)
+      Right comps -> Right comps
+    joinMember = intercalate "/"
 
--- | Extract archives in order, stopping at the first failure.  One
--- budget spans all of them: the caps bound the BUILD's output, not any
--- single archive.
-unpackAll :: FilePath -> UnpackLimits -> [FilePath] -> IO (Either Text ())
-unpackAll _ _ [] = pure (Right ())
-unpackAll outDir budget (archive : rest) = do
-  result <- unpackArchive outDir budget archive
-  case result of
-    Left err -> pure (Left err)
-    Right remaining -> unpackAll outDir remaining rest
+-- | Extract archives in order, stopping at the first failure, and return
+-- the members of @omit@ they held and left out.  One budget spans all of
+-- them: the caps bound the BUILD's output, not any single archive.
+unpackAll :: FilePath -> Set [FilePath] -> UnpackLimits -> [FilePath] -> IO (Either Text (Set [FilePath]))
+unpackAll outDir omit = go Set.empty
+  where
+    go seen _ [] = pure (Right seen)
+    go seen budget (archive : rest) = do
+      result <- unpackArchive outDir omit budget archive
+      case result of
+        Left err -> pure (Left err)
+        Right (remaining, held) -> go (Set.union seen held) remaining rest
 
--- | Unpack one archive into @outDir@, returning the budget left for the
--- archives after it.  The decompressor is chosen by file extension; the
--- tar stream is decoded (GNU + pax long names) and extracted entry by
--- entry.  The archive is read whole, and its file closed, before any of
--- it is decoded, so no handle on it outlives the extraction, whichever
--- entry stops it: a lazy read would hold the file open until a
--- collection, and an open file on Windows cannot be deleted.  It is
--- decompressed and decoded as the entries are forced, so a failure
+-- | Unpack one archive into @outDir@, leaving out the members @omit@
+-- names, and return the budget left for the archives after it with the
+-- members of @omit@ it held.  The decompressor is chosen by file
+-- extension; the tar stream is decoded (GNU + pax long names) and
+-- extracted entry by entry.  The archive is read whole, and its file
+-- closed, before any of it is decoded, so no handle on it outlives the
+-- extraction, whichever entry stops it: a lazy read would hold the file
+-- open until a collection, and an open file on Windows cannot be deleted.
+-- It is decompressed and decoded as the entries are forced, so a failure
 -- surfaces mid-extraction as an exception, and the whole extraction is
 -- wrapped to turn each kind into a clean failure: an 'IOException'
 -- reading the archive or writing the tree, or the 'GZip.DecompressError'
 -- the gzip decoder throws for a corrupt or truncated stream.
-unpackArchive :: FilePath -> UnpackLimits -> FilePath -> IO (Either Text UnpackLimits)
-unpackArchive outDir budget archivePath =
+unpackArchive :: FilePath -> Set [FilePath] -> UnpackLimits -> FilePath -> IO (Either Text (UnpackLimits, Set [FilePath]))
+unpackArchive outDir omit budget archivePath =
   run
     `catches` [ Handler (\(e :: IOException) -> failed e),
                 Handler (\(e :: GZip.DecompressError) -> failed e)
@@ -234,7 +263,7 @@ unpackArchive outDir budget archivePath =
       Nothing -> pure (Left ("unsupported archive format: " <> T.pack archivePath))
       Just decoder -> do
         raw <- BL.fromStrict <$> BS.readFile archivePath
-        extractEntries outDir budget (Tar.decodeLongNames (Tar.read (decoder raw)))
+        extractEntries outDir omit budget (Tar.decodeLongNames (Tar.read (decoder raw)))
 
 -- | Choose a decompressor from the archive file name: @.tar.gz@ (GitHub's
 -- archive of a commit) and plain @.tar@ are supported.
@@ -250,19 +279,22 @@ decoderFor path
 -- Entry extraction
 -- ---------------------------------------------------------------------------
 
--- | Walk the entry stream, extracting each entry under @outDir@ and
--- threading the remaining extraction budget.
-extractEntries :: FilePath -> UnpackLimits -> DecodedEntries -> IO (Either Text UnpackLimits)
-extractEntries outDir = go
+-- | Walk the entry stream, extracting each entry under @outDir@ but those
+-- @omit@ names, threading the remaining extraction budget and the members
+-- of @omit@ the stream held.  A member left out is not charged.
+extractEntries :: FilePath -> Set [FilePath] -> UnpackLimits -> DecodedEntries -> IO (Either Text (UnpackLimits, Set [FilePath]))
+extractEntries outDir omit = go Set.empty
   where
-    go budget stream = case stream of
-      Tar.Done -> pure (Right budget)
+    go seen budget stream = case stream of
+      Tar.Done -> pure (Right (budget, seen))
       Tar.Fail err -> pure (Left ("malformed archive: " <> T.pack (show err)))
-      Tar.Next entry rest -> do
-        result <- extractEntry outDir budget entry
-        case result of
-          Left err -> pure (Left err)
-          Right remaining -> go remaining rest
+      Tar.Next entry rest -> case entryComponents (TarEntry.entryTarPath entry) of
+        Right comps | Set.member comps omit -> go (Set.insert comps seen) budget rest
+        _ -> do
+          result <- extractEntry outDir budget entry
+          case result of
+            Left err -> pure (Left err)
+            Right remaining -> go seen remaining rest
 
 -- | Extract a single entry, after validating its path stays inside the
 -- archive root.

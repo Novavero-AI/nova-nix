@@ -2898,6 +2898,23 @@ jobs:
           fi
           bash .github/bootstrap/no-build-path.sh hello "$out" bin/hello.exe
 
+      # nova-nix trust's report of pkgs/windows' GNU Hello, whose closure
+      # is the stdenv's, the whole ladder, and Hello's source: the seed,
+      # and hex0, which reproduces it, are the only prebuilt code a build
+      # runs, and every other prebuilt file in a source archive is one
+      # pkgs/windows/unused-prebuilt.json lists, which the builds that
+      # unpack the archive remove.  .github/bootstrap/prebuilt-code.sh says
+      # what else fails.  trust takes each fixed-output input it reads from
+      # the substituters, or fetches it, and builds nothing.
+      - name: The seed is the only prebuilt code a build runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/bootstrap/prebuilt-code-cases.sh
+          seed=$("$RUNNER_TEMP/bin/nova-nix.exe" eval --expr '(import ./pkgs/windows/default.nix).stage0-pe32.seed.outPath' | tr -d '"\r')
+          "$RUNNER_TEMP/bin/nova-nix.exe" trust pkgs/windows/hello.nix --json --no-pretty > "$RUNNER_TEMP/trust.json"
+          bash .github/bootstrap/prebuilt-code.sh "$RUNNER_TEMP/trust.json" pkgs/windows/unused-prebuilt.json "$seed"
+
       # test/data/stdenv.nix's flags has busybox's sh run
       # stdenv-flags/flags.sh with the stdenv's PATH: gcc, cc, g++
       # and c++ by name, gcc with -std=c99 and from a make recipe, each

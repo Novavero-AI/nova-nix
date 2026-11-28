@@ -13,6 +13,12 @@
 #                                         through compiler and linker
 #                                         wrappers
 #   lib.nix                               callPackage and friends
+#   unused-prebuilt.json                  the prebuilt files in the source
+#                                         archives that no build uses, each
+#                                         with why: the builds that unpack
+#                                         an archive remove its files, and
+#                                         CI's trust check fails on a
+#                                         prebuilt file the list lacks
 #
 # The set is a fixpoint: callPackage reads each package.nix's formal parameters
 # and supplies them from the set being defined, so a package names its
@@ -23,6 +29,8 @@ let
   lib = import ./lib.nix;
 
   callPackage = lib.callPackageWith self;
+
+  unusedPrebuiltList = builtins.fromJSON (builtins.readFile ./unused-prebuilt.json);
 
   # by-name is sharded to keep any one directory small, so the two levels are
   # walked directly here: the shard is a storage detail and must not show up
@@ -57,6 +65,18 @@ let
     stdenv = callPackage ./stdenv { };
     seedStdenv = callPackage ./seed-stdenv { };
     fetchurl = import ./fetchurl.nix;
+
+    # The files unused-prebuilt.json lists in a source, as its archive names
+    # them, for each build that unpacks the archive to remove: none for a
+    # source that is not a fetched archive or that the list does not name.
+    unusedPrebuilt =
+      src:
+      if src ? outputHash then
+        builtins.concatMap (
+          group: if group.archive == src.name then group.paths else [ ]
+        ) unusedPrebuiltList
+      else
+        [ ];
   };
 in
 self

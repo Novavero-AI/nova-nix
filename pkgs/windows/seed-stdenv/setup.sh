@@ -10,6 +10,8 @@
 #   $dontConfigure                skip ./configure
 #   $buildPhase / $installPhase   replace the default build / install commands
 #   $patches                      patch files applied to the unpacked source
+#   $unusedPrebuilt               files of $src's archive the unpack phase
+#                                 removes, as the archive names them
 #   $preConfigure                 commands run in the source tree before
 #                                 configure
 #   $configureScript              the configure script, ./configure unless
@@ -134,6 +136,13 @@ if [ -d "$src" ]; then
 else
   # busybox's tar reads a compressed archive by its magic number.
   tar xf "$src"
+  # The prebuilt files pkgs/windows/unused-prebuilt.json lists in this
+  # archive, which no build uses, go before anything reads the tree.  rm
+  # fails on a file the archive does not hold, so a list that no longer
+  # matches its archive stops the build.
+  for unused in $unusedPrebuilt; do
+    rm "$unused"
+  done
   # cd into the single unpacked top-level directory.  Anything else is
   # ambiguous, so fail loudly instead of picking one.
   set -- */

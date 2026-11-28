@@ -26,6 +26,7 @@ module Test.Pkgs
     testGccNativeX8664Windows,
     testStdenvWindows,
     testWindowsSources,
+    testUnusedPrebuilt,
     testWindowsRungs,
     testWorkflowSpellings,
   )
@@ -45,13 +46,14 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Nix.Builder.Unpack (builtinUnpackBuilder)
+import Nix.Builder.Unpack (builtinUnpackBuilder, envOmit, envSrcs)
 import Nix.Builtins (parseNixPath)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform (..))
 import Nix.Eval (MonadEval (..), NixValue (..), evalParsed, mkStr, typeName, unrestrictedPolicy)
 import Nix.Eval.IO (EvalState (..), evalBaseEnv, newEvalStateWith, runEvalIO)
 import Nix.Hash (hashPlaceholder, sha256Digest)
 import qualified Nix.Hash as Hash
+import Nix.Json (Json (..), parseJson)
 import Nix.Parser (parseNix)
 import Nix.Store.Path (StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, parseStorePath, storePathToFilePath, storePathToText)
 import Nix.Store.Path.Internal (StorePath (..))
@@ -3615,6 +3617,160 @@ testWindowsSources = do
     knownSources :: [Text]
     knownSources = ["hex0-seed.exe", "busybox-w32-FRP-6354-g5f09fb446.tgz", "hello-2.12.3.tar.gz"]
 
+-- | A group of @pkgs\/windows\/unused-prebuilt.json@: prebuilt files in
+-- one source archive, unused for one reason.
+data UnusedGroup = UnusedGroup
+  { ugArchive :: !Text,
+    ugWhy :: !Text,
+    ugPaths :: ![Text]
+  }
+
+-- | The list's groups, each an object of exactly an @archive@, a @why@ and
+-- its @paths@, none of them empty.
+unusedGroups :: Json -> Either Text [UnusedGroup]
+unusedGroups document = case document of
+  JsonArray items -> traverse group items
+  _ -> Left "the list is not an array"
+  where
+    group item = case item of
+      JsonObject members
+        | Map.keys members == ["archive", "paths", "why"],
+          Just (JsonString archive) <- Map.lookup "archive" members,
+          Just (JsonString why) <- Map.lookup "why" members,
+          Just (JsonArray paths) <- Map.lookup "paths" members,
+          Just texts <- traverse string paths,
+          not (T.null archive || T.null why || null texts) ->
+            Right (UnusedGroup archive why texts)
+      _ -> Left ("a group is not an archive, why its files are unused and their paths: " <> T.pack (show item))
+    string value = case value of
+      JsonString text -> Just text
+      _ -> Nothing
+
+-- | Why a path the list names is not one an archive could name and both
+-- unpackers read the same way, or 'Nothing': a file under the archive's
+-- top-level directory, by a relative path of ASCII with no whitespace,
+-- which the seed stdenv's setup.sh splits the list at, and no empty,
+-- @.@ or @..@ component.
+unusedPathFault :: Text -> Maybe Text
+unusedPathFault path
+  | T.any (\c -> c > '~' || c <= ' ') path = Just "is not printable ASCII without whitespace"
+  | "/" `T.isPrefixOf` path = Just "is absolute"
+  | any (`elem` ["", ".", ".."]) components = Just "has an empty, . or .. component"
+  | length components < 2 = Just "is not under a top-level directory"
+  | otherwise = Nothing
+  where
+    components = T.splitOn "/" path
+
+-- | @pkgs\/windows\/unused-prebuilt.json@, the prebuilt files in the
+-- source archives that no build uses, against the package set.  The list
+-- is pinned by its shape and by its archives with how many files each, so
+-- that a change to it shows here as well as in the list.  Each build in
+-- the set that unpacks a listed archive removes exactly the archive's
+-- files: the seed stdenv's unpack phase, for the stdenv and the seed
+-- stdenv alike, those in @unusedPrebuilt@, and @builtin:unpack@ those in
+-- @omit@.  CI's trust check holds the list to the prebuilt files trust
+-- finds; this holds the builds to the list.
+testUnusedPrebuilt :: IO [Bool]
+testUnusedPrebuilt = do
+  putStrLn "pkgs/unused-prebuilt"
+  cwd <- Dir.getCurrentDirectory
+  let windows = cwd </> "pkgs" </> "windows"
+  contents <- try (BS.readFile (windows </> "unused-prebuilt.json"))
+  let parsed = case contents of
+        Left (err :: IOException) -> Left (T.pack (displayException err))
+        Right bytes -> either (Left . T.pack . show) Right (TE.decodeUtf8' bytes) >>= parseJson >>= unusedGroups
+  storeDir <- evalNixIOStoreDir
+  searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  let source =
+        T.concat
+          [ "let pkgs = import ",
+            nixQuotedPath windows,
+            "; derivationsIn = depth: value:",
+            " if !(builtins.isAttrs value) then [ ]",
+            " else if (value.type or null) == \"derivation\" then [ value.drvPath ]",
+            " else if depth == 0 then [ ]",
+            " else builtins.concatMap (name: derivationsIn (depth - 1) value.${name}) (builtins.attrNames value);",
+            " in builtins.concatStringsSep \" \" (derivationsIn ",
+            T.pack (show packageDepth),
+            " pkgs)"
+          ]
+  outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of
+    Left err -> pure (Left (T.pack (show err)))
+    Right expression -> runEvalIO st $ do
+      value <- evalParsed (pure (evalBaseEnv st)) expression
+      case value of
+        VStr bytes _ -> sessionClosure (T.words (bytesText bytes))
+        other -> throwEvalError ("expected the drvPaths as one string, got " <> typeName other)
+  case (parsed, outcome) of
+    (Left err, _) -> sequence [runTest shaped (Fail err)]
+    (_, Left err) -> sequence [runTest removes (Fail err)]
+    (Right groups, Right closure) -> do
+      let pathsOf archive = concat [ugPaths group | group <- groups, ugArchive group == archive]
+          archives = nub (map ugArchive groups)
+          allPaths = concatMap ugPaths groups
+          -- Each fetch's output, as a derivation names it in src or srcs,
+          -- with the fetch's name, the archive's name.
+          fetched =
+            Map.fromList
+              [ (storePathToText defaultStoreDir (doPath output), bytesText name)
+              | drv <- Map.elems closure,
+                drvBuilder drv == "builtin:fetchurl",
+                Just name <- [Map.lookup "name" (drvEnv drv)],
+                output <- drvOutputs drv
+              ]
+          variable name drv = bytesText <$> Map.lookup name (drvEnv drv)
+          -- Each build that unpacks a fetched archive: the archive's name,
+          -- the derivation's name, and the files the build removes, or
+          -- Nothing where it removes none by either variable.
+          unpacks =
+            [ (archive, bytesText (fromMaybe "" (Map.lookup "name" (drvEnv drv))), T.words <$> removed)
+            | drv <- Map.elems closure,
+              let (sourcesKey, removedKey) = unpackKeys drv
+                  removed = variable removedKey drv,
+              srcs <- maybeToList (variable sourcesKey drv),
+              archive <- mapMaybe (`Map.lookup` fetched) (T.words srcs)
+            ]
+          -- builtin:unpack names its archives in srcs and what it leaves
+          -- out in omit; a stdenv build its archive in src and what its
+          -- unpack phase removes in unusedPrebuilt.
+          unpackKeys drv
+            | drvBuilder drv == builtinUnpackBuilder = (envSrcs, envOmit)
+            | otherwise = ("src", "unusedPrebuilt")
+      sequence
+        [ runTest shaped Pass,
+          runTest "it lists these archives, with these many files in each" $
+            assertEqual "archives" pinnedArchives [(archive, length (pathsOf archive)) | archive <- sort archives],
+          runTest "each path is a file under its archive's top-level directory, by a path both unpackers read" $
+            assertEqual "paths" [] [(path, fault) | path <- allPaths, Just fault <- [unusedPathFault path]],
+          runTest "no file is listed twice" $
+            assertEqual "listed twice" [] [path | (path, count) <- Map.toList (Map.fromListWith (+) [(path, 1 :: Int) | path <- allPaths]), count > 1],
+          runTest "each group says why its files are unused, once" $
+            assertEqual "groups with a reason given twice for one archive" [] [archive | archive <- archives, let whys = [ugWhy group | group <- groups, ugArchive group == archive], length whys /= length (nub whys)],
+          runTest removes $
+            assertEqual "builds that unpack a listed archive and do not remove its files" [] [(archive, name, files) | (archive, name, files) <- unpacks, archive `elem` archives, files /= Just (pathsOf archive)],
+          runTest "a build that unpacks an archive the list does not name removes nothing" $
+            assertEqual "builds that remove files of an unlisted archive" [] [(archive, name, files) | (archive, name, files) <- unpacks, archive `notElem` archives, maybe False (not . null) files],
+          runTest "a build in the set unpacks each listed archive" $
+            assertEqual "listed archives no build unpacks" [] [archive | archive <- archives, archive `notElem` [unpacked | (unpacked, _, _) <- unpacks]]
+        ]
+  where
+    shaped :: Text
+    shaped = "the list is groups of an archive, why its files are unused and their paths"
+    removes :: Text
+    removes = "each build that unpacks a listed archive removes exactly its files"
+    packageDepth :: Int
+    packageDepth = 3
+    pinnedArchives :: [(Text, Int)]
+    pinnedArchives =
+      [ ("binutils-2.41.tar.xz", 7),
+        ("binutils-with-gold-2.46.tar.bz2", 7),
+        ("gcc-10.4.0.tar.xz", 53),
+        ("gcc-16.2.0.tar.xz", 57),
+        ("gcc-core-4.6.4.tar.gz", 4),
+        ("stage0-pe32-a81c837.tar.gz", 1)
+      ]
+
 -- | The workflow whose jobs build one leg of the seed ladder, a job for each
 -- stage, from the repository root.
 ladderWorkflowPath :: FilePath
@@ -3631,9 +3787,10 @@ packageSetBuild = "build " <> packageSetFile <> " -A "
 -- | The attribute paths a job's steps build from the package set, in the
 -- order the steps first name them, read from the workflow's lines.  A step
 -- names one outright, or through its loop's variable, alone or inside a
--- path, the loop being one @for NAME in WORD ...; do@ line.  A build
--- spelled any other way is an error and not a build passed over, so the
--- test fails on a step it cannot read where it would otherwise miss a rung.
+-- path, the loop being one @for NAME in WORD ...; do@ line.  A line that
+-- runs @nova-nix eval@ reads the set and builds nothing.  A build spelled
+-- any other way is an error and not a build passed over, so the test fails
+-- on a step it cannot read where it would otherwise miss a rung.
 jobPackageSetBuilds :: Text -> [Text] -> Either Text [Text]
 jobPackageSetBuilds jobId workflow = case dropWhile (/= jobKey) workflow of
   [] -> Left ("the workflow has no job " <> jobId)
@@ -3659,9 +3816,12 @@ jobPackageSetBuilds jobId workflow = case dropWhile (/= jobKey) workflow of
       | (_, found) <- T.breakOn packageSetBuild line,
         not (T.null found) =
           maybe (unread line) Right (expand loop (T.filter (/= '"') (T.takeWhile isArgumentChar (T.drop (T.length packageSetBuild) found))))
+      | evaluation `T.isInfixOf` line = Right []
       | packageSetFile `T.isInfixOf` line = unread line
       | otherwise = Right []
     isArgumentChar c = isAsciiLower c || isAsciiUpper c || isDigit c || c `elem` ("._-$\"" :: String)
+    -- The executable's path, which a step quotes, then the command.
+    evaluation = "nova-nix.exe\" eval "
     -- The paths an argument names, or nothing where it is not a path and
     -- not the loop's variable in one.
     expand loop argument

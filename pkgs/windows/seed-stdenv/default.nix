@@ -19,6 +19,7 @@
   busybox-w32,
   gnumake,
   tinycc-native,
+  unusedPrebuilt,
 }:
 let
   system = "i686-windows";
@@ -93,6 +94,9 @@ in
         # cannot work out from busybox's uname, whose system name is
         # Windows_NT.
         buildTriple = "i686-pc-mingw32";
+        # The files setup.sh's unpack phase removes from the archive:
+        # prebuilt code no build uses (../unused-prebuilt.json).
+        unusedPrebuilt = unusedPrebuilt (attrs.src or null);
       }
       # Parallel installing follows parallel building unless the package
       # says otherwise, as nixpkgs' mkDerivation sets it.

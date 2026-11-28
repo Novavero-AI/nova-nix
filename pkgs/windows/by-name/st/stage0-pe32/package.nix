@@ -20,9 +20,9 @@
 # and no shell but kaem.  The set is the seed, the ten links, the bin
 # directories kaem, mescc-tools and mescc-tools-extra, each with the
 # programs it holds as attributes, and writeText.
-{ fetchurl }:
+{ fetchurl, unusedPrebuilt }:
 let
-  sources = import ./sources.nix { inherit fetchurl; };
+  sources = import ./sources.nix { inherit fetchurl unusedPrebuilt; };
   inherit (sources)
     seed
     M2-Planet

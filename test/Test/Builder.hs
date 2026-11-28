@@ -108,7 +108,7 @@ import qualified Nix.Builder.Cores as Cores
 import Nix.Builder.Log (emptyPendingLine, endBuildLog, feedBuildLog)
 import qualified Nix.Builder.Sandbox as Sandbox
 import qualified Nix.Builder.Sandbox.Spawn as Spawn
-import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
+import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envOmit, envSrcs, resolveLinkTarget)
 import qualified Nix.Cli.Args as Cli
 import Nix.Config (NixConfig (..))
 import qualified Nix.Config as Config
@@ -3672,7 +3672,9 @@ tarPaxGlobalHeader records =
 -- archive root whose name begins with a dot.  A second build proves
 -- cross-archive file collisions fail loudly, and further builds that a
 -- parent-climbing (..) entry and drive-rooted file, symlink, and hardlink
--- paths are all rejected.
+-- paths are all rejected.  Members @omit@ names are left out, and an
+-- @omit@ path no archive holds, or one outside the archive, fails the
+-- build.
 testUnpackBuildIO :: IO [Bool]
 testUnpackBuildIO = do
   putStrLn "builder/unpack-seed-archives"
@@ -3824,6 +3826,10 @@ testUnpackBuildIO = do
           bigFileOut = StorePath (T.replicate 30 "0" <> "12") "unpack-size-budget"
           amplifyOut = StorePath (T.replicate 30 "0" <> "13") "unpack-amplify-budget"
           gitHubOut = StorePath (T.replicate 30 "0" <> "14") "unpack-github-archive"
+          omitOut = StorePath (T.replicate 30 "0" <> "15") "unpack-omit"
+          omitMissingOut = StorePath (T.replicate 30 "0" <> "16") "unpack-omit-missing"
+          omitEscapeOut = StorePath (T.replicate 30 "0" <> "17") "unpack-omit-escape"
+          omitting members drv = drv {drvEnv = Map.insert envOmit (TE.encodeUtf8 members) (drvEnv drv)}
       let config = defaultBuildConfig storeDir
       seedResult <- buildDerivation config store (mkUnpackDrv seedOut [archiveTools, archiveData]) testDrvPath
       collideResult <- buildDerivation config store (mkUnpackDrv collideOut [archiveTools, archiveCollide]) testDrvPath
@@ -3845,6 +3851,9 @@ testUnpackBuildIO = do
       -- such a read.
       amplifyClosed <- try (withBinaryFile archiveAmplify ReadWriteMode (const (pure ())))
       gitHubResult <- buildDerivation config store (mkUnpackDrv gitHubOut [archiveGitHub]) testDrvPath
+      omitResult <- buildDerivation config store (omitting "pkg/bin/tool-link.exe ./.hidden" (mkUnpackDrv omitOut [archiveTools, archiveData])) testDrvPath
+      omitMissingResult <- buildDerivation config store (omitting "pkg/bin/tool-link.exe pkg/bin/absent.exe" (mkUnpackDrv omitMissingOut [archiveTools])) testDrvPath
+      omitEscapeResult <- buildDerivation config store (omitting "../evil.txt" (mkUnpackDrv omitEscapeOut [archiveTools])) testDrvPath
       seedChecks <- case seedResult of
         BuildFailure msg code ->
           sequence
@@ -3993,7 +4002,27 @@ testUnpackBuildIO = do
               runTest "unpack: the pax global header is not extracted" $
                 assertEqual "top level" ["repo-0123456"] topLevel
             ]
-      pure (seedChecks ++ collideChecks ++ escapeChecks ++ maliciousChecks ++ dirLinkChecks ++ collisionGuardChecks ++ budgetChecks ++ guardChecks ++ gitHubChecks)
+      omitChecks <- case omitResult of
+        BuildFailure msg code ->
+          sequence
+            [ runTest "unpack: the members omit names are left out" $
+                Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg)
+            ]
+        BuildSuccess sp -> do
+          let outRoot = storePathToFilePath storeDir sp
+          present <- traverse (Dir.doesPathExist . (outRoot </>)) [".hidden", "pkg" </> "bin" </> "tool-link.exe", "pkg" </> "bin" </> "tool.exe", "pkg" </> "bin" </> "sh.exe", "pkg" </> "share" </> "data.txt"]
+          sequence
+            [ runTest "unpack: the members omit names are left out, by their paths from the archive's root" $
+                assertEqual ".hidden, tool-link.exe, tool.exe, sh.exe and data.txt present" [False, False, True, True, True] present
+            ]
+      omitFailureChecks <-
+        sequence
+          [ runTest "unpack: an omit path no archive holds fails the build, naming it" $
+              rejectedWith "'omit' names pkg/bin/absent.exe, which no archive in 'srcs' holds" omitMissingResult,
+            runTest "unpack: an omit path outside the archive fails the build" $
+              rejectedWith "'omit': entry path escapes archive root: ../evil.txt" omitEscapeResult
+          ]
+      pure (seedChecks ++ collideChecks ++ escapeChecks ++ maliciousChecks ++ dirLinkChecks ++ collisionGuardChecks ++ budgetChecks ++ guardChecks ++ gitHubChecks ++ omitChecks ++ omitFailureChecks)
 
 -- ---------------------------------------------------------------------------
 -- Profile trees and builtin:buildenv

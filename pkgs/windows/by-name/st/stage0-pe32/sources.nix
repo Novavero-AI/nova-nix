@@ -12,7 +12,7 @@
 # suite's stage0-pe32 group expects, and the link hashes the Stage0 (Windows)
 # CI job compares against, which stage0-pe32's own CI prints for the new
 # commit.
-{ fetchurl }:
+{ fetchurl, unusedPrebuilt }:
 let
   stage0-pe32Rev = "a81c8374592e8e897c0863d31c6480ea69669009";
 
@@ -34,11 +34,15 @@ let
         url = "https://github.com/${owner}/${repo}/archive/${rev}.tar.gz";
         inherit sha256;
       };
+      # builtin:unpack leaves out the members omit names: the prebuilt
+      # files pkgs/windows/unused-prebuilt.json lists in the archive, which
+      # no step uses.
       tree = derivation {
         inherit name;
         system = "builtin";
         builder = "builtin:unpack";
         srcs = [ archive ];
+        omit = unusedPrebuilt archive;
       };
     in
     {
