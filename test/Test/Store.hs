@@ -478,7 +478,26 @@ testExecBit = do
         forceRemoveIfExists dir
         pure $ case entry of
           NAR.NarDirectory [(_, NAR.NarDirectory [(_, NAR.NarRegular True _)])] -> Pass
-          other -> Fail ("expected one marked child, got: " <> T.pack (show other))
+          other -> Fail ("expected one marked child, got: " <> T.pack (show other)),
+      -- Upstream's dump refuses an entry 64 levels below the root, the
+      -- root at 0, before reading it, and no parser accepts its archive,
+      -- so neither the walk nor a reader of what is on disk takes it.
+      runTestM "the walk refuses an entry 64 levels below the root in upstream's words" $ do
+        dir <- freshExecBitDir "deep"
+        let parent = foldl (</>) dir (replicate 63 "d")
+            deepest = parent </> "f"
+        createDirectoryIfMissing True parent
+        BS.writeFile deepest "f"
+        walked <- try (ExecBit.serialiseFromPath processCaseHack dir) :: IO (Either IOException NAR.NarEntry)
+        readBack <- ExecBit.serialiseIfReadable processCaseHack dir
+        forceRemoveIfExists dir
+        pure $ case walked of
+          Left refusal ->
+            assertEqual
+              "refusal, and the tree read as no tree"
+              ("path '" <> T.pack deepest <> "' exceeds maximum NAR directory depth of 64", True)
+              (T.pack (ioeGetErrorString refusal), isNothing readBack)
+          Right _ -> Fail "the walk archived an entry 64 levels down"
     ]
 
 -- | An empty scratch directory for one 'testExecBit' case.

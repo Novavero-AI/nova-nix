@@ -1106,7 +1106,7 @@ sinkNarStream sink source = go Hash.hashInit 0 Stream.narStream `onException` ab
         sunk <- sinkNarEvent sink event
         either (stopWith . NarStreamRefused) (const (go ctx count next)) sunk
       Stream.NarFail msg -> stopWith (NarStreamMalformed (T.pack msg))
-      Stream.NarDone -> pure (Right (Hash.hashFinalize ctx, count))
+      Stream.NarDone () -> pure (Right (Hash.hashFinalize ctx, count))
     stopWith failure = Left failure <$ abortNarUnpack sink
 
 -- ---------------------------------------------------------------------------
