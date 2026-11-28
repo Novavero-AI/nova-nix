@@ -42,8 +42,10 @@ where
 
 import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar, withMVar)
 import Control.Exception (SomeException, bracketOnError, mask, onException, throwIO, try)
+import Data.Text (Text)
 import qualified Data.Text as T
 import Nix.Eval.CanonPath (canonPath)
+import Nix.Logger (Logger)
 import Nix.Store.CaseSensitive (CaseSensitivity, probeCaseSensitivity)
 import Nix.Store.DB (StoreDB, closeStoreDB, createStoreDirectories, metaDirName, openStoreDB)
 import Nix.Store.Lock (LockMode (..), PathLock, acquireLockFileWith, releasePathLock, withLockFileWith)
@@ -63,7 +65,11 @@ data Store = Store
     -- | How the volume holding the store compares sibling names, probed
     -- at open ('probeCaseSensitivity') and consulted by every NAR
     -- materialization into the store.
-    stCaseSensitivity :: !CaseSensitivity
+    stCaseSensitivity :: !CaseSensitivity,
+    -- | Where an operation through the handle reports what it is doing:
+    -- a wait on a lock, a collection's progress, a substitution's
+    -- messages, a build's messages and the lines its builder writes.
+    stLogger :: !Logger
   }
 
 -- | Upstream's name for the store-wide garbage-collector lock file.
@@ -93,19 +99,20 @@ canonicalStoreDir (StoreDir dir) = StoreDir . T.unpack . canonPath . T.pack <$> 
 -- collector's names what is being waited for.  A step that fails
 -- once the lease is held releases what was taken before it, the database
 -- and the lease, so a failed open holds nothing that a later collection
--- would wait on.
-openStore :: StoreDir -> IO Store
-openStore rawDir = do
+-- would wait on.  The line goes to the logger given, which the handle
+-- keeps for its operations ('stLogger').
+openStore :: Logger -> StoreDir -> IO Store
+openStore logger rawDir = do
   dir <- canonicalStoreDir rawDir
   let lockPath = gcLockFilePath dir
   createStoreDirectories dir
-  bracketOnError (acquireLockFileWith LockShared bigGcLockMessage lockPath) releasePathLock $ \lease ->
+  bracketOnError (acquireLockFileWith logger LockShared bigGcLockMessage lockPath) releasePathLock $ \lease ->
     bracketOnError (openStoreDB dir) closeStoreDB $ \db -> do
       -- After the directory exists: the probe answers for a path on disk,
       -- and a fresh store's directory sits on the volume it will live on.
       sensitivity <- probeCaseSensitivity (unStoreDir dir)
       leaseVar <- newMVar lease
-      pure Store {stDir = dir, stDB = db, stGcLease = leaseVar, stCaseSensitivity = sensitivity}
+      pure Store {stDir = dir, stDB = db, stGcLease = leaseVar, stCaseSensitivity = sensitivity, stLogger = logger}
 
 -- | Close the store: the database first, then the lease, so the lock
 -- outlives every write this handle made.  Waits for an in-progress
@@ -116,7 +123,7 @@ closeStore store = do
   withMVar (stGcLease store) releasePathLock
 
 -- | Upstream's announcement when the collector lock is busy.
-bigGcLockMessage :: String
+bigGcLockMessage :: Text
 bigGcLockMessage = "waiting for the big garbage collector lock..."
 
 -- | Run an action holding the collector lock exclusively.  The handle's
@@ -130,12 +137,13 @@ bigGcLockMessage = "waiting for the big garbage collector lock..."
 -- opened again), the surrendered lease goes back instead, so the handle
 -- stays closable: 'closeStore' releases it as a no-op, and the failure
 -- reaches the caller, whose handle holds no lease until it is closed.
+-- The message goes to the handle's logger.
 withCollectorLock :: Store -> IO a -> IO a
 withCollectorLock store act = mask $ \restore -> do
   lease <- takeMVar (stGcLease store)
   releasePathLock lease
-  outcome <- try (restore (withLockFileWith LockExclusive bigGcLockMessage lockPath (const act)))
-  renewed <- acquireLockFileWith LockShared bigGcLockMessage lockPath `onException` putMVar (stGcLease store) lease
+  outcome <- try (restore (withLockFileWith (stLogger store) LockExclusive bigGcLockMessage lockPath (const act)))
+  renewed <- acquireLockFileWith (stLogger store) LockShared bigGcLockMessage lockPath `onException` putMVar (stGcLease store) lease
   putMVar (stGcLease store) renewed
   either (\e -> throwIO (e :: SomeException)) pure outcome
   where

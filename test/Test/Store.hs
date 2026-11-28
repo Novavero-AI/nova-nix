@@ -89,7 +89,7 @@ import qualified System.Info as SI
 import qualified System.OsPath as OP
 import qualified System.Process as Proc
 import System.Timeout (timeout)
-import Test.Harness (TestResult (..), andThen, assertEqual, assertEvalErrorIO, bytesText, canonicalAs, chunkReader, deleteNamed, evalAndBuild, evalNix, evalNixIOIn, evalNixIOStore, findTestShell, forceRemoveIfExists, genDrvName, genFixturePath, mkTestBuildDrv, narInfoRequest, narSpecFileVector, narSpecVector, offeredThenFetched, parseErrorTag, posixOnlyEntries, quotedAsCxx, removeIfExists, runTest, runTestM, servedPaths, sigTestKeyText, simpleTestDrv, symlinksAvailable, testDrvPath, testEvalState, walkWatchdogMicros, withTempStore)
+import Test.Harness (TestResult (..), andThen, assertEqual, assertEvalErrorIO, bytesText, canonicalAs, chunkReader, deleteNamed, evalAndBuild, evalNix, evalNixIOIn, evalNixIOStore, findTestShell, forceRemoveIfExists, genDrvName, genFixturePath, mkTestBuildDrv, narInfoRequest, narSpecFileVector, narSpecVector, offeredThenFetched, parseErrorTag, posixOnlyEntries, quotedAsCxx, removeIfExists, runTest, runTestM, servedPaths, sigTestKeyText, simpleTestDrv, symlinksAvailable, testDrvPath, testEvalState, testLogger, walkWatchdogMicros, withTempStore)
 import qualified Test.QuickCheck as QC
 
 -- ---------------------------------------------------------------------------
@@ -501,7 +501,7 @@ testPathLocks = do
         createDirectoryIfMissing True lockRoot
         let dir = StoreDir lockRoot
             sp = StorePath (T.replicate 32 "a") "lockee"
-        held <- acquirePathLock dir sp
+        held <- acquirePathLock testLogger dir sp
         second <- tryAcquirePathLock dir sp
         releasePathLock held
         third <- tryAcquirePathLock dir sp
@@ -525,12 +525,12 @@ testPathLocks = do
               let tmpStore = tmpBase </> "nova-nix-test-lock-valid"
                   destPath = storePathToFilePath (StoreDir tmpStore) sp
               forceRemoveIfExists tmpStore
-              store <- openStore (StoreDir tmpStore)
+              store <- openStore testLogger (StoreDir tmpStore)
               createDirectoryIfMissing True destPath
               BS.writeFile (destPath </> "payload") "registered bytes"
               reg <- registrationFor store sp Nothing []
               registerPath (stDB store) reg
-              result <- offeredThenFetched defaultFetchRetryPolicy ioRetryEffects store [Subst.CacheConfig base [key] 40] sp
+              result <- offeredThenFetched defaultFetchRetryPolicy (ioRetryEffects testLogger) store [Subst.CacheConfig base [key] 40] sp
               survivor <- BS.readFile (destPath </> "payload")
               -- The short-circuit released the lock, so the path must be
               -- lockable again at once.
@@ -553,7 +553,7 @@ testPathLocks = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-lock-valid-strict"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let sp = StorePath (T.replicate 32 "d") "strictvalid"
             destPath = storePathToFilePath (StoreDir tmpStore) sp
         createDirectoryIfMissing True destPath
@@ -578,7 +578,7 @@ testPathLocks = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-lock-race"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let sp = StorePath (T.replicate 32 "e") "racepath"
             destPath = storePathToFilePath (StoreDir tmpStore) sp
             rawNar = NAR.serialise (NAR.NarDirectory [("data", NAR.NarRegular False "race payload")])
@@ -744,7 +744,7 @@ testCaseSensitiveVolumeBody base = do
             then Pass
             else Fail ("on disk: " <> T.pack (show names))
   forceRemoveIfExists storeRoot
-  store <- openStore storeDir
+  store <- openStore testLogger storeDir
   results <-
     sequence
       [ runTest "the store probes its volume as case-sensitive" $
@@ -1489,7 +1489,7 @@ testStoreAccessIO = do
       -- the installer, and one is made below the other.
       onWindows "a new store's directories and the parents made for them carry a protected DACL with no entry for Authenticated Users or Everyone" $ \user ->
         fresh "new" $
-          bracket (openStore (StoreDir (scratch "new" </> "nix" </> "store"))) closeStore $ \store -> do
+          bracket (openStore testLogger (StoreDir (scratch "new" </> "nix" </> "store"))) closeStore $ \store -> do
             let root = unStoreDir (stDir store)
             outer <- carries "the outer parent" (parentEntries user) (scratch "new")
             inner <- carries "the inner parent" (parentEntries user) (scratch "new" </> "nix")
@@ -1509,7 +1509,7 @@ testStoreAccessIO = do
           createDirectoryIfMissing True (scratch "file")
           let root = scratch "file" </> "store"
           BS.writeFile root "not a store"
-          outcome <- try (openStore (StoreDir root) >>= closeStore)
+          outcome <- try (openStore testLogger (StoreDir root) >>= closeStore)
           expected <- unStoreDir <$> canonicalStoreDir (StoreDir root)
           pure $ case outcome of
             Left err
@@ -1524,7 +1524,7 @@ testStoreAccessIO = do
           let root = scratch "existing" </> "store"
           createDirectoryIfMissing True root
           before <- directoryDacl root
-          openStore (StoreDir root) >>= closeStore
+          openStore testLogger (StoreDir root) >>= closeStore
           after <- directoryDacl root
           pure $
             assertEqual "protected before the open" (Just False) (daclProtected <$> before)
@@ -1600,10 +1600,10 @@ testStoreOpsIO = do
             (thrown, count, refusal) -> Fail ("expected the failure, one close and a refusal, got: " <> T.pack (show (thrown, count, refusal))),
         runTestM "the local store opens at its first operation, holds its lease while open, and closes when the action ends" $ do
           fresh
-          untouched <- withLocalStore config (const (Dir.doesDirectoryExist (metaDir storeDir)))
+          untouched <- withLocalStore testLogger config (const (Dir.doesDirectoryExist (metaDir storeDir)))
           -- An add of nothing asks nothing of the store.
-          emptyAdd <- withLocalStore config $ \ops -> (,) <$> soAddEvalObjects ops noObjects <*> Dir.doesDirectoryExist (metaDir storeDir)
-          during <- withLocalStore config $ \ops -> do
+          emptyAdd <- withLocalStore testLogger config $ \ops -> (,) <$> soAddEvalObjects ops noObjects <*> Dir.doesDirectoryExist (metaDir storeDir)
+          during <- withLocalStore testLogger config $ \ops -> do
             asked <- sqValidPaths (soQueries ops) (Set.singleton (StorePath (T.replicate 32 "q") "queried"))
             (,) asked <$> leaseHeld storeDir
           after <- leaseHeld storeDir
@@ -1626,9 +1626,9 @@ testStoreOpsIO = do
           let named = mapMaybe (parseStorePath defaultStoreDir)
           case (Map.keys . eoSources <$> recorded, named . Map.keys . eoStoreWrites <$> recorded, named . Map.keys . eoDerivations <$> recorded, recorded) of
             (Right [src], Right [note], Right [drv], Right objects) -> do
-              added <- withLocalStore config (`soAddEvalObjects` objects)
+              added <- withLocalStore testLogger config (`soAddEvalObjects` objects)
               (valid, references) <-
-                bracket (openStore storeDir) closeStore $ \store ->
+                bracket (openStore testLogger storeDir) closeStore $ \store ->
                   (,) <$> filterM (isValid store) [src, note, drv] <*> traverse (fmap Set.fromList . queryReferences (stDB store)) [src, note, drv]
               landed <- registrationOrder storeDir
               pure $
@@ -1647,7 +1647,7 @@ testStoreOpsIO = do
           plantedDir <- canonicalStoreDir planted
           refusal <- upstreamManagedRefusal ReplacesUpstreamPaths plantedDir
           (nothingAdded, added, built, checked) <-
-            withLocalStore (defaultBuildConfig plantedDir) $ \ops ->
+            withLocalStore testLogger (defaultBuildConfig plantedDir) $ \ops ->
               (,,,)
                 <$> soAddEvalObjects ops noObjects
                 <*> soAddEvalObjects ops (EvalObjects Map.empty (Map.singleton (storePathToText defaultStoreDir (StorePath (T.replicate 32 "t") "tree")) ([], WriteRecursive)) Map.empty)
@@ -1672,9 +1672,9 @@ testStoreOpsIO = do
               building = mkTestBuildDrv shell buildingOut "mkdir -p $out && echo built > $out/value"
               recipes = noObjects {eoDerivations = Map.fromList [(storePathToText defaultStoreDir sp, toATerm drv) | (sp, drv) <- [(failingDrv, failing), (buildingDrv, building)]]}
           (directBuild, directCheck) <-
-            bracket (openStore storeDir) closeStore $ \store ->
+            bracket (openStore testLogger storeDir) closeStore $ \store ->
               (,) <$> buildWithDeps config store failing failingDrv <*> buildWithDeps config {bcMode = Realise.BuildCheck} store failing failingDrv
-          (added, stopped, unchecked, built, checked) <- withLocalStore config $ \ops ->
+          (added, stopped, unchecked, built, checked) <- withLocalStore testLogger config $ \ops ->
             (,,,,)
               <$> soAddEvalObjects ops recipes
               <*> soBuild ops [(failingDrv, Set.singleton "out")]
@@ -1814,7 +1814,7 @@ testNarKnownAnswer = do
         createDirectoryIfMissing True srcDir
         createDirectoryIfMissing True tmpStore
         BS.writeFile (srcDir </> "data.txt") "hello\n"
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let sp = StorePath (T.replicate 32 "e") "nar-vector"
         addToStore store srcDir sp Nothing []
         recorded <- queryPathInfo (stDB store) sp
@@ -2059,7 +2059,7 @@ testStoreDelete = do
           createDirectoryIfMissing True outsideDir
           TIO.writeFile planted "outside the store"
           flip finally (forceRemoveIfExists sandbox) $
-            bracket (openStore (StoreDir (root </> "store"))) closeStore $ \escapeStore -> do
+            bracket (openStore testLogger (StoreDir (root </> "store"))) closeStore $ \escapeStore -> do
               let storeRoot = unStoreDir (stDir escapeStore)
               rootBefore <- listing root
               storeBefore <- listing storeRoot
@@ -2142,7 +2142,7 @@ testStoreDelete = do
           registerPath (stDB store) (PathRegistration guarded "sha256:l" 1 Nothing [])
           createDirectoryIfMissing True treePath
           TIO.writeFile (treePath </> "data.txt") "guarded"
-          holder <- acquirePathLock sd guarded
+          holder <- acquirePathLock testLogger sd guarded
           done <- newEmptyMVar
           _ <- forkIO (deleteNamed store (basenameOf guarded) >>= putMVar done)
           early <- timeout deleteLockProbeMicros (takeMVar done)
@@ -2173,7 +2173,7 @@ testStoreDelete = do
           case makeFixedOutputPath "mat-locked" "sha256" NarIngestion (sha256Digest (NAR.serialise entry)) of
             Left err -> pure (Fail ("test store path rejected: " <> T.pack (show err)))
             Right guarded -> do
-              holder <- acquirePathLock sd guarded
+              holder <- acquirePathLock testLogger sd guarded
               done <- newEmptyMVar
               _ <- forkIO (materializeEvalSources store (Map.singleton guarded (T.pack srcDir)) >>= putMVar done)
               early <- timeout deleteLockProbeMicros (takeMVar done)
@@ -2356,7 +2356,7 @@ testStoreGC = do
           -- opened through '.', '..' and a trailing separator (and, when
           -- the temp store shares the working directory's drive, through
           -- a relative path) is the same store with the same root.
-          runTestM "openStore keys the store by one spelling of its directory" $ do
+          runTestM "openStore testLogger keys the store by one spelling of its directory" $ do
             cwd <- Dir.getCurrentDirectory
             let dotted = unStoreDir sd </> "." </> "zig" </> ".." <> [pathSeparator]
                 relative =
@@ -2365,7 +2365,7 @@ testStoreGC = do
                   ]
                 spellings = dotted : relative
                 inspect spelling = do
-                  other <- openStore (StoreDir spelling)
+                  other <- openStore testLogger (StoreDir spelling)
                   roots <- findRoots other
                   closeStore other
                   pure (stDir other, roots)
@@ -2470,7 +2470,7 @@ testStoreGC = do
           -- collector needs it exclusive, so it waits for the other
           -- handle to close and runs the moment it does.
           runTestM "collectGarbage waits for another open handle to close" $ do
-            other <- openStore sd
+            other <- openStore testLogger sd
             done <- newEmptyMVar
             _ <- forkIO (collect >>= putMVar done)
             early <- timeout deleteLockProbeMicros (takeMVar done)
@@ -2491,7 +2491,7 @@ testStoreGC = do
               else do
                 let renewalStore = tmpBase </> "nova-nix-test-gc-renewal"
                 Dir.removePathForcibly renewalStore
-                other <- openStore (StoreDir renewalStore)
+                other <- openStore testLogger (StoreDir renewalStore)
                 let lockPath = gcLockFilePath (stDir other)
                 swapped <- try (withCollectorLock other (Dir.removeFile lockPath >> Dir.createDirectory lockPath))
                 closed <- timeout raceWatchdogMicros (closeStore other)
@@ -2511,7 +2511,7 @@ testStoreGC = do
             createDirectoryIfMissing True metaPath
             BS.writeFile (metaPath </> dbFileName) "not a database"
             before <- openDescriptors
-            opened <- try (openStore (StoreDir failingStore))
+            opened <- try (openStore testLogger (StoreDir failingStore))
             after <- openDescriptors
             probe <- FileLock.tryLockFile (gcLockFilePath (StoreDir failingStore)) FileLock.Exclusive
             mapM_ FileLock.unlockFile probe
@@ -2645,7 +2645,7 @@ testStoreGCUpstreamManaged = do
   createDirectoryIfMissing True (takeDirectory upstreamDb)
   BS.writeFile upstreamDb ""
   plant sd
-  store <- openStore sd
+  store <- openStore testLogger sd
   -- The handle's spelling of the directory, which the refusal names and
   -- the sweep reports in.
   let opened = stDir store
@@ -2665,7 +2665,7 @@ testStoreGCUpstreamManaged = do
           let sibling = StoreDir (root </> "nix" </> "nova-store")
           createDirectoryIfMissing True (unStoreDir sibling)
           plant sibling
-          other <- openStore sibling
+          other <- openStore testLogger sibling
           collected <- collectGarbage other
           closeStore other
           treeGone <- not <$> Dir.doesPathExist (storePathToFilePath sibling upstreamPath)
@@ -2688,7 +2688,7 @@ testStoreGCUpstreamManaged = do
               createDirectoryIfMissing True (unStoreDir linkedStore)
               plant linkedStore
               Dir.createDirectoryLink (unStoreDir linkedStore) link
-              viaLink <- openStore (StoreDir link)
+              viaLink <- openStore testLogger (StoreDir link)
               collected <- collectGarbage viaLink
               closeStore viaLink
               treeKept <- Dir.doesPathExist (storePathToFilePath linkedStore upstreamPath </> "data")
@@ -2761,7 +2761,7 @@ testStoreWritesUpstreamManaged = do
             pure sd
           withPlantedStore dir action = do
             sd <- planted (StoreDir (root </> "nix" </> dir))
-            bracket (openStore sd) closeStore $ \store ->
+            bracket (openStore testLogger sd) closeStore $ \store ->
               action store (defaultBuildConfig (stDir store))
           kept store sp = (== Right upstreamBytes) <$> (try (BS.readFile (storePathToFilePath (stDir store) sp </> "data")) :: IO (Either IOException BS.ByteString))
           -- The refusal names upstream's database and this store's
@@ -2803,7 +2803,7 @@ testStoreWritesUpstreamManaged = do
                 withPlantedStore "store" $ \store _ -> do
                   -- A substitution that went ahead holds the path's lock,
                   -- which the next one would wait on forever.
-                  streamed <- offeredThenFetched defaultFetchRetryPolicy ioRetryEffects store [cache base] substPath
+                  streamed <- offeredThenFetched defaultFetchRetryPolicy (ioRetryEffects testLogger) store [cache base] substPath
                   releaseHeld streamed
                   unpacked <- Subst.unpackAndVerify store substPath narInfo nar
                   releaseHeld unpacked
@@ -2834,7 +2834,7 @@ testStoreWritesUpstreamManaged = do
               withHttpServer route $ \base requests _ ->
                 withPlantedStore "nova-store" $ \store config -> do
                   restored <- try (materializeEvalSources store Map.empty) :: IO (Either IOException ())
-                  substituted <- offeredThenFetched defaultFetchRetryPolicy ioRetryEffects store [cache base] substPath
+                  substituted <- offeredThenFetched defaultFetchRetryPolicy (ioRetryEffects testLogger) store [cache base] substPath
                   fetched <- case substituted of
                     Subst.SubstSuccess _ lock -> do
                       releasePathLock lock
@@ -2854,7 +2854,7 @@ testStoreWritesUpstreamManaged = do
                   freshDir = StoreDir (fresh </> "nix" </> "store")
               createDirectoryIfMissing True (fresh </> "nix" </> "var" </> "nix" </> "db")
               BS.writeFile (fresh </> "nix" </> "var" </> "nix" </> "db" </> "db.sqlite") ""
-              added <- withLocalStore (defaultBuildConfig freshDir) $ \ops -> soAddSourceTree ops "tree" Set.empty (NAR.NarRegular False "x")
+              added <- withLocalStore testLogger (defaultBuildConfig freshDir) $ \ops -> soAddSourceTree ops "tree" Set.empty (NAR.NarRegular False "x")
               madeDatabase <- Dir.doesPathExist (unStoreDir freshDir </> metaDirName)
               pure $ case added of
                 Left reason | "upstream Nix's database" `T.isInfixOf` reason, not madeDatabase -> Pass

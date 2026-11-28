@@ -3297,8 +3297,8 @@ deepForce = void . forceInside Set.empty
 builtinSeq :: (MonadEval m) => NixValue -> NixValue -> m NixValue
 builtinSeq !_first = pure
 
--- | @builtins.trace msg val@ - print @msg@ to stderr, then force and
--- return @val@.
+-- | @builtins.trace msg val@ - report @msg@ ('traceMessage'), then force
+-- and return @val@.
 builtinTrace :: (MonadEval m) => NixValue -> BuiltinArg -> m NixValue
 builtinTrace msgVal result = emitTrace msgVal >> argValue result
 
@@ -3319,8 +3319,8 @@ emitTrace msgVal =
     VStr s _ -> pure (bytesToTextLossy s)
     other -> printValue PrintInFull other
 
--- | @builtins.warn msg val@ - print warning to stderr, then force and
--- return @val@.
+-- | @builtins.warn msg val@ - report a warning ('traceMessage'), then
+-- force and return @val@.
 --
 -- The message must be a string: upstream's @prim_warn@ forces it with
 -- @forceString@ (primops.cc at 2.24.9), leaving room to extend the

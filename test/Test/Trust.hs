@@ -42,7 +42,7 @@ import Nix.Trust.Scan (scanFetched)
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory)
 import qualified System.Directory as Dir
 import System.FilePath (takeDirectory, (</>))
-import Test.Harness (TestResult (..), andThen, assertEqual, bytesText, evalNixIOStoreDir, forceRemoveIfExists, nixQuotedPath, runTest, runTestM, sessionClosure, symlinksAvailable, tarDir, tarFile, testOrigin, testSessionStore, trustPe)
+import Test.Harness (TestResult (..), andThen, assertEqual, bytesText, evalNixIOStoreDir, forceRemoveIfExists, nixQuotedPath, runTest, runTestM, sessionClosure, symlinksAvailable, tarDir, tarFile, testLogger, testOrigin, testSessionStore, trustPe)
 import qualified Test.QuickCheck as QC
 import Text.Read (readMaybe)
 
@@ -641,7 +641,7 @@ testTrustWindowsGraphs = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       source = "builtins.concatStringsSep \" \" [ " <> windows <> ".stage0-pe32.kaem-unwrapped.drvPath " <> windows <> ".hello.drvPath ]"
   outcome <- case parseNix cwd testOrigin (TE.encodeUtf8 source) of

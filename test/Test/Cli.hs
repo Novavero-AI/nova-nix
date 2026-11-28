@@ -78,7 +78,7 @@ import System.IO.Error (ioeGetErrorString)
 import qualified System.Info as SI
 import qualified System.OsPath as OP
 import qualified System.Process as Proc
-import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertLeft, assertRight, canonicalAs, envSpelling, evalAndBuild, evalNixIOStore, fetchedStorePath, findTestShell, forceRemoveIfExists, genJson, hostToolsAttrs, makeGitFixture, nixQuotedPath, profileFixture, runTest, runTestM, selfHoldingDerivation, selfHoldingPrinted, selfHoldingPrintedStrict, signedTestNarInfo, symlinksAvailable, tarFile, throwawayKey, trustPe)
+import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertLeft, assertRight, canonicalAs, envSpelling, evalAndBuild, evalNixIOStore, fetchedStorePath, findTestShell, forceRemoveIfExists, genJson, hostToolsAttrs, makeGitFixture, nixQuotedPath, profileFixture, runTest, runTestM, selfHoldingDerivation, selfHoldingPrinted, selfHoldingPrintedStrict, signedTestNarInfo, symlinksAvailable, tarFile, testLogger, throwawayKey, trustPe)
 import qualified Test.QuickCheck as QC
 import Text.Read (readMaybe)
 
@@ -177,7 +177,7 @@ testProfileCLI = do
         -- The store is under a linked directory, so the tree names a
         -- directory it expands at a spelling other than the store's.
         Dir.createDirectoryLink (root </> "real") (root </> "via")
-        store <- openStore (StoreDir (root </> "via" </> "store"))
+        store <- openStore testLogger (StoreDir (root </> "via" </> "store"))
         let storeDir = stDir store
             storeArg = unStoreDir storeDir
             inStore = storePathToFilePath storeDir

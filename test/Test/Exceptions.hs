@@ -32,7 +32,7 @@ import System.FilePath (takeDirectory, (</>))
 import System.IO (IOMode (..), withBinaryFile)
 import qualified System.Info as SI
 import qualified System.Process as Proc
-import Test.Harness (TestResult (..), forceRemoveIfExists, runTestM, testEvalState)
+import Test.Harness (TestResult (..), forceRemoveIfExists, runTestM, testEvalState, testLogger)
 
 -- ---------------------------------------------------------------------------
 -- Tests: an interrupt stops the operation it reaches
@@ -120,7 +120,7 @@ testInterruptsPropagate = do
         | otherwise = runTestM name test
   forceRemoveIfExists root
   createDirectoryIfMissing True (unStoreDir storeDir)
-  results <- bracket (openStore storeDir) closeStore $ \store ->
+  results <- bracket (openStore testLogger storeDir) closeStore $ \store ->
     sequence
       [ runTestM "an interrupt during a push request stops the push" $
           withHttpServer (\_ _ -> Trickle) $ \base _ requested -> do

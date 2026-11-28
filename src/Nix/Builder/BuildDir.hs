@@ -40,8 +40,8 @@
 --
 -- A build's directory is removed when the build ends, however it ends,
 -- unless the build did not succeed and @keep-failed@ is on ('KeepFailed'):
--- then it stays, and the directory the builder worked in is named on
--- standard error, as upstream keeps and names it.  A build that does not
+-- then it stays, and the directory the builder worked in is named to the
+-- logger, as upstream keeps and names it.  A build that does not
 -- succeed is one that stopped short of registering its outputs, or a
 -- check that found one different, whether it stopped with a failure or an
 -- exception, an interrupt included, as upstream keeps the directory of
@@ -77,13 +77,12 @@ where
 
 import Control.Exception (IOException, catch, displayException, mask, onException, throwIO)
 import qualified Data.Text as T
-import qualified Data.Text.IO as TIO
+import Nix.Logger (Logger (..), logWarning)
 import Nix.Store.Access (DirAccess (OwnerAccess), createDirectoryWith)
 import Nix.Store.DB (metaDirName)
 import Nix.Store.Path (StoreDir (..), StorePath (spHash))
 import System.Directory (createDirectoryIfMissing, doesPathExist, pathIsSymbolicLink, removePathForcibly, renamePath)
 import System.FilePath (takeDirectory, (</>))
-import System.IO (stderr)
 
 -- | The directory under the store's state directory that holds every
 -- build directory: upstream's name for its own under its state
@@ -126,8 +125,8 @@ workDirIn workDir dir = case workDir of
 data FailedBuilds
   = -- | It is removed, as it is when the build succeeds.
     RemoveFailed
-  | -- | It is kept, and the directory the builder worked in is named on
-    -- standard error.
+  | -- | It is kept, and the directory the builder worked in is named to
+    -- the logger.
     KeepFailed
   deriving (Eq, Show)
 
@@ -142,19 +141,19 @@ data BuildEnding
 -- | Remove what an earlier build left at a path, or where it cannot be
 -- removed, move it aside, to the first free name of the path with
 -- @.leftover.@ and a number after it, beside it in the state directory,
--- and say so on standard error, so the build goes on.  A build can leave
+-- and warn the logger, so the build goes on.  A build can leave
 -- what its user cannot remove: a directory another user made in it,
 -- through a descriptor a fixed-output builder handed out, which the user
 -- may neither empty nor change, and which removal would otherwise trip on
 -- at every build of the derivation, the name being the derivation's.
 -- What cannot be moved either fails with the removal's error.
-clearLeftover :: FilePath -> IO ()
-clearLeftover path = removePathForcibly path `catch` setAside
+clearLeftover :: Logger -> FilePath -> IO ()
+clearLeftover logger path = removePathForcibly path `catch` setAside
   where
     setAside (failure :: IOException) = do
       aside <- freeName (1 :: Int)
       renamePath path aside `catch` \(_ :: IOException) -> throwIO failure
-      TIO.hPutStrLn stderr ("warning: cannot remove '" <> T.pack path <> "', which an earlier build left (" <> T.pack (displayException failure) <> "); it is now '" <> T.pack aside <> "'")
+      logWarning logger ("cannot remove '" <> T.pack path <> "', which an earlier build left (" <> T.pack (displayException failure) <> "); it is now '" <> T.pack aside <> "'")
     freeName number = do
       let candidate = path <> ".leftover." <> show number
       taken <- (||) <$> doesPathExist candidate <*> pathIsSymbolicLink candidate `catch` \(_ :: IOException) -> pure False
@@ -171,10 +170,11 @@ clearLeftover path = removePathForcibly path `catch` setAside
 -- the directory is removed, unless the build failed under 'KeepFailed';
 -- an exception is a failure.  When the creation fails, whatever took the
 -- name first is left as it is, since this build did not make it.
-withBuildDir :: StoreDir -> StorePath -> WorkDir -> FailedBuilds -> (a -> BuildEnding) -> (FilePath -> IO a) -> IO a
-withBuildDir storeDir firstOutput workDir failedBuilds ending build = do
+-- What it says goes to the logger.
+withBuildDir :: Logger -> StoreDir -> StorePath -> WorkDir -> FailedBuilds -> (a -> BuildEnding) -> (FilePath -> IO a) -> IO a
+withBuildDir logger storeDir firstOutput workDir failedBuilds ending build = do
   createDirectoryIfMissing True (takeDirectory dir)
-  clearLeftover dir
+  clearLeftover logger dir
   mask $ \restore -> do
     createBuildDir dir
     createWorkDir `onException` removeBuildDir dir
@@ -189,7 +189,7 @@ withBuildDir storeDir firstOutput workDir failedBuilds ending build = do
     leave BuildSucceeded = removeBuildDir dir
     leave BuildFailed = case failedBuilds of
       RemoveFailed -> removeBuildDir dir
-      KeepFailed -> TIO.hPutStrLn stderr (keptMessage (workDirIn workDir dir))
+      KeepFailed -> logMessage logger (keptMessage (workDirIn workDir dir))
 
 -- | The note naming a kept build directory, in upstream's words, the path
 -- in the double quotes upstream puts a path in.

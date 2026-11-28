@@ -38,13 +38,12 @@ import Data.Int (Int32)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text.Encoding as TE
-import qualified Data.Text.IO as TIO
 import Nix.Derivation (Derivation (..))
+import Nix.Logger (Logger, logWarning)
 import Nix.Profile.Tree (Built (..), Package (..), buildEnvFailureText, buildProfile, storePackagePath, storeTreeReader, warningText, writeTree)
 import Nix.Store.Path (StoreDir)
 import Nix.Store.Symlink (createSymlinkOfKind)
 import System.Directory (createDirectoryIfMissing)
-import System.IO (stderr)
 import System.OsPath (OsPath, (</>))
 import qualified System.OsPath as OP
 import Text.Read (readMaybe)
@@ -210,14 +209,14 @@ derivationsErrorText failure = case failure of
 -- ---------------------------------------------------------------------------
 
 -- | Run a @builtin:buildenv@ derivation: make its @out@ output the tree of
--- the packages @derivations@ names, printing each warning the tree gives,
--- and link @manifest.nix@ in it to @manifest@.  Upstream reads
+-- the packages @derivations@ names, giving the logger each warning the
+-- tree gives, and link @manifest.nix@ in it to @manifest@.  Upstream reads
 -- @manifest@ once the tree is made, so a tree that fails is the failure
 -- reported when both do.  Returns a failure's exit code and message, which
 -- "Nix.Builder" reports as a refused builder, so the shared validation and
 -- registration there follow.
-runBuiltinBuildenv :: StoreDir -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
-runBuiltinBuildenv storeDir drv outputDirs = first failed <$> runExceptT build
+runBuiltinBuildenv :: Logger -> StoreDir -> Derivation -> [(Text, FilePath)] -> IO (Either (Int, Text) ())
+runBuiltinBuildenv logger storeDir drv outputDirs = first failed <$> runExceptT build
   where
     failed reason = (1, "builtin:buildenv: " <> reason)
     build = do
@@ -227,7 +226,7 @@ runBuiltinBuildenv storeDir drv outputDirs = first failed <$> runExceptT build
       packages <- traverse (\(path, priority) -> (`Package` priority) <$> named derivationsKey path) (elementPackages elements)
       out <- liftIO (OP.encodeFS outDir)
       Built warnings tree <- liftIO (buildProfile (storeTreeReader storeDir) out packages)
-      liftIO (traverse_ (TIO.hPutStrLn stderr . ("warning: " <>) . warningText) warnings)
+      liftIO (traverse_ (logWarning logger . warningText) warnings)
       linked <- liftEither (first buildEnvFailureText tree)
       ExceptT (writeTree out linked)
       manifest <- attribute manifestKey >>= named manifestKey

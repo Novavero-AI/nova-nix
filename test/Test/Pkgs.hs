@@ -58,7 +58,7 @@ import Nix.Store.Path.Internal (StorePath (..))
 import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
 import System.FilePath ((</>))
-import Test.Harness (TestResult (..), assertEqual, bytesText, evalNixIO, evalNixIOStoreDir, nixQuotedPath, runTest, runTestIO, runTestM, sessionClosure, testOrigin, testSessionStore)
+import Test.Harness (TestResult (..), assertEqual, bytesText, evalNixIO, evalNixIOStoreDir, nixQuotedPath, runTest, runTestIO, runTestM, sessionClosure, testLogger, testOrigin, testSessionStore)
 
 -- ---------------------------------------------------------------------------
 -- Tests: NAR and hash known-answer vectors
@@ -137,7 +137,7 @@ testStage0Pe32Chain = do
   -- which resolves against the checkout's data directory as the installed
   -- binary resolves it against its own.
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let chain = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ").stage0-pe32"
       runCommandTests = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "run-command.nix")
       quoted name = "\"" <> name <> "\""
@@ -435,7 +435,7 @@ testMesWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "mes.nix")
       quoted name = "\"" <> name <> "\""
@@ -586,7 +586,7 @@ testTinyccWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "tinycc.nix")
       quoted name = "\"" <> name <> "\""
@@ -858,7 +858,7 @@ testGnumakeWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gnumake.nix")
       source =
@@ -960,7 +960,7 @@ testBusyboxWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "busybox.nix")
       source =
@@ -1083,7 +1083,7 @@ testChecksForbidSubstitutes = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let fileOf name = nixQuotedPath (cwd </> "test" </> "data" </> T.unpack name)
       source =
         T.concat
@@ -1121,7 +1121,7 @@ testSeedStdenvWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "seed-stdenv.nix")
       source =
@@ -1235,7 +1235,7 @@ testBinutilsWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "binutils.nix")
       source =
@@ -1351,7 +1351,7 @@ testGccCoreWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-core.nix")
       source =
@@ -1517,7 +1517,7 @@ testGcc46Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc46.nix")
       source =
@@ -1657,7 +1657,7 @@ testGcc46CxxWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc46-cxx.nix")
       source =
@@ -1835,7 +1835,7 @@ testGcc10Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc10.nix")
       source =
@@ -2025,7 +2025,7 @@ testMingwW64LatestWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "mingw-w64-latest.nix")
       source =
@@ -2170,7 +2170,7 @@ testGccLatestWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-latest.nix")
       source =
@@ -2361,7 +2361,7 @@ testBinutilsX8664Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "binutils-x86_64.nix")
       source =
@@ -2501,7 +2501,7 @@ testGccCoreX8664Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-core-x86_64.nix")
       source =
@@ -2679,7 +2679,7 @@ testMingwW64CrtX8664Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "mingw-w64-x86_64.nix")
       source =
@@ -2806,7 +2806,7 @@ testGccX8664Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-x86_64.nix")
       source =
@@ -2990,7 +2990,7 @@ testBinutilsNativeX8664Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "binutils-native-x86_64.nix")
       source =
@@ -3138,7 +3138,7 @@ testGccNativeX8664Windows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checks = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> "gcc-native-x86_64.nix")
       source =
@@ -3387,7 +3387,7 @@ testStdenvWindows = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = "(import " <> nixQuotedPath (cwd </> "pkgs" </> "windows") <> ")"
       checksOf name = "import " <> nixQuotedPath (cwd </> "test" </> "data" </> name)
       source =
@@ -3553,7 +3553,7 @@ testWindowsSources = do
   cwd <- Dir.getCurrentDirectory
   storeDir <- evalNixIOStoreDir
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = cwd </> "pkgs" </> "windows"
       source =
         T.concat
@@ -3688,7 +3688,7 @@ testWindowsRungs = do
   storeDir <- evalNixIOStoreDir
   workflow <- try (BS.readFile ladderWorkflowPath)
   searchPaths <- parseNixPath (TE.encodeUtf8 (T.pack (cwd </> "data")))
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir cwd
   let windows = cwd </> "pkgs" </> "windows"
       source =
         T.concat

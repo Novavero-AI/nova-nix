@@ -77,9 +77,9 @@ import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar)
 import Control.Exception (bracket)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Nix.Logger (Logger (..))
 import Nix.Store.Path (StoreDir, StorePath, parseStorePathBaseName, storePathToFilePath)
 import System.FileLock (FileLock, SharedExclusive (..), lockFile, tryLockFile, unlockFile)
-import System.IO (hPutStrLn, stderr)
 
 -- | A lock held on one lock file, exclusive on a store path's, or in its
 -- 'LockMode' on one named directly: the lock file's path and the
@@ -117,21 +117,21 @@ lockedPathOf basename = do
   pure stripped
 
 -- | Take the exclusive lock on a store path, blocking until granted.
--- Blocking is upstream's behavior on a busy path lock, announced the
--- same way ('waitingForLockMessage') so a stalled substitution names
--- what it is waiting for.  The non-blocking probe runs first, so the
--- contended case announces itself before the wait begins; the lock
--- file is created if absent, atomically at the open.
-acquirePathLock :: StoreDir -> StorePath -> IO PathLock
-acquirePathLock dir sp = acquireLockFile (pathLockFilePath dir sp)
+-- Blocking is upstream's behavior on a busy path lock, announced to the
+-- logger the same way ('waitingForLockMessage') so a stalled
+-- substitution names what it is waiting for.  The non-blocking probe
+-- runs first, so the contended case announces itself before the wait
+-- begins; the lock file is created if absent, atomically at the open.
+acquirePathLock :: Logger -> StoreDir -> StorePath -> IO PathLock
+acquirePathLock logger dir sp = acquireLockFile logger (pathLockFilePath dir sp)
 
 -- | Take the exclusive lock on a lock file named directly, blocking
 -- until granted.  The raw form exists for the delete path: deletion
 -- accepts basenames the current store-path name rules reject, so their
 -- lock files cannot be named through 'StorePath' - yet they must be the
 -- very files substituters of the same path contend on.
-acquireLockFile :: FilePath -> IO PathLock
-acquireLockFile lockPath = acquireLockFileWith LockExclusive (waitingForLockMessage lockPath) lockPath
+acquireLockFile :: Logger -> FilePath -> IO PathLock
+acquireLockFile logger lockPath = acquireLockFileWith logger LockExclusive (waitingForLockMessage lockPath) lockPath
 
 -- | How a lock file is held.  Every per-path lock is exclusive; the
 -- store-wide garbage-collector lock is the one shared holder, taken
@@ -141,17 +141,16 @@ data LockMode = LockShared | LockExclusive
   deriving (Eq, Show)
 
 -- | Take a directly named lock file in the given mode, blocking until
--- granted.  The message is printed once, to stderr, when the lock is
--- busy and the wait begins: the collector announces itself in
--- upstream's words and a path lock in its own, so the caller supplies
--- the line.
-acquireLockFileWith :: LockMode -> String -> FilePath -> IO PathLock
-acquireLockFileWith mode busyMessage lockPath = do
+-- granted.  The message goes to the logger once, when the lock is busy
+-- and the wait begins: the collector announces itself in upstream's
+-- words and a path lock in its own, so the caller supplies the line.
+acquireLockFileWith :: Logger -> LockMode -> Text -> FilePath -> IO PathLock
+acquireLockFileWith logger mode busyMessage lockPath = do
   probe <- tryLockFile lockPath (toSharedExclusive mode)
   held <- case probe of
     Just granted -> pure granted
     Nothing -> do
-      hPutStrLn stderr busyMessage
+      logMessage logger busyMessage
       lockFile lockPath (toSharedExclusive mode)
   heldRef <- newMVar (Just held)
   pure (PathLock lockPath heldRef)
@@ -162,8 +161,8 @@ toSharedExclusive LockShared = Shared
 toSharedExclusive LockExclusive = Exclusive
 
 -- | Upstream's log line for a busy path lock.
-waitingForLockMessage :: FilePath -> String
-waitingForLockMessage lockPath = "waiting for lock on '" <> lockPath <> "'..."
+waitingForLockMessage :: FilePath -> Text
+waitingForLockMessage lockPath = "waiting for lock on '" <> T.pack lockPath <> "'..."
 
 -- | Take the exclusive lock only if it is free: 'Nothing' when another
 -- holder - this process's or another's - already has it.
@@ -190,15 +189,15 @@ releasePathLock (PathLock _ heldRef) = modifyMVar_ heldRef surrender
       pure Nothing
 
 -- | Run an action holding a path's lock, released on every exit.
-withPathLock :: StoreDir -> StorePath -> (PathLock -> IO a) -> IO a
-withPathLock dir sp = bracket (acquirePathLock dir sp) releasePathLock
+withPathLock :: Logger -> StoreDir -> StorePath -> (PathLock -> IO a) -> IO a
+withPathLock logger dir sp = bracket (acquirePathLock logger dir sp) releasePathLock
 
 -- | Run an action holding a directly named lock file's lock, released
 -- on every exit.  See 'acquireLockFile' for why the raw form exists.
-withLockFile :: FilePath -> (PathLock -> IO a) -> IO a
-withLockFile lockPath = bracket (acquireLockFile lockPath) releasePathLock
+withLockFile :: Logger -> FilePath -> (PathLock -> IO a) -> IO a
+withLockFile logger lockPath = bracket (acquireLockFile logger lockPath) releasePathLock
 
 -- | 'withLockFile' in a chosen mode with a chosen busy message.
-withLockFileWith :: LockMode -> String -> FilePath -> (PathLock -> IO a) -> IO a
-withLockFileWith mode busyMessage lockPath =
-  bracket (acquireLockFileWith mode busyMessage lockPath) releasePathLock
+withLockFileWith :: Logger -> LockMode -> Text -> FilePath -> (PathLock -> IO a) -> IO a
+withLockFileWith logger mode busyMessage lockPath =
+  bracket (acquireLockFileWith logger mode busyMessage lockPath) releasePathLock

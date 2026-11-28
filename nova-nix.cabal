@@ -146,6 +146,7 @@ library
     Nix.Hash
     Nix.Http
     Nix.Json
+    Nix.Logger
 
   autogen-modules:  Paths_nova_nix
   other-modules:

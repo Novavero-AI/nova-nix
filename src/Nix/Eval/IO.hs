@@ -11,8 +11,8 @@
 -- here a read-only one, as @nova-nix eval@ runs:
 --
 -- @
--- withLocalStore (defaultBuildConfig storeDir) {bcSubstitution = RefuseSubstitution} $ \\ops ->
---   withEvalSession (SessionSettings unrestrictedPolicy nixPathSearchPath storeDir "/path/to/project" RegionsCollect (ReadOnlySession (localQueries storeDir) ops)) $ \\st ->
+-- withLocalStore logger (defaultBuildConfig storeDir) {bcSubstitution = RefuseSubstitution} $ \\ops ->
+--   withEvalSession (SessionSettings unrestrictedPolicy nixPathSearchPath storeDir "/path/to/project" RegionsCollect (ReadOnlySession (localQueries storeDir) ops) logger) $ \\st ->
 --     runEvalIO st (evalParsed (pure (evalBaseEnv st)) parsed)
 -- @
 module Nix.Eval.IO
@@ -106,6 +106,7 @@ import Nix.Eval.Types (AttrSet (..), Env (..), MonadEval (..), NixValue (..), Pa
 import Nix.Expr.Resolve (undefinedVariableMessage)
 import Nix.Expr.Types (Expr)
 import Nix.Hash (FileIngestionMethod (..), bytesToHexText, makeFixedOutputPath, makeTextPath, sha256Digest)
+import Nix.Logger (Logger (..))
 import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
 import Nix.Store (UpstreamHazard (..), canonicalizeMetadata, unpackNarEntry, upstreamManagedRefusal)
 import Nix.Store.CaseSensitive (pathCaseHack, probeCaseSensitivity, volumeCaseHack)
@@ -116,7 +117,6 @@ import qualified NovaCache.NAR as NAR
 import qualified System.Directory as Dir
 import System.Exit (ExitCode (..))
 import System.FilePath (isRelative, takeDirectory, (</>))
-import System.IO (hPutStrLn, stderr)
 import System.IO.Error (ioeGetErrorString, isUserError)
 import qualified System.Process as Proc
 
@@ -275,7 +275,9 @@ data EvalState = EvalState
     -- | The store paths of what evaluation made that a read-write session
     -- has added to its store, so a later realisation adds only what came
     -- after.
-    esAdded :: !(IORef (Set Text))
+    esAdded :: !(IORef (Set Text)),
+    -- | Where @builtins.trace@ and an evaluation warning go.
+    esLogger :: !Logger
   }
 
 -- | What an evaluation session starts with: upstream's settings and
@@ -296,7 +298,9 @@ data SessionSettings = SessionSettings
     -- them; a nested session runs whatever the arena's run.
     sessionRegions :: !Regions,
     -- | The store a path reader's context is realised against.
-    sessionStore :: !SessionStore
+    sessionStore :: !SessionStore,
+    -- | Where @builtins.trace@ and an evaluation warning go.
+    sessionLogger :: !Logger
   }
 
 -- | The store a session realises contexts against
@@ -329,7 +333,7 @@ withEvalSession settings action = withArena (bracket crootsMark crootsRelease (c
   where
     session = do
       searchPaths <- sessionSearchPath settings
-      newEvalStateWith (sessionPolicy settings) searchPaths (sessionStore settings) (sessionStoreDir settings) (sessionBaseDir settings) >>= action
+      newEvalStateWith (sessionLogger settings) (sessionPolicy settings) searchPaths (sessionStore settings) (sessionStoreDir settings) (sessionBaseDir settings) >>= action
     withArena body = do
       live <- arenaLive
       if live then body else withRegions (sessionRegions settings) (bracket_ arenaInit arenaDestroy body)
@@ -371,8 +375,8 @@ nixPathValue =
 -- data layer, so this runs in a session ('withEvalSession'), whose roots
 -- the base environment joins, and the search path with it, through
 -- @builtins.nixPath@.
-newEvalStateWith :: EvalPolicy -> [Thunk] -> SessionStore -> SP.StoreDir -> FilePath -> IO EvalState
-newEvalStateWith policy searchPaths store storeDir baseDir = do
+newEvalStateWith :: Logger -> EvalPolicy -> [Thunk] -> SessionStore -> SP.StoreDir -> FilePath -> IO EvalState
+newEvalStateWith logger policy searchPaths store storeDir baseDir = do
   cache <- newIORef Map.empty
   drvCache <- newIORef Map.empty
   drvClosure <- newIORef Map.empty
@@ -403,7 +407,8 @@ newEvalStateWith policy searchPaths store storeDir baseDir = do
         esRegions = regions,
         esAllowedPaths = allowedPaths,
         esStore = store,
-        esAdded = added
+        esAdded = added,
+        esLogger = logger
       }
 
 -- | Grant access to a path prefix, as upstream Nix grants one: the
@@ -991,7 +996,9 @@ instance MonadEval EvalIO where
     allowPath storePath
     pure storePath
 
-  traceMessage msg = EvalIO (liftIO (hPutStrLn stderr (T.unpack msg)))
+  traceMessage msg = do
+    logger <- EvalIO (asks esLogger)
+    EvalIO (liftIO (logMessage logger msg))
 
   evalPolicy = EvalIO (asks esPolicy)
 

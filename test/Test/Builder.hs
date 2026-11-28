@@ -57,6 +57,7 @@ import qualified Codec.Archive.Tar.Entry as TarEntry
 import qualified Codec.Compression.GZip as GZip
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, cancel, poll, wait, waitCatch, withAsync, withAsyncBound)
+import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Exception (AsyncException (..), IOException, bracket, bracket_, catches, finally, fromException, throwIO, toException, try)
 import Control.Monad (guard, replicateM, replicateM_, unless, void, when, (>=>))
 import Control.Monad.Except (runExceptT)
@@ -97,7 +98,7 @@ import Nix.Builder (AttrsDelivery (..), BuildConfig (..), BuildLayout (..), Buil
 import Nix.Builder.BuildDir (BuildEnding (..), FailedBuilds (..), WorkDir (..), buildDirFor, createBuildDir, withBuildDir)
 import Nix.Builder.Buildenv (Activity (..), DerivationsError (..), Element (..), builtinBuildenvBuilder, elementPackages, parseDerivations)
 import qualified Nix.Builder.Cores as Cores
-import Nix.Builder.Log (EscapeFilter (..), emptyPendingLine, endBuildLog, feedBuildLog, filterLogLine)
+import Nix.Builder.Log (emptyPendingLine, endBuildLog, feedBuildLog)
 import qualified Nix.Builder.Sandbox as Sandbox
 import qualified Nix.Builder.Sandbox.Spawn as Spawn
 import Nix.Builder.Unpack (UnpackLimits (..), builtinUnpackBuilder, entryComponents, envSrcs, resolveLinkTarget)
@@ -112,12 +113,13 @@ import Nix.Hash (FileIngestionMethod (..), hashPlaceholder, makeFixedOutputPath,
 import qualified Nix.Hash as Hash
 import Nix.HostPath (hostPathFromBytes, hostPathText)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), TransferError (..), defaultFetchRetryPolicy, fetchExceptionFailure, fetchStatusFailure, ioRetryEffects, retryDelayMs, retryTransient, statusError, transferBodyReader, transferFailureHandlers, userAgent, withUserAgent)
+import Nix.Logger (EscapeFilter (..), Logger (..), filterLogLine, handleLogger)
 import qualified Nix.Profile.Generation as Gen
 import qualified Nix.Profile.Manifest as Manifest
 import Nix.Profile.Tree (BuildEnvFailure (..), Built (..), EntryKind (..), Listing (..), Node (..), Package (..), ReadFailure (..), Tree, TreeReader (..), Warning (..), buildEnvFailureText, buildProfile, propagatedTokens, warningText)
 import Nix.Push (PushCompression (..), preparePath, storePathBasename)
 import qualified Nix.Realise as Realise
-import Nix.Store (DeleteOutcome (..), Store (..), addToStore, canonicalizeMetadata, closeStore, collectGarbage, freshCopyPath, gcRootsDir, isValid, openStore, releasePathLock, replaceWithCopy, rewriteRegularFile, tryAcquirePathLock, writeDrv)
+import Nix.Store (DeleteOutcome (..), Store (..), acquirePathLock, addToStore, canonicalizeMetadata, closeStore, collectGarbage, freshCopyPath, gcRootsDir, isValid, openStore, pathLockFilePath, releasePathLock, replaceWithCopy, rewriteRegularFile, tryAcquirePathLock, waitingForLockMessage, writeDrv)
 import Nix.Store.CaseSensitive (volumeCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), metaDirName, queryDeriver, queryPathInfo, queryReferences, registerPaths)
 import qualified Nix.Store.ExecBit as ExecBit
@@ -136,14 +138,14 @@ import qualified System.Directory.OsPath as OsDir
 import System.Environment (getExecutablePath, lookupEnv, setEnv, unsetEnv)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath (takeDirectory, takeFileName, (</>))
-import System.IO (IOMode (..), hClose, hFlush, hGetLine, hPutStrLn, stderr, stdout, withBinaryFile)
+import System.IO (Handle, IOMode (..), hClose, hFlush, hGetLine, hPutStrLn, stderr, stdout, withBinaryFile)
 import System.IO.Error (isAlreadyExistsError, mkIOError, resourceVanishedErrorType)
 import qualified System.Info as SI
 import System.OsPath (OsPath)
 import qualified System.OsPath as OP
 import qualified System.Process as Proc
 import System.Timeout (timeout)
-import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertLeft, assertRight, bytesText, canonicalAs, deleteNamed, evalDerivationIO, evalNixIO, findTestShell, forceRemoveIfExists, genFixturePath, genTextOf, hostToolsEnv, mkTestBuildDrv, narInfoRequest, narRequest, narSpecFileVector, narSpecStr, narSpecVector, offeredSubstitute, profileFixture, pureDepGraph, runTest, runTestM, servedPaths, signedTestNarInfo, symlinksAvailable, tarDir, tarFile, tarPathOrDie, testDrvPath, withEnvVar, withTempStore)
+import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertLeft, assertRight, bytesText, canonicalAs, deleteNamed, evalDerivationIO, evalNixIO, findTestShell, forceRemoveIfExists, genFixturePath, genTextOf, hostToolsEnv, mkTestBuildDrv, narInfoRequest, narRequest, narSpecFileVector, narSpecStr, narSpecVector, offeredSubstitute, profileFixture, pureDepGraph, runTest, runTestM, servedPaths, signedTestNarInfo, symlinksAvailable, tarDir, tarFile, tarPathOrDie, testDrvPath, testLogger, withEnvVar, withTempStore)
 import qualified Test.QuickCheck as QC
 import Text.Read (readMaybe)
 import UserResources (continueProcess, newSession, withHangupIgnored, withPseudoTerminal, withUnixListener)
@@ -263,7 +265,7 @@ testBuildOrchestrator = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-orch"
         createDirectoryIfMissing True tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let drv =
               Derivation
                 { drvOutputs =
@@ -1445,7 +1447,7 @@ testSandboxSpawnIO = do
           runFake name plan command = do
             let logPath = root </> (name <> ".log")
             run <- withBinaryFile logPath WriteMode $ \logHandle ->
-              Spawn.runHelper logHandle (helperAt name) plan root command
+              Spawn.runHelper (handleLogger DropEscapes logHandle) (helperAt name) plan root command
             logged <- BS.readFile logPath
             pure (run, logged)
           framedPlan bytes = Sandbox.planVersionLine <> BS8.pack (show (BS.length bytes)) <> "\n" <> bytes
@@ -1458,7 +1460,7 @@ testSandboxSpawnIO = do
               [ runTestM "a chroot holds its skeleton while the build runs, and is gone after" $ do
                   createDirectoryIfMissing True buildDir
                   inside <-
-                    Spawn.withChroot buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) $ \chrootRoot -> do
+                    Spawn.withChroot testLogger buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) $ \chrootRoot -> do
                       passwd <- BS.readFile (chrootRoot </> "etc" </> "passwd")
                       tmpMode <- fmap nsPermissions <$> nodeStatus (chrootRoot </> "tmp")
                       storeMode <- fmap nsPermissions <$> nodeStatus (chrootRoot <> storeDirPath)
@@ -1481,7 +1483,7 @@ testSandboxSpawnIO = do
                   Dir.createDirectoryLink outside (Spawn.chrootDirFor buildDir </> "root" </> "linked")
                   BS.writeFile (leftover </> "stale") "x"
                   Dir.getPermissions leftover >>= Dir.setPermissions leftover . Dir.setOwnerWritable False
-                  made <- Spawn.withChroot buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.HostNetwork []) (\chrootRoot -> Dir.doesPathExist (chrootRoot </> "etc" </> "stale"))
+                  made <- Spawn.withChroot testLogger buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.HostNetwork []) (\chrootRoot -> Dir.doesPathExist (chrootRoot </> "etc" </> "stale"))
                   kept <- BS.readFile (outside </> "kept")
                   pure (assertEqual "stale file" (Right False) made `andThen` assertEqual "what the link named" "host" kept),
                 -- A real chroot's /dev/fd names /proc/self/fd; a read-only
@@ -1497,7 +1499,7 @@ testSandboxSpawnIO = do
                   Proc.callProcess "chmod" ["0555", sentinel]
                   Dir.createDirectoryLink sentinel (leftover </> "fd")
                   Dir.getPermissions leftover >>= Dir.setPermissions leftover . Dir.setOwnerWritable False
-                  made <- Spawn.withChroot buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) (\chrootRoot -> Dir.getSymbolicLinkTarget (chrootRoot </> "dev" </> "fd"))
+                  made <- Spawn.withChroot testLogger buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) (\chrootRoot -> Dir.getSymbolicLinkTarget (chrootRoot </> "dev" </> "fd"))
                   sentinelMode <- fmap nsPermissions <$> nodeStatus sentinel
                   kept <- BS.readFile (sentinel </> "kept")
                   pure $
@@ -1556,7 +1558,7 @@ testSandboxSpawnIO = do
                       -- left can be removed.
                       let release = for_ [Spawn.chrootDirFor buildDir, aside] $ \dir -> Proc.readProcessWithExitCode "chflags" ["-R", "nouchg", dir] ""
                       ( do
-                          made <- Spawn.withChroot buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) (\chrootRoot -> Dir.doesDirectoryExist (chrootRoot </> "etc"))
+                          made <- Spawn.withChroot testLogger buildDir (Sandbox.chrootSkeleton storeBytes "/build" Sandbox.PrivateNetwork []) (\chrootRoot -> Dir.doesDirectoryExist (chrootRoot </> "etc"))
                           movedAside <- Dir.doesPathExist (aside </> "root" </> "stuck" </> "f")
                           pure (assertEqual "the chroot made" (Right True) made `andThen` assertEqual "moved aside" True movedAside)
                         )
@@ -1662,7 +1664,7 @@ sandboxBuildChild helper busybox storeRoot marker = do
   let outPath = StorePath (T.replicate 31 "s" <> "e") "sandboxed"
       config store = (defaultBuildConfig (stDir store)) {bcSandbox = linuxSandboxConfig helper busyboxBytes}
       script = "/bin/busybox sleep " <> T.pack marker <> "; echo ran > $out"
-  bracket (openStore (StoreDir storeRoot)) closeStore $ \store ->
+  bracket (openStore testLogger (StoreDir storeRoot)) closeStore $ \store ->
     void (buildDerivation (config store) store (mkTestBuildDrv "/bin/sh" outPath script) testDrvPath)
 
 -- | The sandbox the Linux sandbox tests build in: on, with no fallback,
@@ -1683,14 +1685,14 @@ sandboxFallbackChildFlag = "--sandbox-fallback-child"
 
 -- | Run two builds that fall back to running unsandboxed, exiting 0 when
 -- both succeed.  The warnings go to standard error, which the parent
--- reads.
+-- reads, and the builders' lines to standard output.
 sandboxFallbackChild :: FilePath -> IO ()
 sandboxFallbackChild storeRoot = do
   shell <- findTestShell
-  let config store = (defaultBuildConfig (stDir store)) {bcSandbox = Sandbox.defaultSandboxConfig {Sandbox.scMode = Sandbox.SandboxEnabled}, bcBuildLog = stdout}
+  let config store = (defaultBuildConfig (stDir store)) {bcSandbox = Sandbox.defaultSandboxConfig {Sandbox.scMode = Sandbox.SandboxEnabled}}
       outPath letter = StorePath (T.replicate 31 "f" <> T.singleton letter) "fallback"
-  results <- bracket (openStore (StoreDir storeRoot)) closeStore $ \store ->
-    traverse (\letter -> buildDerivation (config store) store (mkTestBuildDrv shell (outPath letter) "echo ran > $out") testDrvPath) ['1', '2']
+  results <- bracket (openStore testLogger (StoreDir storeRoot)) closeStore $ \store ->
+    traverse (\letter -> buildDerivation (config store) (buildLogTo stdout store) (mkTestBuildDrv shell (outPath letter) "echo ran > $out") testDrvPath) ['1', '2']
   traverse_ (TIO.hPutStrLn stderr) [msg | BuildFailure msg _ <- results]
   case [() | BuildSuccess _ <- results] of
     [_, _] -> pure ()
@@ -1869,7 +1871,7 @@ testDarwinSandboxBody helper = do
       drvFor letter = mkTestBuildDrv "/bin/sh" (outputAt letter)
       configFor store = (defaultBuildConfig (stDir store)) {bcSandbox = sandbox}
       outputFile store letter = storePathToFilePath (stDir store) (outputAt letter)
-      withSandboxStore = bracket (openStore (StoreDir storeRoot)) closeStore
+      withSandboxStore = bracket (openStore testLogger (StoreDir storeRoot)) closeStore
       readOutput store letter = BS.readFile (outputFile store letter)
       unsandboxedConfig store = (configFor store) {bcSandbox = sandbox {Sandbox.scMode = Sandbox.SandboxDisabled}}
       -- A build that runs the test binary as a child the flag names,
@@ -2003,7 +2005,7 @@ testDarwinSandboxBody helper = do
                 logPath = root </> "profile.log"
             allowed <- buildDerivation relaxed store (withProfile 'd' ("(allow file-read* (literal \"" <> realSecret <> "\"))")) testDrvPath
             seen <- readOutput store 'd'
-            refused <- withBinaryFile logPath WriteMode $ \logHandle -> buildDerivation relaxed {bcBuildLog = logHandle} store (withProfile 'e' "(allow nonsense-operation)") testDrvPath
+            refused <- withBinaryFile logPath WriteMode $ \logHandle -> buildDerivation relaxed (buildLogTo logHandle store) (withProfile 'e' "(allow nonsense-operation)") testDrvPath
             logged <- BS.readFile logPath
             pure $
               assertEqual "allowed" (BuildSuccess (outputAt 'd')) allowed
@@ -2031,7 +2033,7 @@ testDarwinSandboxBody helper = do
                     }
               plan = Sandbox.DarwinPlan realScratch profile (Sandbox.darwinParameters realScratch Sandbox.LocalNetworkingDenied) []
           run <- withBinaryFile (root </> "large-profile.log") WriteMode $ \logHandle ->
-            Spawn.runHelper logHandle helper (Sandbox.renderDarwinPlan plan) scratch ["/bin/sh", "-c", "exit 7"]
+            Spawn.runHelper (handleLogger DropEscapes logHandle) helper (Sandbox.renderDarwinPlan plan) scratch ["/bin/sh", "-c", "exit 7"]
           pure $
             assertEqual "the profile's size" True (BS.length profile > 65536)
               `andThen` assertEqual
@@ -2166,7 +2168,7 @@ testDarwinSandboxBody helper = do
           withSandboxStore $ \store -> do
             let logPath = root </> "large-output.log"
                 script = "/bin/dd if=/dev/zero bs=1000 count=1000 2>/dev/null; echo end; echo ran > $out"
-            result <- withBinaryFile logPath WriteMode $ \logHandle -> buildDerivation (configFor store) {bcBuildLog = logHandle} store (drvFor 'j' script) testDrvPath
+            result <- withBinaryFile logPath WriteMode $ \logHandle -> buildDerivation (configFor store) (buildLogTo logHandle store) (drvFor 'j' script) testDrvPath
             logged <- BS.readFile logPath
             pure $
               assertEqual "build" (BuildSuccess (outputAt 'j')) result
@@ -2179,7 +2181,7 @@ testDarwinSandboxBody helper = do
                 writers = length . filter (TE.encodeUtf8 writer `BS.isPrefixOf`) <$> runningCommands
             -- Not withAsync, which would wait for a build that cannot end,
             -- so a cancel that never returns fails the test at the timeout.
-            build <- async (buildDerivation (configFor store) {bcBuildLog = discard} store (drvFor '0' (startedScript <> writer <> "; echo ran > $out")) testDrvPath)
+            build <- async (buildDerivation (configFor store) (buildLogTo discard store) (drvFor '0' (startedScript <> writer <> "; echo ran > $out")) testDrvPath)
             running <- awaitStart (buildDirFor (stDir store) (outputAt '0')) (isJust <$> poll build)
             started <- (running &&) <$> waitUntilWithin startWaitMicros ((== 1) <$> writers)
             cancelled <- timeout startWaitMicros (cancel build)
@@ -2321,7 +2323,7 @@ testLinuxSandboxBody helper busybox = do
       drvFor letter = mkTestBuildDrv "/bin/sh" (outputAt letter)
       configFor store = (defaultBuildConfig (stDir store)) {bcSandbox = sandbox}
       outputFile store letter = storePathToFilePath (stDir store) (outputAt letter)
-      withSandboxStore = bracket (openStore (StoreDir storeRoot)) closeStore
+      withSandboxStore = bracket (openStore testLogger (StoreDir storeRoot)) closeStore
   bracket_
     (forceRemoveIfExists root >> createDirectoryIfMissing True outside >> BS.writeFile (outside </> "secret") "host secret\n")
     (forceRemoveIfExists root)
@@ -2356,7 +2358,7 @@ testLinuxSandboxBody helper busybox = do
                   base = drvFor 'b' "while [ ! -e /build/release ]; do /bin/busybox sleep 1; done; echo \"$LD_DEBUG $LD_PRELOAD\" > $out"
                   drv = base {drvEnv = Map.union (Map.fromList [("LD_DEBUG", "libs"), ("LD_PRELOAD", "/nonexistent-nova-nix-preload.so")]) (drvEnv base)}
               (result, environs) <- withBinaryFile logPath WriteMode $ \logHandle ->
-                withAsync (buildDerivation (configFor store) {bcBuildLog = logHandle} store drv testDrvPath) $ \build -> do
+                withAsync (buildDerivation (configFor store) (buildLogTo logHandle store) drv testDrvPath) $ \build -> do
                   _ <- waitForProcesses helperLine (not . null)
                   helpers <- processesWith helperLine
                   -- Read while the helper runs, then let the build go on.
@@ -2822,7 +2824,7 @@ testBuildDirIO = do
       -- A fresh store, removed when the action ends, however it ends.
       inStore label action =
         bracket_ (forceRemoveIfExists (scratch label)) (forceRemoveIfExists (scratch label)) $
-          bracket (openStore (StoreDir (scratch label))) closeStore action
+          bracket (openStore testLogger (StoreDir (scratch label))) closeStore action
       outSP = StorePath (T.replicate 31 "b" <> "d") "build-dir"
       -- Spelled out rather than taken from 'buildDirFor', so the test
       -- pins the location instead of echoing it.
@@ -2969,7 +2971,7 @@ testBuildDirIO = do
               drv = (mkTestBuildDrv shell outSP "echo ran") {drvOutputs = []}
           result <-
             withBinaryFile logPath WriteMode $ \logHandle ->
-              buildDerivation (defaultBuildConfig (stDir store)) {bcBuildLog = logHandle} store drv testDrvPath
+              buildDerivation (defaultBuildConfig (stDir store)) (buildLogTo logHandle store) drv testDrvPath
           logged <- BS.readFile logPath
           made <- Dir.doesPathExist (unStoreDir (stDir store) </> metaDirName </> "builds")
           pure $
@@ -3006,9 +3008,9 @@ testBuildLogIO = do
         BS.writeFile logFile ""
         ( do
             result <-
-              bracket (openStore (StoreDir tmpStore)) closeStore $ \store ->
+              bracket (openStore testLogger (StoreDir tmpStore)) closeStore $ \store ->
                 withBinaryFile logFile mode $ \logHandle ->
-                  buildDerivation (defaultBuildConfig (stDir store)) {bcBuildLog = logHandle} store drv testDrvPath
+                  buildDerivation (defaultBuildConfig (stDir store)) (buildLogTo logHandle store) drv testDrvPath
             logged <- BS.readFile logFile
             pure (result, logged)
           )
@@ -3097,6 +3099,37 @@ testBuildLogIO = do
           BuildFailure msg code ->
             assertEqual "failure and log" ("builder failed", 3, "out-line\nerr-line\n20%\ntail\n") (msg, code, logged)
           BuildSuccess _ -> Fail "expected the builder's exit 3 to fail the build",
+      -- The test holds the output's lock, lets the build go once the
+      -- store's logger has its wait, and then holds each line the builder
+      -- wrote, in order, with nothing else.
+      runTestM "a build's wait on a held lock and its lines reach the store's logger" $ do
+        forceRemoveIfExists tmpStore
+        reports <- newIORef []
+        firstMessage <- newEmptyMVar
+        let record report = atomicModifyIORef' reports (\earlier -> (report : earlier, ()))
+            capturing =
+              Logger
+                { logMessage = \message -> record (ReportedMessage message) *> void (tryPutMVar firstMessage ()),
+                  logBuildLine = record . ReportedLine
+                }
+            contend store =
+              bracket (acquirePathLock testLogger (stDir store) outPath) releasePathLock $ \holder ->
+                withAsync (buildDerivation (defaultBuildConfig (stDir store)) store nativeDrv testDrvPath) $ \build -> do
+                  announced <- timeout processWaitMicros (takeMVar firstMessage)
+                  releasePathLock holder
+                  result <- wait build
+                  pure (announced, result, pathLockFilePath (stDir store) outPath)
+        (announced, result, lockFile) <-
+          bracket (openStore capturing (StoreDir tmpStore)) closeStore contend `finally` forceRemoveIfExists tmpStore
+        reported <- reverse <$> readIORef reports
+        pure $ case result of
+          BuildSuccess _ ->
+            assertEqual "announced" (Just ()) announced
+              `andThen` assertEqual
+                "reports"
+                [ReportedMessage (waitingForLockMessage lockFile), ReportedLine "one", ReportedLine "two", ReportedLine "three"]
+                reported
+          BuildFailure msg code -> Fail ("build failed (exit " <> T.pack (show code) <> "): " <> msg),
       -- A handle open only for reading refuses every write, as a standard
       -- error whose reader has gone does.
       runTestM "a build log that refuses its lines does not fail the build" $ do
@@ -3132,6 +3165,19 @@ testBuildLogIO = do
           (3, QC.elements [0x61, 0x62]),
           (1, QC.arbitrary)
         ]
+
+-- | The store, its builds writing their lines to a handle, as a build log
+-- with every escape dropped, and its other reports going where they went.
+buildLogTo :: Handle -> Store -> Store
+buildLogTo handle store = store {stLogger = (stLogger store) {logBuildLine = logBuildLine (handleLogger DropEscapes handle)}}
+
+-- | What a build told its store's logger.
+data Reported
+  = -- | A message.
+    ReportedMessage !Text
+  | -- | A line its builder wrote.
+    ReportedLine !BS.ByteString
+  deriving (Eq, Show)
 
 -- | The lines a builder's output makes when it is read in the chunks
 -- given.
@@ -4647,7 +4693,7 @@ testProfileUpdateIO = do
     then [] <$ putStrLn "  SKIP  a profile's links need symlink privilege (Windows needs Developer Mode or elevation)"
     else bracket_ (forceRemoveIfExists root >> createDirectoryIfMissing True root) (forceRemoveIfExists root) $ do
       rootPath <- OP.encodeFS root
-      store <- openStore (StoreDir (root </> "store"))
+      store <- openStore testLogger (StoreDir (root </> "store"))
       let storeDir = stDir store
           stage name = root </> "stage" </> name
           hello = profileFixture 'a' "hello-1.0"
@@ -4671,7 +4717,7 @@ testProfileUpdateIO = do
           sourceNar = fromRight (NAR.NarDirectory []) (Gen.generationNar Gen.hostNarTargets Map.empty "{}")
           generations = fmap (map (\(Gen.Generation (Gen.GenerationNumber n) _) -> n))
       linkTarget <- osLinkIfThere (rootPath OP.</> asciiOsPath "home" OP.</> asciiOsPath ".nix-profile")
-      (added, restarted, reused, firstManifest, lastManifest, sourceAdds, sourceRefs) <- withLocalStore (defaultBuildConfig storeDir) $ \ops -> do
+      (added, restarted, reused, firstManifest, lastManifest, sourceAdds, sourceRefs) <- withLocalStore testLogger (defaultBuildConfig storeDir) $ \ops -> do
         let -- The first add the store is asked for runs another change of
             -- the profile to completion before it answers, as a command
             -- running beside this one would.
@@ -4679,27 +4725,27 @@ testProfileUpdateIO = do
               ops
                 { soAddSourceTree = \name refs entry -> do
                     first <- atomicModifyIORef' firstChanged (False,)
-                    when first (void (Gen.updateProfile ops storeDir profile (adding "world" world)))
+                    when first (void (Gen.updateProfile testLogger ops storeDir profile (adding "world" world)))
                     soAddSourceTree ops name refs entry
                 }
-        added <- Gen.updateProfile ops storeDir profile (adding "hello" hello)
-        restarted <- Gen.updateProfile interrupted storeDir profile (adding "again" hello)
+        added <- Gen.updateProfile testLogger ops storeDir profile (adding "hello" hello)
+        restarted <- Gen.updateProfile testLogger interrupted storeDir profile (adding "again" hello)
         -- The same manifest again, under a spelling of the store directory
         -- that collapses to the store's own.  A spelling through a link is
         -- another store to the database, which keys rows by the spelling
         -- ('Nix.Store.Handle.canonicalStoreDir').
-        reused <- Gen.updateProfile ops (StoreDir (unStoreDir storeDir </> ".")) profile (pure . Gen.Changed)
+        reused <- Gen.updateProfile testLogger ops (StoreDir (unStoreDir storeDir </> ".")) profile (pure . Gen.Changed)
         firstManifest <- Gen.readManifest (Gen.generationName profile (Gen.GenerationNumber 1))
         lastManifest <- Gen.readManifest profile
         sourceAdds <- replicateM 2 (soAddSourceTree ops Gen.generationStoreName (Set.fromList [hello, world]) sourceNar)
         sourceRefs <- either (pure . Left) (sqReferences (soQueries ops)) (fromMaybe (Left "no add") (listToMaybe sourceAdds))
         pure (added, restarted, reused, firstManifest, lastManifest, sourceAdds, sourceRefs)
       createDirectoryIfMissing True (root </> "other")
-      refusedOther <- withLocalStore (defaultBuildConfig (StoreDir (root </> "other-store"))) $ \otherOps -> do
-        made <- Gen.updateProfile otherOps (StoreDir (root </> "other-store")) otherProfile (\_ -> pure (Gen.Changed Manifest.emptyManifest))
-        withLocalStore (defaultBuildConfig storeDir) $ \ops -> (,) made <$> Gen.updateProfile ops storeDir otherProfile (adding "hello" hello)
-      missingDirectory <- withLocalStore (defaultBuildConfig storeDir) $ \ops ->
-        Gen.updateProfile ops storeDir (rootPath OP.</> asciiOsPath "missing" OP.</> asciiOsPath "profile") (\_ -> pure (Gen.Changed Manifest.emptyManifest))
+      refusedOther <- withLocalStore testLogger (defaultBuildConfig (StoreDir (root </> "other-store"))) $ \otherOps -> do
+        made <- Gen.updateProfile testLogger otherOps (StoreDir (root </> "other-store")) otherProfile (\_ -> pure (Gen.Changed Manifest.emptyManifest))
+        withLocalStore testLogger (defaultBuildConfig storeDir) $ \ops -> (,) made <$> Gen.updateProfile testLogger ops storeDir otherProfile (adding "hello" hello)
+      missingDirectory <- withLocalStore testLogger (defaultBuildConfig storeDir) $ \ops ->
+        Gen.updateProfile testLogger ops storeDir (rootPath OP.</> asciiOsPath "missing" OP.</> asciiOsPath "profile") (\_ -> pure (Gen.Changed Manifest.emptyManifest))
       createDirectoryIfMissing True (root </> "nix-env-tree")
       BS.writeFile (root </> "nix-env-tree" </> "manifest.nix") "[ ]"
       Dir.createDirectoryLink (root </> "nix-env-tree") (root </> "nix-env-profile")
@@ -4712,7 +4758,7 @@ testProfileUpdateIO = do
       -- at the store's, so a conflict's files are under both.
       createDirectoryIfMissing True (root </> "real")
       Dir.createDirectoryLink (root </> "real") (root </> "via")
-      viaStore <- openStore (StoreDir (root </> "via" </> "store"))
+      viaStore <- openStore testLogger (StoreDir (root </> "via" </> "store"))
       let viaDir = stDir viaStore
           alpha = profileFixture 'c' "alpha-1.0"
           beta = profileFixture 'd' "beta-1.0"
@@ -4724,10 +4770,10 @@ testProfileUpdateIO = do
       addToStore viaStore (stage "beta") beta Nothing []
       closeStore viaStore
       createDirectoryIfMissing True (root </> "via-profiles")
-      (viaAdded, viaAgain, viaConflict) <- withLocalStore (defaultBuildConfig viaDir) $ \ops -> do
-        viaAdded <- Gen.updateProfile ops viaDir viaProfile (adding "alpha" alpha)
-        viaAgain <- Gen.updateProfile ops viaDir viaProfile (pure . Gen.Changed)
-        viaConflict <- Gen.updateProfile ops viaDir viaProfile (adding "beta" beta)
+      (viaAdded, viaAgain, viaConflict) <- withLocalStore testLogger (defaultBuildConfig viaDir) $ \ops -> do
+        viaAdded <- Gen.updateProfile testLogger ops viaDir viaProfile (adding "alpha" alpha)
+        viaAgain <- Gen.updateProfile testLogger ops viaDir viaProfile (pure . Gen.Changed)
+        viaConflict <- Gen.updateProfile testLogger ops viaDir viaProfile (adding "beta" beta)
         pure (viaAdded, viaAgain, viaConflict)
       linked <- osLinkIfThere profile
       helloRun <- either (\(_ :: IOException) -> Nothing) Just <$> try (BS.readFile (root </> "home" </> ".nix-profile" </> "bin" </> "hello"))
@@ -4872,7 +4918,7 @@ testBuildCheckIO = do
         let root = tmpBase </> ("nova-nix-test-check-" <> label)
         forceRemoveIfExists root
         createDirectoryIfMissing True root
-        store <- openStore (StoreDir (root </> "store"))
+        store <- openStore testLogger (StoreDir (root </> "store"))
         action store (defaultBuildConfig (stDir store))
           `finally` (closeStore store >> forceRemoveIfExists root)
       checking config = config {bcMode = Realise.BuildCheck}
@@ -5020,7 +5066,7 @@ testBuildCheckIO = do
           before <- snapshot store [outSP]
           checked <-
             withBinaryFile logPath WriteMode $ \logHandle ->
-              buildWithDeps (checking config) {bcBuildLog = logHandle} store drv drvSP
+              buildWithDeps (checking config) (buildLogTo logHandle store) drv drvSP
           after <- snapshot store [outSP]
           logged <- BS.readFile logPath
           pure $
@@ -5193,7 +5239,7 @@ testBuildCheckIO = do
           before <- snapshot store [outSP]
           checked <-
             withBinaryFile logPath WriteMode $ \logHandle ->
-              checkDerivation config {bcBuildLog = logHandle} store drv drvSP
+              checkDerivation config (buildLogTo logHandle store) drv drvSP
           after <- snapshot store [outSP]
           logged <- BS.readFile logPath
           pure $
@@ -5832,7 +5878,7 @@ testFetchMirrors = do
           config = (defaultBuildConfig dir) {bcFetchRetry = defaultFetchRetryPolicy {frpBaseDelayMs = 1}}
       sp <- either (fail . show) pure (makeFixedOutputPath "mirrors" "sha256" FlatIngestion (sha256Digest "hello"))
       bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
-        bracket (openStore dir) closeStore $
+        bracket (openStore testLogger dir) closeStore $
           \store -> action store config sp
     fixtureDrv sp env =
       Derivation
@@ -5908,7 +5954,7 @@ testFetchurlUnpack = do
                 Left err -> pure (Fail (T.pack (show err)))
                 Right sp ->
                   bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
-                    bracket (openStore dir) closeStore $ \store -> do
+                    bracket (openStore testLogger dir) closeStore $ \store -> do
                       let drv =
                             Derivation
                               { drvOutputs = [DerivationOutput "out" sp algo (Hash.bytesToHexText digest)],
@@ -6085,7 +6131,7 @@ testSubstituteFromCaches = do
               config = (defaultBuildConfig (StoreDir root)) {bcCaches = caches, bcFetchRetry = defaultFetchRetryPolicy {frpBaseDelayMs = 1}}
           outcome <-
             bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
-              bracket (openStore (StoreDir root)) closeStore (substitute config)
+              bracket (openStore testLogger (StoreDir root)) closeStore (substitute config)
           (,) outcome <$> traverse snd served
       -- Substitute paths with their closure: the outcome, then whether each
       -- observed path is valid and the base names of what the store records
@@ -6101,14 +6147,14 @@ testSubstituteFromCaches = do
       -- The top path's own offer fetched without what it references, then
       -- whether each path is valid.
       fetchedAlone config store = do
-        offer <- evalStateT (Subst.queryReferencesWith defaultFetchRetryPolicy ioRetryEffects Realise.NoFallback (bcCaches config) top) Subst.emptyNarInfoMemo
+        offer <- evalStateT (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy (ioRetryEffects testLogger) Realise.NoFallback (bcCaches config) top) Subst.emptyNarInfoMemo
         outcome <- traverse (substitutePaths config store Realise.RegisterAll . (:| [])) (offeredSubstitute offer)
         (,) outcome <$> mapM (isValid store) [dep, top]
       -- The dep path's own substitute: the path it names, then what fetching
       -- it registering nothing and then registering it gives, each with
       -- whether the path is valid after.
       probedThenFetched config store = do
-        offer <- evalStateT (Subst.queryReferencesWith defaultFetchRetryPolicy ioRetryEffects Realise.NoFallback (bcCaches config) dep) Subst.emptyNarInfoMemo
+        offer <- evalStateT (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy (ioRetryEffects testLogger) Realise.NoFallback (bcCaches config) dep) Subst.emptyNarInfoMemo
         let substitute = offeredSubstitute offer
             fetchAs registration = do
               outcome <- traverse (substitutePaths config store registration . (:| [])) substitute
@@ -6297,7 +6343,7 @@ testWantedOutputsIO = do
           let root = tmpBase </> ("nova-nix-test-wanted-outputs-" ++ label)
               config = (defaultBuildConfig (StoreDir root)) {bcCaches = [Subst.CacheConfig base [key] 40]}
           bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
-            bracket (openStore (StoreDir root)) closeStore $ \store -> do
+            bracket (openStore testLogger (StoreDir root)) closeStore $ \store -> do
               writeDrv store (libDrv libScript) libDrvSP
               writeDrv store midDrv midDrvSP
               writeDrv store (appDrv inputs) appDrvSP
@@ -6384,7 +6430,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder1"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1" "simple-test"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo hello > $out/result.txt"
             config = defaultBuildConfig (stDir store)
@@ -6400,7 +6446,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder2"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "content-test"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo 'test content 42' > $out/data.txt"
             config = defaultBuildConfig (stDir store)
@@ -6422,7 +6468,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder3"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "cccccccccccccccccccccccccccccccc" "fail-test"
             drv =
               Derivation
@@ -6446,7 +6492,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder4"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "dddddddddddddddddddddddddddddddd" "exitfail"
             drv = mkTestBuildDrv shell outSP "exit 42"
             config = defaultBuildConfig (stDir store)
@@ -6462,7 +6508,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-leak"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "pppppppppppppppppppppppppppppppp" "leaktest"
             drv = mkTestBuildDrv (T.pack (tmpBase </> "no-such-builder.exe")) outSP "unused"
             config = defaultBuildConfig (stDir store)
@@ -6486,7 +6532,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-structured"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "ssssssssssssssssssssssssssssssss" "structured"
             outText = T.pack (storePathToFilePath (stDir store) outSP)
             attrs =
@@ -6545,7 +6591,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-passasfile"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "gggggggggggggggggggggggggggggggg" "passasfile"
             outDir = storePathToFilePath (stDir store) outSP
             dep = "/dddddddddddddddddddddddddddddddd-dep"
@@ -6573,7 +6619,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder5"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "cccccccccccccccccccccccccccccccc" "pathtest"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && touch $out/marker"
             config = defaultBuildConfig (stDir store)
@@ -6595,7 +6641,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-stale"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq" "staletest"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && echo fresh > $out/data.txt"
             config = defaultBuildConfig (stDir store)
@@ -6620,7 +6666,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder6"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "ffffffffffffffffffffffffffffffff" "dbtest"
             drv = mkTestBuildDrv shell outSP "mkdir -p $out && touch $out/file"
             config = defaultBuildConfig (stDir store)
@@ -6638,7 +6684,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder7"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "ggggggggggggggggggggggggggggggg1" "multi"
             devSP = StorePath "ggggggggggggggggggggggggggggggg2" "multi-dev"
             drv =
@@ -6676,7 +6722,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-deriver"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "ggggggggggggggggggggggggggggggg9" "deriver"
             devSP = StorePath "gggggggggggggggggggggggggggggggb" "deriver-dev"
             drv =
@@ -6709,7 +6755,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-partial-valid"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "ggggggggggggggggggggggggggggggg3" "partial-main"
             devSP = StorePath "ggggggggggggggggggggggggggggggg4" "partial-dev"
             mkDrv script =
@@ -6749,7 +6795,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-partial-both"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "ggggggggggggggggggggggggggggggg5" "both-main"
             devSP = StorePath "ggggggggggggggggggggggggggggggg6" "both-dev"
             mkDrv script =
@@ -6798,7 +6844,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-scratch-leak"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "ggggggggggggggggggggggggggggggg7" "leak-main"
             devSP = StorePath "ggggggggggggggggggggggggggggggg8" "leak-dev"
             mkDrv script =
@@ -6845,7 +6891,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-noout"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii" "nooutput"
             drv = mkTestBuildDrv shell outSP "echo 'forgot to create output'"
             config = defaultBuildConfig (stDir store)
@@ -6862,7 +6908,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-partial-missing"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiii1" "partial-output"
             devSP = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiii2" "missing-output"
             drv =
@@ -6898,7 +6944,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-fileout"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjj" "fileout"
             drv = mkTestBuildDrv shell outSP "echo 'I am a file output' > $out"
             config = defaultBuildConfig (stDir store)
@@ -6913,7 +6959,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder8"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh" "cleantest"
             drv = mkTestBuildDrv shell outSP "exit 1"
             config = defaultBuildConfig (stDir store)
@@ -6927,7 +6973,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-fo1"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let payload = "fixed output payload\n"
             digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" payload)
             outSP = StorePath "ffffffffffffffffffffffffffffff01" "fo-flat-good"
@@ -6950,7 +6996,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-impure1"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         setEnv "NOVA_TEST_IMPURE" "proxy-ok"
         unsetEnv "NOVA_TEST_ABSENT"
         let payload = "fixed output payload\n"
@@ -6971,7 +7017,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-impure2"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         setEnv "NOVA_TEST_IMPURE" "must-not-leak"
         let outSP = StorePath "ffffffffffffffffffffffffffffff04" "impure-scrubbed"
             script = "[ -z \"${NOVA_TEST_IMPURE-}\" ] && echo ok > $out"
@@ -6993,7 +7039,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-nul"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz" "nul-ends"
             script = "printf '%s|%s|%s|%s\\n' \"$0\" \"$1\" \"$smuggled\" \"${INJECTED-unset}\" > $out"
             base = mkTestBuildDrv shell outSP script
@@ -7019,7 +7065,7 @@ testBuilder = do
             tmpBase <- getTemporaryDirectory
             let tmpStore = tmpBase </> "nova-nix-test-builder-open-output"
             forceRemoveIfExists tmpStore
-            store <- openStore (StoreDir tmpStore)
+            store <- openStore testLogger (StoreDir tmpStore)
             let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaay" "open-output"
                 outPath = storePathToFilePath (stDir store) outSP
             result <- buildDerivation (defaultBuildConfig (stDir store)) store (mkTestBuildDrv shell outSP "mkdir $out && chmod 0777 $out") testDrvPath
@@ -7045,7 +7091,7 @@ testBuilder = do
                 release = tmpBase </> "nova-nix-test-builder-fixed-fd.release"
             forceRemoveIfExists tmpStore
             Dir.removePathForcibly release
-            store <- openStore (StoreDir tmpStore)
+            store <- openStore testLogger (StoreDir tmpStore)
             let payload = "payload"
                 digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" payload)
                 outSP = StorePath "ffffffffffffffffffffffffffffff0y" "fixed-fd"
@@ -7079,7 +7125,7 @@ testBuilder = do
             tmpBase <- getTemporaryDirectory
             let tmpStore = tmpBase </> "nova-nix-test-builder-dangling"
             forceRemoveIfExists tmpStore
-            store <- openStore (StoreDir tmpStore)
+            store <- openStore testLogger (StoreDir tmpStore)
             let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaax" "dangling"
             result <- buildDerivation (defaultBuildConfig (stDir store)) store (mkTestBuildDrv shell outSP "ln -s /nonexistent-nova-nix-target $out") testDrvPath
             target <- Dir.getSymbolicLinkTarget (storePathToFilePath (stDir store) outSP)
@@ -7090,7 +7136,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-builder-fresh-copy"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" "payload")
             outSP = StorePath "ffffffffffffffffffffffffffffff0x" "fresh-copy"
             leftover = storePathToFilePath (stDir store) outSP <> ".tmp"
@@ -7110,7 +7156,7 @@ testBuilder = do
             tmpBase <- getTemporaryDirectory
             let tmpStore = tmpBase </> "nova-nix-test-builder-canonical-first"
             forceRemoveIfExists tmpStore
-            store <- openStore (StoreDir tmpStore)
+            store <- openStore testLogger (StoreDir tmpStore)
             let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaw" "canonical-first"
                 outPath = storePathToFilePath (stDir store) outSP
             result <- buildDerivation (defaultBuildConfig (stDir store)) store (mkTestBuildDrv shell outSP "mkdir $out && echo hidden > $out/file && chmod 0200 $out/file") testDrvPath
@@ -7129,7 +7175,7 @@ testBuilder = do
             tmpBase <- getTemporaryDirectory
             let tmpStore = tmpBase </> "nova-nix-test-builder-unreadable-dir"
             forceRemoveIfExists tmpStore
-            store <- openStore (StoreDir tmpStore)
+            store <- openStore testLogger (StoreDir tmpStore)
             let outSP = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaav" "unreadable-dir"
                 outPath = storePathToFilePath (stDir store) outSP
             result <- buildDerivation (defaultBuildConfig (stDir store)) store (mkTestBuildDrv shell outSP "mkdir -p $out/d && touch $out/d/f && chmod 0644 $out/d") testDrvPath
@@ -7168,7 +7214,7 @@ testBuilder = do
             tmpBase <- getTemporaryDirectory
             let tmpStore = tmpBase </> "nova-nix-test-builder-fixed-references"
             forceRemoveIfExists tmpStore
-            store <- openStore (StoreDir tmpStore)
+            store <- openStore testLogger (StoreDir tmpStore)
             let outSP = StorePath "ffffffffffffffffffffffffffffff0w" "fixed-references"
                 outPath = storePathToFilePath (stDir store) outSP
                 digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" (TE.encodeUtf8 (T.pack outPath)))
@@ -7188,7 +7234,7 @@ testBuilder = do
             tmpBase <- getTemporaryDirectory
             let tmpStore = tmpBase </> "nova-nix-test-builder-fixed-unreadable"
             forceRemoveIfExists tmpStore
-            store <- openStore (StoreDir tmpStore)
+            store <- openStore testLogger (StoreDir tmpStore)
             let outSP = StorePath "ffffffffffffffffffffffffffffff0v" "fixed-unreadable"
                 tree = NAR.NarDirectory [("f", NAR.NarRegular False "x\n")]
                 digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" (NAR.serialise tree))
@@ -7215,7 +7261,7 @@ testBuilder = do
             Proc.callProcess "chflags" ["uchg", dir </> "stuck" </> "f"]
             -- The flag comes off whatever happens, so the store can go.
             ( do
-                ran <- withBuildDir storeDir firstOutput WorksInBuildDir RemoveFailed (const BuildSucceeded) Dir.doesDirectoryExist
+                ran <- withBuildDir testLogger storeDir firstOutput WorksInBuildDir RemoveFailed (const BuildSucceeded) Dir.doesDirectoryExist
                 movedAside <- Dir.doesPathExist (aside </> "stuck" </> "f")
                 pure (assertEqual "the build" True ran `andThen` assertEqual "moved aside" True movedAside)
               )
@@ -7262,19 +7308,19 @@ testBuilder = do
                   drv = baseDrv {drvOutputs = outputs, drvEnv = Map.insert "impureEnvVars" "NOVA_TEST_IMPURE" (drvEnv baseDrv)}
               _ <-
                 withBinaryFile logPath WriteMode $ \logHandle ->
-                  buildDerivation (defaultBuildConfig (stDir store)) {bcBuildLog = logHandle} store drv testDrvPath
+                  buildDerivation (defaultBuildConfig (stDir store)) (buildLogTo logHandle store) drv testDrvPath
               BS.readFile logPath
         forceRemoveIfExists tmpStore
         results <-
           bracket_ (setEnv "NOVA_TEST_IMPURE" "passed") (unsetEnv "NOVA_TEST_IMPURE" *> forceRemoveIfExists tmpStore *> Dir.removePathForcibly logPath) $
-            bracket (openStore (StoreDir tmpStore)) closeStore $ \store ->
+            bracket (openStore testLogger (StoreDir tmpStore)) closeStore $ \store ->
               traverse (\(label, outputs, expected) -> assertEqual ("what " <> label <> " saw") expected <$> seenBy store outputs) kinds
         pure (foldr andThen Pass results),
       runTestM "fixed-output flat mismatch fails and removes the output" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-fo2"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" "expected content\n")
             outSP = StorePath "ffffffffffffffffffffffffffffff02" "fo-flat-bad"
             drv = mkFixedOutputDrv shell outSP "printf 'tampered content\\n' > $out" "sha256" digest
@@ -7301,7 +7347,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-fo3"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let tree = NAR.NarDirectory [("data.txt", NAR.NarRegular False "inner bytes\n")]
             digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" (NAR.serialise tree))
             outSP = StorePath "ffffffffffffffffffffffffffffff03" "fo-rec-good"
@@ -7320,7 +7366,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-fo4"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let tree = NAR.NarDirectory [("data.txt", NAR.NarRegular False "declared bytes\n")]
             digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" (NAR.serialise tree))
             outSP = StorePath "ffffffffffffffffffffffffffffff04" "fo-rec-bad"
@@ -7339,7 +7385,7 @@ testBuilder = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-fo5"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let digest = maybe "" Hash.bytesToHexText (Hash.rawHashWithAlgo "sha256" "whatever\n")
             outSP = StorePath "ffffffffffffffffffffffffffffff05" "fo-flat-dir"
             drv = mkFixedOutputDrv shell outSP "mkdir -p $out && printf 'x' > $out/f" "sha256" digest
@@ -7387,7 +7433,7 @@ testFlatOutputFormIO = do
         Left err -> pure (Fail (T.pack (show err)))
         Right outSP ->
           bracket_ (forceRemoveIfExists tmpStore) (forceRemoveIfExists tmpStore) $
-            bracket (openStore (StoreDir tmpStore)) closeStore $ \store -> do
+            bracket (openStore testLogger (StoreDir tmpStore)) closeStore $ \store -> do
               let drv = mkFixedOutputDrv shell outSP script "sha256" (Hash.bytesToHexText digest)
               result <- buildDerivation (defaultBuildConfig (stDir store)) store drv testDrvPath
               registered <- isValid store outSP

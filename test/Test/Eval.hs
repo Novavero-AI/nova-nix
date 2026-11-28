@@ -234,7 +234,7 @@ import System.FilePath (dropDrive, makeRelative, takeDirectory, takeFileName, (<
 import qualified System.Info as SI
 import qualified System.Process as Proc
 import System.Timeout (timeout)
-import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertEval, assertEvalError, assertEvalErrorIO, assertEvalFail, assertLeft, assertParse, assertParseFail, assertRight, bytesText, canonicalAs, censusStoreHash, compiledBindings, decodeFormals, emits, envSpelling, evalAndBuild, evalDerivationIO, evalDerivationIOStore, evalNix, evalNixIO, evalNixIOIn, evalNixIOStore, evalNixIOStoreDir, evalNixInFile, evalNixWith, fetchedStorePath, findTestShell, fixtureGit, forceRemoveIfExists, hostToolsAttrs, inTestSession, jsonInFile, makeGitFixture, nixQuotedPath, positionJson, positionsFile, purePolicy, removeIfExists, repeatedMarker, restrictedPolicy, runTest, runTestIO, runTestM, selfHoldingDerivation, selfHoldingPrinted, selfHoldingPrintedStrict, setLayerRhsMax, setMaxLayers, sitesAdded, storePathStringValue, symlinksAvailable, testBaseDir, testEvalState, testOrigin, testPos, testSessionStore, unexpectedOps, upstreamBaseEnvNames, walkWatchdogMicros, withEnvVar, withGlobals)
+import Test.Harness (TestResult (..), andThen, asciiOsPath, assertEqual, assertEval, assertEvalError, assertEvalErrorIO, assertEvalFail, assertLeft, assertParse, assertParseFail, assertRight, bytesText, canonicalAs, censusStoreHash, compiledBindings, decodeFormals, emits, envSpelling, evalAndBuild, evalDerivationIO, evalDerivationIOStore, evalNix, evalNixIO, evalNixIOIn, evalNixIOStore, evalNixIOStoreDir, evalNixInFile, evalNixWith, fetchedStorePath, findTestShell, fixtureGit, forceRemoveIfExists, hostToolsAttrs, inTestSession, jsonInFile, makeGitFixture, nixQuotedPath, positionJson, positionsFile, purePolicy, removeIfExists, repeatedMarker, restrictedPolicy, runTest, runTestIO, runTestM, selfHoldingDerivation, selfHoldingPrinted, selfHoldingPrintedStrict, setLayerRhsMax, setMaxLayers, sitesAdded, storePathStringValue, symlinksAvailable, testBaseDir, testEvalState, testLogger, testOrigin, testPos, testSessionStore, unexpectedOps, upstreamBaseEnvNames, walkWatchdogMicros, withEnvVar, withGlobals)
 import qualified Test.QuickCheck as QC
 
 -- ---------------------------------------------------------------------------
@@ -4206,7 +4206,7 @@ evalNixIOWithNixPath :: FilePath -> Text -> IO (Either Text NixValue)
 evalNixIOWithNixPath baseDir source = do
   storeDir <- evalNixIOStoreDir
   searchPaths <- nixPathSearchPath
-  st <- newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir baseDir
+  st <- newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir baseDir
   evalNixIOIn st baseDir source
 
 -- | 'evalNixIO' keeping a failure whole, its lines of context included.
@@ -5616,7 +5616,7 @@ unpairedSurrogateNixPath dir
       runTestM "NIX_PATH holding an unpaired surrogate is refused" $
         withEnvVar (T.unpack nixPathVarName) "a=\xD800" $ do
           storeDir <- evalNixIOStoreDir
-          outcome <- try (nixPathSearchPath >>= \searchPaths -> newEvalStateWith unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir dir)
+          outcome <- try (nixPathSearchPath >>= \searchPaths -> newEvalStateWith testLogger unrestrictedPolicy searchPaths (testSessionStore storeDir) storeDir dir)
           pure $ case outcome of
             Left (err :: IOException)
               | unpairedSurrogateWords `T.isInfixOf` T.pack (displayException err) -> Pass
@@ -7960,10 +7960,10 @@ testRealiseContextIO = do
       nixString text = "\"" <> T.replace "\"" "\\\"" (T.replace "\\" "\\\\" text) <> "\""
       evalWith = evalUnder unrestrictedPolicy
       evalUnder policy store source = do
-        st <- newEvalStateWith policy [] store storeDir root
+        st <- newEvalStateWith testLogger policy [] store storeDir root
         evalTracedIn st root source
       evalAt dir store source = do
-        st <- newEvalStateWith unrestrictedPolicy [] store (StoreDir dir) root
+        st <- newEvalStateWith testLogger unrestrictedPolicy [] store (StoreDir dir) root
         evalTracedIn st root source
       -- A read-only session's answer, the same as a read-write one's,
       -- with nothing written to its store, where the read-write one has
@@ -8286,7 +8286,7 @@ testRealiseContextIO = do
             pure (assertEqual "answer and calls" (Right (mkStr "fetched bytes\n"), [FakeAdded]) (answer, asked)),
           runTestM "a read-only session over a store that does not exist refuses, and makes no directory, metadata, database or lock" $ do
             let absent = StoreDir (root </> "absent-store")
-            st <- newEvalStateWith unrestrictedPolicy [] (ReadOnlySession (localQueries absent) unexpectedOps) absent root
+            st <- newEvalStateWith testLogger unrestrictedPolicy [] (ReadOnlySession (localQueries absent) unexpectedOps) absent root
             answer <- evalTracedIn st root ("import " <> twoOutputs)
             made <- Dir.doesPathExist (unStoreDir absent)
             pure $ case answer of
@@ -8300,7 +8300,7 @@ testRealiseContextIO = do
                 dir = StoreDir (root </> "queried-store")
                 metadata = unStoreDir dir </> metaDirName
                 walIndex = Set.fromList [dbFileName <> "-wal", dbFileName <> "-shm"]
-            bracket (openStore dir) closeStore $ \store -> do
+            bracket (openStore testLogger dir) closeStore $ \store -> do
               createDirectoryIfMissing True (storePathToFilePath (stDir store) held)
               registrationFor store held Nothing [] >>= registerPath (stDB store)
             before <- Set.fromList <$> Dir.listDirectory metadata
@@ -8325,7 +8325,7 @@ testRealiseContextIO = do
               (Right (valid, Right references), "") | Set.null valid, Set.null references -> Pass
               other -> Fail ("expected nothing held and the database still empty, got: " <> T.pack (show other)),
           runTestM "a read-only session over a database without the store's tables refuses a derivation in upstream's words" $ do
-            st <- newEvalStateWith unrestrictedPolicy [] (ReadOnlySession (localQueries emptyDatabaseStore) unexpectedOps) emptyDatabaseStore root
+            st <- newEvalStateWith testLogger unrestrictedPolicy [] (ReadOnlySession (localQueries emptyDatabaseStore) unexpectedOps) emptyDatabaseStore root
             outcome <- try (evalTracedIn st root ("import " <> twoOutputs))
             pure $ case outcome :: Either SQL.SQLError (Either EvalFailure NixValue) of
               Right (Left failure) | notValidDerivation failure -> Pass
@@ -8576,7 +8576,7 @@ testPhase4IO = do
         -- Search path with --nix-path equivalent (populated nixPath)
         runTestM "search path with populated nixPath" $ do
           nixPaths <- parseNixPath (TE.encodeUtf8 ("mypkg=" <> T.pack subDir))
-          st <- newEvalStateWith unrestrictedPolicy nixPaths (ReadOnlySession (localQueries platformStoreDir) unexpectedOps) platformStoreDir testDir
+          st <- newEvalStateWith testLogger unrestrictedPolicy nixPaths (ReadOnlySession (localQueries platformStoreDir) unexpectedOps) platformStoreDir testDir
           result <- runEvalIO st (eval (evalBaseEnv st) (EApp (EApp (EVar "__findFile") (EVar "__nixPath")) (EStr [StrLit "mypkg"])))
           pure $ case result of
             Right (VPath _) -> Pass
@@ -10306,7 +10306,7 @@ testInStoreCopyIO = do
              -- the address evaluation hashed.
              runTestM "materializeEvalSources restores a copy of a path in the store it was given" $ do
                placeTree restoreStore
-               store <- openStore (StoreDir restoreStore)
+               store <- openStore testLogger (StoreDir restoreStore)
                outcome <-
                  try (materializeEvalSources store (Map.fromList [(casedCopy, inTree "cased"), (smallCopy, small)]))
                valid <- mapM (isValid store) [casedCopy, smallCopy]
@@ -10809,7 +10809,7 @@ evalPolicyIO policy roots searchPaths baseDir source = do
   case parseNixWithScope (rootScopeNames policy) baseDir testOrigin (TE.encodeUtf8 source) of
     Left err -> pure (Left (T.pack (show err)))
     Right parsed -> do
-      st <- newEvalStateWith policy searchPaths (testSessionStore storeDir) storeDir baseDir
+      st <- newEvalStateWith testLogger policy searchPaths (testSessionStore storeDir) storeDir baseDir
       mapM_ (allowEvalPath st) roots
       runEvalIO st (evalParsed (pure (evalBaseEnv st)) parsed)
 

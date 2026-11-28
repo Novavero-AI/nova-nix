@@ -48,7 +48,7 @@ import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermis
 import qualified System.Directory as Dir
 import System.FilePath ((</>))
 import qualified System.Info as SI
-import Test.Harness (TestResult (..), andThen, assertEqual, assertLeft, canonicalAs, chunkReader, forceRemoveIfExists, narRequest, offeredSubstitute, offeredThenFetched, posixOnlyEntries, quotedAsCxx, runTest, runTestM, servedPaths, sigTestKeyText, sigTestWrongKeyText)
+import Test.Harness (TestResult (..), andThen, assertEqual, assertLeft, canonicalAs, chunkReader, forceRemoveIfExists, narRequest, offeredSubstitute, offeredThenFetched, posixOnlyEntries, quotedAsCxx, runTest, runTestM, servedPaths, sigTestKeyText, sigTestWrongKeyText, testLogger)
 import qualified Test.QuickCheck as QC
 
 -- ---------------------------------------------------------------------------
@@ -458,7 +458,7 @@ testSubstituter = do
         let tmpStore = tmpBase </> "nova-nix-test-materialize-ok"
         forceRemoveIfExists tmpStore
         createDirectoryIfMissing True tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let sp = StorePath sampleHash "stream"
             destPath = storePathToFilePath (StoreDir tmpStore) sp
         source <- chunkReader (streamChunks 7 streamTestNar)
@@ -478,7 +478,7 @@ testSubstituter = do
         let tmpStore = tmpBase </> "nova-nix-test-materialize-digest"
         forceRemoveIfExists tmpStore
         createDirectoryIfMissing True tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let sp = StorePath sampleHash "stream"
             destPath = storePathToFilePath (StoreDir tmpStore) sp
         source <- chunkReader (streamChunks 7 streamTestNar)
@@ -498,7 +498,7 @@ testSubstituter = do
         let tmpStore = tmpBase </> "nova-nix-test-materialize-trunc"
         forceRemoveIfExists tmpStore
         createDirectoryIfMissing True tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let sp = StorePath sampleHash "stream"
             destPath = storePathToFilePath (StoreDir tmpStore) sp
         source <- chunkReader (streamChunks 7 (BS.take (BS.length streamTestNar - 10) streamTestNar))
@@ -684,8 +684,8 @@ testSubstituter = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-subst"
         createDirectoryIfMissing True tmpStore
-        store <- openStore (StoreDir tmpStore)
-        result <- offeredThenFetched defaultFetchRetryPolicy ioRetryEffects store [] (StorePath "test" "hello")
+        store <- openStore testLogger (StoreDir tmpStore)
+        result <- offeredThenFetched defaultFetchRetryPolicy (ioRetryEffects testLogger) store [] (StorePath "test" "hello")
         closeStore store
         removeDirectoryRecursive tmpStore
         pure (assertEqual "no-caches" Subst.SubstNotFound result),
@@ -829,7 +829,7 @@ testSubstituter = do
             rawNar = NAR.serialise posixOnlyTree
             info = (streamTestNarInfo rawNar) {NarInfo.niStorePath = storePathToText defaultStoreDir sp}
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         result <- Subst.unpackAndVerify store sp info rawNar
         onDisk <- case result of
           Subst.SubstSuccess _ lock -> do
@@ -1140,7 +1140,7 @@ testSubstituter = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-unpack-verify"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let sp = StorePath (T.replicate 32 "b") "roundtrip"
             tree =
               NAR.NarDirectory
@@ -1183,7 +1183,7 @@ testSubstituter = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-unpack-canonical"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let sp = StorePath (T.replicate 32 "t") "canonical"
             dest = storePathToFilePath (stDir store) sp
             rawNar =
@@ -1227,7 +1227,7 @@ testSubstituter = do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-unpack-unverified"
         forceRemoveIfExists tmpStore
-        store <- openStore (StoreDir tmpStore)
+        store <- openStore testLogger (StoreDir tmpStore)
         let sp = StorePath (T.replicate 32 "f") "unverified"
             rawNar = NAR.serialise (NAR.NarDirectory [("data.txt", NAR.NarRegular False "untrusted bytes")])
             consistent =
@@ -1536,7 +1536,7 @@ testSubstituterRetry = do
                       }
                 outPath = storePathToFilePath storeDir sp
             bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
-              bracket (openStore storeDir) closeStore $ \store -> do
+              bracket (openStore testLogger storeDir) closeStore $ \store -> do
                 writeDrv store drv drvSP
                 result <- buildWithDeps config store drv drvSP
                 substituted <- Dir.doesFileExist (outPath </> "data")
@@ -1556,7 +1556,7 @@ testSubstituterRetry = do
                         reWarn = \msg -> atomicModifyIORef' warnings (\seen -> (seen ++ [msg], ()))
                       }
               bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
-                bracket (openStore (StoreDir root)) closeStore $ \store -> do
+                bracket (openStore testLogger (StoreDir root)) closeStore $ \store -> do
                   result <- offeredThenFetched defaultFetchRetryPolicy effects store [cache] sp
                   outcome <- case result of
                     Subst.SubstSuccess _ lock -> do
@@ -1580,8 +1580,8 @@ testSubstituterRetry = do
                           caches = [Subst.CacheConfig base [key] 40]
                           config = (defaultBuildConfig (StoreDir root)) {bcCaches = caches}
                       bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
-                        bracket (openStore (StoreDir root)) closeStore $ \store -> do
-                          offers <- evalStateT (traverse (Subst.queryReferencesWith defaultFetchRetryPolicy quietRetry Realise.NoFallback caches) (high :| [low])) Subst.emptyNarInfoMemo
+                        bracket (openStore testLogger (StoreDir root)) closeStore $ \store -> do
+                          offers <- evalStateT (traverse (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy quietRetry Realise.NoFallback caches) (high :| [low])) Subst.emptyNarInfoMemo
                           case traverse offeredSubstitute offers of
                             Nothing -> pure (Fail ("not offered: " <> T.pack (show (fmap offerCache offers))))
                             Just batch -> do
@@ -1786,7 +1786,7 @@ testSubstituterRetry = do
     statusCode = T.unpack . T.take 3
     quietRetry = RetryEffects {reSleepMs = const (pure ()), reJitter = pure 0, reWarn = const (pure ())}
     queryOffer fallback caches path =
-      offerCache <$> evalStateT (Subst.queryReferencesWith defaultFetchRetryPolicy quietRetry fallback caches path) Subst.emptyNarInfoMemo
+      offerCache <$> evalStateT (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy quietRetry fallback caches path) Subst.emptyNarInfoMemo
     hash = T.replicate 32 "b"
     sp = StorePath hash "retry"
     narInfoPath = "/" <> TE.encodeUtf8 hash <> ".narinfo"

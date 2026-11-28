@@ -128,7 +128,6 @@ import Data.Ord (comparing)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import qualified Data.Text.IO as TIO
 import Data.Word (Word64)
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
@@ -137,6 +136,7 @@ import Nix.Compression (NarCompression (..), parseNarCompression)
 import Nix.Daemon.Protocol (ContentAddressMethod (..), caAlgo, caDigest, caMethod, parseContentAddress)
 import Nix.Hash (FileIngestionMethod (..), ModuloHash, moduloHashFinalize, moduloHashInit, moduloHashUpdate)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, RetryEffects, TransferError (..), attemptFailureMessage, catchSync, fetchStatusFailure, retryTransient, statusError, transferFailureHandlers, withTransfer, withUserAgent)
+import Nix.Logger (Logger (..))
 import Nix.Realise (Fallback (..), Offer (..))
 import Nix.Store (CaseSensitivity, NarStreamFailure (..), PathLock, Store (..), UpstreamHazard (..), abortNarUnpack, acquirePathLock, canonicalizeMetadata, finishNarUnpack, isValid, newNarUnpackSink, releasePathLock, sinkNarStream, unpackNarEntry, upstreamManagedRefusal, volumeCaseHack)
 import Nix.Store.DB (PathRegistration (..))
@@ -152,7 +152,7 @@ import qualified NovaCache.Validate as Validate
 import qualified NovaCache.Xz as Xz
 import qualified NovaCache.Zstd as Zstd
 import qualified System.Directory as Dir
-import System.IO (IOMode (ReadMode), stderr, withBinaryFile)
+import System.IO (IOMode (ReadMode), withBinaryFile)
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -304,7 +304,7 @@ underPathLock store sp substituteLocked = do
       -- keep-alive) rather than creating a fresh one per call and per
       -- output.
       manager <- HTTPS.getGlobalManager
-      lock <- acquirePathLock (stDir store) sp
+      lock <- acquirePathLock (stLogger store) (stDir store) sp
       locked manager lock `onException` releasePathLock lock
     locked manager lock = do
       valid <- isValid store sp
@@ -333,26 +333,26 @@ underPathLock store sp substituteLocked = do
 -- retries are spent or on a narinfo that does not validate, ends the scan
 -- with 'QueryFailed' under 'NoFallback', as upstream rethrows it.  Under
 -- 'BuildFromSource' it is reported and passed over, as upstream logs it
--- and asks the next cache.
+-- and asks the next cache.  What the scan says goes to the logger.
 --
 -- A cache that answered about the path before in this run answers from
 -- the run's t'NarInfoMemo' instead, so a closure requests each narinfo
 -- once and a path no cache holds is looked for once; a query that failed
 -- is made again.
-queryReferencesWith :: FetchRetryPolicy -> RetryEffects IO -> Fallback -> [CacheConfig] -> StorePath -> StateT NarInfoMemo IO (Offer Substitute)
-queryReferencesWith policy effects fallback caches = offerFrom (Retrying policy effects) fallback (sortCaches caches)
+queryReferencesWith :: Logger -> FetchRetryPolicy -> RetryEffects IO -> Fallback -> [CacheConfig] -> StorePath -> StateT NarInfoMemo IO (Offer Substitute)
+queryReferencesWith logger policy effects fallback caches = offerFrom logger (Retrying policy effects) fallback (sortCaches caches)
 
 -- | 'queryReferencesWith' over the caches after the one a t'Substitute'
 -- came from, for a path that substitute did not deliver: upstream's goal
 -- moving on to its next substituter (@PathSubstitutionGoal::init@ at
 -- 2.24.9).
-queryNextOfferWith :: FetchRetryPolicy -> RetryEffects IO -> Fallback -> Substitute -> StateT NarInfoMemo IO (Offer Substitute)
-queryNextOfferWith policy effects fallback (Substitute sp _ _ later) = offerFrom (Retrying policy effects) fallback later sp
+queryNextOfferWith :: Logger -> FetchRetryPolicy -> RetryEffects IO -> Fallback -> Substitute -> StateT NarInfoMemo IO (Offer Substitute)
+queryNextOfferWith logger policy effects fallback (Substitute sp _ _ later) = offerFrom logger (Retrying policy effects) fallback later sp
 
 -- | The first offer for a path among caches in the order given.
-offerFrom :: Retrying -> Fallback -> [CacheConfig] -> StorePath -> StateT NarInfoMemo IO (Offer Substitute)
-offerFrom _ _ [] _ = pure NotOffered
-offerFrom retry fallback caches sp = do
+offerFrom :: Logger -> Retrying -> Fallback -> [CacheConfig] -> StorePath -> StateT NarInfoMemo IO (Offer Substitute)
+offerFrom _ _ _ [] _ = pure NotOffered
+offerFrom logger retry fallback caches sp = do
   manager <- liftIO HTTPS.getGlobalManager
   firstAnswer manager caches
   where
@@ -362,17 +362,17 @@ offerFrom retry fallback caches sp = do
       let next = firstAnswer manager rest
           failed failure = case fallback of
             NoFallback -> pure (QueryFailed (ccUrl cache <> ": " <> spName sp <> ": " <> failure))
-            BuildFromSource -> liftIO (reportCache cache sp failure) >> next
+            BuildFromSource -> liftIO (reportCache logger cache sp failure) >> next
       case answer of
         NarInfoUsable narInfo -> either failed (pure . Offered (Substitute sp cache narInfo rest)) (parseReferences (NarInfo.niReferences narInfo))
         NarInfoAbsent -> next
-        NarInfoPassedOver reason -> liftIO (reportCache cache sp reason) >> next
+        NarInfoPassedOver reason -> liftIO (reportCache logger cache sp reason) >> next
         NarInfoFailed failure -> failed failure
 
--- | Say on stderr what one cache did with a path.
-reportCache :: CacheConfig -> StorePath -> Text -> IO ()
-reportCache cache sp message =
-  TIO.hPutStrLn stderr ("  [subst] " <> ccUrl cache <> ": " <> spName sp <> ": " <> message)
+-- | Tell the logger what one cache did with a path.
+reportCache :: Logger -> CacheConfig -> StorePath -> Text -> IO ()
+reportCache logger cache sp message =
+  logMessage logger ("  [subst] " <> ccUrl cache <> ": " <> spName sp <> ": " <> message)
 
 -- | The retry policy and its effects, carried to every request one
 -- substitution makes.
@@ -571,7 +571,7 @@ unpackVerifiedNar store sp verified refs deriver =
       maybe (unpackUnderLock narEntry) (pure . SubstError) refusal
   where
     unpackUnderLock narEntry = do
-      lock <- acquirePathLock (stDir store) sp
+      lock <- acquirePathLock (stLogger store) (stDir store) sp
       result <- unpackLocked narEntry lock `onException` releasePathLock lock
       case result of
         SubstSuccess _ _ -> pure result
@@ -834,7 +834,7 @@ streamWithRetry retry mgr store cache sp narInfo lock = do
   case outcome of
     Right (Just registration) -> pure (SubstSuccess registration lock)
     Right Nothing -> do
-      reportCache cache sp ("file '" <> NarInfo.niUrl narInfo <> "' does not exist in the binary cache")
+      reportCache (stLogger store) cache sp ("file '" <> NarInfo.niUrl narInfo <> "' does not exist in the binary cache")
       pure SubstNotFound
     Left failure -> pure (SubstError (attemptFailureMessage failure))
 
