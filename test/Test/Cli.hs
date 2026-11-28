@@ -2513,6 +2513,7 @@ cliOperands name flagName = case name of
   Ref.ProfileHistoryCommand -> []
   Ref.ProfileRollbackCommand -> []
   Ref.ProfileWipeHistoryCommand -> []
+  Ref.DaemonCommand -> []
   where
     expression = concat [["--expr", "1"] | flagName /= Ref.ExprFlag]
 
@@ -2533,6 +2534,7 @@ cliSelects name parsed = case (name, parsed) of
   (Ref.ProfileHistoryCommand, Cli.CmdProfileHistory {}) -> True
   (Ref.ProfileRollbackCommand, Cli.CmdProfileRollback {}) -> True
   (Ref.ProfileWipeHistoryCommand, Cli.CmdProfileWipeHistory {}) -> True
+  (Ref.DaemonCommand, Cli.CmdDaemon {}) -> True
   _ -> False
 
 -- | One word read back as a POSIX shell reads it, for what
@@ -2693,10 +2695,15 @@ testNixConfig = do
         assertEqual "nbsp-bool" (Left "Boolean setting 'pure-eval' has invalid value 'true\xA0'") (ncPureEval <$> resolveTexts ["pure-eval = true\xC2\xA0"]),
       -- Bytes with no UTF-8 reading in a setting.
       runTest "a comment and an unknown setting holding a byte with no UTF-8 reading are never decoded" $
-        assertEqual "bytes-ignored" (Right ["https://a"]) (substitutersOf Map.empty [] (Just ("trusted-users = " <> latin1 <> "\nsubstituters = https://a # " <> latin1))),
+        assertEqual "bytes-ignored" (Right ["https://a"]) (substitutersOf Map.empty [] (Just ("max-jobs = " <> latin1 <> "\nsubstituters = https://a # " <> latin1))),
       runTest "a list setting holding a byte with no UTF-8 reading is refused under its own name" $
         let expected = "setting 'substituters' has invalid value 'https://caf\xFFFD.example': not valid UTF-8"
          in assertEqual "list-bytes" (Left expected) (substitutersOf Map.empty [] (Just ("extra-binary-caches = https://" <> latin1 <> ".example"))),
+      runTest "the daemon's lists of users keep a byte with no UTF-8 reading, and extra- adds to them" $
+        assertEqual
+          "users"
+          (Right ["root", "caf\xE9", "@wheel"])
+          (Config.ncTrustedUsers <$> Config.resolveConfig [Config.ConfigAssignment "trusted-users" "root caf\xE9", Config.ConfigAssignment "extra-trusted-users" "@wheel"]),
       runTest "a Boolean or integer setting holding such a byte is upstream's invalid-value error" $
         assertEqual
           "scalar-bytes"
@@ -3101,7 +3108,7 @@ testConfigBytesCLI = do
             (const (expectImpure "conf-dir-decoy" (decoyDir </> confName) "")),
         envCase
           "CLI NIX_CONFIG holding such a byte in a comment and an unknown setting applies the rest"
-          ("trusted-users = " <> latin1 <> "\npure-eval = true # " <> latin1 <> "\n")
+          ("max-jobs = " <> latin1 <> "\npure-eval = true # " <> latin1 <> "\n")
           (expectPure "env-bytes-ignored" noConfDir),
         envCase
           "CLI NIX_CONFIG holding such a byte in a list setting is refused"

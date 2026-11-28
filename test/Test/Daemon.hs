@@ -1,15 +1,21 @@
 {-# LANGUAGE LambdaCase #-}
 
--- | Tests of the daemon's wire format, its protocol, and its side of a
--- connection, scripted byte by byte against a store in memory.
+-- | Tests of the daemon's wire format, its protocol, its side of a
+-- connection, scripted byte by byte against a store in memory, who may
+-- connect to it, and the daemon itself on a socket over a store on disk.
 module Test.Daemon
   ( testDaemonWire,
     testDaemonProtocol,
     testDaemonFixtures,
     testDaemonServer,
+    testDaemonAuth,
+    testDaemonSocketIO,
   )
 where
 
+import Control.Concurrent (forkFinally, killThread)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (bracket, finally, onException)
 import Control.Monad (replicateM, void, when)
 import Control.Monad.State.Strict (State, gets, modify', runState, state)
 import Data.Bits (shiftR)
@@ -18,6 +24,8 @@ import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import Data.Foldable (traverse_)
+import Data.Functor.Identity (Identity, runIdentity)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.List (isSuffixOf, sort)
 import qualified Data.Map.Strict as Map
@@ -27,22 +35,33 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word64, Word8)
+import Network.Socket (Family (AF_UNIX), SockAddr (SockAddrUnix), Socket, SocketType (Stream), close, connect, defaultProtocol, socket)
+import Network.Socket.ByteString (recv, sendAll)
 import Nix.Config (NixConfig (..), defaultNixConfig)
+import qualified Nix.Daemon.Auth as Auth
 import qualified Nix.Daemon.Connection as Conn
+import qualified Nix.Daemon.Listen as Listen
+import Nix.Daemon.LocalStore (ServedStore, newServedStore, serveLocal)
 import qualified Nix.Daemon.Ops as Ops
 import qualified Nix.Daemon.Protocol as Proto
 import qualified Nix.Daemon.Wire as Wire
+import Nix.Environment (argumentBytes)
 import Nix.Hash (FileIngestionMethod (..), sha256Digest)
 import qualified Nix.Hash as Hash
+import Nix.Logger (Logger (..))
 import Nix.Push (storePathBasename)
+import Nix.Store (Store (..), closeStore, openStore)
+import Nix.Store.DB (PathRegistration (..), Ultimate (..), registerPath)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, storePathHashLen, storePathToText)
 import Nix.Store.Path.Internal (StorePath (..))
+import NodeStatus (NodeStatus (..), nodeStatus)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
 import qualified System.Directory as Dir
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
-import Test.Harness (TestResult (..), andThen, assertEqual, assertRight, genContentAddress, genSignatures, runTest, runTestM)
+import System.Timeout (timeout)
+import Test.Harness (TestResult (..), andThen, assertEqual, assertRight, forceRemoveIfExists, genContentAddress, genSignatures, runTest, runTestM)
 import qualified Test.QuickCheck as QC
 
 -- ---------------------------------------------------------------------------
@@ -903,8 +922,7 @@ serverConfigAt version =
       Conn.scVersion = version,
       Conn.scNixVersion = serverNixVersion,
       Conn.scVerbosity = Proto.Verbosity 3,
-      Conn.scConfig = defaultNixConfig {ncSubstituters = [daemonSubstituter]},
-      Conn.scTrustedSubstituters = [trustedSubstituter]
+      Conn.scConfig = defaultNixConfig {ncSubstituters = [daemonSubstituter], ncTrustedSubstituters = [trustedSubstituter]}
     }
 
 serverConfig :: Conn.ServerConfig
@@ -1670,3 +1688,251 @@ alsoWrittenByTheDaemon (file, check) = (file, \bytes -> check bytes `andThen` da
     daemonWrites bytes =
       let (ended, written, _) = runScript (serverConfigAt (Proto.Version (Proto.VersionNumber 1 10) Set.empty)) Proto.Trusted emptyFake [le64 clientMagicWord <> le64 0x10a]
        in assertEqual "the daemon's handshake" bytes written `andThen` assertEqual "end" (Conn.HandshakeFailed "the Nix client version is too old") ended
+
+-- ---------------------------------------------------------------------------
+-- Tests: who may connect
+-- ---------------------------------------------------------------------------
+
+-- | A user database with two users, three groups, and a directory that
+-- counts @alice@ in @staff@ though the group lists no one.
+fakeUsers :: Auth.UserDatabase Identity
+fakeUsers =
+  Auth.UserDatabase
+    { Auth.udUserName = \uid -> pure (Map.lookup uid (Map.fromList [(1000, "alice"), (1001, "bob")])),
+      Auth.udGroupName = \gid -> pure (Map.lookup gid (Map.fromList [(100, "users"), (200, "wheel"), (300, "staff")])),
+      Auth.udGroup = \name -> pure (Map.lookup name (Map.fromList [("users", Auth.GroupEntry 100 []), ("wheel", Auth.GroupEntry 200 ["bob"]), ("staff", Auth.GroupEntry 300 [])])),
+      Auth.udMembership = \uid gid -> pure (if (uid, gid) == (1000, 300) then Just True else Nothing)
+    }
+
+-- | Upstream's refusal of a user.
+notAllowed :: Text -> Auth.Admission
+notAllowed user = Auth.Refused ("user '" <> user <> "' is not allowed to connect to the Nix daemon")
+
+-- | Admission decided as upstream's daemon decides it, over a user
+-- database of the test's own.
+testDaemonAuth :: IO [Bool]
+testDaemonAuth = do
+  putStrLn "daemon/auth"
+  sequence
+    [ runTest "a peer is trusted and admitted as trusted-users and allowed-users name it, by user, group or everyone" $
+        let admit trusted allowed buildGroup peer = runIdentity (Auth.admitPeer fakeUsers (Auth.AuthSettings trusted allowed buildGroup) peer)
+            alice = Auth.Peer (Just 7) (Just 1000) (Just 100)
+            bob = Auth.Peer Nothing (Just 1001) (Just 100)
+         in assertEqual "allowed" (Auth.Admitted Proto.NotTrusted (Just "alice")) (admit ["root"] ["*"] "" alice)
+              `andThen` assertEqual "by name" (Auth.Admitted Proto.Trusted (Just "alice")) (admit ["alice"] [] "" alice)
+              `andThen` assertEqual "everyone" (Auth.Admitted Proto.Trusted (Just "alice")) (admit ["*"] [] "" alice)
+              `andThen` assertEqual "a group's member list" (Auth.Admitted Proto.Trusted (Just "bob")) (admit ["@wheel"] [] "" bob)
+              `andThen` assertEqual "the peer's own group" (Auth.Admitted Proto.Trusted (Just "alice")) (admit ["@users"] [] "" alice)
+              `andThen` assertEqual "the directory's membership" (Auth.Admitted Proto.Trusted (Just "alice")) (admit ["@staff"] [] "" alice)
+              `andThen` assertEqual "no such group, not named" (notAllowed "alice") (admit ["@nosuch"] ["bob"] "" alice)
+              `andThen` assertEqual "a trusted user always may" (Auth.Admitted Proto.Trusted (Just "bob")) (admit ["bob"] [] "" bob)
+              `andThen` assertEqual "a user with no entry is its number" (Auth.Admitted Proto.NotTrusted (Just "4242")) (admit [] ["4242"] "" (Auth.Peer Nothing (Just 4242) (Just 4243)))
+              `andThen` assertEqual "a peer with no user" (Auth.Admitted Proto.NotTrusted Nothing) (admit [] ["*"] "" Auth.unknownPeer)
+              `andThen` assertEqual "a peer with no user, not allowed" (notAllowed "<unknown>") (admit [] ["alice"] "" Auth.unknownPeer)
+              `andThen` assertEqual "the build users' group, trusted or not" (notAllowed "alice") (admit ["*"] ["*"] "users" alice),
+      runTest "an admitted connection is logged as upstream's daemon logs it" $
+        assertEqual "trusted" "accepted connection from pid 7, user alice (trusted)" (Auth.acceptedMessage (Auth.Peer (Just 7) (Just 1000) Nothing) (Auth.Admitted Proto.Trusted (Just "alice")))
+          `andThen` assertEqual "not trusted, nothing known" "accepted connection from pid <unknown>, user <unknown>" (Auth.acceptedMessage Auth.unknownPeer (Auth.Admitted Proto.NotTrusted Nothing))
+    ]
+
+-- ---------------------------------------------------------------------------
+-- Tests: the daemon on a socket
+-- ---------------------------------------------------------------------------
+
+-- | How long a socket test may take before it fails: well past what any
+-- of them takes, so only a daemon that stopped answering reaches it.
+socketTestMicros :: Int
+socketTestMicros = 60 * 1000 * 1000
+
+-- | A store of its own in a directory of its own, served as a daemon
+-- serves one, holding 'fooPath', valid, and a logger keeping what is
+-- logged, which the test is given in order; the directory is removed
+-- after.
+withServedStore :: (FilePath -> Store -> ServedStore -> Logger -> IO [Text] -> IO TestResult) -> IO TestResult
+withServedStore body = do
+  tmp <- Dir.getTemporaryDirectory
+  let root = tmp </> "nn-daemon"
+  forceRemoveIfExists root
+  Dir.createDirectoryIfMissing True (root </> "store")
+  logged <- newIORef []
+  let logger = Logger (\message -> atomicModifyIORef' logged (\messages -> (message : messages, ()))) (const (pure ()))
+  result <- bracket (openStore logger (StoreDir (root </> "store"))) closeStore $ \store -> do
+    registerPath (stDB store) (PathRegistration fooPath (Hash.formatNixHash (Hash.hashBytes (narOf fooPath))) (BS.length (narOf fooPath)) Nothing [] NotUltimate Set.empty Nothing)
+    served <- newServedStore store
+    body root store served logger (reverse <$> readIORef logged)
+  forceRemoveIfExists root
+  pure result
+
+-- | The scripts' daemon configuration, for a store a test serves.
+servedConfig :: Store -> NixConfig -> Conn.ServerConfig
+servedConfig store config = serverConfig {Conn.scStoreDir = stDir store, Conn.scConfig = config}
+
+-- | A daemon serving a store of its own on a socket beside it, on a
+-- thread stopped once the test is done, with what it logged.
+withSocketDaemon :: Listen.TrustOverride -> (NixConfig -> NixConfig) -> (StoreDir -> FilePath -> IO [Text] -> IO TestResult) -> IO TestResult
+withSocketDaemon trust configure body =
+  withServedStore $ \root store served logger logged -> do
+    let socketPath = root </> "socket"
+        config = configure defaultNixConfig
+    auth <- Listen.authSettingsFor config
+    spelled <- argumentBytes socketPath
+    opened <- maybe (pure (Left "the socket path has no spelling as bytes")) Listen.openListener spelled
+    case opened of
+      Left refusal -> pure (Fail refusal)
+      Right listener -> do
+        stopped <- newEmptyMVar
+        let options = Listen.DaemonOptions trust auth (serveLocal served (servedConfig store config))
+        thread <- forkFinally (Listen.serveListener logger options listener) (\_ -> putMVar stopped ())
+        ran <- timeout socketTestMicros (body (stDir store) socketPath logged) `finally` (killThread thread >> takeMVar stopped >> Listen.closeListener listener)
+        pure (fromMaybe (Fail "the daemon stopped answering") ran)
+
+-- | A transport over a client's input, given in chunks, and what the
+-- daemon wrote to it.
+memoryTransport :: [BS.ByteString] -> IO (Conn.Transport IO, IO BS.ByteString)
+memoryTransport input = do
+  pending <- newIORef (filter (not . BS.null) input)
+  written <- newIORef []
+  let receive = atomicModifyIORef' pending (\case [] -> ([], Nothing); chunk : rest -> (rest, Just chunk))
+      send bytes = atomicModifyIORef' written (\chunks -> (builtBytes bytes : chunks, ()))
+  pure (Conn.Transport receive send, BS.concat . reverse <$> readIORef written)
+
+-- | A path as the wire names it under a store's directory, and a request
+-- naming one.
+pathAt :: StoreDir -> StorePath -> BS.ByteString
+pathAt dir = TE.encodeUtf8 . storePathToText dir
+
+reqPathAt :: StoreDir -> Word64 -> StorePath -> BS.ByteString
+reqPathAt dir code path = le64 code <> wstr (pathAt dir path)
+
+-- | A client's connection to the daemon's socket.
+connectDaemon :: FilePath -> IO Socket
+connectDaemon path = do
+  sock <- socket AF_UNIX Stream defaultProtocol
+  connect sock (SockAddrUnix path) `onException` close sock
+  pure sock
+
+-- | Send bytes, and read back as many as are expected, or what the
+-- daemon wrote before it closed the connection.
+exchange :: Socket -> BS.ByteString -> Int -> IO BS.ByteString
+exchange sock request count = sendAll sock request >> receiveCount sock count
+
+receiveCount :: Socket -> Int -> IO BS.ByteString
+receiveCount sock count = go [] 0
+  where
+    go chunks got
+      | got >= count = pure (BS.concat (reverse chunks))
+      | otherwise =
+          recv sock (count - got) >>= \chunk ->
+            if BS.null chunk then pure (BS.concat (reverse chunks)) else go (chunk : chunks) (got + BS.length chunk)
+
+-- | Everything the daemon writes until it closes the connection.
+receiveToEnd :: Socket -> IO BS.ByteString
+receiveToEnd sock = go []
+  where
+    go chunks =
+      recv sock receiveSize >>= \chunk ->
+        if BS.null chunk then pure (BS.concat (reverse chunks)) else go (chunk : chunks)
+    receiveSize = 4096
+
+-- | A client's opening, and what the daemon answers it with.
+helloOver :: Socket -> Proto.Trust -> IO TestResult
+helloOver sock trust =
+  assertEqual "handshake" (serverHello 38 trust) <$> exchange sock (clientHello 38) (BS.length (serverHello 38 trust))
+
+-- | The daemon's socket tests: a client served over it, two at once, an
+-- untrusted one refused what it may not ask, and one refused outright.
+testDaemonSocketIO :: IO [Bool]
+testDaemonSocketIO = do
+  putStrLn "daemon/socket"
+  case Listen.daemonUnavailable of
+    Just reason -> do
+      putStrLn ("  SKIP  " ++ T.unpack reason)
+      pure []
+    Nothing ->
+      sequence
+        [ runTestM "a client is served over a socket every user may write, its paths' info read from the store" $
+            withSocketDaemon Listen.DefaultTrust (\config -> config {ncTrustedUsers = ["*"]}) $ \dir socketPath logged ->
+              bracket (connectDaemon socketPath) close $ \sock -> do
+                mode <- nodeStatus socketPath
+                hello <- helloOver sock Proto.Trusted
+                valid <- exchange sock (reqPathAt dir 1 fooPath <> reqPathAt dir 1 missingPath) (2 * BS.length (msgLast <> le64 1))
+                info <- exchange sock (reqPathAt dir 26 fooPath) infoReplySize
+                messages <- logged
+                pure $
+                  assertEqual "mode" (Just 0o666) (nsPermissions <$> mode)
+                    `andThen` hello
+                    `andThen` assertEqual "valid" (msgLast <> le64 1 <> msgLast <> le64 0) valid
+                    `andThen` assertEqual
+                      "info"
+                      (Right (Just (fromIntegral (BS.length (narOf fooPath)), False, Proto.narHashFromDigest (sha256Digest (narOf fooPath)))))
+                      (fmap (\i -> (Proto.upiNarSize i, Proto.upiUltimate i, Just (Proto.upiNarHash i))) <$> decodeWhole (pathInfoReply dir) info)
+                    `andThen` assertEqual "logged" [True] (map (\message -> "accepted connection from pid " `T.isPrefixOf` message && " (trusted)" `T.isSuffixOf` message) messages),
+          runTestM "two clients are served at once, one shown the temporary root the other holds" $
+            withSocketDaemon Listen.DefaultTrust (\config -> config {ncTrustedUsers = ["*"]}) $ \dir socketPath _ ->
+              bracket (connectDaemon socketPath) close $ \first -> do
+                firstHello <- helloOver first Proto.Trusted
+                rooted <- exchange first (reqPathAt dir 11 fooPath) (BS.length (msgLast <> le64 1))
+                bracket (connectDaemon socketPath) close $ \second -> do
+                  secondHello <- helloOver second Proto.Trusted
+                  shown <- exchange second (le64 14) (BS.length (rootsHeldBy dir 0))
+                  firstValid <- exchange first (reqPathAt dir 1 fooPath) (BS.length (msgLast <> le64 1))
+                  pure $
+                    firstHello
+                      `andThen` assertEqual "rooted" (msgLast <> le64 1) rooted
+                      `andThen` secondHello
+                      `andThen` assertEqual "the first's root, shown to the second" (rootsHeldBy dir 0) shown
+                      `andThen` assertEqual "the first, served after the second" (msgLast <> le64 1) firstValid,
+          runTestM "a connection's temporary roots go with it, and a client the daemon does not trust is not told who holds one" $
+            withServedStore $ \_ store served _ _ -> do
+              let serveOne trust input = do
+                    (transport, written) <- memoryTransport input
+                    ended <- serveLocal served (servedConfig store defaultNixConfig) trust transport
+                    (,) ended <$> written
+              first <- serveOne Proto.Trusted [clientHello 38, reqPathAt (stDir store) 11 fooPath, le64 14]
+              second <- serveOne Proto.NotTrusted [clientHello 38, le64 14]
+              pure $
+                assertEqual "first" (Conn.ClientClosed, serverHello 38 Proto.Trusted <> msgLast <> le64 1 <> rootsHeldBy (stDir store) 0) first
+                  `andThen` assertEqual "second" (Conn.ClientClosed, serverHello 38 Proto.NotTrusted <> rootsWithNone) second,
+          runTestM "a client trusted-users does not name is not trusted, and is refused a repair as upstream's daemon refuses it" $
+            withSocketDaemon Listen.DefaultTrust (\config -> config {ncTrustedUsers = []}) $ \dir socketPath logged ->
+              bracket (connectDaemon socketPath) close $ \sock -> do
+                hello <- helloOver sock Proto.NotTrusted
+                sendAll sock (le64 9 <> wstrs [pathAt dir drvPath <> "!out"] <> le64 1)
+                refused <- receiveToEnd sock
+                messages <- logged
+                let message = "repairing is not allowed because you are not in 'trusted-users'"
+                pure $
+                  hello
+                    `andThen` assertEqual "refused" (msgError message <> msgError message) refused
+                    `andThen` assertEqual "logged" [False] (map (" (trusted)" `T.isSuffixOf`) messages),
+          runTestM "a client allowed-users does not name is sent nothing and the connection closed, and the daemon says why" $
+            withSocketDaemon Listen.DefaultTrust (\config -> config {ncTrustedUsers = [], ncAllowedUsers = []}) $ \_ socketPath logged ->
+              bracket (connectDaemon socketPath) close $ \sock -> do
+                written <- receiveToEnd sock
+                messages <- logged
+                pure $
+                  assertEqual "written" "" written
+                    `andThen` assertEqual
+                      "logged"
+                      [True]
+                      (map (\message -> "error: while processing connection: user '" `T.isPrefixOf` message && "' is not allowed to connect to the Nix daemon" `T.isSuffixOf` message) messages),
+          runTestM "a daemon told to trust every client trusts one no setting names, without asking who it is" $
+            withSocketDaemon Listen.ForceTrusted (\config -> config {ncTrustedUsers = [], ncAllowedUsers = []}) $ \_ socketPath logged ->
+              bracket (connectDaemon socketPath) close $ \sock -> do
+                hello <- helloOver sock Proto.Trusted
+                messages <- logged
+                pure (hello `andThen` assertEqual "logged" ["accepted connection from pid <unknown>, user <unknown> (trusted)"] messages)
+        ]
+  where
+    -- A path's info, answered: the end of the work, the flag, the info.
+    pathInfoReply dir =
+      Proto.getStderrMessage replyVersion >>= \case
+        Proto.StderrLast -> Wire.getBool >>= \found -> if found then Just <$> Proto.getUnkeyedValidPathInfo dir replyVersion else pure Nothing
+        other -> Wire.malformed ("expected the end of the work, got " <> T.pack (show other))
+    replyVersion = Proto.Version Proto.latestVersionNumber (Set.fromList (map Proto.Feature serverFeatures))
+    infoReplySize = BS.length (msgLast <> le64 1) + BS.length (winfoSized (narOf fooPath))
+    -- A path's info with no deriver, references or signatures: its size
+    -- on the wire, whatever its registration time.
+    winfoSized nar = wstr "" <> wstr (BS.replicate 64 0x30) <> wpaths [] <> le64 0 <> le64 (fromIntegral (BS.length nar)) <> le64 0 <> wstrs [] <> wstr ""
+    rootsHeldBy dir holder = msgLast <> le64 1 <> wstr ("{temp:" <> BS8.pack (show (holder :: Int)) <> "}") <> wstr (pathAt dir fooPath)
+    rootsWithNone = msgLast <> le64 0

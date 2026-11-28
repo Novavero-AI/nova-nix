@@ -12,8 +12,10 @@
 -- @allowed-impure-host-deps@ and @darwin-log-sandbox-violations@ among
 -- them), what a build that fails leaves (@keep-failed@), where the link to
 -- the default profile is
--- (@use-xdg-base-directories@), and the prompt of a @develop@ shell
--- (@bash-prompt@ and its prefix and suffix).
+-- (@use-xdg-base-directories@), the prompt of a @develop@ shell
+-- (@bash-prompt@ and its prefix and suffix), and who may connect to the
+-- daemon and what it lets them do (@trusted-users@, @allowed-users@,
+-- @build-users-group@, @trusted-substituters@).
 --
 -- == The format
 --
@@ -47,6 +49,8 @@
 -- against a narinfo's signatures, a URI prefix matched against the
 -- evaluator's URIs).  A token that is not UTF-8 is refused rather than
 -- spelled with U+FFFD, which would name a different cache, key or URI.
+-- The daemon's lists of users stay bytes, as upstream keeps them, since
+-- they are matched against the names the system gives in bytes.
 --
 -- == Where the files are
 --
@@ -224,7 +228,21 @@ data NixConfig = NixConfig
     ncDarwinLogSandboxViolations :: !Bool,
     -- | Upstream's @keep-failed@: a build that fails keeps its directory,
     -- and a check its rebuild of an output that differs.
-    ncKeepFailed :: !Bool
+    ncKeepFailed :: !Bool,
+    -- | Upstream's @trusted-users@: the users, and with @\@@ the groups,
+    -- the daemon trusts, as bytes, as the system names them.
+    ncTrustedUsers :: ![ByteString],
+    -- | Upstream's @allowed-users@: the users, and with @\@@ the groups,
+    -- who may connect to the daemon, @*@ for everyone, as bytes.
+    ncAllowedUsers :: ![ByteString],
+    -- | Upstream's @trusted-substituters@: substituters a client the
+    -- daemon does not trust may ask for.
+    ncTrustedSubstituters :: ![Text],
+    -- | Upstream's @build-users-group@, when a source sets it: no user
+    -- whose group it is may connect to the daemon.  Its default is
+    -- @nixbld@ for a daemon run as root and none otherwise, which only IO
+    -- can tell apart.
+    ncBuildUsersGroup :: !(Maybe ByteString)
   }
   deriving (Eq, Show)
 
@@ -285,7 +303,11 @@ defaultNixConfig =
       ncBashPromptSuffix = "",
       ncAllowedImpureHostDeps = PathSetValue KeepsDefault Set.empty,
       ncDarwinLogSandboxViolations = False,
-      ncKeepFailed = False
+      ncKeepFailed = False,
+      ncTrustedUsers = ["root"],
+      ncAllowedUsers = ["*"],
+      ncTrustedSubstituters = [],
+      ncBuildUsersGroup = Nothing
     }
 
 -- ---------------------------------------------------------------------------
@@ -647,6 +669,7 @@ unitBase = 1024
 -- | Apply one assignment to the accumulated config.  The name is resolved
 -- through the aliases (@binary-caches@ -> @substituters@,
 -- @binary-cache-public-keys@ -> @trusted-public-keys@,
+-- @trusted-binary-caches@ -> @trusted-substituters@,
 -- @build-fallback@ -> @fallback@, @build-cores@ -> @cores@,
 -- @build-use-chroot@ and @build-use-sandbox@ -> @sandbox@,
 -- @build-chroot-dirs@ and @build-sandbox-paths@ -> @sandbox-paths@) and the
@@ -663,6 +686,8 @@ applyAssignment config (ConfigAssignment name value) =
     Nothing -> Right config
     Just (ListSetting field, mode) ->
       (\items -> setList field (combine mode (getList field config) items) config) <$> listItems field value
+    Just (WordsSetting field, mode) ->
+      Right (setWords field (combine mode (getWords field config) (configTokens value)) config)
     -- Upstream's Boolean and integer errors name the setting by its own
     -- name, not the alias it was set through (@BaseSetting\<T\>::parse@
     -- throws with @name@, the setting's, which @Config::set@ reaches
@@ -706,6 +731,7 @@ resolveName name =
   case BS.stripPrefix extraPrefix name of
     Just base -> case baseSetting base of
       Just setting@(ListSetting _) -> Just (setting, AppendMode)
+      Just setting@(WordsSetting _) -> Just (setting, AppendMode)
       Just setting@(PathSetSetting _) -> Just (setting, AppendMode)
       _ -> Nothing
     Nothing -> case baseSetting name of
@@ -715,6 +741,10 @@ resolveName name =
     baseSetting n
       | n == substitutersKey || n == substitutersAlias = Just (ListSetting SubstitutersField)
       | n == trustedKeysKey || n == trustedKeysAlias = Just (ListSetting TrustedKeysField)
+      | n == trustedUsersKey = Just (WordsSetting TrustedUsersField)
+      | n == allowedUsersKey = Just (WordsSetting AllowedUsersField)
+      | n == trustedSubstitutersKey || n == trustedSubstitutersAlias = Just (ListSetting TrustedSubstitutersField)
+      | n == buildUsersGroupKey = Just (BytesSetting BuildUsersGroupField)
       | n == allowedUrisKey = Just (ListSetting AllowedUrisField)
       | n == fallbackKey || n == fallbackAlias = Just (BoolSetting FallbackField)
       | n == alwaysAllowSubstitutesKey = Just (BoolSetting AlwaysAllowSubstitutesField)
@@ -742,10 +772,11 @@ resolveName name =
       | otherwise = Nothing
 
 -- | A setting this layer resolves, by the shape of its value: a list of
--- text, a Boolean, an unsigned integer, @sandbox@'s mode, a string kept as
--- bytes, or a set of paths.
+-- text, a list of tokens kept as bytes, a Boolean, an unsigned integer,
+-- @sandbox@'s mode, a string kept as bytes, or a set of paths.
 data Setting
   = ListSetting !ListField
+  | WordsSetting !WordsField
   | BoolSetting !BoolField
   | ScalarSetting !ScalarField
   | ModeSetting
@@ -758,7 +789,16 @@ data PathSetField = SandboxPathsField | AllowedImpureHostDepsField
   deriving (Eq, Show)
 
 -- | The list settings.
-data ListField = SubstitutersField | TrustedKeysField | AllowedUrisField
+data ListField
+  = SubstitutersField
+  | TrustedKeysField
+  | AllowedUrisField
+  | TrustedSubstitutersField
+  deriving (Eq, Show)
+
+-- | The settings whose value is a list of tokens kept as bytes: user and
+-- group names, which the system spells in bytes.
+data WordsField = TrustedUsersField | AllowedUsersField
   deriving (Eq, Show)
 
 -- | The Boolean settings.
@@ -785,6 +825,7 @@ data BytesField
   | BashPromptField
   | BashPromptPrefixField
   | BashPromptSuffixField
+  | BuildUsersGroupField
   deriving (Eq, Show)
 
 -- | The scalar settings, which only ever replace.
@@ -799,16 +840,27 @@ getList :: ListField -> NixConfig -> [Text]
 getList SubstitutersField = ncSubstituters
 getList TrustedKeysField = ncTrustedPublicKeys
 getList AllowedUrisField = ncAllowedUris
+getList TrustedSubstitutersField = ncTrustedSubstituters
 
 setList :: ListField -> [Text] -> NixConfig -> NixConfig
 setList SubstitutersField v config = config {ncSubstituters = v}
 setList TrustedKeysField v config = config {ncTrustedPublicKeys = v}
 setList AllowedUrisField v config = config {ncAllowedUris = v}
+setList TrustedSubstitutersField v config = config {ncTrustedSubstituters = v}
+
+getWords :: WordsField -> NixConfig -> [ByteString]
+getWords TrustedUsersField = ncTrustedUsers
+getWords AllowedUsersField = ncAllowedUsers
+
+setWords :: WordsField -> [ByteString] -> NixConfig -> NixConfig
+setWords TrustedUsersField v config = config {ncTrustedUsers = v}
+setWords AllowedUsersField v config = config {ncAllowedUsers = v}
 
 listFieldKey :: ListField -> ByteString
 listFieldKey SubstitutersField = substitutersKey
 listFieldKey TrustedKeysField = trustedKeysKey
 listFieldKey AllowedUrisField = allowedUrisKey
+listFieldKey TrustedSubstitutersField = trustedSubstitutersKey
 
 setScalar :: ScalarField -> Word32 -> NixConfig -> NixConfig
 setScalar MaxCallDepthField v config = config {ncMaxCallDepth = v}
@@ -863,6 +915,7 @@ setBytes SslCertFileField v config = config {ncSslCertFile = Just v}
 setBytes BashPromptField v config = config {ncBashPrompt = v}
 setBytes BashPromptPrefixField v config = config {ncBashPromptPrefix = v}
 setBytes BashPromptSuffixField v config = config {ncBashPromptSuffix = v}
+setBytes BuildUsersGroupField v config = config {ncBuildUsersGroup = Just v}
 
 -- | Upstream's Boolean spellings (@BaseSetting\<bool\>::parse@): anything
 -- else is an error with upstream's wording, which names the setting alone,
@@ -941,6 +994,16 @@ sslCertFileKey = "ssl-cert-file"
 
 useXdgBaseDirectoriesKey :: ByteString
 useXdgBaseDirectoriesKey = "use-xdg-base-directories"
+
+-- | The daemon's settings: who it trusts and who may connect, the group
+-- of its build users, and the substituters an untrusted client may ask
+-- for, with that setting's older name.
+trustedUsersKey, allowedUsersKey, buildUsersGroupKey, trustedSubstitutersKey, trustedSubstitutersAlias :: ByteString
+trustedUsersKey = "trusted-users"
+allowedUsersKey = "allowed-users"
+buildUsersGroupKey = "build-users-group"
+trustedSubstitutersKey = "trusted-substituters"
+trustedSubstitutersAlias = "trusted-binary-caches"
 
 -- | The settings of a @develop@ shell's prompt (@DevelopSettings@ in
 -- develop.cc).

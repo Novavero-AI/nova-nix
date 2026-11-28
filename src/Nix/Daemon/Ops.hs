@@ -546,9 +546,10 @@ data ConnectionSettings = ConnectionSettings
 -- model being ignored as upstream ignores an unknown one; so does an
 -- untrusted client's @timeout@, @max-silent-time@, @build-poll-interval@,
 -- @connect-timeout@ or empty @builders@.  An untrusted client's
--- substituters keep only those the daemon trusts (its trusted
--- substituters and those it already uses), each other one warned of, and
--- its other settings are refused with upstream's warning.  A value a
+-- substituters keep only those the connection trusts (its
+-- @trusted-substituters@ and the substituters it already uses), each
+-- other one warned of, and its other settings are refused with upstream's
+-- warning.  A value a
 -- setting cannot take is warned of as upstream warns of a value it
 -- refuses, and the setting keeps its value.
 --
@@ -557,8 +558,8 @@ data ConnectionSettings = ConnectionSettings
 -- no slash ending what precedes its query also matching one that has, as
 -- upstream's comparison allows.  Two spellings of one reference's
 -- parameters in different orders match there and not here.
-applyClientSettings :: Trust -> [Text] -> ClientSettings -> ConnectionSettings -> (ConnectionSettings, [ByteString])
-applyClientSettings trust trustedSubstituters client current =
+applyClientSettings :: Trust -> ClientSettings -> ConnectionSettings -> (ConnectionSettings, [ByteString])
+applyClientSettings trust client current =
   ( current {connVerbosity = csVerbosity client, connConfig = configured, connClient = Just client},
     reverse warnings
   )
@@ -576,7 +577,7 @@ applyClientSettings trust trustedSubstituters client current =
       | trust == Trusted || name `elem` unrestrictedSettings || (name == buildersSetting && BS.null value) =
           either (\refusal -> (config, usageWarning refusal : said)) (\applied -> (applied, said)) (applyAssignment config (ConfigAssignment name value))
       | name `elem` substituterSettings =
-          let (kept, refused) = trustedOnly (trustedSubstituters ++ ncSubstituters config) value
+          let (kept, refused) = trustedOnly (ncTrustedSubstituters config ++ ncSubstituters config) value
            in (config {ncSubstituters = kept}, reverse (map (warningLine . untrustedSubstituterWarning) refused) ++ said)
       | otherwise = (config, warningLine (restrictedWarning name) : said)
 
