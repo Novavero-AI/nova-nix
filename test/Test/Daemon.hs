@@ -365,6 +365,123 @@ carriedStderrMessage version message = case message of
     | otherwise -> Proto.StderrError err {Proto.errLevel = Proto.errorVerbosity, Proto.errTraces = []}
   _ -> message
 
+-- | Every version a request's form changes at, with each combination of
+-- the two features that change what one carries.
+requestVersions :: [Proto.Version]
+requestVersions =
+  [ Proto.Version (Proto.VersionNumber 1 minor) (Set.fromList features)
+  | minor <- [10 .. Proto.vnMinor Proto.latestVersionNumber],
+    features <- [[], [Proto.featureRealisationWithPath], [Proto.featureDeleteDeadSpecificReferrers], [Proto.featureRealisationWithPath, Proto.featureDeleteDeadSpecificReferrers]]
+  ]
+
+-- | A request a client may send at a version, its derived paths ones
+-- the version can spell.
+genRequest :: Proto.Version -> QC.Gen Ops.Request
+genRequest version =
+  QC.oneof
+    [ Ops.SetOptions <$> genClientSettings,
+      Ops.IsValidPath <$> genWireStorePath,
+      Ops.QueryValidPaths <$> genPathSet <*> QC.elements [Ops.NoSubstitute, Ops.Substitute],
+      Ops.QuerySubstitutablePaths <$> genPathSet,
+      Ops.QueryReferrers <$> genWireStorePath,
+      Ops.QueryValidDerivers <$> genWireStorePath,
+      Ops.QueryDerivationOutputMap <$> genWireStorePath,
+      pure Ops.QueryAllValidPaths,
+      Ops.QueryPathInfo <$> genWireStorePath,
+      Ops.QueryMissing <$> targets,
+      Ops.AddToStore <$> (Ops.AddToStoreRequest <$> genWireBytes <*> genWireBytes <*> genPathSet <*> repair),
+      Ops.AddToStoreNar <$> (Proto.ValidPathInfo <$> genWireStorePath <*> genPathInfo) <*> repair <*> QC.elements [Ops.CheckSigs, Ops.NoCheckSigs],
+      Ops.AddMultipleToStore <$> repair <*> QC.elements [Ops.CheckSigs, Ops.NoCheckSigs],
+      Ops.BuildPaths <$> targets <*> mode,
+      Ops.BuildPathsWithResults <$> targets <*> mode,
+      Ops.EnsurePath <$> genWireStorePath,
+      Ops.AddTempRoot <$> genWireStorePath,
+      Ops.AddIndirectRoot . ("/" <>) . BS8.intercalate "/" <$> QC.resize 3 (QC.listOf1 (BS8.pack <$> QC.listOf1 (QC.elements (['a' .. 'z'] ++ "-_")))),
+      pure Ops.FindRoots,
+      Ops.CollectGarbage
+        <$> ( Ops.GCRequest
+                <$> QC.elements [Proto.ReturnLive, Proto.ReturnDead, Proto.DeleteDead, Proto.DeleteSpecific]
+                <*> QC.oneof [pure Proto.WholeStore, Proto.SpecificPaths <$> genPathSet <*> QC.arbitrary]
+                <*> QC.arbitrary
+            )
+        <*> QC.elements [Ops.KeepLiveness, Ops.IgnoreLiveness],
+      pure Ops.OptimiseStore,
+      Ops.VerifyStore <$> QC.elements [Ops.SkipContents, Ops.CheckContents] <*> repair,
+      Ops.AddSignatures <$> genWireStorePath <*> genSignatures,
+      Ops.NarFromPath <$> genWireStorePath
+    ]
+  where
+    targets = QC.resize 3 (QC.listOf (genDerivedPath `QC.suchThat` spellable version))
+    repair = QC.elements [Ops.NoRepair, Ops.Repair]
+    mode = QC.elements [Proto.BuildNormal, Proto.BuildRepair, Proto.BuildCheck]
+
+genPathSet :: QC.Gen (Set.Set StorePath)
+genPathSet = Set.fromList <$> QC.resize 3 (QC.listOf genWireStorePath)
+
+-- | What a version carries of a request: below 1.27 no substitute flag,
+-- derived paths as the version spells them, and without the
+-- delete-specific feature a collection's paths as a bare set, so the
+-- whole store for a specific deletion reads back as no paths.
+carriedRequest :: Proto.Version -> Ops.Request -> Ops.Request
+carriedRequest version = \case
+  Ops.QueryValidPaths paths _ | not (versionAtLeast version 27) -> Ops.QueryValidPaths paths Ops.NoSubstitute
+  Ops.QueryMissing targets -> Ops.QueryMissing (map (carriedDerivedPath version) targets)
+  Ops.BuildPaths targets mode -> Ops.BuildPaths (map (carriedDerivedPath version) targets) mode
+  Ops.BuildPathsWithResults targets mode -> Ops.BuildPathsWithResults (map (carriedDerivedPath version) targets) mode
+  Ops.CollectGarbage (Ops.GCRequest action paths maxFreed) liveness
+    | not (Set.member Proto.featureDeleteDeadSpecificReferrers (Proto.versionFeatures version)) ->
+        let bare = case paths of
+              Proto.WholeStore | action == Proto.DeleteSpecific -> Proto.SpecificPaths Set.empty False
+              _ -> paths
+         in Ops.CollectGarbage (Ops.GCRequest action bare maxFreed) liveness
+  request -> request
+
+-- | Upstream's refusal of a request a version cannot carry, or 'Nothing'
+-- where it can carry it.
+refusalFor :: Proto.Version -> Ops.Request -> Maybe Text
+refusalFor version = \case
+  Ops.AddToStore _ | not (versionAtLeast version 25) -> Just "AddToStore before protocol 1.25 is not supported by this daemon"
+  Ops.AddToStoreNar {} | not (versionAtLeast version 23) -> Just "AddToStoreNar before protocol 1.23 is not supported by this daemon"
+  Ops.CollectGarbage (Ops.GCRequest action (Proto.SpecificPaths _ referrers) _) _
+    | not (Set.member Proto.featureDeleteDeadSpecificReferrers (Proto.versionFeatures version)) ->
+        if action /= Proto.DeleteSpecific
+          then Just "Your daemon version is too old to support garbage collecting a specific set of paths"
+          else if referrers then Just "Your daemon version is too old to support deleting referrers." else Nothing
+  _ -> Nothing
+
+-- | A request as a daemon reads one: its code, then what that names.
+requestReader :: Proto.Version -> Wire.Decoder Ops.Request
+requestReader version = Wire.getWord32 >>= \code -> fromMaybe (Wire.malformed ("no request has code " <> T.pack (show code))) (Ops.getRequest wireStoreDir version code)
+
+-- | A client's settings: its verbosity at most upstream's loudest, as a
+-- daemon reads it.
+genClientSettings :: QC.Gen Ops.ClientSettings
+genClientSettings =
+  Ops.ClientSettings
+    <$> QC.arbitrary
+    <*> QC.arbitrary
+    <*> QC.arbitrary
+    <*> (Proto.Verbosity <$> QC.choose (0, 7))
+    <*> QC.arbitrary
+    <*> QC.arbitrary
+    <*> QC.arbitrary
+    <*> QC.arbitrary
+    <*> QC.arbitrary
+    <*> (Map.fromList <$> QC.resize 3 (QC.listOf ((,) <$> genWireBytes <*> genWireBytes)))
+
+genMissing :: QC.Gen Proto.Missing
+genMissing = Proto.Missing <$> genPathSet <*> genPathSet <*> genPathSet <*> QC.arbitrary <*> QC.arbitrary
+
+genGCResult :: QC.Gen Proto.GCResult
+genGCResult = Proto.GCResult . Set.fromList <$> QC.resize 3 (QC.listOf genWireBytes) <*> QC.arbitrary
+
+genOutputMap :: QC.Gen (Map.Map Proto.OutputName (Maybe StorePath))
+genOutputMap = Map.fromList <$> QC.resize 3 (QC.listOf ((,) <$> genOutputName <*> QC.oneof [pure Nothing, Just <$> genWireStorePath]))
+
+-- | Roots, each kept by at least one link, as a listing gives them.
+genRoots :: QC.Gen (Map.Map StorePath (Set.Set BS.ByteString))
+genRoots = Map.fromList <$> QC.resize 3 (QC.listOf ((,) <$> genWireStorePath <*> (Set.fromList <$> QC.resize 2 (QC.listOf1 genWireBytes))))
+
 -- | Every value the protocol carries, written and read back at every
 -- version gate, and the refusals upstream makes of bytes it does not
 -- accept.
@@ -580,6 +697,37 @@ testDaemonProtocol = do
               decodeWhole Proto.getGCAction (builtBytes (Proto.putGCAction action)) QC.=== Right action,
               decodeWhole (Proto.getGCPaths wireStoreDir) (builtBytes (Proto.putGCPaths wireStoreDir paths)) QC.=== Right paths
             ],
+      runTestM "a request reads back, at every version and with every feature, as what the version carries of it, and one it cannot carry is refused in upstream's words" $
+        codecProperty $
+          QC.forAll (QC.elements requestVersions) $
+            \version -> QC.forAll (genRequest version) $ \request ->
+              QC.counterexample (show version) $ case Ops.putRequest wireStoreDir version request of
+                Right bytes -> decodeWhole (requestReader version) (builtBytes bytes) QC.=== Right (carriedRequest version request)
+                Left refusal -> refusalFor version request QC.=== Just refusal,
+      runTestM "a client's settings read back as themselves" $
+        codecProperty $
+          QC.forAll genClientSettings $ \settings ->
+            decodeWhole Ops.getClientSettings (builtBytes (Ops.putClientSettings settings)) QC.=== Right settings,
+      runTestM "what realising paths would take, a collection's result, a derivation's outputs and the roots read back as themselves" $
+        codecProperty $
+          QC.forAll ((,,,) <$> genMissing <*> genGCResult <*> genOutputMap <*> genRoots) $ \(missing, collected, outputs, roots) ->
+            QC.conjoin
+              [ decodeWhole (Proto.getMissing wireStoreDir) (builtBytes (Proto.putMissing wireStoreDir missing)) QC.=== Right missing,
+                decodeWhole Proto.getGCResult (builtBytes (Proto.putGCResult collected)) QC.=== Right collected,
+                decodeWhole (Proto.getOutputMap wireStoreDir) (builtBytes (Proto.putOutputMap wireStoreDir outputs)) QC.=== Right outputs,
+                decodeWhole (Proto.getRoots wireStoreDir) (builtBytes (Proto.putRoots wireStoreDir roots)) QC.=== Right roots
+              ],
+      runTestM "build results with the paths they answer read back as far as each version carries them"
+        $ codecProperty
+        $ QC.conjoin
+          [ QC.counterexample (show version) $
+              QC.forAll (QC.resize 3 (QC.listOf (Proto.KeyedBuildResult <$> (genDerivedPath `QC.suchThat` spellable version) <*> genBuildResult))) $ \results ->
+                let (bytes, refusal) = Proto.putKeyedBuildResults wireStoreDir version results
+                 in refusal QC.=== Nothing
+                      QC..&&. decodeWhole (Proto.getKeyedBuildResults wireStoreDir version) (builtBytes bytes)
+                        QC.=== Right [Proto.KeyedBuildResult (carriedDerivedPath version path) (carriedBuildResult version result) | Proto.KeyedBuildResult path result <- results]
+          | version <- gateVersions
+          ],
       runTestM "a daemon's message to its client reads back as far as each version carries it"
         $ codecProperty
         $ roundTripsAtEveryVersion (const genStderrMessage) carriedStderrMessage Proto.getStderrMessage Proto.putStderrMessage,
@@ -1106,7 +1254,7 @@ fakeStore =
         Right (Map.fromList [(Proto.OutputName "out", Just fooPath), (Proto.OutputName "dev", Nothing)]) <$ asked w "QueryDerivationOutputMap",
       Ops.dsQueryAllValidPaths = \w -> asked w "QueryAllValidPaths" >> (Right . Map.keysSet <$> validPaths),
       Ops.dsQueryPathInfo = \w path -> asked w "QueryPathInfo" >> (Right . Map.lookup path <$> validPaths),
-      Ops.dsQueryMissing = \w _ -> Right (Ops.Missing (Set.singleton drvPath) (Set.singleton offeredPath) Set.empty 10 20) <$ asked w "QueryMissing",
+      Ops.dsQueryMissing = \w _ -> Right (Proto.Missing (Set.singleton drvPath) (Set.singleton offeredPath) Set.empty 10 20) <$ asked w "QueryMissing",
       Ops.dsAddToStore = \w upload -> do
         asked w ("AddToStore " <> TE.decodeLatin1 (Ops.duName upload) <> " " <> T.pack (show (Ops.duMethod upload)) <> " " <> Ops.duAlgo upload)
         pure . collecting BS.empty $ \dump -> do
@@ -1128,7 +1276,7 @@ fakeStore =
       Ops.dsAddIndirectRoot = \w link -> Right () <$ asked w ("AddIndirectRoot " <> TE.decodeLatin1 link),
       Ops.dsFindRoots = \w censoring -> Right (rootsShown censoring) <$ asked w ("FindRoots " <> T.pack (show censoring)),
       Ops.dsCollectGarbage = \w request ->
-        Right (Ops.GCResult (Set.singleton (pathOnWire (StorePath "0000000000000000000000000000000a" "dead"))) 4096) <$ asked w ("CollectGarbage " <> T.pack (show request)),
+        Right (Proto.GCResult (Set.singleton (pathOnWire (StorePath "0000000000000000000000000000000a" "dead"))) 4096) <$ asked w ("CollectGarbage " <> T.pack (show request)),
       Ops.dsOptimiseStore = \w -> Right () <$ asked w "OptimiseStore",
       Ops.dsVerifyStore = \w contents repair -> Right False <$ asked w ("VerifyStore " <> T.pack (show contents) <> " " <> T.pack (show repair)),
       Ops.dsAddSignatures = \w path sigs -> Right () <$ asked w ("AddSignatures " <> spName path <> " " <> T.pack (show (Set.size sigs))),

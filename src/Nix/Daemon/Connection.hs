@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TupleSections #-}
 
 -- | A daemon's side of one connection, as upstream's daemon serves one:
 -- the handshake, then each operation the client asks, run over the store
@@ -40,8 +41,6 @@ import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder)
 import qualified Data.ByteString.Builder as BB
 import Data.Foldable (traverse_)
-import Data.Map.Strict (Map)
-import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -54,10 +53,8 @@ import Nix.Daemon.Ops
     ConnectionSettings (..),
     DaemonStore (..),
     DumpUpload (..),
-    GCResult (..),
     Intake (..),
     LogEvent (..),
-    Missing (..),
     NarBoundary (..),
     Repair,
     Request (..),
@@ -73,8 +70,6 @@ import Nix.Daemon.Ops
 import Nix.Daemon.Protocol
   ( Activity (..),
     DaemonError,
-    KeyedBuildResult,
-    OutputName,
     StderrMessage (..),
     Trust,
     UnkeyedValidPathInfo (..),
@@ -89,20 +84,21 @@ import Nix.Daemon.Protocol
     minimumVersionNumber,
     parseContentAddressMethod,
     putFeatures,
+    putGCResult,
     putHandshakeInfo,
-    putKeyedBuildResult,
-    putOptionalStorePath,
-    putOutputName,
+    putKeyedBuildResults,
+    putMissing,
+    putOutputMap,
+    putRoots,
     putServerMagic,
     putStderrMessage,
-    putStorePath,
     putStorePathSet,
     putUnkeyedValidPathInfo,
     putValidPathInfo,
     putVersionNumber,
   )
-import Nix.Daemon.Wire (DecodeError (..), Decoder, Decoding (..), feedInput, getFrame, getWord32, getWord64, putBool, putBytes, putList, putNum, startDecoding)
-import Nix.Store.Path (StoreDir, StorePath)
+import Nix.Daemon.Wire (DecodeError (..), Decoder, Decoding (..), feedInput, getFrame, getWord32, getWord64, putBool, putNum, startDecoding)
+import Nix.Store.Path (StoreDir)
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -334,10 +330,6 @@ validFlag, invalidFlag :: Word64
 validFlag = 1
 invalidFlag = 0
 
--- | The word that follows a collection's result, which no client reads.
-obsoleteCollectionWord :: Word64
-obsoleteCollectionWord = 0
-
 -- | The level of a warning (@lvlWarn@).
 warningVerbosity :: Verbosity
 warningVerbosity = Verbosity 1
@@ -476,7 +468,7 @@ feedArchive transport boundary intake = case boundary of
     Taking onChunk onEnd onBroken ->
       nextChunk transport >>= \case
         Left err -> (Left err, ArchiveUnread boundary) <$ lift (lift onBroken)
-        Right Nothing -> (\result -> (result, ArchiveUnread boundary)) <$> lift (lift onEnd)
+        Right Nothing -> (,ArchiveUnread boundary) <$> lift (lift onEnd)
         Right (Just chunk) -> case step chunk of
           BoundaryReached rest -> do
             let archived = BS.take (BS.length chunk - BS.length rest) chunk
@@ -519,46 +511,6 @@ importPaths env repair checkSigs = runExceptT $ do
       case left of
         ArchiveRead -> pure ()
         ArchiveUnread boundary -> ExceptT (skipArchive transport boundary)
-
--- ---------------------------------------------------------------------------
--- Replies
--- ---------------------------------------------------------------------------
-
--- | A derivation's outputs and their paths.
-putOutputMap :: StoreDir -> Map OutputName (Maybe StorePath) -> Builder
-putOutputMap storeDir outputs = putList (\(name, path) -> putOutputName name <> putOptionalStorePath storeDir path) (Map.toAscList outputs)
-
--- | What realising some paths would take.
-putMissing :: StoreDir -> Missing -> Builder
-putMissing storeDir missing =
-  putStorePathSet storeDir (missingWillBuild missing)
-    <> putStorePathSet storeDir (missingWillSubstitute missing)
-    <> putStorePathSet storeDir (missingUnknown missing)
-    <> putNum (missingDownloadSize missing)
-    <> putNum (missingNarSize missing)
-
--- | The roots: how many there are, then each one's link and the path it
--- keeps, in the order of the paths and then of the links.
-putRoots :: StoreDir -> Map StorePath (Set.Set ByteString) -> Builder
-putRoots storeDir roots =
-  putNum (sum (map Set.size (Map.elems roots)))
-    <> foldMap (\(target, links) -> foldMap (\link -> putBytes link <> putStorePath storeDir target) (Set.toAscList links)) (Map.toAscList roots)
-
--- | What a collection did.
-putGCResult :: GCResult -> Builder
-putGCResult result =
-  putList putBytes (Set.toAscList (gcResultPaths result))
-    <> putNum (gcResultBytesFreed result)
-    <> putNum obsoleteCollectionWord
-
--- | Build results with the paths they answer, as far as they can be
--- written, and the refusal of the first that cannot.
-putKeyedBuildResults :: StoreDir -> Version -> [KeyedBuildResult] -> (Builder, Maybe Text)
-putKeyedBuildResults storeDir version results = go (putNum (length results)) results
-  where
-    go written = \case
-      [] -> (written, Nothing)
-      result : rest -> either (\refusal -> (written, Just refusal)) (\bytes -> go (written <> bytes) rest) (putKeyedBuildResult storeDir version result)
 
 -- ---------------------------------------------------------------------------
 -- Input and output

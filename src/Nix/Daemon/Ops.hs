@@ -1,4 +1,5 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TupleSections #-}
 
 -- | The operations a daemon serves, as upstream's daemon reads and judges
 -- them: what each one reads before its work begins ('getRequest'), what a
@@ -19,7 +20,9 @@ module Nix.Daemon.Ops
   ( -- * Requests
     Request (..),
     getRequest,
+    putRequest,
     getUploadPathInfo,
+    putUploadPathInfo,
     Substitute (..),
     Repair (..),
     CheckSigs (..),
@@ -29,6 +32,14 @@ module Nix.Daemon.Ops
     AddToStoreRequest (..),
     GCRequest (..),
 
+    -- ** The versions requests change at
+    substituteFlagSince,
+    framedAddToStoreSince,
+    framedAddToStoreNarSince,
+    queryMissingSince,
+    outputMapSince,
+    buildResultsSince,
+
     -- * Trust
     Authorization (..),
     authorize,
@@ -36,6 +47,8 @@ module Nix.Daemon.Ops
 
     -- * Client settings
     ClientSettings (..),
+    getClientSettings,
+    putClientSettings,
     ConnectionSettings (..),
     applyClientSettings,
 
@@ -45,8 +58,6 @@ module Nix.Daemon.Ops
     LogEvent (..),
     Intake (..),
     DumpUpload (..),
-    Missing (..),
-    GCResult (..),
     daemonError,
 
     -- * Archives in uploads
@@ -58,6 +69,7 @@ where
 import Control.Monad (replicateM, replicateM_, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.ByteString.Builder (Builder)
 import qualified Data.ByteString.Char8 as BS8
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -79,7 +91,9 @@ import Nix.Daemon.Protocol
     Field,
     GCAction (..),
     GCPaths (..),
+    GCResult,
     KeyedBuildResult,
+    Missing,
     OutputName,
     ResultType,
     Signature,
@@ -100,8 +114,16 @@ import Nix.Daemon.Protocol
     getStorePath,
     getStorePathSet,
     getValidPathInfo,
+    putBuildMode,
+    putDerivedPath,
+    putGCAction,
+    putGCPaths,
+    putSignatureSet,
+    putStorePath,
+    putStorePathSet,
+    putValidPathInfo,
   )
-import Nix.Daemon.Wire (Decoder, getBool, getBytes, getList, getWord32, getWord64, malformed)
+import Nix.Daemon.Wire (Decoder, getBool, getBytes, getList, getWord32, getWord64, malformed, putBool, putBytes, putNum)
 import Nix.Store.Path (StoreDir, StorePath)
 
 -- ---------------------------------------------------------------------------
@@ -274,10 +296,19 @@ opCode = \case
 opsByCode :: Map Word32 Op
 opsByCode = Map.fromList [(opCode op, op) | op <- [minBound .. maxBound]]
 
+-- | The version an upload's path info is read and written at, whatever
+-- version was agreed: the one that carries it whole.
+uploadInfoVersion :: Version
+uploadInfoVersion = Version (VersionNumber 1 16) Set.empty
+
 -- | The info an upload sends for a path, which upstream reads as the
 -- version that carries it whole sends it, whatever version was agreed.
 getUploadPathInfo :: StoreDir -> Decoder ValidPathInfo
-getUploadPathInfo storeDir = getValidPathInfo storeDir (Version (VersionNumber 1 16) Set.empty)
+getUploadPathInfo storeDir = getValidPathInfo storeDir uploadInfoVersion
+
+-- | Write the info an upload sends for a path.
+putUploadPathInfo :: StoreDir -> ValidPathInfo -> Builder
+putUploadPathInfo storeDir = putValidPathInfo storeDir uploadInfoVersion
 
 -- | A query's substitute flag is sent from this version.
 substituteFlagSince :: VersionNumber
@@ -292,6 +323,21 @@ framedAddToStoreSince = VersionNumber 1 25
 -- either unframed or on the daemon's request.
 framedAddToStoreNarSince :: VersionNumber
 framedAddToStoreNarSince = VersionNumber 1 23
+
+-- | The versions from which upstream's client asks a daemon what
+-- realising some paths would take (QueryMissing), a derivation's outputs
+-- and their paths (QueryDerivationOutputMap), and each path's build
+-- result (BuildPathsWithResults).  Below each, it works the answer out
+-- from other operations itself.
+queryMissingSince, outputMapSince, buildResultsSince :: VersionNumber
+queryMissingSince = VersionNumber 1 19
+outputMapSince = VersionNumber 1 22
+buildResultsSince = VersionNumber 1 34
+
+-- | Upstream's refusal of a form older than this daemon reads, in which
+-- an upload is not framed.
+unframedRefusal :: Text -> VersionNumber -> Text
+unframedRefusal name gate = name <> " before protocol 1." <> T.pack (show (vnMinor gate)) <> " is not supported by this daemon"
 
 -- | The request an operation code names, read as upstream's daemon reads
 -- it before the operation's work begins, or 'Nothing' for a code this
@@ -337,8 +383,98 @@ getRequest storeDir version code = requestFor <$> Map.lookup code opsByCode
       OpVerifyStore -> VerifyStore . checkContentsFrom <$> getBool <*> (repairFrom <$> getBool)
       OpAddSignatures -> AddSignatures <$> path <*> getSignatureSet
       OpNarFromPath -> NarFromPath <$> path
-    unframedForm name gate =
-      malformed (name <> " before protocol 1." <> T.pack (show (vnMinor gate)) <> " is not supported by this daemon")
+    unframedForm name gate = malformed (unframedRefusal name gate)
+
+-- | The operation a request is.
+requestOp :: Request -> Op
+requestOp = \case
+  SetOptions _ -> OpSetOptions
+  IsValidPath _ -> OpIsValidPath
+  QueryValidPaths _ _ -> OpQueryValidPaths
+  QuerySubstitutablePaths _ -> OpQuerySubstitutablePaths
+  QueryReferrers _ -> OpQueryReferrers
+  QueryValidDerivers _ -> OpQueryValidDerivers
+  QueryDerivationOutputMap _ -> OpQueryDerivationOutputMap
+  QueryAllValidPaths -> OpQueryAllValidPaths
+  QueryPathInfo _ -> OpQueryPathInfo
+  QueryMissing _ -> OpQueryMissing
+  AddToStore _ -> OpAddToStore
+  AddToStoreNar {} -> OpAddToStoreNar
+  AddMultipleToStore _ _ -> OpAddMultipleToStore
+  BuildPaths _ _ -> OpBuildPaths
+  BuildPathsWithResults _ _ -> OpBuildPathsWithResults
+  EnsurePath _ -> OpEnsurePath
+  AddTempRoot _ -> OpAddTempRoot
+  AddIndirectRoot _ -> OpAddIndirectRoot
+  FindRoots -> OpFindRoots
+  CollectGarbage _ _ -> OpCollectGarbage
+  OptimiseStore -> OpOptimiseStore
+  VerifyStore _ _ -> OpVerifyStore
+  AddSignatures _ _ -> OpAddSignatures
+  NarFromPath _ -> OpNarFromPath
+
+-- | A request as upstream's client writes it: its operation's code, then
+-- what 'getRequest' reads before the operation's work begins.  A version
+-- that cannot carry the request is refused in upstream's words: an
+-- upload whose form is older than a framed one, a derived path the
+-- version cannot spell, and, without
+-- 'featureDeleteDeadSpecificReferrers', a collection of some paths that
+-- deletes other than those, or their referrers.  Below 1.27 a query's
+-- substitute flag is not sent, as upstream's client does not send it.
+putRequest :: StoreDir -> Version -> Request -> Either Text Builder
+putRequest storeDir version request = (putNum (opCode (requestOp request)) <>) <$> body
+  where
+    since gate = versionNumber version >= gate
+    path = putStorePath storeDir
+    paths = putStorePathSet storeDir
+    derivedPaths targets = (\spelled -> putNum (length targets) <> mconcat spelled) <$> traverse (putDerivedPath storeDir version) targets
+    body = case request of
+      SetOptions settings -> Right (putClientSettings settings)
+      IsValidPath p -> Right (path p)
+      QueryValidPaths ps substitute ->
+        Right (paths ps <> (if since substituteFlagSince then putBool (substitute == Substitute) else mempty))
+      QuerySubstitutablePaths ps -> Right (paths ps)
+      QueryReferrers p -> Right (path p)
+      QueryValidDerivers p -> Right (path p)
+      QueryDerivationOutputMap p -> Right (path p)
+      QueryAllValidPaths -> Right mempty
+      QueryPathInfo p -> Right (path p)
+      QueryMissing targets -> derivedPaths targets
+      AddToStore upload
+        | since framedAddToStoreSince ->
+            Right (putBytes (atsName upload) <> putBytes (atsMethod upload) <> paths (atsReferences upload) <> putBool (atsRepair upload == Repair))
+        | otherwise -> Left (unframedRefusal "AddToStore" framedAddToStoreSince)
+      AddToStoreNar info repair checkSigs
+        | since framedAddToStoreNarSince ->
+            Right (putUploadPathInfo storeDir info <> putBool (repair == Repair) <> putBool (checkSigs == NoCheckSigs))
+        | otherwise -> Left (unframedRefusal "AddToStoreNar" framedAddToStoreNarSince)
+      AddMultipleToStore repair checkSigs -> Right (putBool (repair == Repair) <> putBool (checkSigs == NoCheckSigs))
+      BuildPaths targets mode -> (<> putBuildMode mode) <$> derivedPaths targets
+      BuildPathsWithResults targets mode -> (<> putBuildMode mode) <$> derivedPaths targets
+      EnsurePath p -> Right (path p)
+      AddTempRoot p -> Right (path p)
+      AddIndirectRoot link -> Right (putBytes link)
+      FindRoots -> Right mempty
+      CollectGarbage (GCRequest action considered maxFreed) liveness ->
+        (\pathsSent -> putGCAction action <> pathsSent <> putBool (liveness == IgnoreLiveness) <> putNum maxFreed <> obsoleteFields)
+          <$> collectedPaths action considered
+      OptimiseStore -> Right mempty
+      VerifyStore contents repair -> Right (putBool (contents == CheckContents) <> putBool (repair == Repair))
+      AddSignatures p sigs -> Right (path p <> putSignatureSet sigs)
+      NarFromPath p -> Right (path p)
+    obsoleteFields = mconcat (replicate obsoleteCollectionFields (putNum obsoleteWord))
+    collectedPaths action considered
+      | Set.member featureDeleteDeadSpecificReferrers (versionFeatures version) = Right (putGCPaths storeDir considered)
+      | otherwise = case considered of
+          WholeStore -> Right (paths Set.empty)
+          SpecificPaths specific referrers
+            | action /= DeleteSpecific -> Left "Your daemon version is too old to support garbage collecting a specific set of paths"
+            | referrers -> Left "Your daemon version is too old to support deleting referrers."
+            | otherwise -> Right (paths specific)
+
+-- | The value upstream's client sends in each obsolete field.
+obsoleteWord :: Word64
+obsoleteWord = 0
 
 -- | A flag upstream reads as an @unsigned int@ and takes as set when it is
 -- not 0.
@@ -520,6 +656,35 @@ getClientSettings = do
         csOverrides = Map.fromListWith (\_later earlier -> earlier) overrides
       }
 
+-- | Write a client's settings as upstream's client writes them: the
+-- obsolete build-hook flag set, the build log's verbosity the error
+-- level for a verbose build and the loudest otherwise, and the obsolete
+-- logging numbers 0, then the other settings in name order.
+putClientSettings :: ClientSettings -> Builder
+putClientSettings settings =
+  putBool (csKeepFailed settings)
+    <> putBool (csKeepGoing settings)
+    <> putBool (csTryFallback settings)
+    <> putNum verbosity
+    <> putNum (csMaxBuildJobs settings)
+    <> putNum (csMaxSilentTime settings)
+    <> putBool obsoleteBuildHook
+    <> putNum (if csVerboseBuild settings then errorLevel else loudestVerbosity)
+    <> putNum obsoleteWord
+    <> putNum obsoleteWord
+    <> putNum (csBuildCores settings)
+    <> putBool (csUseSubstitutes settings)
+    <> putNum (Map.size (csOverrides settings))
+    <> foldMap (\(name, value) -> putBytes name <> putBytes value) (Map.toAscList (csOverrides settings))
+  where
+    Verbosity verbosity = csVerbosity settings
+    Verbosity errorLevel = errorVerbosity
+
+-- | The obsolete build-hook flag, which upstream's client still sends
+-- set.
+obsoleteBuildHook :: Bool
+obsoleteBuildHook = True
+
 -- | What a connection's operations run under: the daemon's own until the
 -- client sends settings, and then those its trust lets it change.
 data ConnectionSettings = ConnectionSettings
@@ -574,7 +739,7 @@ applyClientSettings trust trustedSubstituters client current =
       | name `elem` ignoredSettings = (config, said)
       | name == pluginFilesSetting = (config, warningLine pluginFilesWarning : said)
       | trust == Trusted || name `elem` unrestrictedSettings || (name == buildersSetting && BS.null value) =
-          either (\refusal -> (config, usageWarning refusal : said)) (\applied -> (applied, said)) (applyAssignment config (ConfigAssignment name value))
+          either (\refusal -> (config, usageWarning refusal : said)) (,said) (applyAssignment config (ConfigAssignment name value))
       | name `elem` substituterSettings =
           let (kept, refused) = trustedOnly (trustedSubstituters ++ ncSubstituters config) value
            in (config {ncSubstituters = kept}, reverse (map (warningLine . untrustedSubstituterWarning) refused) ++ said)
@@ -703,27 +868,6 @@ data DumpUpload = DumpUpload
     duAlgo :: !Text,
     duReferences :: !(Set StorePath),
     duRepair :: !Repair
-  }
-  deriving (Eq, Show)
-
--- | What realising some paths would take.
-data Missing = Missing
-  { missingWillBuild :: !(Set StorePath),
-    missingWillSubstitute :: !(Set StorePath),
-    missingUnknown :: !(Set StorePath),
-    -- | The bytes substituting would download.
-    missingDownloadSize :: !Word64,
-    -- | The NAR bytes substituting would unpack.
-    missingNarSize :: !Word64
-  }
-  deriving (Eq, Show)
-
--- | What a collection did.
-data GCResult = GCResult
-  { -- | The paths it found or deleted, as upstream names them.
-    gcResultPaths :: !(Set ByteString),
-    -- | The bytes it freed.
-    gcResultBytesFreed :: !Word64
   }
   deriving (Eq, Show)
 

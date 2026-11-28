@@ -141,12 +141,30 @@ module Nix.Daemon.Protocol
     getGCPaths,
     putGCPaths,
 
+    -- * Replies
+    Missing (..),
+    getMissing,
+    putMissing,
+    GCResult (..),
+    getGCResult,
+    putGCResult,
+    getOutputMap,
+    putOutputMap,
+    getRoots,
+    putRoots,
+    getKeyedBuildResults,
+    putKeyedBuildResults,
+
     -- * Messages to the client
     Verbosity (..),
     errorVerbosity,
     ActivityId (..),
     ActivityType (..),
+    actBuild,
+    actSubstitute,
     ResultType (..),
+    resBuildLogLine,
+    resPostBuildLogLine,
     Field (..),
     Activity (..),
     DaemonError (..),
@@ -1362,6 +1380,97 @@ putGCPaths storeDir paths = case paths of
   WholeStore -> putNum (1 :: Word8)
 
 -- ---------------------------------------------------------------------------
+-- Replies
+-- ---------------------------------------------------------------------------
+
+-- | What realising some paths would take, as a daemon answers a client
+-- that asks.
+data Missing = Missing
+  { missingWillBuild :: !(Set StorePath),
+    missingWillSubstitute :: !(Set StorePath),
+    missingUnknown :: !(Set StorePath),
+    -- | The bytes substituting would download.
+    missingDownloadSize :: !Word64,
+    -- | The NAR bytes substituting would unpack.
+    missingNarSize :: !Word64
+  }
+  deriving (Eq, Show)
+
+-- | Read what realising some paths would take: the paths to build, to
+-- substitute and that are unknown, then the two sizes.
+getMissing :: StoreDir -> Decoder Missing
+getMissing storeDir =
+  Missing <$> getStorePathSet storeDir <*> getStorePathSet storeDir <*> getStorePathSet storeDir <*> getWord64 <*> getWord64
+
+-- | Write what realising some paths would take.
+putMissing :: StoreDir -> Missing -> Builder
+putMissing storeDir missing =
+  putStorePathSet storeDir (missingWillBuild missing)
+    <> putStorePathSet storeDir (missingWillSubstitute missing)
+    <> putStorePathSet storeDir (missingUnknown missing)
+    <> putNum (missingDownloadSize missing)
+    <> putNum (missingNarSize missing)
+
+-- | What a collection did.
+data GCResult = GCResult
+  { -- | The paths it found or deleted, as upstream names them.
+    gcResultPaths :: !(Set ByteString),
+    -- | The bytes it freed.
+    gcResultBytesFreed :: !Word64
+  }
+  deriving (Eq, Show)
+
+-- | The word that follows a collection's result, which no client reads.
+obsoleteCollectionWord :: Word64
+obsoleteCollectionWord = 0
+
+-- | Read what a collection did, and pass over the obsolete word after
+-- it.
+getGCResult :: Decoder GCResult
+getGCResult = GCResult . Set.fromList <$> getList getBytes <*> getWord64 <* getWord64
+
+-- | Write what a collection did.
+putGCResult :: GCResult -> Builder
+putGCResult result =
+  putList putBytes (Set.toAscList (gcResultPaths result))
+    <> putNum (gcResultBytesFreed result)
+    <> putNum obsoleteCollectionWord
+
+-- | Read a derivation's outputs and their paths, where known.
+getOutputMap :: StoreDir -> Decoder (Map OutputName (Maybe StorePath))
+getOutputMap storeDir = Map.fromList <$> getList ((,) <$> getOutputName <*> getOptionalStorePath storeDir)
+
+-- | Write a derivation's outputs and their paths.
+putOutputMap :: StoreDir -> Map OutputName (Maybe StorePath) -> Builder
+putOutputMap storeDir outputs = putList (\(name, path) -> putOutputName name <> putOptionalStorePath storeDir path) (Map.toAscList outputs)
+
+-- | Read the roots: how many there are, then each one's link and the
+-- path it keeps.
+getRoots :: StoreDir -> Decoder (Map StorePath (Set ByteString))
+getRoots storeDir =
+  Map.fromListWith Set.union <$> getList ((\link path -> (path, Set.singleton link)) <$> getBytes <*> getStorePath storeDir)
+
+-- | Write the roots, in the order of the paths and then of the links.
+putRoots :: StoreDir -> Map StorePath (Set ByteString) -> Builder
+putRoots storeDir roots =
+  putNum (sum (map Set.size (Map.elems roots)))
+    <> foldMap (\(target, links) -> foldMap (\link -> putBytes link <> putStorePath storeDir target) (Set.toAscList links)) (Map.toAscList roots)
+
+-- | Read build results with the paths they answer.
+getKeyedBuildResults :: StoreDir -> Version -> Decoder [KeyedBuildResult]
+getKeyedBuildResults storeDir version = getList (getKeyedBuildResult storeDir version)
+
+-- | Write build results with the paths they answer, as far as they can
+-- be written, and the refusal of the first that cannot: upstream writes
+-- each as it goes, so what comes before that one is written.
+putKeyedBuildResults :: StoreDir -> Version -> [KeyedBuildResult] -> (Builder, Maybe Text)
+putKeyedBuildResults storeDir version results = go (putNum (length results)) results
+  where
+    go written = \case
+      [] -> (written, Nothing)
+      result : rest -> either (\refusal -> (written, Just refusal)) (\bytes -> go (written <> bytes) rest) (putKeyedBuildResult storeDir version result)
+
+-- ---------------------------------------------------------------------------
 -- Messages to the client
 -- ---------------------------------------------------------------------------
 
@@ -1381,9 +1490,19 @@ newtype ActivityId = ActivityId Word64
 newtype ActivityType = ActivityType Word32
   deriving (Eq, Show)
 
+-- | A derivation's build, and a path's substitution.
+actBuild, actSubstitute :: ActivityType
+actBuild = ActivityType 105
+actSubstitute = ActivityType 108
+
 -- | What kind of result an activity reports: upstream's @ResultType@.
 newtype ResultType = ResultType Word32
   deriving (Eq, Show)
+
+-- | A line a build's builder wrote, and one its post-build hook wrote.
+resBuildLogLine, resPostBuildLogLine :: ResultType
+resBuildLogLine = ResultType 101
+resPostBuildLogLine = ResultType 107
 
 -- | A field of an activity or a result.
 data Field
