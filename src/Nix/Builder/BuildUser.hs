@@ -79,12 +79,9 @@ import qualified Data.Text.Encoding as TE
 import Data.Word (Word32)
 import Nix.Logger (Logger (..))
 import System.Exit (ExitCode (..))
+import qualified System.FilePath.Posix as PosixPath
 
-#if defined(mingw32_HOST_OS)
-
-import System.FilePath ((</>))
-
-#else
+#if !defined(mingw32_HOST_OS)
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, bracket, displayException, finally, mask, onException, try, uninterruptibleMask_)
@@ -177,9 +174,11 @@ buildUsersSupported = False
 -- | The user pool's directory, given @NIX_STATE_DIR@ where it is set and
 -- not empty: @userpool@ in upstream's state directory, which upstream's
 -- daemon shares, so that its builds and nova-nix's never take one user at
--- once.
+-- once.  It is a POSIX path on every system, since build users exist only
+-- on Linux and macOS ('buildUsersFor'), and a Windows build of nova-nix
+-- names it the same.
 userPoolDir :: Maybe FilePath -> FilePath
-userPoolDir stateDir = fromMaybe defaultStateDir stateDir </> "userpool"
+userPoolDir stateDir = fromMaybe defaultStateDir stateDir PosixPath.</> "userpool"
   where
     defaultStateDir = "/nix/var/nix"
 
