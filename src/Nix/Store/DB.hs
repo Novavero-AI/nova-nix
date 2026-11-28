@@ -256,9 +256,10 @@ openStoreDB dir = do
 
 -- | Create the store directory and its metadata subdirectory where
 -- they are missing, with any missing parent of the store directory, as
--- 'createStateDirectory' creates them: on Windows the two are open to
--- whom 'Nix.Store.Access.StoreAccess' says, and a parent this creates
--- to whom 'Nix.Store.Access.ParentAccess' says.  A directory already
+-- 'createStateDirectory' creates them: on Windows the store directory
+-- is open to whom 'Nix.Store.Access.StoreAccess' says, the metadata
+-- directory to whom 'Nix.Store.Access.StateAccess' says, and a parent
+-- this creates to whom 'Nix.Store.Access.ParentAccess' says.  A directory already
 -- there keeps the access it has, and on Windows one another account
 -- could change is refused before anything is created in it.
 createStoreDirectories :: StoreDir -> IO ()

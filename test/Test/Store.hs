@@ -51,7 +51,7 @@ import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Word (Word16, Word32, Word8)
 import qualified Database.SQLite.Simple as SQL
-import DirDacl (Dacl (..), DaclEntry (..), directoryDacl, processUserSid)
+import DirDacl (Dacl (..), DaclEntry (..), directoryDacl, entryOwner, processUserSid)
 import GHC.IO.Exception (IOErrorType (..), IOException (..))
 import HttpFixture (Reply (..), httpResponse, withHttpServer)
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuildStop (..), buildDerivation, buildWithDeps, checkDerivation, defaultBuildConfig, verifyFetchHash)
@@ -69,7 +69,7 @@ import Nix.Logger (Logger (..))
 import Nix.Push (computeClosure)
 import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, closeStore, collectGarbage, copyPathInto, deleteSpecificPaths, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, reachableFrom, referencesMap, referrersFirst, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, specificStillAliveMessage, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv)
-import Nix.Store.Access (AclEntry (..), DirAccess (..), DirSecurity (..), Distrust (..), accessSddl, descriptorDistrust, distrustMessage, parseSecurityDescriptor, securityDistrust, sidFromText, stateDirectories, storeDirectories)
+import Nix.Store.Access (AclEntry (..), DirAccess (..), DirSecurity (..), Distrust (..), StoreAccounts (..), accessSddl, descriptorDistrust, distrustMessage, parseSecurityDescriptor, securityDistrust, sidFromText, stateDirectories, storeDirectories, validPathSddl)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack)
 import Nix.Store.DB (PathInfo (..), PathRegistration (..), Ultimate (..), UnregisterResult (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathFromHashPart, queryPathInfo, queryReferences, queryReferrers, queryValidDerivers, registerPath, registerPaths, unregisterPathRow)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
@@ -1873,7 +1873,14 @@ testStoreAccessIO = do
       someUser = "S-1-5-21-1-2-3-1001"
       -- The SDDL a directory of the access gets for the user, or the
       -- refusal, which no expected SDDL equals.
-      sddlFor user access = maybe ("refused: " <> user) (`accessSddl` access) (sidFromText user)
+      sddlFor user access = maybe ("refused: " <> user) (\sid -> accessSddl (singleUser sid) access) (sidFromText user)
+      -- A store's accounts where the machine has no build accounts'
+      -- group: the user alone.
+      singleUser sid = StoreAccounts sid Nothing
+      buildersGroup = "S-1-5-21-1-2-3-1100"
+      -- The case with someUser as the service and buildersGroup as the
+      -- build accounts' group.
+      withBuilders check = maybe (Fail "a SID in the case is not one") check (StoreAccounts <$> sidFromText someUser <*> (Just <$> sidFromText buildersGroup))
       -- An SDDL's entries, each as its fields, when it is a protected
       -- DACL of entries and nothing else.
       sddlEntries sddl = map (T.splitOn ";") . T.splitOn ")(" <$> (T.stripPrefix "D:P(" sddl >>= T.stripSuffix ")")
@@ -1883,12 +1890,14 @@ testStoreAccessIO = do
           <> [sddlEntry "0x1f01ff" localSystem, sddlEntry "0x1f01ff" "S-1-5-32-544"]
       intendedEntries user access = case access of
         StoreAccess -> trustedEntries user <> [sddlEntry "0x1200a9" "S-1-5-32-545"]
+        StateAccess -> trustedEntries user <> [sddlEntry "0x1200a9" "S-1-5-32-545"]
         ParentAccess -> trustedEntries user
         OwnerAccess -> [sddlEntry "0x1f01ff" user]
+      everyAccess = [StoreAccess, StateAccess, ParentAccess, OwnerAccess]
       -- Every access renders the accepted SID as the trustee of exactly
       -- the entries it intends, and nothing else.
       rendersIntended user sid =
-        QC.conjoin [sddlEntries (accessSddl sid access) QC.=== Just (intendedEntries user access) | access <- [StoreAccess, ParentAccess, OwnerAccess]]
+        QC.conjoin [sddlEntries (accessSddl (singleUser sid) access) QC.=== Just (intendedEntries user access) | access <- everyAccess]
       decimalField = T.pack . show <$> (QC.arbitrary :: QC.Gen Word32)
       -- An authority of 2^32 or more, as ConvertSidToStringSidW writes
       -- one: its top digit is not zero.
@@ -1963,16 +1972,33 @@ testStoreAccessIO = do
           ("GENERIC_ALL", 0x10000000),
           ("GENERIC_WRITE", 0x40000000)
         ]
-      allowing rights sid = AllowEntry rights <$> sidFromText sid
+      -- OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE, as the installer and
+      -- nova-nix write their entries.
+      passedDownFlags = 0x3
+      allowing rights sid = AllowEntry passedDownFlags rights <$> sidFromText sid
       installerEntries = [allowing fullControl someUser, allowing fullControl localSystem, allowing fullControl administrators, allowing readAndExecute users]
       -- The decision for someUser over an owner and a DACL, their SIDs
       -- given as text, which is Nothing when one is not a SID.
       decision owner entries = do
         user <- sidFromText someUser
         security <- DirSecurity <$> traverse sidFromText owner <*> traverse sequenceA entries
-        pure (securityDistrust user security)
+        pure (securityDistrust (singleUser user) ParentAccess security)
       decides label owner entries expected =
         runTest label (fromMaybe (Fail "a SID in the case is not one") (assertEqual label <$> expected <*> decision owner entries))
+      -- The decision for a directory of the access given, with someUser
+      -- as the service and buildersGroup as the build accounts' group.
+      buildersDecide label access entries expected =
+        runTest label $
+          withBuilders $ \accounts ->
+            fromMaybe
+              (Fail "a SID in the case is not one")
+              ( assertEqual label
+                  <$> expected
+                  <*> (securityDistrust accounts access . DirSecurity (Just (saService accounts)) . Just <$> sequenceA entries)
+              )
+      allowingWith flags rights sid = AllowEntry flags rights <$> sidFromText sid
+      -- The build accounts' group's grant on a store's directory.
+      createOnlyRights = 0x1000A6
       accepted = Just Nothing
       refusedAs reason = Just <$> reason
       writableBy sid = refusedAs (WritableBy <$> sidFromText sid)
@@ -2038,7 +2064,7 @@ testStoreAccessIO = do
         sid <- sidBytes sidText
         named <- sidFromText sidText
         let meaning
-              | kind `elem` allowKinds = AllowEntry mask named
+              | kind `elem` allowKinds = AllowEntry flags mask named
               | kind `elem` (0x4 : commonKinds <> objectKinds) = OtherEntry
               | otherwise = UnknownEntry kind
             bytes
@@ -2096,6 +2122,35 @@ testStoreAccessIO = do
           (sddlFor localSystem StoreAccess),
       runTest "a build directory's DACL is protected, with full control for the user alone, passed down" $
         assertEqual "SDDL" "D:P(A;OICI;0x1f01ff;;;S-1-5-21-1-2-3-1001)" (sddlFor someUser OwnerAccess),
+      runTest "with a build accounts' group, a store directory's entries apply to it alone, and the group may only create entries in it" $
+        withBuilders $ \accounts ->
+          assertEqual
+            "SDDL"
+            "D:P(A;;0x1f01ff;;;S-1-5-21-1-2-3-1001)(A;;0x1f01ff;;;S-1-5-18)(A;;0x1f01ff;;;S-1-5-32-544)(A;;0x1200a9;;;S-1-5-32-545)(A;;0x1000a6;;;S-1-5-21-1-2-3-1100)"
+            (accessSddl accounts StoreAccess),
+      runTest "a store's state directory passes the store's grants down, with a build accounts' group or none" $
+        withBuilders $ \accounts ->
+          assertEqual "SDDL" (sddlFor someUser StoreAccess) (accessSddl accounts StateAccess)
+            `andThen` assertEqual "SDDL" (sddlFor someUser StoreAccess) (sddlFor someUser StateAccess),
+      runTest "a registered path is the service's, with a protected DACL for the service, SYSTEM and Administrators, read and execute for Users and the build accounts' group, and read-control for its owner" $
+        withBuilders $ \accounts ->
+          assertEqual
+            "single user"
+            "O:S-1-5-21-1-2-3-1001D:P(A;OICI;0x1f01ff;;;S-1-5-21-1-2-3-1001)(A;OICI;0x1f01ff;;;S-1-5-18)(A;OICI;0x1f01ff;;;S-1-5-32-544)(A;OICI;0x1200a9;;;S-1-5-32-545)(A;OICI;0x20000;;;S-1-3-4)"
+            (validPathSddl accounts {saBuilders = Nothing})
+            `andThen` assertEqual
+              "build accounts"
+              "O:S-1-5-21-1-2-3-1001D:P(A;OICI;0x1f01ff;;;S-1-5-21-1-2-3-1001)(A;OICI;0x1f01ff;;;S-1-5-18)(A;OICI;0x1f01ff;;;S-1-5-32-544)(A;OICI;0x1200a9;;;S-1-5-32-545)(A;OICI;0x1200a9;;;S-1-5-21-1-2-3-1100)(A;OICI;0x20000;;;S-1-3-4)"
+              (validPathSddl accounts)
+            `andThen` maybe
+              (Fail "SYSTEM is not a SID")
+              ( assertEqual
+                  "SYSTEM as the service"
+                  "O:S-1-5-18D:P(A;OICI;0x1f01ff;;;S-1-5-18)(A;OICI;0x1f01ff;;;S-1-5-32-544)(A;OICI;0x1200a9;;;S-1-5-32-545)(A;OICI;0x20000;;;S-1-3-4)"
+                  . validPathSddl
+                  . singleUser
+              )
+              (sidFromText localSystem),
       runTest "a SID of the form S-1-I-S... is accepted, its authority in decimal or wide hexadecimal" $
         assertEqual
           "refused"
@@ -2202,12 +2257,12 @@ testStoreAccessIO = do
             (storeDirectories "D:\\a\\_temp\\store")
           `andThen` assertEqual "a store at a drive root" [] (storeDirectories "E:\\")
           `andThen` assertEqual "a trailing separator" [("C:\\nix", ParentAccess), ("C:\\nix\\store", StoreAccess)] (storeDirectories "C:\\nix\\store\\"),
-      runTest "the directories a store's open checks are those down to the store, then its state directory, made with StoreAccess" $
+      runTest "the directories a store's open checks are those down to the store, then its state directory, made with StateAccess" $
         assertEqual
           "the default store"
-          [("C:\\nix", ParentAccess), ("C:\\nix\\store", StoreAccess), ("C:\\nix\\store\\.nova-nix", StoreAccess)]
+          [("C:\\nix", ParentAccess), ("C:\\nix\\store", StoreAccess), ("C:\\nix\\store\\.nova-nix", StateAccess)]
           (stateDirectories "C:\\nix\\store\\.nova-nix")
-          `andThen` assertEqual "a store at a drive root" [("E:\\.nova-nix", StoreAccess)] (stateDirectories "E:\\.nova-nix"),
+          `andThen` assertEqual "a store at a drive root" [("E:\\.nova-nix", StateAccess)] (stateDirectories "E:\\.nova-nix"),
       decides "install-nova-nix's DACL, on a directory the user owns, is trusted with a store" (Just someUser) (Just installerEntries) accepted,
       decides "a directory Administrators own, as one an elevated shell makes is, is trusted" (Just administrators) (Just installerEntries) accepted,
       decides "a directory SYSTEM owns is trusted" (Just localSystem) (Just installerEntries) accepted,
@@ -2237,6 +2292,31 @@ testStoreAccessIO = do
         (Just someUser)
         (Just [allowing 0x40 authenticatedUsers, allowing fullControl users])
         (writableBy authenticatedUsers),
+      buildersDecide
+        "the build accounts' group may create entries in the store's directory, by an entry passed to nothing it holds"
+        StoreAccess
+        (installerEntries <> [allowingWith 0x0 createOnlyRights buildersGroup])
+        accepted,
+      buildersDecide
+        "the build accounts' create-only grant is refused passed down"
+        StoreAccess
+        (installerEntries <> [allowingWith passedDownFlags createOnlyRights buildersGroup])
+        (writableBy buildersGroup),
+      buildersDecide
+        "the build accounts' create-only grant is refused on a directory other than the store's"
+        StateAccess
+        (installerEntries <> [allowingWith 0x0 createOnlyRights buildersGroup])
+        (writableBy buildersGroup),
+      buildersDecide
+        "the build accounts' group is refused a right past creating entries"
+        StoreAccess
+        (installerEntries <> [allowingWith 0x0 (createOnlyRights .|. 0x10000) buildersGroup])
+        (writableBy buildersGroup),
+      buildersDecide
+        "another account's create-only grant on the store's directory is refused"
+        StoreAccess
+        (installerEntries <> [allowingWith 0x0 createOnlyRights authenticatedUsers])
+        (writableBy authenticatedUsers),
       runTest "each right that changes a directory, granted alone to another account, is refused, and every other right together is trusted" $
         foldr
           (\(name, rights) rest -> assertEqual name (writableBy authenticatedUsers) (decision (Just someUser) (Just [allowing rights authenticatedUsers])) `andThen` rest)
@@ -2250,44 +2330,49 @@ testStoreAccessIO = do
         fromMaybe (Fail "not a SID") $ do
           user <- sidFromText "S-1-0x123456789abc-1"
           spelled <- sidFromText "S-1-0x123456789ABC-1"
-          pure (assertEqual "the decision" Nothing (securityDistrust user (DirSecurity (Just spelled) (Just [AllowEntry fullControl spelled])))),
+          pure (assertEqual "the decision" Nothing (securityDistrust (singleUser user) ParentAccess (DirSecurity (Just spelled) (Just [AllowEntry passedDownFlags fullControl spelled])))),
       -- What nova-nix creates a directory with, read back from the SDDL
       -- it writes.
-      runTestM "a directory nova-nix creates, owned by the user, is trusted with a store, for every user and access" $
+      runTestM "a directory nova-nix creates, owned by the user, is trusted with a store, for every user and access, with a build accounts' group or none" $
         let readBack user sddl = do
               entries <- sddlEntries sddl
               DirSecurity (Just user) . Just <$> traverse allowEntryOf entries
             allowEntryOf fields = case fields of
-              ["A", "OICI", rights, "", "", trustee] -> AllowEntry <$> readMaybe (T.unpack rights) <*> sidFromText trustee
+              ["A", flags, rights, "", "", trustee] -> AllowEntry <$> flagsOf flags <*> readMaybe (T.unpack rights) <*> sidFromText trustee
+              _ -> Nothing
+            flagsOf flags = case flags of
+              "OICI" -> Just passedDownFlags
+              "" -> Just 0x0
               _ -> Nothing
          in property $
-              QC.forAll genSid $ \text -> case sidFromText text of
-                Nothing -> QC.counterexample ("refused " <> T.unpack text) False
-                Just user ->
+              QC.forAll ((,) <$> genSid <*> genSid) $ \(text, groupText) -> case (sidFromText text, sidFromText groupText) of
+                (Just user, Just builders) ->
                   QC.conjoin
-                    [ QC.counterexample (show access) (fmap (securityDistrust user) (readBack user (accessSddl user access)) QC.=== Just Nothing)
-                    | access <- [StoreAccess, ParentAccess, OwnerAccess]
-                    ],
+                    [ QC.counterexample (show (access, accounts)) (fmap (securityDistrust accounts access) (readBack user (accessSddl accounts access)) QC.=== Just Nothing)
+                    | accounts <- [singleUser user, StoreAccounts user (Just builders)],
+                      access <- everyAccess
+                    ]
+                _ -> QC.counterexample ("refused " <> T.unpack text <> " or " <> T.unpack groupText) False,
       runTest "a security descriptor is read as MS-DTYP lays it out" $
         fromMaybe (Fail "not a SID") $ do
           owner <- sidFromText administrators
           system <- sidFromText localSystem
           pure $
-            assertEqual "the fixture" (Just (DirSecurity (Just owner) (Just [AllowEntry fullControl system]))) (parseSecurityDescriptor fixture)
+            assertEqual "the fixture" (Just (DirSecurity (Just owner) (Just [AllowEntry passedDownFlags fullControl system]))) (parseSecurityDescriptor fixture)
               `andThen` assertEqual "the fixture as built" fixture (descriptorOf (Just administratorsBytes) (Just (Just (aclOf [common 0x0 0x03 fullControl systemBytes BS.empty])))),
       runTest "an inherit-only entry granting another account a change is refused" $
         fromMaybe (Fail "not a SID") $ do
           user <- sidFromText someUser
           grantee <- sidFromText creatorOwner
           -- OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE
-          pure (assertEqual "the decision" (Just (WritableBy grantee)) (descriptorDistrust user (ownedByUser [common 0x0 0x0B 0x10000000 creatorOwnerBytes BS.empty]))),
+          pure (assertEqual "the decision" (Just (WritableBy grantee)) (descriptorDistrust (singleUser user) ParentAccess (ownedByUser [common 0x0 0x0B 0x10000000 creatorOwnerBytes BS.empty]))),
       runTest "a null DACL, a descriptor that says it has no DACL, and one with no owner are refused" $
         fromMaybe (Fail "not a SID") $ do
           user <- sidFromText someUser
           pure $
-            assertEqual "a null DACL" (Just NoDacl) (descriptorDistrust user (descriptorOf (Just userBytes) (Just Nothing)))
-              `andThen` assertEqual "no DACL" (Just NoDacl) (descriptorDistrust user (descriptorOf (Just userBytes) Nothing))
-              `andThen` assertEqual "no owner" (Just (OwnedBy Nothing)) (descriptorDistrust user (descriptorOf Nothing (Just (Just (aclOf []))))),
+            assertEqual "a null DACL" (Just NoDacl) (descriptorDistrust (singleUser user) ParentAccess (descriptorOf (Just userBytes) (Just Nothing)))
+              `andThen` assertEqual "no DACL" (Just NoDacl) (descriptorDistrust (singleUser user) ParentAccess (descriptorOf (Just userBytes) Nothing))
+              `andThen` assertEqual "no owner" (Just (OwnedBy Nothing)) (descriptorDistrust (singleUser user) ParentAccess (descriptorOf Nothing (Just (Just (aclOf []))))),
       runTest "an allow entry of every kind is read, past a callback's data and an object entry's GUIDs" $
         fromMaybe (Fail "not a SID") $ do
           user <- sidFromText someUser
@@ -2295,7 +2380,7 @@ testStoreAccessIO = do
           pure $
             assertEqual
               "the entries"
-              (Just (DirSecurity (Just user) (Just (replicate 5 (AllowEntry 0x2 grantee)))))
+              (Just (DirSecurity (Just user) (Just (replicate 5 (AllowEntry 0x0 0x2 grantee)))))
               ( parseSecurityDescriptor
                   ( ownedByUser
                       [ common 0x0 0x0 0x2 authenticatedBytes BS.empty,
@@ -2315,7 +2400,7 @@ testStoreAccessIO = do
               restricting = [0x1, 0x2, 0x3, 0xA, 0xD, 0xE, 0x6, 0x7, 0x8, 0xC, 0xF, 0x10]
           pure $
             assertEqual "the entries" (Just (DirSecurity (Just user) (Just (map (const OtherEntry) restricting)))) (parseSecurityDescriptor (ownedByUser (map granting restricting)))
-              `andThen` assertEqual "a mandatory label" (Just UnreadableEntry) (descriptorDistrust user (ownedByUser [common 0x11 0x0 0x1 authenticatedBytes BS.empty])),
+              `andThen` assertEqual "a mandatory label" (Just UnreadableEntry) (descriptorDistrust (singleUser user) ParentAccess (ownedByUser [common 0x11 0x0 0x1 authenticatedBytes BS.empty])),
       runTest "bytes that are not a security descriptor are refused as unreadable" $
         fromMaybe (Fail "not a SID") $ do
           user <- sidFromText someUser
@@ -2332,7 +2417,7 @@ testStoreAccessIO = do
                   ("a SID of another revision", setByte 20 2 fixture),
                   ("a SID of sixteen subauthorities", descriptorOf (Just (BS.pack [1, 16, 0, 0, 0, 0, 0, 5] <> foldMap le32 (replicate 16 1))) Nothing)
                 ]
-          pure (foldr (\(name, bytes) rest -> assertEqual name (Just UnreadableDescriptor) (descriptorDistrust user bytes) `andThen` rest) Pass malformed),
+          pure (foldr (\(name, bytes) rest -> assertEqual name (Just UnreadableDescriptor) (descriptorDistrust (singleUser user) ParentAccess bytes) `andThen` rest) Pass malformed),
       runTestM "a descriptor is read back as it was laid out, and no part of it cut short is read" $
         property $
           QC.forAll ((,) <$> QC.oneof [pure Nothing, Just <$> genSid] <*> genDacl) $ \spec -> case encodedDescriptor spec of
@@ -2362,6 +2447,36 @@ testStoreAccessIO = do
           openStore testLogger (StoreDir root) >>= closeStore
           outcome <- try (openStore testLogger (StoreDir root) >>= closeStore)
           pure (either (\err -> Fail ("the second open failed: " <> T.pack (show (err :: IOException)))) (const Pass) outcome),
+      -- A path is made canonical as registration makes it, on a machine
+      -- with no build accounts' group: each node the user's, as the
+      -- service's, with a valid path's protected DACL, the exec stream
+      -- and so the NAR hash kept.
+      onWindows "a path made canonical gives each node the service as owner and a valid path's protected DACL, and keeps its NAR hash" $ \user ->
+        fresh "valid-path" $ do
+          let root = scratch "valid-path" </> "path"
+              tool = root </> "sub" </> "tool.exe"
+              validEntries = [allow user fullControl | user /= localSystem] <> [allow localSystem fullControl, allow "S-1-5-32-544" fullControl, allow "S-1-5-32-545" readAndExecute, allow "S-1-3-4" readControl]
+              -- READ_CONTROL alone, which OWNER RIGHTS is given.
+              readControl = 0x20000
+          createDirectoryIfMissing True (takeDirectory tool)
+          BS.writeFile tool "a program"
+          ExecBit.markExecutable tool
+          BS.writeFile (root </> "data") "data"
+          before <- ExecBit.narHashOfPath processCaseHack root
+          canonicalizeMetadata root
+          after <- ExecBit.narHashOfPath processCaseHack root
+          rootDacl <- carries "the path" validEntries root
+          dirDacl <- carries "a directory in it" validEntries (takeDirectory tool)
+          fileDacl <- carries "a file in it" validEntries tool
+          owners <- traverse entryOwner [root, takeDirectory tool, tool, root </> "data"]
+          executable <- ExecBit.isExecutable tool
+          pure $
+            assertEqual "the NAR hash" before after
+              `andThen` rootDacl
+              `andThen` dirDacl
+              `andThen` fileDacl
+              `andThen` assertEqual "the owners" (replicate 4 (Just user)) owners
+              `andThen` assertEqual "the exec stream" True executable,
       -- An evaluation's write can come before the store is opened: its
       -- directories are made as the open makes them, and the state
       -- directory, which only the open makes, is not.

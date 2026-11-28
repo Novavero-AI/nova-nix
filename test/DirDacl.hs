@@ -2,13 +2,14 @@
 
 -- | A directory's DACL as Windows reads it back, for the store access
 -- tests: whether it is protected and each of its entries, through
--- GetNamedSecurityInfoW (test/cbits/nn_test_dacl.c), and the user the
--- process runs as.  A POSIX directory has no DACL, so both answer
--- 'Nothing' there.
+-- GetNamedSecurityInfoW (test/cbits/nn_test_dacl.c), an entry's owner,
+-- and the user the process runs as.  A POSIX directory has no DACL, so
+-- each answers 'Nothing' there.
 module DirDacl
   ( Dacl (..),
     DaclEntry (..),
     directoryDacl,
+    entryOwner,
     processUserSid,
   )
 where
@@ -57,6 +58,10 @@ directoryDacl :: FilePath -> IO (Maybe Dacl)
 -- the grants it writes, or 'Nothing' off Windows.
 processUserSid :: IO (Maybe Text)
 
+-- | The SID of the owner of the entry at the path, or 'Nothing' off
+-- Windows.  A failure to read it throws.
+entryOwner :: FilePath -> IO (Maybe Text)
+
 #if defined(mingw32_HOST_OS)
 
 foreign import ccall unsafe "nn_test_dacl_read"
@@ -77,11 +82,19 @@ foreign import ccall unsafe "nn_token_user_sid"
 foreign import ccall unsafe "LocalFree"
   c_LocalFree :: Ptr a -> IO (Ptr a)
 
+foreign import ccall unsafe "nn_test_owner_read"
+  c_nn_test_owner_read :: CWString -> Ptr CWString -> IO CULong
+
 directoryDacl path =
   withCWString path $ \cPath -> alloca $ \out -> do
     succeeded "GetNamedSecurityInfoW" =<< c_nn_test_dacl_read cPath out
     descriptor <- peek out
     (Just <$> readDacl descriptor) `finally` c_LocalFree descriptor
+
+entryOwner path =
+  withCWString path $ \cPath -> alloca $ \sidOut -> do
+    succeeded "GetNamedSecurityInfoW" =<< c_nn_test_owner_read cPath sidOut
+    Just <$> (takeWideString =<< peek sidOut)
 
 processUserSid =
   alloca $ \sidOut -> alloca $ \failedOut -> do
@@ -127,6 +140,8 @@ succeeded call code =
 #else
 
 directoryDacl _ = pure Nothing
+
+entryOwner _ = pure Nothing
 
 processUserSid = pure Nothing
 
