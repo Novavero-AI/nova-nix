@@ -13,6 +13,7 @@
 -- is killed, and that a build waits for a free member.
 module Test.BuildUser
   ( testBuildUsersPure,
+    testBuildUsersUnprivilegedIO,
     buildUsersRootFlag,
     buildUsersRootChild,
   )
@@ -27,16 +28,17 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import Data.Word (Word32)
-import Nix.Builder.BuildUser (BuildUser (..), BuildUsers (..), ProcessPrivilege (..), UserDatabase (..), acquireBuildUser, buildUsersFor, defaultBuildUsersGroup, peerInBuildUsersGroup, userPoolDir, waitingForBuildUserMessage, worldWritableMessage)
+import Nix.Builder.BuildUser (BuildUsers (NoBuildUsers), Member (..), ProcessPrivilege (..), UserDatabase (..), acquireBuildUser, buildUsersFor, defaultBuildUsersGroup, peerInBuildUsersGroup, userPoolDir, waitingForBuildUserMessage, withBuildUser, worldWritableMessage)
 import System.FilePath ((</>))
 import qualified System.Info
 import qualified Test.QuickCheck as QC
 
 #if defined(mingw32_HOST_OS)
 
+import System.Directory (doesDirectoryExist, getTemporaryDirectory, removePathForcibly)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
-import Test.Harness (TestResult (..), andThen, assertEqual, runTest, runTestM)
+import Test.Harness (TestResult (..), andThen, assertEqual, runTest, runTestM, testLogger)
 
 #else
 
@@ -48,14 +50,17 @@ import Data.Bits ((.&.))
 import Data.Foldable (traverse_)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Maybe (catMaybes)
-import Foreign.C.Types (CInt (..))
+import Foreign.C.Error (Errno (..), eINVAL, ePERM)
+import Foreign.C.Types (CInt (..), CUInt (..))
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Ptr (Ptr)
 import qualified Nix.Builder as Builder
 import qualified Nix.Builder.Sandbox.Spawn as Spawn
 import Nix.Logger (Logger (..))
 import Nix.Store (Store (..), closeStore, openStore)
 import Nix.Store.Path (StoreDir (..), defaultStoreDir, storePathToFilePath, storePathToText)
 import Nix.Store.Path.Internal (StorePath (..))
-import System.Directory (createDirectoryIfMissing, doesFileExist, removePathForcibly)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getTemporaryDirectory, removePathForcibly)
 import System.Exit (exitFailure)
 import System.FileLock (SharedExclusive (Exclusive), tryLockFile, unlockFile)
 import System.IO (hPutStrLn, stderr)
@@ -79,7 +84,7 @@ testBuildUsersPure = do
     [ runTest "build-users-group defaults to nixbld for root and to nothing for anyone else, and builds run as its members only for root with it set" $
         assertEqual "root's default" "nixbld" (defaultBuildUsersGroup RunsAsRoot)
           `andThen` assertEqual "another's default" "" (defaultBuildUsersGroup RunsUnprivileged)
-          `andThen` assertEqual "root with a group" (if supported then BuildUsersOf "nixbld" pool else NoBuildUsers) (buildUsersFor RunsAsRoot pool "nixbld")
+          `andThen` assertEqual "root with a group" supported (buildUsersFor RunsAsRoot pool "nixbld" /= NoBuildUsers)
           `andThen` assertEqual "root with none" NoBuildUsers (buildUsersFor RunsAsRoot pool "")
           `andThen` assertEqual "another with a group" NoBuildUsers (buildUsersFor RunsUnprivileged pool "nixbld"),
       runTest "the user pool is in upstream's state directory, or the one NIX_STATE_DIR names" $
@@ -96,7 +101,7 @@ testBuildUsersPure = do
           `andThen` assertEqual "a missing member" (Left "the user 'ghost' in the group 'nixbld' does not exist") (fst (acquired (groupOf ["ghost"]) Set.empty [])),
       runTest "the first member whose lock is free is taken, with its supplementary groups but the build users' own, and those after it are not looked up" $
         let (outcome, model) = acquired (groupOf (memberNames 3)) (Set.singleton (uidOf 1)) []
-         in assertEqual "taken" (Right (Just (BuildUser (uidOf 2) buildGid [kvmGid], uidOf 2))) outcome
+         in assertEqual "taken" (Right (Just (Member (uidOf 2) buildGid [kvmGid], uidOf 2))) outcome
               `andThen` assertEqual "locks" (Set.fromList [uidOf 1, uidOf 2]) (modelLocked model)
               `andThen` assertEqual "looked up" ["nixbld2", "nixbld1"] (modelLookedUp model),
       runTest "with every member taken there is none to take, and no lock is held" $
@@ -117,7 +122,7 @@ testBuildUsersPure = do
                   (outcome, model) = acquired (groupOf (memberNames count)) locked []
                   firstFree = take 1 [uid | n <- [1 .. count], let uid = uidOf n, Set.notMember uid locked]
                in case (outcome, firstFree) of
-                    (Right (Just (user, lock)), [uid]) -> buUid user QC.=== uid QC..&&. lock QC.=== uid QC..&&. modelLocked model QC.=== Set.insert uid locked
+                    (Right (Just (member, lock)), [uid]) -> memberUid member QC.=== uid QC..&&. lock QC.=== uid QC..&&. modelLocked model QC.=== Set.insert uid locked
                     (Right Nothing, []) -> modelLocked model QC.=== locked
                     _ -> QC.counterexample (show outcome) False
         pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
@@ -188,6 +193,78 @@ buildGid = 30000
 kvmGid = 78
 
 -- ---------------------------------------------------------------------------
+-- Without root, in IO
+-- ---------------------------------------------------------------------------
+
+-- | What a process that is not root may not do: kill a build user's
+-- processes, which the shim refuses before it forks, since its child could
+-- only become the caller and kill the caller's every other process; and
+-- take a build user at all, which 'withBuildUser' refuses before it makes
+-- the pool, whatever privilege 'buildUsersFor' was told of.  The suite
+-- runs as a user that is not root, and as root these are passed over.  On
+-- Windows, which has no build users, there is no shim to ask, and a build
+-- user is never taken.
+testBuildUsersUnprivilegedIO :: IO [Bool]
+testBuildUsersUnprivilegedIO = do
+  putStrLn "builder/build-users-unprivileged"
+  root <- runsAsRoot
+  if root
+    then sequence [runTest "a process that is not root takes no build user (skipped: running as root)" Pass]
+    else do
+      temporary <- getTemporaryDirectory
+      let scratch = temporary </> "nova-nix-test-build-users-unprivileged"
+          pool = scratch </> "userpool"
+      sequence
+        [ runTestM "the shim refuses to kill a user's processes for a caller that is not root, before it forks" shimRefusal,
+          runTestM "a process that is not root takes no build user, and makes no pool, whatever privilege it named" $ do
+            removePathForcibly scratch
+            taken <- withBuildUser testLogger (buildUsersFor RunsAsRoot pool "nixbld") "/nix/store/x.drv" (\_ -> pure ())
+            made <- doesDirectoryExist pool
+            pure $ case taken of
+              Left message ->
+                assertEqual "refusal" "builds run as the members of 'nixbld' only for root, and this process is not root" message
+                  `andThen` assertEqual "pool made" False made
+              Right ()
+                | supported -> Fail "a build user was taken by a process that is not root"
+                | otherwise -> assertEqual "pool made" False made
+        ]
+  where
+    supported = System.Info.os `elem` ["linux", "darwin"]
+
+-- | Whether this process runs as root.  Never on Windows.
+runsAsRoot :: IO Bool
+
+-- | The shim's refusal, for a caller that is not root, to kill another
+-- user's processes, and of uid 0's: each answered before any child is
+-- forked, as the errno the shim returns says, where a fork would answer 0
+-- and the child's status.  The other user is @nobody@, whom the caller
+-- cannot become, so a shim that forked anyway would still kill nothing.
+shimRefusal :: IO TestResult
+
+#if defined(mingw32_HOST_OS)
+
+runsAsRoot = pure False
+
+shimRefusal = pure Pass
+
+#else
+
+runsAsRoot = (== 0) <$> User.getEffectiveUserID
+
+shimRefusal = do
+  nobody <- User.getUserEntryForName "nobody"
+  refused <- alloca $ \statusPtr -> c_nn_kill_user (fromIntegral (User.userID nobody)) statusPtr
+  rootRefused <- alloca $ \statusPtr -> c_nn_kill_user 0 statusPtr
+  pure (assertEqual "another user" (errnoValue ePERM) refused `andThen` assertEqual "root" (errnoValue eINVAL) rootRefused)
+  where
+    errnoValue (Errno number) = number
+
+foreign import ccall safe "nn_kill_user"
+  c_nn_kill_user :: CUInt -> Ptr CInt -> IO CInt
+
+#endif
+
+-- ---------------------------------------------------------------------------
 -- As root
 -- ---------------------------------------------------------------------------
 
@@ -230,7 +307,7 @@ rootChecks helper busybox root group = do
   nobody <- User.getUserEntryForName "nobody"
   let storeDir = StoreDir (root </> "store")
       pool = root </> "state" </> "userpool"
-      unsandboxed store = (Builder.defaultBuildConfig (stDir store)) {Builder.bcBuildUsers = BuildUsersOf group pool}
+      unsandboxed store = (Builder.defaultBuildConfig (stDir store)) {Builder.bcBuildUsers = buildUsersFor RunsAsRoot pool group}
       sandboxed store = (unsandboxed store) {Builder.bcSandbox = linuxSandboxConfig helper busyboxBytes}
       sandboxAvailable = System.Info.os == "linux" && helperThere
       outPath letter = StorePath (T.replicate 32 (T.singleton letter))

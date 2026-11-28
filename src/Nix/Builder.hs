@@ -130,7 +130,7 @@ import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTP
 import Nix.Builder.BuildDir (BuildEnding (..), FailedBuilds (..), WorkDir (..), buildDirFor, sandboxedBuildDir, withBuildDir, workDirIn)
-import Nix.Builder.BuildUser (BuildUser (..), BuildUsers (..), giveToBuildUser, invokingUserIds, killBuildUser, openStoreToBuildUsers, runAsBuildUser, withBuildUser, worldWritableAncestor, worldWritableMessage)
+import Nix.Builder.BuildUser (BuildUser, BuildUsers (NoBuildUsers), buGid, buUid, giveToBuildUser, invokingUserIds, killBuildUser, openStoreToBuildUsers, runAsBuildUser, withBuildUser, worldWritableAncestor, worldWritableMessage)
 import Nix.Builder.Buildenv (builtinBuildenvBuilder, runBuiltinBuildenv)
 import Nix.Builder.Log (openLogPipe, streamBuildLog)
 import Nix.Builder.Sandbox (BuilderIds (..), DarwinOptions (..), DarwinPathInputs (..), DarwinPaths (..), DarwinPlan (..), DarwinProfile (..), HelperOutcome (..), Network, PathPresence (..), PlanInputs (..), SandboxBackend (..), SandboxConfig (..), SandboxFallback (..), SandboxPath (..), SandboxUse (..), backendFallback, chrootSkeleton, darwinOptions, darwinParameters, darwinPathsInSandbox, darwinProfile, darwinSetupFailureMessage, darwinStageName, defaultSandboxConfig, helperOutcome, hostSandboxBackend, renderDarwinPlan, renderPlan, rootRefusal, sandboxHome, sandboxPlan, sandboxUse, setupFailureMessage, setupStageName, unavailableMessage)
@@ -729,19 +729,20 @@ buildUnderLock config store drvPath drv redirected succeeded finish = runExceptT
 -- every user may write ('worldWritableAncestor'); otherwise the user
 -- nova-nix runs as, who runs every builtin.
 asBuilder :: BuildConfig -> BuildContext -> BuilderRun -> FilePath -> (BuilderIdentity -> IO (Either BuildStop a)) -> IO (Either BuildStop a)
-asBuilder config context run buildsDir action = case (run, bcBuildUsers config) of
-  (RunsSpawned _, BuildUsersOf group pool) -> do
-    taken <- withBuildUser (buildLogger context) group pool (storePathToText defaultStoreDir (bxDrvPath context)) $ \user -> runExceptT $ do
+asBuilder config context run buildsDir action = case run of
+  RunsBuiltin _ -> action AsInvoker
+  RunsSpawned _ -> do
+    taken <- withBuildUser (buildLogger context) (bcBuildUsers config) (storePathToText defaultStoreDir (bxDrvPath context)) (maybe (action AsInvoker) asUser)
+    pure (either (Left . stopped) id taken)
+  where
+    stopped reason = BuildStop reason 1
+    asUser user = runExceptT $ do
       ExceptT (first stopped <$> killBuildUser user)
       liftIO (openStoreToBuildUsers (unStoreDir (bcStoreDir config)) user)
       liftIO (createDirectoryIfMissing True buildsDir)
       writable <- liftIO (worldWritableAncestor buildsDir)
       for_ writable (throwError . stopped . worldWritableMessage)
       ExceptT (action (AsBuildUser user))
-    pure (either (Left . stopped) id taken)
-  _ -> action AsInvoker
-  where
-    stopped reason = BuildStop reason 1
 
 -- | What a build that does not succeed leaves of its directory: what
 -- 'bcFailedBuilds' says, unless its builder is a builtin, of which

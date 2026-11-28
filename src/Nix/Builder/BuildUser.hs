@@ -40,7 +40,7 @@ module Nix.Builder.BuildUser
     ProcessPrivilege (..),
     processPrivilege,
     defaultBuildUsersGroup,
-    BuildUsers (..),
+    BuildUsers (NoBuildUsers),
     buildUsersFor,
     userPoolDir,
 
@@ -48,7 +48,11 @@ module Nix.Builder.BuildUser
     peerInBuildUsersGroup,
 
     -- * Choosing a build user
-    BuildUser (..),
+    BuildUser,
+    buUid,
+    buGid,
+    buSupplementaryGids,
+    Member (..),
     UserDatabase (..),
     acquireBuildUser,
     withBuildUser,
@@ -86,7 +90,7 @@ import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, bracket, displayException, finally, mask, onException, try, uninterruptibleMask_)
 import Control.Monad (unless, void)
 import Data.Bits (complement, (.&.))
-import Foreign.C.Error (Errno (..), errnoToIOError)
+import Foreign.C.Error (Errno (..), eINVAL, ePERM, errnoToIOError)
 import Foreign.C.String (CString, peekCString)
 import Foreign.C.Types (CInt (..), CUInt (..))
 import Foreign.Marshal.Alloc (alloca)
@@ -143,7 +147,9 @@ defaultBuildUsersGroup privilege = case privilege of
   RunsAsRoot -> "nixbld"
   RunsUnprivileged -> ""
 
--- | Whom a spawned builder runs as.
+-- | Whom a spawned builder runs as.  Only 'buildUsersFor' makes the
+-- first, for root, so a build user is taken only where builds are to run
+-- as one ('withBuildUser').
 data BuildUsers
   = -- | A member of this group, taken from the pool in this directory.
     BuildUsersOf !ByteString !FilePath
@@ -194,14 +200,34 @@ peerInBuildUsersGroup group peerGroup = not (BS.null group) && peerGroup == Just
 -- Choosing a build user
 -- ---------------------------------------------------------------------------
 
--- | A build user a build runs as: its uid, the build users' group, and its
--- supplementary groups but that one.
-data BuildUser = BuildUser
-  { buUid :: !Word32,
-    buGid :: !Word32,
-    buSupplementaryGids :: ![Word32]
+-- | A member of the build users' group a build may run as: its uid, the
+-- build users' group, and its supplementary groups but that one.
+data Member = Member
+  { memberUid :: !Word32,
+    memberGid :: !Word32,
+    memberGroups :: ![Word32]
   }
   deriving (Eq, Show)
+
+-- | A member a build holds and runs as.  Only 'withBuildUser' makes one,
+-- for a process that runs as root with build users ('buildUsersFor'), its
+-- lock held and its uid neither root's nor this process's, so a build
+-- user's processes, which 'killBuildUser' ends and 'runAsBuildUser'
+-- starts, are never the caller's own.
+newtype BuildUser = BuildUser Member
+  deriving (Eq, Show)
+
+-- | A build user's uid.
+buUid :: BuildUser -> Word32
+buUid (BuildUser member) = memberUid member
+
+-- | The build users' group, which a build user builds as.
+buGid :: BuildUser -> Word32
+buGid (BuildUser member) = memberGid member
+
+-- | A build user's supplementary groups but the build users' own.
+buSupplementaryGids :: BuildUser -> [Word32]
+buSupplementaryGids (BuildUser member) = memberGroups member
 
 -- | What choosing a build user reads and locks, over a monad, holding a
 -- lock of type @lock@.
@@ -231,7 +257,7 @@ data UserDatabase m lock = UserDatabase
 -- up only as far as the first free one, as upstream looks them up.  On
 -- Linux the user keeps its supplementary groups, as upstream lets an
 -- administrator give a build one such as @kvm@.
-acquireBuildUser :: (Monad m) => UserDatabase m lock -> [Word32] -> ByteString -> m (Either Text (Maybe (BuildUser, lock)))
+acquireBuildUser :: (Monad m) => UserDatabase m lock -> [Word32] -> ByteString -> m (Either Text (Maybe (Member, lock)))
 acquireBuildUser database ownUids group = do
   found <- udGroup database group
   case found of
@@ -255,7 +281,7 @@ acquireBuildUser database ownUids group = do
                   throwError ("the Nix user should not be a member of '" <> shown group <> "'")
               | otherwise -> do
                   groups <- inner (udGroups database member primary)
-                  pure (Just (BuildUser uid gid (filter (/= gid) groups), lock))
+                  pure (Just (Member uid gid (filter (/= gid) groups), lock))
     -- A name in a message, shown with any byte that is not UTF-8 replaced.
     shown = TE.decodeUtf8Lenient
 
@@ -264,14 +290,17 @@ acquireBuildUser database ownUids group = do
 waitingForBuildUserMessage :: Text -> Text
 waitingForBuildUserMessage drvPath = "waiting for a free build user ID for '" <> drvPath <> "'"
 
--- | Run an action as a member of the build users' group, given the group,
--- the pool's directory and the @.drv@ path the build is of: a free member
--- is taken ('acquireBuildUser') and given back when the action ends,
--- however it ends.  While every member is taken the build says so once
+-- | Run an action as whom builds run as, given the @.drv@ path the build
+-- is of: with no build users, as the user nova-nix runs as ('Nothing');
+-- otherwise as a free member of the build users' group, taken
+-- ('acquireBuildUser') and given back when the action ends, however it
+-- ends.  While every member is taken the build says so once
 -- ('waitingForBuildUserMessage') and looks again at upstream's default
 -- @poll-interval@, since a member another process gives back announces
--- nothing.  'Left' is why there is no member to take.
-withBuildUser :: Logger -> ByteString -> FilePath -> Text -> (BuildUser -> IO a) -> IO (Either Text a)
+-- nothing.  'Left' is why there is no member to take, a process that is
+-- not root among the reasons, whatever privilege 'buildUsersFor' was
+-- told of.
+withBuildUser :: Logger -> BuildUsers -> Text -> (Maybe BuildUser -> IO a) -> IO (Either Text a)
 
 -- | Kill every process of a build user, as upstream kills them before and
 -- after a build, from a child of this process that is that user, so the
@@ -321,7 +350,9 @@ invokingUserIds :: IO (Word32, Word32)
 
 #if defined(mingw32_HOST_OS)
 
-withBuildUser _ _ _ _ _ = pure (Left unsupported)
+withBuildUser _ users _ action = case users of
+  NoBuildUsers -> Right <$> action Nothing
+  BuildUsersOf _ _ -> pure (Left unsupported)
 
 killBuildUser _ = pure (Left unsupported)
 
@@ -341,19 +372,24 @@ unsupported = "build users need Linux or macOS"
 
 #else
 
-withBuildUser logger group pool drvPath action = do
-  createDirectoryIfMissing True pool
-  ownUids <- traverse (fmap fromIntegral) [User.getRealUserID, User.getEffectiveUserID]
-  let attempt announced = mask $ \restore -> do
-        found <- acquireBuildUser (systemUserDatabase pool) ownUids group
-        case found of
-          Left reason -> pure (Left reason)
-          Right (Just (user, lock)) -> Right <$> (restore (action user) `finally` unlockFile lock)
-          Right Nothing -> restore $ do
-            unless announced (logMessage logger (waitingForBuildUserMessage drvPath))
-            threadDelay freeUserPollMicros
-            attempt True
-  attempt False
+withBuildUser logger users drvPath action = case users of
+  NoBuildUsers -> Right <$> action Nothing
+  BuildUsersOf group pool -> do
+    ownUids <- traverse (fmap fromIntegral) [User.getRealUserID, User.getEffectiveUserID]
+    if any (/= 0) ownUids
+      then pure (Left ("builds run as the members of '" <> TE.decodeUtf8Lenient group <> "' only for root, and this process is not root"))
+      else do
+        createDirectoryIfMissing True pool
+        let attempt announced = mask $ \restore -> do
+              found <- acquireBuildUser (systemUserDatabase pool) ownUids group
+              case found of
+                Left reason -> pure (Left reason)
+                Right (Just (member, lock)) -> Right <$> (restore (action (Just (BuildUser member))) `finally` unlockFile lock)
+                Right Nothing -> restore $ do
+                  unless announced (logMessage logger (waitingForBuildUserMessage drvPath))
+                  threadDelay freeUserPollMicros
+                  attempt True
+        attempt False
 
 -- | How long a build waiting for a free build user waits before it looks
 -- again: upstream's default @poll-interval@, five seconds.
@@ -382,15 +418,20 @@ systemUserDatabase pool =
   where
     lockFileMode = 0o600
 
-killBuildUser user
-  | buUid user == 0 = pure (Left (cannot "uid 0 is root, whose kill would reach every process"))
-  | otherwise = alloca $ \statusPtr -> do
-      failure <- c_nn_kill_user (fromIntegral (buUid user)) statusPtr
-      status <- peek statusPtr
-      if failure /= 0
-        then pure (Left ("unable to fork" <> errnoSuffix (fromIntegral failure)))
-        else killOutcome status
+killBuildUser user = alloca $ \statusPtr -> do
+  failure <- c_nn_kill_user (fromIntegral (buUid user)) statusPtr
+  status <- peek statusPtr
+  if failure /= 0
+    then pure (Left (refused (Errno failure)))
+    else killOutcome status
   where
+    -- The shim refuses uid 0 and a caller that is not root before it
+    -- forks, which a build user never is; any other errno is the fork's
+    -- or the wait's.
+    refused errno@(Errno number)
+      | errno == eINVAL = cannot "uid 0 is root's, whose kill would reach every process"
+      | errno == ePERM = cannot "only root may kill a build user's processes"
+      | otherwise = "unable to fork" <> errnoSuffix (fromIntegral number)
     killOutcome status
       | status == 0 = pure (Right ())
       | status > signalledBase = do
