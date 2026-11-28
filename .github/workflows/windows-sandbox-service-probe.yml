@@ -1,0 +1,165 @@
+name: Windows sandbox service probe
+
+# A throwaway probe of what the Windows build sandbox's service rests on,
+# and of the network rule a build that is not fixed-output needs, run
+# before the service is written.  It installs a service whose binary is
+# probe/windows-sandbox-service.c, running as its virtual account
+# NT SERVICE\nnprobesvc with the start privileges an install would grant,
+# and two slot accounts, and prints one MEASURE line per thing it saw: the
+# service's token and privileges, its logons, window stations and
+# desktops, nova-nix-sandbox's start of a builder for it, which account a
+# start opens the builder's image as, whether a build starts a process
+# outside its job and what that process holds, and what a slot's build
+# reaches of the network with no rule, under WFP filters on the slot's and
+# its group's SIDs, under a Windows Firewall rule, and under a filter the
+# service adds itself.  The probe judges nothing.  Its last step removes
+# the service, its rights, the accounts, their rights and group, the task
+# a build made and the firewall rule, by name, on every path; the probe's
+# layout is under the runner's temporary directory.
+
+on:
+  push:
+    branches: [probe/windows-sandbox-service]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Windows sandbox service probe
+    runs-on: windows-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
+        with:
+          ghc-version: "9.14.1"
+          cabal-version: "latest"
+
+      - name: Describe the runner
+        run: |
+          "image: $env:ImageOS $env:ImageVersion"
+          [System.Environment]::OSVersion.VersionString
+          whoami /user /groups /priv
+          Get-NetFirewallProfile | Format-Table Name, Enabled, DefaultInboundAction, DefaultOutboundAction -AutoSize
+          Get-Service BFE, MpsSvc, Schedule, Winmgmt | Format-Table Name, Status, StartType -AutoSize
+          $global:LASTEXITCODE = 0
+
+      - name: Build the sandbox helper
+        run: |
+          cabal build exe:nova-nix-sandbox
+          if ($LASTEXITCODE -ne 0) { throw "cabal failed with $LASTEXITCODE" }
+          "PROBE_HELPER=$(cabal list-bin exe:nova-nix-sandbox)" >> $env:GITHUB_ENV
+          "PROBE_ROOT=$(Join-Path $env:RUNNER_TEMP 'nnprobe')" >> $env:GITHUB_ENV
+
+      # ghc --info prints each setting as a Haskell string, its backslashes
+      # and quotes escaped.
+      - name: Build the probe with GHC's C compiler
+        run: |
+          $probe = Join-Path $env:RUNNER_TEMP 'nnprobe-build\probe.exe'
+          New-Item -ItemType Directory -Force -Path (Split-Path $probe), $env:PROBE_ROOT | Out-Null
+          $info = (ghc --info) -join "`n"
+          $libdir = (ghc --print-libdir).Trim()
+          function Get-GhcSetting([string] $name) {
+            $pattern = '\("' + [regex]::Escape($name) + '","((?:[^"\\]|\\.)*)"\)'
+            $found = [regex]::Match($info, $pattern)
+            if (-not $found.Success) { throw "ghc --info has no '$name'" }
+            ($found.Groups[1].Value -replace '\\(.)', '$1').Replace('$topdir', $libdir)
+          }
+          $cc = Get-GhcSetting 'C compiler command'
+          $flags = @((Get-GhcSetting 'C compiler flags') -split '\s+' | Where-Object { $_ })
+          $linkFlags = @((Get-GhcSetting 'C compiler link flags') -split '\s+' | Where-Object { $_ })
+          & $cc --version
+          & $cc @flags @linkFlags -std=c99 -Wall -Wextra -pedantic -O1 -municode probe/windows-sandbox-service.c -o $probe `
+            -ladvapi32 -lnetapi32 -lws2_32 -lfwpuclnt -lbcrypt
+          if ($LASTEXITCODE -ne 0) { throw "the probe did not build: $LASTEXITCODE" }
+          "PROBE_EXE=$probe" >> $env:GITHUB_ENV
+
+      - name: Set up the slot accounts and the service
+        run: |
+          & $env:PROBE_EXE setup $env:PROBE_ROOT $env:PROBE_HELPER
+          exit $LASTEXITCODE
+
+      - name: The service's checks, as NT SERVICE\nnprobesvc
+        run: |
+          & $env:PROBE_EXE phase $env:PROBE_ROOT main
+          & $env:PROBE_EXE escapes $env:PROBE_ROOT
+          exit $LASTEXITCODE
+
+      - name: Network, no rule
+        run: |
+          & $env:PROBE_EXE phase $env:PROBE_ROOT net
+          exit $LASTEXITCODE
+
+      - name: Network, a WFP filter on the slot's SID
+        if: ${{ !cancelled() }}
+        run: |
+          & $env:PROBE_EXE wfp $env:PROBE_ROOT slot
+          exit $LASTEXITCODE
+
+      - name: Network, a WFP filter on the slot group's SID
+        if: ${{ !cancelled() }}
+        run: |
+          & $env:PROBE_EXE wfp $env:PROBE_ROOT group
+          exit $LASTEXITCODE
+
+      # The rule names the slot by an SDDL, as New-NetFirewallRule's
+      # -LocalUser takes principals.  A profile that is off filters
+      # nothing, so the step turns any that is off on for the rule's run,
+      # and back off after it.
+      - name: Network, a Windows Firewall rule for the slot
+        if: ${{ !cancelled() }}
+        run: |
+          $config = Get-Content -LiteralPath (Join-Path $env:PROBE_ROOT 'service\config')
+          $sid = ($config | Where-Object { $_ -like 'slot1-sid=*' }) -replace '^slot1-sid=', ''
+          $wereOff = @(Get-NetFirewallProfile | Where-Object { -not $_.Enabled } | ForEach-Object { $_.Name })
+          "MEASURE firewall profiles off before the rule: $($wereOff -join ', ')"
+          try {
+            if ($wereOff.Count -gt 0) { Set-NetFirewallProfile -Name $wereOff -Enabled True }
+            $added = Measure-Command {
+              New-NetFirewallRule -Name nnprobe-block -DisplayName nnprobe-block -Direction Outbound -Action Block `
+                -LocalUser "D:(A;;CC;;;$sid)" | Out-Null
+            }
+            "MEASURE firewall rule for the slot added in $([int]$added.TotalMilliseconds) ms"
+            & $env:PROBE_EXE phase $env:PROBE_ROOT net
+            $removed = Measure-Command { Remove-NetFirewallRule -Name nnprobe-block }
+            "MEASURE firewall rule removed in $([int]$removed.TotalMilliseconds) ms"
+          } finally {
+            Remove-NetFirewallRule -Name nnprobe-block -ErrorAction SilentlyContinue
+            if ($wereOff.Count -gt 0) { Set-NetFirewallProfile -Name $wereOff -Enabled False }
+          }
+
+      - name: Network, a WFP filter the service adds itself, granted the rights
+        if: ${{ !cancelled() }}
+        run: |
+          & $env:PROBE_EXE wfp-self $env:PROBE_ROOT
+          exit $LASTEXITCODE
+
+      - name: Network, no rule again
+        if: ${{ !cancelled() }}
+        run: |
+          & $env:PROBE_EXE phase $env:PROBE_ROOT net
+          exit $LASTEXITCODE
+
+      # The probe's teardown removes what its setup made, by name; this
+      # removes the same again with Windows PowerShell's own modules, for a
+      # run that ended before the probe could.  Windows PowerShell carries
+      # the LocalAccounts module itself.
+      - name: Remove everything the probe made
+        if: always()
+        shell: powershell
+        run: |
+          if ($env:PROBE_EXE -and (Test-Path -LiteralPath $env:PROBE_EXE)) { & $env:PROBE_EXE teardown $env:PROBE_ROOT }
+          Remove-NetFirewallRule -Name nnprobe-block -ErrorAction SilentlyContinue
+          schtasks.exe /delete /tn nnprobe-escape-task /f 2>$null
+          sc.exe delete nnprobesvc 2>$null
+          @(Get-LocalUser | Where-Object Name -like 'nnprobe*') | ForEach-Object {
+            "removing the leftover account $($_.Name)"
+            Remove-LocalUser -SID $_.SID
+          }
+          Remove-LocalGroup -Name nnprobegrp -ErrorAction SilentlyContinue
+          $global:LASTEXITCODE = 0
