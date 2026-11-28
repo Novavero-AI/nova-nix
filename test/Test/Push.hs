@@ -13,24 +13,33 @@ import CacheFixture (CacheSetup (..), Fault (..), Logged (..), Multipart (..), R
 import Control.Exception (IOException, bracket, bracket_, try)
 import Control.Monad (filterM, forM_, guard, (>=>))
 import Control.Monad.Except (runExceptT)
+import Control.Monad.State.Strict (evalStateT)
 import qualified Data.ByteString as BS
-import Data.Either (isLeft, isRight)
-import Data.List (nub, sort)
+import qualified Data.ByteString.Char8 as BS8
+import Data.Char (isDigit)
+import Data.Either (isLeft)
+import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.Int (Int32)
+import Data.List (intercalate, nub, sort)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (listToMaybe, mapMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import HttpFixture (withDirectoryServer)
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig)
+import Nix.CacheDirectory (CacheInfo (..), CacheOpenFailure (..), cacheFilePath, cacheInfoFileName, cacheInfoText, directoryUrl, fileUrlDirectory, parsePriority, readCacheInfo)
 import qualified Nix.Cli.Args as Cli
 import Nix.Derivation (Derivation (..), DerivationOutput (..), currentPlatform)
 import qualified Nix.Hash as Hash
-import Nix.Http (FetchRetryPolicy (..), defaultFetchRetryPolicy)
+import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), defaultFetchRetryPolicy)
+import Nix.Logger (Logger (..))
 import Nix.Push (PushArtifact (..), PushCompression (..), PushConfig (..), PushSummary (..), checkRecordedNarHash, computeClosure, defaultPartSize, isDerivationPath, loadKeyFile, mkNarInfo, mkPartSize, mkPushArtifact, narFileName, narHashMatches, outputPathsOnly, parsePushCompression, partSizeBytes, planMissing, preparePath, pushPaths, splitParts, storePathBasename, stripHashPrefix)
-import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), cacheInfoFileName, cacheInfoText, checkCacheInfo, ed25519SeedBytes, loadSecretKeyFile, pushTarget, pushToDirectory, signNarInfo)
-import Nix.Store (Store (..), addToStore, closeStore, openStore, writeDrv)
-import Nix.Store.DB (PathInfo (..), PathRegistration (..), queryReferences, registerPaths)
+import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), ed25519SeedBytes, loadSecretKeyFile, pushTarget, pushToDirectory, signNarInfo)
+import qualified Nix.Realise as Realise
+import Nix.Store (Store (..), addToStore, closeStore, openStore, releasePathLock, writeDrv)
+import Nix.Store.DB (PathInfo (..), PathRegistration (..), Ultimate (..), queryReferences, registerPaths)
 import Nix.Store.Path (StoreDir (..), parseStorePath, storePathToFilePath)
 import Nix.Store.Path.Internal (StorePath (..))
 import qualified Nix.Substituter as Subst
@@ -42,9 +51,9 @@ import qualified NovaCache.NarInfo as NarInfo
 import qualified NovaCache.Signing as Signing
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getTemporaryDirectory)
 import qualified System.Directory as Dir
-import System.FilePath ((</>))
+import System.FilePath (equalFilePath, (</>))
 import qualified System.Info as SI
-import Test.Harness (TestResult (..), andThen, assertEqual, assertRight, findTestShell, forceRemoveIfExists, runTest, runTestM, testLogger, throwawayKey, withTempStore)
+import Test.Harness (TestResult (..), andThen, assertEqual, assertRight, findTestShell, forceRemoveIfExists, offeredThenFetched, runTest, runTestM, testLogger, throwawayKey, withTempStore)
 import qualified Test.QuickCheck as QC
 
 -- ---------------------------------------------------------------------------
@@ -201,7 +210,10 @@ testPushPure = do
           piNarHash = recordedHash,
           piNarSize = 1234,
           piDeriver = Nothing,
-          piRegTime = 0
+          piRegTime = 0,
+          piUltimate = NotUltimate,
+          piSignatures = Set.empty,
+          piContentAddress = Nothing
         }
 
 -- | Closure computation against a real (temp) store database.
@@ -218,7 +230,10 @@ testPushClosureIO = do
               prNarHash = "sha256:" <> T.replicate 52 "0",
               prNarSize = 1,
               prDeriver = Nothing,
-              prReferences = refs
+              prReferences = refs,
+              prUltimate = NotUltimate,
+              prSignatures = Set.empty,
+              prContentAddress = Nothing
             }
     registerPaths (stDB store) [regFor spTop [spMid], regFor spMid [spLeaf], regFor spLeaf []]
     fromTop <- computeClosure store [spTop]
@@ -456,12 +471,13 @@ testPushMultipart = do
     cloudflareBodyLimit = 100 * 1000 * 1000
 
 -- | push to a directory: the binary cache it writes, read back file by
--- file and substituted from by nova-nix's own substituter as a static web
--- server serves it; what a second push skips; the refusal of a cache for
--- another store directory and of a key file that holds no secret key;
--- and how @--cache@ and the key files select where a push writes.  The
--- key is generated for the run, and each case that pushes pushes top,
--- which references leaf, from a store of its own.
+-- file and substituted from by nova-nix's own substituter, as a static web
+-- server serves it and through its @file:\/\/@ URL; what a second push
+-- skips; the refusal of a cache for another store directory and of a key
+-- file that holds no secret key; how @--cache@ and the key files select
+-- where a push writes; and how a substitution opens and reads a
+-- @file:\/\/@ cache.  The key is generated for the run, and each case that
+-- pushes pushes top, which references leaf, from a store of its own.
 testPushDirectory :: IO [Bool]
 testPushDirectory = do
   putStrLn "push/directory"
@@ -478,18 +494,19 @@ testPushDirectory = do
         fmap (,publicKey) <$> loadSecretKeyFile keyFile
     case key of
       Left err -> sequence [runTest "push/directory key" (Fail err)]
-      Right (secretKey, publicKey) -> (++) <$> directoryCases root secretKey publicKey <*> targetCases root
+      Right (secretKey, publicKey) -> concat <$> sequence [directoryCases root secretKey publicKey, substitutionCases root secretKey publicKey, targetCases root, cacheInfoCases]
   where
     leaf = StorePath (T.replicate 32 "p") "leaf"
     top = StorePath (T.replicate 32 "q") "top"
     contentsOf sp = TE.encodeUtf8 (spName sp) <> "\n"
     narOf sp = NAR.serialise (NAR.NarDirectory [("data", NAR.NarRegular False (contentsOf sp))])
     narInfoFile cache sp = cache </> T.unpack (spHash sp) <> ".narinfo"
-    -- The directories upstream's file:// store makes in a cache it opens
-    -- (LocalBinaryCacheStore::init in local-binary-cache-store.cc), sorted,
-    -- with the realisations directory under its name through 2.34.9 and
-    -- from 2.35.4.
-    upstreamCacheDirectories = ["build-trace-v2", "log", "nar", "realisations"]
+    -- The directories the newest upstream release's file:// store makes in
+    -- a cache it opens, sorted, which a substitution makes too.
+    openedCacheDirectories = ["build-trace-v2", "log", "nar"]
+    -- Those a push makes, sorted: the realisations directory under the
+    -- name older upstream releases read as well.
+    pushedCacheDirectories = sort ("realisations" : openedCacheDirectories)
     readMaybeFile path = either (const Nothing) Just <$> (try (BS.readFile path) :: IO (Either IOException BS.ByteString))
     -- A store holding top and leaf under the root, and the cache
     -- directory beside it.
@@ -503,11 +520,15 @@ testPushDirectory = do
           BS.writeFile (source </> "data") (contentsOf sp)
           addToStore store source sp Nothing references
         action store (base </> "cache")
+    -- A cache directory as a substitution reads it: served over loopback
+    -- HTTP, or through its file:// URL.
+    overHttp = withDirectoryServer
+    directly cache use = use (directoryUrl cache)
     -- Build a derivation whose one output is top, with a builder that
-    -- fails, in a fresh store whose one cache is the directory, served
-    -- over loopback: the result, what leaf and top hold, and top's
-    -- references there.
-    substituteFrom root label cache publicKey = withDirectoryServer cache $ \base -> do
+    -- fails, in a fresh store whose one cache is the directory, served as
+    -- given: the result, what leaf and top hold, and top's references
+    -- there.
+    substituteFrom serving root label cache publicKey = serving cache $ \base -> do
       shell <- findTestShell
       let dest = StoreDir (root </> label </> "dest")
           drvSP = StorePath (T.replicate 32 "r") "top.drv"
@@ -534,29 +555,35 @@ testPushDirectory = do
           narHash = CHash.formatNixHash (CHash.hashBytes nar)
           narUrl = "nar/" <> stripHashPrefix narHash <> ".nar"
           size = T.pack (show (BS.length nar))
-      (pushed, directories, narInfoBytes, cacheInfo, storedNar, substituted, again, before, after, modes) <-
+      (pushed, directories, narInfoBytes, cacheInfo, storedNar, substituted, direct, again, before, after, modes) <-
         withSourceStore root "main" $ \store cache -> do
           pushed <- pushTo cache PushNone store [top]
-          directories <- filterM (Dir.doesDirectoryExist . (cache </>)) upstreamCacheDirectories
+          directories <- filterM (Dir.doesDirectoryExist . (cache </>)) pushedCacheDirectories
           narInfoBytes <- readMaybeFile (narInfoFile cache top)
           cacheInfo <- readMaybeFile (cache </> cacheInfoFileName)
           storedNar <- readMaybeFile (cache </> T.unpack narUrl)
-          substituted <- substituteFrom root "main" cache publicKey
+          substituted <- substituteFrom overHttp root "main" cache publicKey
+          listed <- cacheListing cache
+          substitutedDirectly <- substituteFrom directly root "main-direct" cache publicKey
+          listedAfter <- cacheListing cache
+          let direct = (substitutedDirectly, listed == listedAfter)
           before <- cacheListing cache
           again <- pushTo cache PushNone store [top]
           after <- cacheListing cache
           let plain = root </> "main" </> "plain"
           BS.writeFile plain "plain"
           modes <- mapM (fmap (fmap nsPermissions) . nodeStatus) [plain, narInfoFile cache top, cache </> T.unpack narUrl, cache </> cacheInfoFileName]
-          pure (pushed, directories, narInfoBytes, cacheInfo, storedNar, substituted, again, before, after, modes)
+          pure (pushed, directories, narInfoBytes, cacheInfo, storedNar, substituted, direct, again, before, after, modes)
       sequence
         [ runTest "a push to a directory writes the closure, and nova-nix substitutes it from the directory served over HTTP, building nothing" $
             assertEqual "push" (Right (PushSummary 2 0)) pushed
               `andThen` assertEqual "substitution" (BuildSuccess top, [Just (contentsOf leaf), Just (contentsOf top)], [Just leaf]) substituted,
+          runTest "nova-nix substitutes the closure from the directory's file:// URL directly, file:///C:/... on Windows, building nothing, and writes nothing to the cache" $
+            assertEqual "substitution" ((BuildSuccess top, [Just (contentsOf leaf), Just (contentsOf top)], [Just leaf]), True) direct,
           -- Upstream's file:// store creates these in every cache it opens,
           -- and a reader that cannot create a missing one drops the cache.
           runTest "a push makes the nar, log and realisations directories upstream's file:// store makes, the last as realisations and as build-trace-v2, so a reader of any pinned version that cannot write opens the cache" $
-            assertEqual "directories" upstreamCacheDirectories directories,
+            assertEqual "directories" pushedCacheDirectories directories,
           runTest "the narinfo holds upstream's fields in upstream's order, names its NAR by the file's hash, and carries one signature the public key verifies" $
             case TE.decodeUtf8' <$> narInfoBytes of
               Just (Right text) ->
@@ -614,13 +641,14 @@ testPushDirectory = do
               pure $
                 assertEqual "push failed" True (isLeft refused)
                   `andThen` assertEqual "files" [(leafFile, leafNar), (cacheInfoFileName, cacheInfoText)] listing,
-          runTestM "with zstd the NAR is written compressed under its file's hash, and substitutes" $
+          runTestM "with zstd the NAR is written compressed under its file's hash, and substitutes, over HTTP and from the directory, by its Compression field" $
             withSourceStore root "zstd" $ \store cache -> do
               zstdPushed <- pushTo cache PushZstd store [top]
               narInfo <- maybe (Left "no narinfo") (either (Left . show) Right . TE.decodeUtf8' >=> NarInfo.parseNarInfo) <$> readMaybeFile (narInfoFile cache top)
               stored <- either (const (pure Nothing)) (\found -> readMaybeFile (cache </> T.unpack (NarInfo.niUrl found))) narInfo
               decompressed <- maybe (pure (Left "no NAR")) (Subst.decompressNar (toInteger (BS.length nar)) "zstd") stored
-              zstdSubstituted <- substituteFrom root "zstd" cache publicKey
+              zstdSubstituted <- substituteFrom overHttp root "zstd" cache publicKey
+              zstdDirect <- substituteFrom directly root "zstd-direct" cache publicKey
               pure $
                 assertEqual "push" (Right (PushSummary 2 0)) zstdPushed
                   `andThen` assertRight
@@ -632,8 +660,9 @@ testPushDirectory = do
                           `andThen` assertEqual "FileHash" (CHash.formatNixHash . CHash.hashBytes <$> stored) (NarInfo.niFileHash found)
                     )
                   `andThen` assertEqual "decompressed" (Right nar) decompressed
-                  `andThen` assertEqual "substitution" (BuildSuccess top, [Just (contentsOf leaf), Just (contentsOf top)], [Just leaf]) zstdSubstituted,
-          runTestM "a nix-cache-info for another store directory is refused in upstream's words, and the push leaves no file but it, only the empty directories upstream's store also makes before it refuses" $
+                  `andThen` assertEqual "substitution" (BuildSuccess top, [Just (contentsOf leaf), Just (contentsOf top)], [Just leaf]) zstdSubstituted
+                  `andThen` assertEqual "direct substitution" (BuildSuccess top, [Just (contentsOf leaf), Just (contentsOf top)], [Just leaf]) zstdDirect,
+          runTestM "a nix-cache-info for another store directory is refused in upstream's words, and the push leaves no file but it, only the empty directories the newest upstream's store also makes before it refuses" $
             withSourceStore root "foreign" $ \store cache -> do
               createDirectoryIfMissing True cache
               BS.writeFile (cache </> cacheInfoFileName) "StoreDir: /gnu/store\n"
@@ -641,22 +670,9 @@ testPushDirectory = do
               entries <- sort <$> Dir.listDirectory cache
               listing <- cacheListing cache
               pure $
-                assertEqual "push" (Left ("binary cache 'file://" <> T.pack cache <> "' is for Nix stores with prefix '/gnu/store', not '/nix/store'")) refused
-                  `andThen` assertEqual "entries" (sort (cacheInfoFileName : upstreamCacheDirectories)) entries
+                assertEqual "push" (Left ("binary cache '" <> directoryUrl cache <> "' is for Nix stores with prefix '/gnu/store', not '/nix/store'")) refused
+                  `andThen` assertEqual "entries" (sort (cacheInfoFileName : openedCacheDirectories)) entries
                   `andThen` assertEqual "files" [(cacheInfoFileName, "StoreDir: /gnu/store\n")] listing,
-          runTest "nix-cache-info is read as upstream reads it: each StoreDir trimmed, and every other field let be" $
-            assertEqual
-              "accepted"
-              [True, True, True, False, False]
-              ( map
-                  (isRight . checkCacheInfo "/c")
-                  [ cacheInfoText,
-                    "WantMassQuery: 1\nStoreDir: \t/nix/store \r\nPriority: 40\n",
-                    "Priority: 40",
-                    "StoreDir: /nix/store\nStoreDir: /gnu/store\n",
-                    "StoreDir: /nix/store/\n"
-                  ]
-              ),
           runTestM "signing a narinfo adds the key's signature to the sorted set of those it carries, so signing again changes nothing" $ do
             let unsigned =
                   NarInfo.NarInfo
@@ -704,6 +720,217 @@ testPushDirectory = do
                   not (mismatchedKey `T.isInfixOf` halvesErr) ->
                     assertEqual "loaded" secretKey loaded
               other -> Fail ("unexpected loads: " <> T.pack (show other))
+        ]
+    -- What one run's queries for the paths find among the caches under the
+    -- fallback: each offer's cache and the priority it was asked at, or
+    -- the query's failure, with the warnings the run gave its logger.
+    queried fallback caches paths = do
+      messages <- newIORef []
+      let logger = Logger {logMessage = \message -> modifyIORef' messages (++ [message]), logBuildLine = const (pure ())}
+      offers <- evalStateT (traverse (Subst.queryReferencesWith logger defaultFetchRetryPolicy quietEffects fallback caches) paths) Subst.emptyCacheMemo
+      (,) (map offeredBy offers) . mapMaybe (T.stripPrefix "warning: ") <$> readIORef messages
+    offeredBy offer = case offer of
+      Realise.Offered substitute _ ->
+        let cache = Subst.substituteCache substitute
+         in Right (Just (Subst.ccUrl cache, Subst.ccPriority cache))
+      Realise.NotOffered -> Right Nothing
+      Realise.QueryFailed failure -> Left failure
+    quietEffects = RetryEffects {reSleepMs = const (pure ()), reJitter = pure 0, reWarn = const (pure ())}
+    -- A cache by its file:// URL, trusting the key, at the configured
+    -- priority its nix-cache-info replaces.
+    fileCache key cache = Subst.CacheConfig (directoryUrl cache) [Signing.renderPublicKey key] 50
+    -- Fetch top as a build does, from the first of the caches to offer it,
+    -- into a fresh store.
+    fetchedInto root label caches =
+      bracket (openStore testLogger (StoreDir (root </> label </> "dest"))) closeStore $ \store -> do
+        result <- offeredThenFetched defaultFetchRetryPolicy quietEffects store caches top
+        case result of
+          Subst.SubstSuccess _ lock -> releasePathLock lock
+          _ -> pure ()
+        pure result
+    substitutionCases root secretKey publicKey = do
+      let pushTo cache = pushToDirectory (DirectoryPush cache secretKey PushNone)
+          missing = StorePath (T.replicate 32 "m") "missing"
+          offeredAt cache priority = Right (Just (directoryUrl cache, priority))
+          otherKey = snd <$> throwawayKey (BS.replicate ed25519SeedBytes 7)
+          withField name value narInfo = BS8.unlines [if (name <> ": ") `BS.isPrefixOf` line then name <> ": " <> value else line | line <- BS8.lines narInfo]
+          unsigned = BS8.unlines . filter (not . BS.isPrefixOf "Sig: ") . BS8.lines
+          rewrite path change = BS.readFile path >>= BS.writeFile path . change
+          statePriority cache priority = BS.writeFile (cache </> cacheInfoFileName) (cacheInfoText <> "Priority: " <> priority <> "\n")
+          narUrl = "nar/" <> stripHashPrefix (CHash.formatNixHash (CHash.hashBytes (narOf top))) <> ".nar"
+          refusedWith ending result = case result of
+            Subst.SubstError err | ending `T.isSuffixOf` err -> Pass
+            other -> Fail ("expected a failure ending " <> ending <> ", got " <> T.pack (show other))
+      sequence
+        [ runTestM "a file:// cache offers what it holds at the priority it states, 0 when it states none, and a path it lacks is a miss, with no warning" $
+            withSourceStore root "subst-miss" $ \store cache -> do
+              _ <- pushTo cache store [top]
+              found <- queried Realise.NoFallback [fileCache publicKey cache] [top, missing]
+              pure (assertEqual "offers" ([offeredAt cache 0, Right Nothing], []) found),
+          runTestM "a narinfo no trusted key signed is passed over, and so is one with no signature, as signatures are required" $
+            withSourceStore root "subst-signatures" $ \store cache -> do
+              _ <- pushTo cache store [top]
+              signedOther <- either (const (pure ([], []))) (\key -> queried Realise.NoFallback [fileCache key cache] [top]) otherKey
+              rewrite (narInfoFile cache top) unsigned
+              withoutSignature <- queried Realise.NoFallback [fileCache publicKey cache] [top]
+              pure $
+                assertRight "other key" otherKey (const Pass)
+                  `andThen` assertEqual "signed by another key" ([Right Nothing], []) signedOther
+                  `andThen` assertEqual "unsigned" ([Right Nothing], []) withoutSignature,
+          runTestM "a file:// cache whose nix-cache-info names another store directory is passed over for the run, after upstream's warning, given once" $
+            withSourceStore root "subst-foreign" $ \store cache -> do
+              _ <- pushTo cache store [top]
+              BS.writeFile (cache </> cacheInfoFileName) "StoreDir: /gnu/store\n"
+              found <- queried Realise.NoFallback [fileCache publicKey cache] [top, leaf]
+              pure (assertEqual "offers" ([Right Nothing, Right Nothing], ["binary cache '" <> directoryUrl cache <> "' is for Nix stores with prefix '/gnu/store', not '/nix/store'"]) found),
+          runTestM "a file:// cache is asked at the Priority its nix-cache-info states, among HTTP caches at theirs, and caches of one priority in the order given" $
+            withSourceStore root "subst-priority" $ \store firstCache -> do
+              let secondCache = root </> "subst-priority" </> "second"
+              _ <- pushTo firstCache store [top]
+              _ <- pushTo secondCache store [top]
+              withDirectoryServer firstCache $ \base -> do
+                let served = Subst.CacheConfig base [Signing.renderPublicKey publicKey] 40
+                    both = [fileCache publicKey firstCache, fileCache publicKey secondCache]
+                statePriority firstCache "30"
+                statePriority secondCache "10"
+                lower <- queried Realise.NoFallback both [top]
+                statePriority firstCache "10"
+                tied <- queried Realise.NoFallback both [top]
+                BS.writeFile (secondCache </> cacheInfoFileName) cacheInfoText
+                unstated <- queried Realise.NoFallback [served, fileCache publicKey secondCache] [top]
+                statePriority secondCache "60"
+                later <- queried Realise.NoFallback [fileCache publicKey secondCache, served] [top]
+                pure $
+                  assertEqual "the lower priority first" ([offeredAt secondCache 10], []) lower
+                    `andThen` assertEqual "one priority in the order given" ([offeredAt firstCache 10], []) tied
+                    `andThen` assertEqual "none stated, before HTTP's 40" ([offeredAt secondCache 0], []) unstated
+                    `andThen` assertEqual "60, after HTTP's 40" ([Right (Just (base, 40))], []) later,
+          runTestM "a Priority that is not a 32-bit integer fails the query whatever the fallback" $
+            withSourceStore root "subst-bad-priority" $ \store cache -> do
+              _ <- pushTo cache store [top]
+              statePriority cache "high"
+              refused <- traverse (\fallback -> queried fallback [fileCache publicKey cache] [top]) [Realise.NoFallback, Realise.BuildFromSource]
+              let failure = Left ("binary cache '" <> directoryUrl cache <> "' gives the Priority 'high' in its nix-cache-info, which is not a 32-bit integer")
+              pure (assertEqual "queries" [([failure], []), ([failure], [])] refused),
+          runTestM "a file:// URL that names no directory, and a cache that cannot be opened, are passed over after a warning" $ do
+            let base = root </> "subst-unopenable"
+                plain = base </> "plain"
+                underFile = plain </> "cache"
+            createDirectoryIfMissing True base
+            BS.writeFile plain "plain"
+            (offers, warnings) <- queried Realise.NoFallback [Subst.CacheConfig (directoryUrl base <> "?priority=1") [Signing.renderPublicKey publicKey] 50, fileCache publicKey underFile] [top]
+            pure $ case warnings of
+              [urlWarning, openWarning]
+                | "a file:// URL with a query" `T.isPrefixOf` urlWarning,
+                  ("cannot open binary cache '" <> directoryUrl underFile <> "': ") `T.isPrefixOf` openWarning ->
+                    assertEqual "offers" [Right Nothing] offers
+              other -> Fail ("warnings: " <> T.pack (show other)),
+          runTestM "opening a directory that holds no cache makes the directories and the nix-cache-info the newest upstream's store makes, and no realisations directory under its older name" $ do
+            let cache = root </> "subst-empty" </> "cache"
+            createDirectoryIfMissing True cache
+            found <- queried Realise.NoFallback [fileCache publicKey cache] [top]
+            entries <- sort <$> Dir.listDirectory cache
+            cacheInfo <- readMaybeFile (cache </> cacheInfoFileName)
+            pure $
+              assertEqual "offers" ([Right Nothing], []) found
+                `andThen` assertEqual "entries" (sort (cacheInfoFileName : openedCacheDirectories)) entries
+                `andThen` assertEqual "nix-cache-info" (Just cacheInfoText) cacheInfo,
+          runTestM "a cache without the realisations directory's older name, as the newest upstream writes one, opens where the substitution cannot write" $
+            withSourceStore root "subst-read-only" $ \store cache -> do
+              _ <- pushTo cache store [top]
+              Dir.removeDirectory (cache </> "realisations")
+              let writable allowed = Dir.getPermissions cache >>= Dir.setPermissions cache . Dir.setOwnerWritable allowed
+              found <- bracket_ (writable False) (writable True) (queried Realise.NoFallback [fileCache publicKey cache] [top])
+              pure (assertEqual "offers" ([offeredAt cache 0], []) found),
+          runTestM "a NAR a narinfo names outside the cache is refused in upstream's words, and one that is gone is a miss" $
+            withSourceStore root "subst-nar-files" $ \store cache -> do
+              _ <- pushTo cache store [top]
+              original <- BS.readFile (narInfoFile cache top)
+              let caches = [fileCache publicKey cache]
+              BS.writeFile (narInfoFile cache top) (withField "URL" "../escape.nar" original)
+              escaping <- fetchedInto root "subst-nar-escaping" caches
+              BS.writeFile (narInfoFile cache top) (withField "URL" "/escape.nar" original)
+              absolute <- fetchedInto root "subst-nar-absolute" caches
+              BS.writeFile (narInfoFile cache top) original
+              Dir.removeFile (cache </> T.unpack narUrl)
+              stillOffered <- queried Realise.NoFallback caches [top]
+              gone <- fetchedInto root "subst-nar-gone" caches
+              pure $
+                refusedWith "local binary cache path '../escape.nar' must not contain '..' or '.' segments" escaping
+                  `andThen` refusedWith "local binary cache path '/escape.nar' must not be absolute" absolute
+                  `andThen` assertEqual "offered" ([offeredAt cache 0], []) stillOffered
+                  `andThen` assertEqual "gone" Subst.SubstNotFound gone
+        ]
+    cacheInfoCases = do
+      let windows = SI.os == "mingw32"
+          foreignStore prefix = Left (CacheUnopenable ("binary cache 'file:///c' is for Nix stores with prefix '" <> prefix <> "', not '/nix/store'"))
+          badPriority value = Left (CachePriorityInvalid ("binary cache 'file:///c' gives the Priority '" <> value <> "' in its nix-cache-info, which is not a 32-bit integer"))
+          holds label prop = runTestM label $ do
+            result <- QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} prop
+            pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result)))
+          segment = QC.listOf1 (QC.elements (['a' .. 'z'] <> ['0' .. '9'] <> "-_.")) `QC.suchThat` (`notElem` [".", ".."])
+          directory
+            | windows = ("C:\\" <>) . intercalate "\\" <$> QC.listOf1 segment
+            | otherwise = ("/" <>) . intercalate "/" <$> QC.listOf1 segment
+          beforeNumber = QC.listOf (QC.elements " \t\n\v\f\r")
+          afterNumber = QC.listOf (QC.elements ['\32' .. '\126']) `QC.suchThat` (maybe True (not . isDigit) . listToMaybe)
+      sequence
+        [ runTest "nix-cache-info is read as upstream reads it: each StoreDir trimmed and held to /nix/store, the last Priority the cache's, the first field refused the refusal, and WantMassQuery and fields named with spaces let be" $
+            assertEqual
+              "read"
+              [ Right (CacheInfo Nothing),
+                Right (CacheInfo (Just 40)),
+                Right (CacheInfo (Just 40)),
+                Right (CacheInfo (Just (-3))),
+                Right (CacheInfo Nothing),
+                foreignStore "/gnu/store",
+                foreignStore "/nix/store/",
+                badPriority "high",
+                foreignStore "/gnu/store",
+                badPriority "2147483648"
+              ]
+              ( map
+                  (readCacheInfo "file:///c")
+                  [ cacheInfoText,
+                    "WantMassQuery: 1\nStoreDir: \t/nix/store \r\nPriority: 40\n",
+                    "Priority: 10\nPriority:40",
+                    "Priority: -3 lowest\n",
+                    " StoreDir: /gnu/store\nStoreDir : /gnu/store\n",
+                    "StoreDir: /nix/store\nStoreDir: /gnu/store\n",
+                    "StoreDir: /nix/store/\n",
+                    "Priority: high\nStoreDir: /gnu/store\n",
+                    "StoreDir: /gnu/store\nPriority: high\n",
+                    "Priority: 2147483648\n"
+                  ]
+              ),
+          holds "a Priority reads as C reads an int: white space, a sign and digits, what follows them ignored" $
+            QC.forAll ((,,) <$> beforeNumber <*> QC.arbitrary <*> afterNumber) $ \(before, number, after) ->
+              parsePriority (BS8.pack (before <> show (number :: Int32) <> after)) QC.=== Just (fromIntegral number),
+          runTest "a Priority without digits, or past a 32-bit int, does not read, and one with a plus sign or after a vertical tab does" $
+            assertEqual
+              "read"
+              [Nothing, Nothing, Nothing, Nothing, Just 7, Just 12, Just 0, Just 2147483647, Just (-2147483648)]
+              (map parsePriority ["", "-", "x1", "2147483648", "+7", "\v12", "0x10", "2147483647", "-2147483648"]),
+          holds "the file:// URL directoryUrl spells names the directory again" $
+            QC.forAll directory $ \dir ->
+              case fileUrlDirectory "" (T.unpack (directoryUrl dir)) of
+                Just (Right named) -> QC.counterexample named (equalFilePath named dir)
+                other -> QC.counterexample (show other) False,
+          runTest "directoryUrl puts a slash before a Windows drive and spells each separator a slash, and a URL of another scheme is no file:// one" $
+            assertEqual "URL" (if windows then "file:///C:/srv/cache" else "file:///srv/cache") (directoryUrl (if windows then "C:\\srv\\cache" else "/srv/cache"))
+              `andThen` assertEqual "https" Nothing (fileUrlDirectory "" "https://cache.example.org"),
+          runTest "a file a narinfo names is held below the cache, in upstream's words" $
+            assertEqual
+              "paths"
+              [ Right ("cache" </> "nar/x.nar"),
+                Left "local binary cache path must not be empty",
+                Left "local binary cache path '/x.nar' must not be absolute",
+                Left "local binary cache path 'nar/../x.nar' must not contain '..' or '.' segments",
+                Left "local binary cache path './x.nar' must not contain '..' or '.' segments",
+                if windows then Left "local binary cache path 'C:\\x.nar' must not be absolute" else Right ("cache" </> "C:\\x.nar"),
+                if windows then Left "local binary cache path 'nar\\..\\x.nar' must not contain '..' or '.' segments" else Right ("cache" </> "nar\\..\\x.nar")
+              ]
+              (map (cacheFilePath "cache") ["nar/x.nar", "", "/x.nar", "nar/../x.nar", "./x.nar", "C:\\x.nar", "nar\\..\\x.nar"])
         ]
     targetCases root = do
       let windows = SI.os == "mingw32"

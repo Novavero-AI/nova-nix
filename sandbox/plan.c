@@ -77,7 +77,9 @@ static int skip_tokens(struct tokens *cursor, size_t count)
     return 1;
 }
 
-/* A decimal id that fits the int a uid_t or gid_t is given as. */
+/* A decimal that fits an int: a uid_t or gid_t, or the value of a handle
+ * a process inherits, whose significant bits on Windows are its low 32
+ * and which a process's handle table keeps small. */
 static int parse_id(const char *text, unsigned long *out)
 {
     char *rest = NULL;
@@ -90,6 +92,40 @@ static int parse_id(const char *text, unsigned long *out)
         return 0;
     *out = value;
     return 1;
+}
+
+/* A decimal size in bytes. */
+static int parse_size(const char *text, unsigned long long *out)
+{
+    char *rest = NULL;
+    unsigned long long value;
+    if (*text < '0' || *text > '9')
+        return 0;
+    errno = 0;
+    value = strtoull(text, &rest, 10);
+    if (errno != 0 || rest == NULL || *rest != '\0')
+        return 0;
+    *out = value;
+    return 1;
+}
+
+/* Whether TEXT is an absolute Windows path: a drive letter, a colon and a
+ * separator, or two backslashes, which start a UNC path or a device's. */
+static int windows_absolute(const char *text)
+{
+    int letter = (text[0] >= 'A' && text[0] <= 'Z') || (text[0] >= 'a' && text[0] <= 'z');
+    if (letter && text[1] == ':' && (text[2] == '\\' || text[2] == '/'))
+        return 1;
+    return text[0] == '\\' && text[1] == '\\';
+}
+
+/* Whether TEXT names a window station and a desktop on it, as a process's
+ * start takes them: STATION\DESKTOP, neither empty, since neither name
+ * may hold a backslash. */
+static int station_and_desktop(const char *text)
+{
+    const char *separator = strchr(text, '\\');
+    return separator != NULL && separator != text && separator[1] != '\0' && strchr(separator + 1, '\\') == NULL;
 }
 
 /* A bind's flags: "-" for none, else letters r (read-only), o (optional)
@@ -157,6 +193,27 @@ static int parse_darwin_singletons(struct tokens *cursor, struct plan *plan)
     return 1;
 }
 
+/* A SID's string form, which starts S-1-, as the helper takes it: never
+ * one of the two-letter aliases a security descriptor's text may use. */
+#define SID_PREFIX "S-1-"
+
+static int parse_windows_singletons(struct tokens *cursor, struct plan *plan)
+{
+    char *value;
+    if (!read_value(cursor, "build-dir", &value) || !windows_absolute(value))
+        return 0;
+    plan->build_dir = value;
+    if (!read_value(cursor, "token", &value) || !parse_id(value, &plan->token_handle) || plan->token_handle == 0)
+        return 0;
+    if (!read_value(cursor, "slot-sid", &value) || strncmp(value, SID_PREFIX, sizeof SID_PREFIX - 1) != 0)
+        return 0;
+    plan->slot_sid = value;
+    if (!read_value(cursor, "desktop", &value) || !station_and_desktop(value))
+        return 0;
+    plan->desktop = value;
+    return read_value(cursor, "memory-cap", &value) && parse_size(value, &plan->memory_cap) && plan->memory_cap > 0;
+}
+
 static int parse_singletons(struct tokens *cursor, struct plan *plan)
 {
     char *value;
@@ -170,11 +227,16 @@ static int parse_singletons(struct tokens *cursor, struct plan *plan)
         plan->backend = PLAN_DARWIN;
         return parse_darwin_singletons(cursor, plan);
     }
+    if (strcmp(value, "windows") == 0) {
+        plan->backend = PLAN_WINDOWS;
+        return parse_windows_singletons(cursor, plan);
+    }
     return 0;
 }
 
 /* The entries a backend's plan repeats before the environment: binds on
- * Linux, each three tokens after its key, and params on Darwin, each two. */
+ * Linux, each three tokens after its key, and params on Darwin, each two.
+ * A Windows plan repeats none, which a NULL key says. */
 struct section {
     const char *key;
     size_t width;
@@ -183,12 +245,19 @@ struct section {
 static struct section backend_section(enum plan_backend backend)
 {
     struct section section;
-    if (backend == PLAN_LINUX) {
+    section.key = NULL;
+    section.width = 0;
+    switch (backend) {
+    case PLAN_LINUX:
         section.key = "bind";
         section.width = 3;
-    } else {
+        break;
+    case PLAN_DARWIN:
         section.key = "param";
         section.width = 2;
+        break;
+    case PLAN_WINDOWS:
+        break;
     }
     return section;
 }
@@ -201,7 +270,7 @@ static int count_sections(struct tokens cursor, struct section section, size_t *
     enum token_read read = read_token(&cursor, &key);
     *repeated = 0;
     *entries = 0;
-    while (read == TOKEN_FOUND && strcmp(key, section.key) == 0) {
+    while (read == TOKEN_FOUND && section.key != NULL && strcmp(key, section.key) == 0) {
         if (!skip_tokens(&cursor, section.width))
             return 0;
         (*repeated)++;
@@ -261,6 +330,8 @@ static int allocate_sections(struct plan *plan, size_t repeated, size_t entries)
     return plan->environment != NULL;
 }
 
+/* Parse the REPEATED entries count_sections found, which a Windows plan
+ * has none of. */
 static int parse_repeated(struct tokens *cursor, struct plan *plan, size_t repeated)
 {
     size_t i;

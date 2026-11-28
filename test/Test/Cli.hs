@@ -44,10 +44,13 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
+import Data.Time.Clock (getCurrentTime)
+import Data.Time.Format (defaultTimeLocale, formatTime)
 import Data.Word (Word32)
 import HttpFixture (Reply (..), httpResponse, withHttpServer, withKeepAliveDirectoryServer)
 import Nix.Builder (BuildResult (..))
 import qualified Nix.Builder.Cores as Cores
+import Nix.CacheDirectory (directoryUrl)
 import qualified Nix.Cli.Args as Cli
 import qualified Nix.Cli.Reference as Ref
 import Nix.Config (NixConfig (..))
@@ -61,7 +64,7 @@ import Nix.HostPath (hostPathFromBytes)
 import Nix.Json (Json (..), parseJson)
 import qualified Nix.Profile.Generation as Gen
 import Nix.Push.Directory (ed25519SeedBytes)
-import Nix.Store (Store (..), addToStore, closeStore, isValid, openStore)
+import Nix.Store (Store (..), addToStore, canonicalizeMetadata, closeStore, isValid, openStore)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (executablePermissions, readOnlyPermissions)
 import Nix.Store.Path (StoreDir (..), StorePath, defaultStoreDir, storePathToFilePath, storePathToText)
@@ -92,7 +95,9 @@ import Text.Read (readMaybe)
 -- program under ~/.nix-profile/bin, listing prints upstream's lines and
 -- JSON, each generation is a root the collector keeps, removing takes the
 -- program off, and a profile of another store or a store upstream Nix
--- manages is refused.
+-- manages is refused; a rollback brings back an earlier generation, the
+-- history prints upstream's lines, and wiping it deletes old generations,
+-- whose roots the next collection drops along with what only they kept.
 testProfileCLI :: IO [Bool]
 testProfileCLI = do
   putStrLn "cli/profile"
@@ -103,7 +108,7 @@ testProfileCLI = do
   let root = tmpBase </> "nova-nix-test-cli-profile"
   if not canLink
     then [] <$ putStrLn "  SKIP  a profile's links need symlink privilege (Windows needs Developer Mode or elevation)"
-    else bracket_ (forceRemoveIfExists root >> mapM_ (createDirectoryIfMissing True . (root </>)) ["work", "home", "home-xdg", "home-state-link", "real"]) (forceRemoveIfExists root) $ do
+    else bracket_ (forceRemoveIfExists root >> mapM_ (createDirectoryIfMissing True . (root </>)) ["work", "home", "home-xdg", "home-state-link", "real", "hist"]) (forceRemoveIfExists root) $ do
       -- Built, if it is not, with the ambient environment cabal needs, then
       -- run by its path, so the isolated environment reaches only it.
       _ <- Proc.readCreateProcessWithExitCode (Proc.proc "cabal" ["run", "-v0", "exe:nova-nix", "--", "--version"]) ""
@@ -121,10 +126,17 @@ testProfileCLI = do
             ]
               ++ stateVars
               ++ extra
+          -- The variables that decide whether stdout is styled, which no
+          -- run inherits.
+          colourVariables = ["NO_COLOR", "NOCOLOR", "CLICOLOR_FORCE", "FORCE_COLOR"]
           isolated given config =
             ("NIX_CONFIG", "substituters =\ntrusted-public-keys =\n" <> config)
               : given
-              ++ filter (\(key, _) -> key `notElem` ("NIX_CONFIG" : "NIX_USER_CONF_FILES" : "NIX_PATH" : "NIX_STATE_HOME" : "XDG_STATE_HOME" : map fst given)) ambient
+              ++ filter (\(key, _) -> key `notElem` ("NIX_CONFIG" : "NIX_USER_CONF_FILES" : "NIX_PATH" : "NIX_STATE_HOME" : "XDG_STATE_HOME" : colourVariables ++ map fst given)) ambient
+          -- A run's process, given variables that name no location beside
+          -- the locations.
+          processIn settings given config args = (Proc.proc exe args) {Proc.env = Just (isolated (settings ++ given) config), Proc.cwd = Just (root </> "work")}
+          refusedRun = "the test refused to run: a location is outside " <> root
           home = root </> "home"
           state = [("NIX_STATE_HOME", root </> "state")]
           vars = locations home state []
@@ -134,11 +146,27 @@ testProfileCLI = do
           -- links the binary computes from them on this host, are under the
           -- root.  On Windows a state directory NIX_STATE_HOME does not name
           -- is the Local AppData folder, which no variable moves.
-          runIn given config args = do
+          runIn = runWith []
+          -- A run with variables that name no location beside the
+          -- locations it is given.
+          runWith settings given config args = do
             inside <- locationsUnder given
             if inside
-              then Proc.readCreateProcessWithExitCode ((Proc.proc exe args) {Proc.env = Just (isolated given config), Proc.cwd = Just (root </> "work")}) ""
-              else pure (ExitFailure 1, "", "the test refused to run: a location is outside " <> root)
+              then Proc.readCreateProcessWithExitCode (processIn settings given config args) ""
+              else pure (ExitFailure 1, "", refusedRun)
+          -- A run in the default locations whose stdout is read as bytes,
+          -- since a profile's history is not ASCII, with variables beside
+          -- them.  stderr is read once stdout ends, which a run that writes
+          -- little there allows.
+          bytesIn settings args = do
+            inside <- locationsUnder vars
+            if inside
+              then Proc.withCreateProcess ((processIn settings vars "" args) {Proc.std_out = Proc.CreatePipe, Proc.std_err = Proc.CreatePipe}) $ \_ out err process -> do
+                printed <- maybe (pure BS.empty) BS.hGetContents out
+                complaint <- maybe (pure BS.empty) BS.hGetContents err
+                code <- Proc.waitForProcess process
+                pure (code, printed, complaint)
+              else pure (ExitFailure 1, BS.empty, BS8.pack refusedRun)
           locationsUnder given = do
             rootPath <- OP.encodeFS root
             stateHome <- case (lookup "NIX_STATE_HOME" given, onWindows) of
@@ -197,6 +225,8 @@ testProfileCLI = do
             then pure Nothing
             else Just <$> Proc.readProcessWithExitCode (T.unpack shell) [helloPath] ""
         listedText <- nn ["profile", "list", "--store", storeArg]
+        listedStyled <- runWith [("FORCE_COLOR", "1")] vars "" ["profile", "list", "--store", storeArg]
+        listedUnstyled <- runWith [("CLICOLOR_FORCE", ""), ("NOCOLOR", "")] vars "" ["profile", "list", "--store", storeArg]
         listedJson <- nn ["profile", "list", "--json", "--store", storeArg]
         prettyJson <- nn ["profile", "list", "--json", "--pretty", "--store", storeArg]
         compactJson <- nn ["profile", "list", "--pretty", "--json", "--no-pretty", "--store", storeArg]
@@ -236,6 +266,68 @@ testProfileCLI = do
         stateLinked <- runIn (locations (root </> "home-state-link") [("NIX_STATE_HOME", root </> "state-link")] []) "use-xdg-base-directories = true\n" ["profile", "list", "--store", storeArg]
         stateLink <- linkIfThere (root </> "state-link" </> "profile")
         homeLinkMade <- Dir.doesPathExist (root </> "home-state-link" </> ".nix-profile")
+        -- A profile --profile names, for rollbacks and the history, with
+        -- packages of its own, added after the collection above, which took
+        -- what no root kept then.
+        let historyProfile = root </> "hist" </> "profile"
+            alpha = profileFixture 'd' "alpha-1.0"
+            beta = profileFixture 'f' "beta-2.0"
+            onHistory args = nn (["profile"] ++ args ++ ["--store", storeArg, "--profile", historyProfile])
+            historyLink n = historyProfile <> "-" <> show (n :: Int) <> "-link"
+            historyLinks = traverse (fmap isJust . linkIfThere . historyLink) [1, 2, 3, 4]
+            historyArgs = ["profile", "history", "--store", storeArg, "--profile", historyProfile]
+            utcDay = T.pack . formatTime defaultTimeLocale "%Y-%m-%d" <$> getCurrentTime
+            defaultProfileState = (,) . sort <$> Dir.listDirectory profiles <*> linkIfThere (profiles </> "profile")
+        writeStaged (stage "alpha" </> "bin" </> "alpha") (script "alpha")
+        writeStaged (stage "beta" </> "bin" </> "beta") (script "beta")
+        historyStore <- openStore testLogger storeDir
+        mapM_ (\(name, path) -> addToStore historyStore (stage name) path Nothing []) [("alpha", alpha), ("beta", beta)]
+        closeStore historyStore
+        dayBefore <- utcDay
+        historyMade <- traverse onHistory [["add", inStore alpha], ["add", inStore beta], ["remove", "alpha"]]
+        rolledBack <- onHistory ["rollback"]
+        rolledLink <- linkIfThere historyProfile
+        alphaBack <- Dir.doesPathExist (historyProfile </> "bin" </> "alpha")
+        rolledTo <- onHistory ["rollback", "--to", "3"]
+        toLink <- linkIfThere historyProfile
+        alphaOff <- Dir.doesPathExist (historyProfile </> "bin" </> "alpha")
+        dryRolled <- onHistory ["rollback", "--dry-run"]
+        dryLink <- linkIfThere historyProfile
+        missingVersion <- onHistory ["rollback", "--to", "9"]
+        badUnit <- onHistory ["rollback", "--to", "5x", "--to", "2"]
+        toOldest <- onHistory ["rollback", "--to", "1"]
+        noOlder <- onHistory ["rollback"]
+        backToSecond <- onHistory ["rollback", "--to", "2"]
+        afterRollback <- onHistory ["remove", "beta"]
+        fourthLink <- linkIfThere historyProfile
+        wipeDry <- onHistory ["wipe-history", "--dry-run"]
+        wipeRecent <- onHistory ["wipe-history", "--older-than", "1d"]
+        linksKept <- historyLinks
+        wipeUnsuffixed <- onHistory ["wipe-history", "--older-than", "14"]
+        wipeZero <- onHistory ["wipe-history", "--older-than", "0d"]
+        defaultBefore <- defaultProfileState
+        wipeForeign <- nn ["profile", "wipe-history", "--store", root </> "other-store"]
+        rollbackForeign <- nn ["profile", "rollback", "--store", root </> "other-store"]
+        defaultAfter <- defaultProfileState
+        -- The first two generations' links take a store path's time, a
+        -- second past the epoch, long before any cutoff.  The other two keep
+        -- the time they were made, where the paths they lead to have a store
+        -- path's time too, so a date of theirs is their link's own.
+        mapM_ (canonicalizeMetadata . historyLink) [1, 2]
+        printedHistory <- bytesIn [] historyArgs
+        colouredHistory <- bytesIn [("FORCE_COLOR", "1")] historyArgs
+        -- NO_COLOR counts as set whatever its value, as upstream reads it:
+        -- given one, and given none, which reads as set on Windows too.
+        uncolouredHistory <- bytesIn [("FORCE_COLOR", "1"), ("NO_COLOR", "1")] historyArgs
+        blankNoColourHistory <- bytesIn [("FORCE_COLOR", "1"), ("NO_COLOR", "")] historyArgs
+        dayAfter <- utcDay
+        wipeOld <- onHistory ["wipe-history", "--older-than", "5d"]
+        oldLinks <- historyLinks
+        wipeAll <- onHistory ["wipe-history"]
+        allLinks <- historyLinks
+        swept <- nn ["store", "gc", "--store", storeArg]
+        betaSwept <- not <$> Dir.doesPathExist (inStore beta)
+        alphaKept <- Dir.doesPathExist (inStore alpha)
         let jsonOf paths = "{\"elements\":{" <> T.intercalate "," paths <> "},\"version\":3}"
             elementJson name priority paths = "\"" <> name <> "\":{\"active\":true,\"priority\":" <> T.pack (show (priority :: Int)) <> ",\"storePaths\":[" <> T.intercalate "," ["\"" <> path <> "\"" | path <- paths] <> "]}"
             builtPaths = case builtJson of
@@ -245,6 +337,32 @@ testProfileCLI = do
               JsonObject top | Just (JsonObject elements) <- Map.lookup "elements" top -> [(name, [p | JsonString p <- paths]) | (name, JsonObject element) <- Map.toList elements, Just (JsonArray paths) <- [Map.lookup "storePaths" element]]
               _ -> []
             outputOf name = filter (T.isSuffixOf ("-two-1.0" <> name))
+            ranWell (code, _, _) = code == ExitSuccess
+            exitOf (code, _, _) = code
+            -- A version line names the day its generation was made, which
+            -- for a generation this run made is the day it began or ended.
+            undated line = foldr (\day -> T.replace ("(" <> day <> ")") "(DAY)") line [dayBefore, dayAfter]
+            historyIs (code, printed, complaint) expected = case (code, TE.decodeUtf8' (BS8.filter (/= '\r') printed)) of
+              (ExitSuccess, Right text) -> assertEqual "lines" expected (map undated (T.lines text))
+              _ -> Fail ("exit " <> T.pack (show code) <> "; stdout=" <> T.pack (show printed) <> "; stderr=" <> T.pack (show complaint))
+            historyLines = versionLines ("", "")
+            colouredLines = versionLines ("\ESC[1m", "\ESC[32;1m")
+            versionLines (bold, green) =
+              [ "Version " <> bold <> "1" <> reset bold <> " (1970-01-01):",
+                "  alpha: \x2205 -> 1.0",
+                "",
+                "Version " <> bold <> "2" <> reset bold <> " (1970-01-01) <- 1:",
+                "  beta: \x2205 -> 2.0",
+                "",
+                "Version " <> bold <> "3" <> reset bold <> " (DAY) <- 2:",
+                "  alpha: 1.0 -> \x2205",
+                "",
+                "Version " <> green <> "4" <> reset green <> " (DAY) <- 3:",
+                "  alpha: \x2205 -> 1.0",
+                "  beta: 2.0 -> \x2205"
+              ]
+            reset escape = if T.null escape then "" else "\ESC[0m"
+            staleRecordOf n line = "removing stale link from '" `isPrefixOf` line && "hist" `isInfixOf` line && ("profile-" <> show n <> "-link'") `isSuffixOf` line
         (++ xdgCases)
           <$> sequence
             [ runTest "profile list of a profile that is not there prints nothing and makes ~/.nix-profile" $
@@ -255,9 +373,13 @@ testProfileCLI = do
                 case ran of
                   Nothing -> Pass
                   Just (code, out, err) -> assertEqual "run" (ExitSuccess, "hello from the profile\n") (code, out) `andThen` assertEqual "stderr" "" err,
-              runTest "profile list prints upstream's lines, the name in bold"
-                $ succeeded listedText
-                $ assertEqual "lines" ["Name:               \ESC[1mhello\ESC[0m", "Store paths:        " <> inStore hello] (let (_, out, _) = listedText in lines (filter (/= '\r') out)),
+              runTest "profile list prints upstream's lines, the name in bold where colour is forced and in neither a pipe nor under NOCOLOR"
+                $ succeeded listedText . succeeded listedStyled . succeeded listedUnstyled
+                $ let printed (_, out, _) = lines (filter (/= '\r') out)
+                      paths = "Store paths:        " <> inStore hello
+                   in assertEqual "a pipe" ["Name:               hello", paths] (printed listedText)
+                        `andThen` assertEqual "forced" ["Name:               \ESC[1mhello\ESC[0m", paths] (printed listedStyled)
+                        `andThen` assertEqual "NOCOLOR" ["Name:               hello", paths] (printed listedUnstyled),
               runTest "profile list --json prints the manifest, paths in the canonical spelling"
                 $ succeeded listedJson
                 $ assertEqual "json" (jsonOf [elementJson "hello" 5 [canonical hello]]) (let (_, out, _) = listedJson in T.strip (T.pack out)),
@@ -316,7 +438,48 @@ testProfileCLI = do
                   (ExitFailure 1, _, err) | "profile add: " `isPrefixOf` err -> Pass
                   _ -> Fail (outcome upstream),
               runTest "use-xdg-base-directories links the default profile from the state directory, not the home" $
-                succeeded stateLinked (assertEqual "link" (Just (root </> "state-link" </> "profiles" </> "profile")) stateLink `andThen` assertEqual "home link" False homeLinkMade)
+                succeeded stateLinked (assertEqual "link" (Just (root </> "state-link" </> "profiles" </> "profile")) stateLink `andThen` assertEqual "home link" False homeLinkMade),
+              runTest "a rollback switches the profile to the generation before the current one, which brings back what a later change took off" $
+                case filter (not . ranWell) historyMade of
+                  [] -> succeeded rolledBack (assertEqual "line" ["switching profile from version 3 to 2"] (stderrLines rolledBack) `andThen` assertEqual "link" (Just "profile-2-link") rolledLink `andThen` assertEqual "bin/alpha" True alphaBack)
+                  failed -> Fail (T.intercalate "; " (map outcome failed)),
+              runTest "rollback --to switches the profile to the generation it names" $
+                succeeded rolledTo (assertEqual "line" ["switching profile from version 2 to 3"] (stderrLines rolledTo) `andThen` assertEqual "link" (Just "profile-3-link") toLink `andThen` assertEqual "bin/alpha" False alphaOff),
+              runTest "rollback --dry-run says where it would switch the profile, and switches nothing" $
+                succeeded dryRolled (assertEqual "line" ["switching profile from version 3 to 2"] (stderrLines dryRolled) `andThen` assertEqual "link" (Just "profile-3-link") dryLink),
+              runTest "a rollback to a generation the profile lacks, or from its oldest, and one with any --to that does not read, are refused in upstream's words" $
+                assertEqual "--to 9" (ExitFailure 1, ["error: profile version 9 does not exist"]) (exitOf missingVersion, stderrLines missingVersion)
+                  `andThen` assertEqual "--to 5x before a --to that reads" (ExitFailure 1, ["error: invalid unit specifier 'X'"]) (exitOf badUnit, stderrLines badUnit)
+                  `andThen` succeeded toOldest (assertEqual "from the oldest" (ExitFailure 1, ["error: no profile version older than the current (1) exists"]) (exitOf noOlder, stderrLines noOlder)),
+              runTest "a change after a rollback makes the generation after the newest, not after the current one"
+                $ succeeded backToSecond . succeeded afterRollback
+                $ assertEqual "link" (Just "profile-4-link") fourthLink,
+              runTest "wipe-history --dry-run names every generation but the current one, and --older-than keeps those made since its cutoff"
+                $ succeeded wipeDry . succeeded wipeRecent
+                $ assertEqual "dry run" ["would remove profile version 1", "would remove profile version 2", "would remove profile version 3"] (stderrLines wipeDry)
+                  `andThen` assertEqual "since the cutoff" [] (stderrLines wipeRecent)
+                  `andThen` assertEqual "links" [True, True, True, True] linksKept,
+              runTest "an --older-than without its d, or of fewer than one day, is refused in upstream's words" $
+                assertEqual "14" (ExitFailure 1, ["error: invalid number of days specifier '14', expected something like '14d'"]) (exitOf wipeUnsuffixed, stderrLines wipeUnsuffixed)
+                  `andThen` assertEqual "0d" (ExitFailure 1, ["error: invalid number of days specifier '0d'"]) (exitOf wipeZero, stderrLines wipeZero),
+              runTest "rollback and wipe-history refuse a profile whose current generation is in another store, and change nothing" $
+                case (exitOf wipeForeign, exitOf rollbackForeign) of
+                  (ExitFailure 1, ExitFailure 1) ->
+                    assertEqual "names the flags" [True, True] [any (\line -> "--store" `isInfixOf` line && "--profile" `isInfixOf` line) (stderrLines run) | run <- [wipeForeign, rollbackForeign]]
+                      `andThen` assertEqual "the default profile" defaultBefore defaultAfter
+                  _ -> Fail (outcome wipeForeign <> "; " <> outcome rollbackForeign),
+              runTest "profile history prints each generation's day in UTC by its link's own time, and what changed from the one before it, in upstream's lines" $
+                historyIs printedHistory historyLines,
+              runTest "profile history sets the current generation's number in green and the others' in bold where colour is forced, and in neither under NO_COLOR" $
+                historyIs colouredHistory colouredLines `andThen` historyIs uncolouredHistory historyLines `andThen` historyIs blankNoColourHistory historyLines,
+              runTest "wipe-history --older-than deletes what was made before its cutoff but the newest of those" $
+                succeeded wipeOld (assertEqual "line" ["removing profile version 1"] (stderrLines wipeOld) `andThen` assertEqual "links" [False, True, True, True] oldLinks),
+              runTest "wipe-history deletes every generation but the current one" $
+                succeeded wipeAll (assertEqual "lines" ["removing profile version 2", "removing profile version 3"] (stderrLines wipeAll) `andThen` assertEqual "links" [False, False, False, True] allLinks),
+              runTest "the next collection drops the deleted generations' records in upstream's line and deletes what only they kept"
+                $ succeeded swept
+                $ assertEqual "stale records" [1, 2, 3] [n | n <- [1, 2, 3 :: Int], any (staleRecordOf n) (stderrLines swept)]
+                  `andThen` assertEqual "beta deleted, alpha kept" (True, True) (betaSwept, alphaKept)
             ]
 
 -- ---------------------------------------------------------------------------
@@ -1397,7 +1560,8 @@ runDevelopCLI bash binary fixture ambientEnv root store marker shellTemp = do
     _ -> pure (Left ())
   structuredPrinted@(_, structuredPrintedOut, _) <- structured "print-dev-env" []
   structuredLeft <- sort <$> Dir.listDirectory structuredTemp
-  descriptors <- substitutedDescriptors run substituting inShell fixture root
+  descriptors <- substitutedDescriptors run substituting inShell fixture root "http" withKeepAliveDirectoryServer
+  directDescriptors <- substitutedDescriptors run substituting inShell fixture root "file" (\cache use -> use (directoryUrl cache))
   direct <- Proc.readCreateProcessWithExitCode (Proc.proc "/bin/sh" ["-c", "ls /dev/fd/"]) {Proc.env = Just env, Proc.close_fds = True} ""
   gcrootEnvironment <- case T.splitOn "|" (T.pack seenOut) of
     [_, gcroot] -> Right <$> BS.readFile (T.unpack gcroot)
@@ -1447,6 +1611,9 @@ runDevelopCLI bash binary fixture ambientEnv root store marker shellTemp = do
       runTest "after a substitution over HTTP, the command starts with the descriptors a process started directly has" $
         assertRight "substituted" descriptors $ \listing ->
           assertEqual "descriptors" (snd3 direct) listing,
+      runTest "after a substitution from a file:// cache, the command starts with the descriptors a process started directly has" $
+        assertRight "substituted" directDescriptors $ \listing ->
+          assertEqual "descriptors" (snd3 direct) listing,
       runTest "print-dev-env prints a script bash sources, followed by a newline" $
         assertEqual "sourced" (ExitSuccess, T.unpack fixtureGreeting) (fst3 sourced, snd3 sourced)
           `andThen` (if "eval \"${shellHook:-}\"\n\n" `isSuffixOf` printedOut then Pass else Fail (outcome printed)),
@@ -1482,27 +1649,31 @@ runDevelopCLI bash binary fixture ambientEnv root store marker shellTemp = do
     snd3 (_, out, _) = out
 
 -- | What @ls /dev/fd/@ prints in a @develop@ shell whose capture first
--- substitutes the fixture's build input from a binary cache served over
--- HTTP by a server that keeps its connections open, which leaves one in
--- the HTTP client's pool: the input is built into a store of its own,
--- pushed to a directory as a signed cache, and the directory served on
--- loopback.  Given the CLI, @develop@ into a
--- store with flags, the command the shell runs, the fixture and the
--- root.  'Left' with what went wrong.
+-- substitutes the fixture's build input from a binary cache: the input is
+-- built into a store of its own, pushed to a directory as a signed cache,
+-- and the directory handed to the substitution by its URL, as the given
+-- function serves it.  Served over HTTP by a server that keeps its
+-- connections open, the substitution leaves one in the HTTP client's pool;
+-- read through its @file:\/\/@ URL, it opens the cache's files.  Given the
+-- CLI, @develop@ into a store with flags, the command the shell runs, the
+-- fixture, the root, a label naming this run's cache and store under it,
+-- and the serving.  'Left' with what went wrong.
 substitutedDescriptors ::
   ([String] -> IO (ExitCode, String, String)) ->
   (FilePath -> [String] -> IO (ExitCode, String, String)) ->
   (String -> [String]) ->
   FilePath ->
   FilePath ->
+  String ->
+  (FilePath -> (Text -> IO (ExitCode, String, String)) -> IO (ExitCode, String, String)) ->
   IO (Either Text String)
-substitutedDescriptors run develop inShell fixture root = do
+substitutedDescriptors run develop inShell fixture root label serving = do
   seed <- BS.pack <$> QC.generate (QC.vectorOf ed25519SeedBytes QC.arbitrary)
   case throwawayKey seed of
     Left err -> pure (Left (T.pack err))
     Right (keyText, publicKey) -> do
-      let keyFile = root </> "cache-secret-key"
-          cache = root </> "cache"
+      let keyFile = root </> ("cache-secret-key-" <> label)
+          cache = root </> ("cache-" <> label)
           source = root </> "source-store"
       BS.writeFile keyFile (TE.encodeUtf8 keyText)
       built@(_, builtOut, _) <- run ["build", "--expr", "{ fixture }: builtins.head (import fixture { marker = \"\"; }).buildInputs", "--argstr", "fixture", fixture, "--store", source, "--no-out-link", "--no-sandbox"]
@@ -1510,9 +1681,9 @@ substitutedDescriptors run develop inShell fixture root = do
         Nothing -> pure (Left ("build: " <> T.pack (show built)))
         Just tool -> do
           pushed <- run ["push", "--cache", "file://" <> cache, "--secret-key-file", keyFile, "--store", source, tool]
-          shown <- withKeepAliveDirectoryServer cache $ \base ->
+          shown <- serving cache $ \base ->
             develop
-              (root </> "substituted-store")
+              (root </> ("substituted-store-" <> label))
               (["--substituter", T.unpack base, "--trusted-key", T.unpack (Signing.renderPublicKey publicKey)] <> inShell "ls /dev/fd/")
           pure $ case shown of
             (ExitSuccess, listing, err)
@@ -2339,6 +2510,9 @@ cliOperands name flagName = case name of
   Ref.ProfileAddCommand -> expression
   Ref.ProfileRemoveCommand -> ["hello" | flagName /= Ref.AllFlag]
   Ref.ProfileListCommand -> []
+  Ref.ProfileHistoryCommand -> []
+  Ref.ProfileRollbackCommand -> []
+  Ref.ProfileWipeHistoryCommand -> []
   where
     expression = concat [["--expr", "1"] | flagName /= Ref.ExprFlag]
 
@@ -2356,6 +2530,9 @@ cliSelects name parsed = case (name, parsed) of
   (Ref.ProfileAddCommand, Cli.CmdProfileAdd {}) -> True
   (Ref.ProfileRemoveCommand, Cli.CmdProfileRemove {}) -> True
   (Ref.ProfileListCommand, Cli.CmdProfileList {}) -> True
+  (Ref.ProfileHistoryCommand, Cli.CmdProfileHistory {}) -> True
+  (Ref.ProfileRollbackCommand, Cli.CmdProfileRollback {}) -> True
+  (Ref.ProfileWipeHistoryCommand, Cli.CmdProfileWipeHistory {}) -> True
   _ -> False
 
 -- | One word read back as a POSIX shell reads it, for what

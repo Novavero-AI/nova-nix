@@ -10,6 +10,7 @@ module Test.Store
     testCaseSensitiveVolumeIO,
     testFoldingVolumeIO,
     testStoreDB,
+    testPathInfo,
     testParseStorePath,
     testStoreAccessIO,
     testStoreOpsIO,
@@ -32,44 +33,46 @@ where
 
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Exception (IOException, SomeException, bracket, bracket_, evaluate, finally, throwIO, try)
-import Control.Monad (filterM, forM, when)
-import Data.Bits (xor, (.&.))
+import Control.Monad (filterM, forM, join, when)
+import Data.Bits (complement, popCount, shiftR, xor, (.&.), (.|.))
 import qualified Data.ByteString as BS
 import Data.Char (isDigit)
 import Data.Either (isLeft, isRight)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isPrefixOf, nub, sort)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust, isNothing, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
-import Data.Word (Word32, Word8)
+import Data.Word (Word16, Word32, Word8)
 import qualified Database.SQLite.Simple as SQL
 import DirDacl (Dacl (..), DaclEntry (..), directoryDacl, processUserSid)
 import GHC.IO.Exception (IOErrorType (..), IOException (..))
 import HttpFixture (Reply (..), httpResponse, withHttpServer)
 import Nix.Builder (BuildConfig (..), BuildResult (..), BuildStop (..), buildDerivation, buildWithDeps, checkDerivation, defaultBuildConfig, verifyFetchHash)
 import Nix.Builder.BuildDir (createBuildDir)
+import qualified Nix.Daemon.Protocol as Proto
 import Nix.Derivation (Derivation (..), DerivationOutput (..), currentPlatform, toATerm)
 import Nix.Eval (NixValue (..))
 import Nix.Eval.CanonPath (canonPath, canonPathValue)
 import Nix.Eval.IO (EvalState (..), sourceCopies)
 import Nix.Hash (FileIngestionMethod (..), compressHash, makeFixedOutputPath, makeTextPath, sha256Digest)
 import qualified Nix.Hash as Hash
+import Nix.HostPath (hostPathBytes, hostPathFromBytes)
 import Nix.Http (defaultFetchRetryPolicy, ioRetryEffects)
 import Nix.Push (computeClosure)
 import qualified Nix.Realise as Realise
 import Nix.Store (DeleteOutcome (..), GcResults (..), GcRoot (..), Store (..), SweepPlan (..), acquirePathLock, addOutLinkRoot, addToStore, autoRootsDir, canonicalStoreDir, canonicalizeMetadata, closeStore, collectGarbage, copyPathInto, deleteStorePathRaw, deleteStorePaths, findRoots, gcLockFilePath, gcRootsDir, gcSummaryLine, indirectRootRecordName, isValid, materializeEvalSources, materializeEvalStoreWrites, openStore, orderLinks, pathExists, reachableFrom, referencesMap, registrationFor, releasePathLock, resolveDeleteTarget, rewriteBytes, rewriteStoreHashes, scanReferences, showFreedBytes, storeEntryName, storeEntryNameText, sweepPlan, tryAcquirePathLock, unpackNarEntry, upstreamDatabasePath, withCollectorLock, writeDrv)
-import Nix.Store.Access (DirAccess (..), accessSddl, sidFromText)
+import Nix.Store.Access (AclEntry (..), DirAccess (..), DirSecurity (..), Distrust (..), accessSddl, descriptorDistrust, distrustMessage, parseSecurityDescriptor, securityDistrust, sidFromText, stateDirectories, storeDirectories)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, processCaseHack)
-import Nix.Store.DB (PathInfo (..), PathRegistration (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathInfo, queryReferences, registerPath, registerPaths)
+import Nix.Store.DB (PathInfo (..), PathRegistration (..), Ultimate (..), UnregisterResult (..), closeStoreDB, dbFileName, isValidPath, metaDirName, openStoreDB, queryAllValidPaths, queryDeriver, queryPathFromHashPart, queryPathInfo, queryReferences, queryReferrers, queryValidDerivers, registerPath, registerPaths, unregisterPathRow)
 import Nix.Store.EntryName (NameRules (..), checkEntryName, checkLinkTarget)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (MetadataChange (..), NodeKind (..), NodeMetadata (..), Ownership (..), canonicalPermissions, executablePermissions, metadataChanges, readOnlyPermissions, storeModificationTime)
-import Nix.Store.Ops (EvalObjects (..), StoreOps (..), StoreQueries (..), withLocalStore, withOpenedOnFirstUse)
+import Nix.Store.Ops (EvalObjects (..), StoreOps (..), StoreQueries (..), localQueries, withLocalStore, withOpenedOnFirstUse)
 import Nix.Store.Path (StoreDir (..), StorePath, StoreWriteMode (..), defaultStoreDir, defaultStoreDirText, isCanonicalStoreText, parseStorePath, parseStorePathBaseName, parseStorePathPrefix, platformStoreDir, qualifyPathText, storePathHashLen, storePathToFilePath, storePathToText, storeTextToFilePath, windowsStoreDir)
 import Nix.Store.Path.Internal (StorePath (..))
 import Nix.Store.Upstream (UpstreamHazard (..), upstreamManagedRefusal)
@@ -82,15 +85,17 @@ import qualified NovaCache.Signing as Signing
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getPermissions, getTemporaryDirectory, removeDirectoryRecursive, writable)
 import qualified System.Directory as Dir
 import System.Environment (lookupEnv)
+import System.Exit (ExitCode (..))
 import qualified System.FileLock as FileLock
 import System.FilePath (dropDrive, joinPath, pathSeparator, splitDirectories, takeDirectory, takeDrive, takeFileName, (</>))
-import System.IO.Error (ioeGetErrorString, ioeGetFileName, isAlreadyExistsError)
+import System.IO.Error (ioeGetErrorString, ioeGetFileName, isAlreadyExistsError, isUserError)
 import qualified System.Info as SI
 import qualified System.OsPath as OP
 import qualified System.Process as Proc
 import System.Timeout (timeout)
-import Test.Harness (TestResult (..), andThen, assertEqual, assertEvalErrorIO, bytesText, canonicalAs, chunkReader, deleteNamed, evalAndBuild, evalNix, evalNixIOIn, evalNixIOStore, findTestShell, forceRemoveIfExists, genDrvName, genFixturePath, mkTestBuildDrv, narInfoRequest, narSpecFileVector, narSpecVector, offeredThenFetched, parseErrorTag, posixOnlyEntries, quotedAsCxx, removeIfExists, runTest, runTestM, servedPaths, sigTestKeyText, simpleTestDrv, symlinksAvailable, testDrvPath, testEvalState, testLogger, walkWatchdogMicros, withTempStore)
+import Test.Harness (TestResult (..), andThen, assertEqual, assertEvalErrorIO, bytesText, canonicalAs, chunkReader, deleteNamed, evalAndBuild, evalNix, evalNixIOIn, evalNixIOStore, findTestShell, forceRemoveIfExists, genContentAddress, genDrvName, genFixturePath, genSignatures, mkTestBuildDrv, narInfoRequest, narSpecFileVector, narSpecVector, offeredThenFetched, parseErrorTag, posixOnlyEntries, quotedAsCxx, removeIfExists, runTest, runTestM, servedPaths, sigTestKeyText, simpleTestDrv, symlinksAvailable, testDrvPath, testEvalState, testLogger, walkWatchdogMicros, withTempStore)
 import qualified Test.QuickCheck as QC
+import Text.Read (readMaybe)
 
 -- ---------------------------------------------------------------------------
 -- Tests: Store paths (existing)
@@ -1081,7 +1086,7 @@ testStoreDB = do
         runTestM "db register + isValid" $ do
           db <- openStoreDB storeDir
           let sp = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2" "hello"
-              reg = PathRegistration sp "sha256:abc" 100 Nothing []
+              reg = PathRegistration sp "sha256:abc" 100 Nothing [] NotUltimate Set.empty Nothing
           registerPath db reg
           result <- isValidPath db sp
           closeStoreDB db
@@ -1103,7 +1108,7 @@ testStoreDB = do
             SQL.close peer
             putMVar released ()
           let sp = StorePath "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3" "busywait"
-          registerPath db (PathRegistration sp "sha256:busy" 10 Nothing [])
+          registerPath db (PathRegistration sp "sha256:busy" 10 Nothing [] NotUltimate Set.empty Nothing)
           takeMVar released
           result <- isValidPath db sp
           closeStoreDB db
@@ -1114,9 +1119,9 @@ testStoreDB = do
           let ref1 = StorePath "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "dep1"
               ref2 = StorePath "cccccccccccccccccccccccccccccccc" "dep2"
               mainSp = StorePath "dddddddddddddddddddddddddddddddd" "mainpkg"
-          registerPath db (PathRegistration ref1 "sha256:r1" 50 Nothing [])
-          registerPath db (PathRegistration ref2 "sha256:r2" 60 Nothing [])
-          registerPath db (PathRegistration mainSp "sha256:m1" 200 Nothing [ref1, ref2])
+          registerPath db (PathRegistration ref1 "sha256:r1" 50 Nothing [] NotUltimate Set.empty Nothing)
+          registerPath db (PathRegistration ref2 "sha256:r2" 60 Nothing [] NotUltimate Set.empty Nothing)
+          registerPath db (PathRegistration mainSp "sha256:m1" 200 Nothing [ref1, ref2] NotUltimate Set.empty Nothing)
           refs <- queryReferences db mainSp
           closeStoreDB db
           let ref1Path = T.pack (storePathToFilePath storeDir ref1)
@@ -1137,11 +1142,11 @@ testStoreDB = do
               sp = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii" "refresh-main"
           registerPaths
             db
-            [ PathRegistration refA "sha256:ra" 10 Nothing [],
-              PathRegistration refB "sha256:rb" 11 Nothing [],
-              PathRegistration sp "sha256:rm" 12 Nothing [refA, refB]
+            [ PathRegistration refA "sha256:ra" 10 Nothing [] NotUltimate Set.empty Nothing,
+              PathRegistration refB "sha256:rb" 11 Nothing [] NotUltimate Set.empty Nothing,
+              PathRegistration sp "sha256:rm" 12 Nothing [refA, refB] NotUltimate Set.empty Nothing
             ]
-          registerPath db (PathRegistration sp "sha256:rm" 12 Nothing [refA])
+          registerPath db (PathRegistration sp "sha256:rm" 12 Nothing [refA] NotUltimate Set.empty Nothing)
           refs <- queryReferences db sp
           closeStoreDB db
           let refAPath = T.pack (storePathToFilePath storeDir refA)
@@ -1160,7 +1165,7 @@ testStoreDB = do
           db <- openStoreDB storeDir
           let ghost = StorePath "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj" "ghost"
               sp = StorePath "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk" "orphan-edge"
-          outcome <- try (registerPath db (PathRegistration sp "sha256:oe" 13 Nothing [ghost]))
+          outcome <- try (registerPath db (PathRegistration sp "sha256:oe" 13 Nothing [ghost] NotUltimate Set.empty Nothing))
           recorded <- isValidPath db sp
           closeStoreDB db
           pure $ case outcome of
@@ -1185,8 +1190,8 @@ testStoreDB = do
             try
               ( registerPaths
                   db
-                  [ PathRegistration late "sha256:lt" 14 Nothing [ghostA],
-                    PathRegistration early "sha256:er" 15 Nothing [ghostC, ghostB]
+                  [ PathRegistration late "sha256:lt" 14 Nothing [ghostA] NotUltimate Set.empty Nothing,
+                    PathRegistration early "sha256:er" 15 Nothing [ghostC, ghostB] NotUltimate Set.empty Nothing
                   ]
               )
           closeStoreDB db
@@ -1201,7 +1206,7 @@ testStoreDB = do
         runTestM "db queryDeriver nothing" $ do
           db <- openStoreDB storeDir
           let sp = StorePath "cccccccccccccccccccccccccccccccc" "noderiver"
-          registerPath db (PathRegistration sp "sha256:nd" 80 Nothing [])
+          registerPath db (PathRegistration sp "sha256:nd" 80 Nothing [] NotUltimate Set.empty Nothing)
           result <- queryDeriver db sp
           closeStoreDB db
           pure (assertEqual "no deriver" Nothing result),
@@ -1209,7 +1214,7 @@ testStoreDB = do
         runTestM "db queryDeriver just" $ do
           db <- openStoreDB storeDir
           let sp = StorePath "ffffffffffffffffffffffffffffffff" "hasdrv"
-          registerPath db (PathRegistration sp "sha256:hd" 90 (Just "/nix/store/xxx.drv") [])
+          registerPath db (PathRegistration sp "sha256:hd" 90 (Just "/nix/store/xxx.drv") [] NotUltimate Set.empty Nothing)
           result <- queryDeriver db sp
           closeStoreDB db
           pure (assertEqual "has deriver" (Just "/nix/store/xxx.drv") result),
@@ -1217,7 +1222,7 @@ testStoreDB = do
         runTestM "db queryPathInfo" $ do
           db <- openStoreDB storeDir
           let sp = StorePath "gggggggggggggggggggggggggggggggg" "infotest"
-          registerPath db (PathRegistration sp "sha256:info" 150 (Just "/drv") [])
+          registerPath db (PathRegistration sp "sha256:info" 150 (Just "/drv") [] NotUltimate Set.empty Nothing)
           minfo <- queryPathInfo db sp
           closeStoreDB db
           pure $ case minfo of
@@ -1238,7 +1243,7 @@ testStoreDB = do
         runTestM "db double register idempotent" $ do
           db <- openStoreDB storeDir
           let sp = StorePath "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii" "double"
-              reg = PathRegistration sp "sha256:dup" 120 Nothing []
+              reg = PathRegistration sp "sha256:dup" 120 Nothing [] NotUltimate Set.empty Nothing
           registerPath db reg
           registerPath db reg
           result <- isValidPath db sp
@@ -1250,9 +1255,9 @@ testStoreDB = do
           let spA = StorePath "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj" "a"
               spB = StorePath "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk" "b"
               spC = StorePath "llllllllllllllllllllllllllllllll" "c"
-          registerPath db (PathRegistration spA "sha256:a" 10 Nothing [])
-          registerPath db (PathRegistration spB "sha256:b" 20 Nothing [spA])
-          registerPath db (PathRegistration spC "sha256:c" 30 Nothing [spA, spB])
+          registerPath db (PathRegistration spA "sha256:a" 10 Nothing [] NotUltimate Set.empty Nothing)
+          registerPath db (PathRegistration spB "sha256:b" 20 Nothing [spA] NotUltimate Set.empty Nothing)
+          registerPath db (PathRegistration spC "sha256:c" 30 Nothing [spA, spB] NotUltimate Set.empty Nothing)
           refsC <- queryReferences db spC
           refsA <- queryReferences db spA
           closeStoreDB db
@@ -1263,6 +1268,230 @@ testStoreDB = do
               then Pass
               else Fail ("bad ref graph: c refs=" <> T.pack (show refsC) <> " a refs=" <> T.pack (show refsA))
       ]
+
+-- | What a path's info records beyond its NAR, whether this store built
+-- it, its signatures and its content address, in the columns upstream's
+-- schema has; the queries that read the references, the derivations'
+-- outputs and the hash parts back; and a database an earlier nova-nix
+-- made, which opens with the new fields absent.
+testPathInfo :: IO [Bool]
+testPathInfo = do
+  putStrLn "store/path-info"
+  tmpBase <- getTemporaryDirectory
+  shell <- findTestShell
+  let root = tmpBase </> "nova-nix-test-path-info"
+      dir = StoreDir (root </> "store")
+      dbPath = unStoreDir dir </> metaDirName </> dbFileName
+      at hash = StorePath (T.replicate 32 hash)
+      pathText = T.pack . storePathToFilePath dir
+      registration sp refs = PathRegistration sp "sha256:x" 1 Nothing refs NotUltimate Set.empty Nothing
+      trustOf info = (piUltimate info, piSignatures info, piContentAddress info)
+      signature name bytes = maybe Set.empty Set.singleton (Proto.signatureFromParts name bytes)
+      zeroAddress = Proto.contentAddressFromParts (Proto.FixedMethod NarIngestion) "sha256" (BS.replicate 32 0)
+      inFreshStore action = do
+        forceRemoveIfExists root
+        createDirectoryIfMissing True (unStoreDir dir)
+        bracket (openStoreDB dir) closeStoreDB action `finally` forceRemoveIfExists root
+      -- A derivation's file at its path, with outputs at the paths given.
+      writeDerivation drvPath outputs =
+        BS.writeFile (storePathToFilePath dir drvPath) (toATerm (mkTestBuildDrv shell (at "0" "unused") "true") {drvOutputs = [DerivationOutput name out "" "" | (name, out) <- outputs]})
+  sequence
+    [ runTestM "registration round-trips whether this store built a path, its signatures and its content address" $ do
+        counter <- newIORef (0 :: Int)
+        inFreshStore $ \db -> do
+          result <-
+            QC.quickCheckWithResult QC.stdArgs {QC.chatty = False} $
+              QC.forAll ((,,) <$> QC.elements [Ultimate, NotUltimate] <*> genSignatures <*> QC.oneof [pure Nothing, Just <$> genContentAddress]) $ \trust@(ultimate, sigs, ca) ->
+                QC.ioProperty $ do
+                  number <- atomicModifyIORef' counter (\n -> (n + 1, n))
+                  let sp = StorePath (T.justifyRight 32 '0' (T.pack (show number))) "trust"
+                  registerPath db (registration sp []) {prUltimate = ultimate, prSignatures = sigs, prContentAddress = ca}
+                  info <- queryPathInfo db sp
+                  pure (fmap trustOf info QC.=== Just trust)
+          pure (if QC.isSuccess result then Pass else Fail (T.pack (QC.output result))),
+      -- Upstream writes 1 or NULL, the signatures separated by spaces or
+      -- NULL, and the address as it renders one or NULL.
+      runTestM "the trust columns hold what upstream's schema holds" $ do
+        let trusted = at "a" "trusted"
+            plain = at "b" "plain"
+            sigs = signature "cache.example.org-1" "\x01\x02" <> signature "other-1" "\x03"
+        inFreshStore $ \db -> do
+          registerPath db (registration trusted []) {prUltimate = Ultimate, prSignatures = sigs, prContentAddress = zeroAddress}
+          registerPath db (registration plain [])
+          rows <- bracket (SQL.open dbPath) SQL.close $ \conn ->
+            SQL.query_ conn "SELECT ultimate, sigs, ca FROM ValidPaths ORDER BY path" :: IO [(Maybe Int, Maybe Text, Maybe Text)]
+          pure $
+            assertEqual
+              "columns"
+              [ (Just 1, Just "cache.example.org-1:AQI= other-1:Aw==", Just ("fixed:r:sha256:" <> T.replicate 52 "0")),
+                (Nothing, Nothing, Nothing)
+              ]
+              rows,
+      -- A derivation written again must not drop the signatures it was
+      -- substituted with.
+      runTestM "re-registration keeps the trust fields it leaves absent and replaces those it states" $ do
+        let sp = at "c" "again"
+            first = signature "first-1" "\x01"
+            second = signature "second-1" "\x02"
+        inFreshStore $ \db -> do
+          registerPath db (registration sp []) {prUltimate = Ultimate, prSignatures = first, prContentAddress = zeroAddress}
+          registerPath db (registration sp [])
+          kept <- fmap trustOf <$> queryPathInfo db sp
+          registerPath db (registration sp []) {prSignatures = second}
+          replaced <- fmap trustOf <$> queryPathInfo db sp
+          pure $
+            assertEqual "kept" (Just (Ultimate, first, zeroAddress)) kept
+              `andThen` assertEqual "replaced" (Just (Ultimate, second, zeroAddress)) replaced,
+      runTestM "a database an earlier nova-nix made opens with its paths not ultimate, unsigned and unaddressed, and its derivations' outputs listed" $ do
+        let old = at "d" "old"
+            drvPath = at "f" "old.drv"
+            out = at "g" "old-out"
+        forceRemoveIfExists root
+        createDirectoryIfMissing True (unStoreDir dir </> metaDirName)
+        writeDerivation drvPath [("out", out)]
+        bracket (SQL.open dbPath) SQL.close $ \conn -> do
+          mapM_ (SQL.execute_ conn) earlierSchema
+          mapM_ (SQL.execute conn "INSERT INTO ValidPaths (path, hash, registrationTime, deriver, narSize) VALUES (?, 'sha256:x', 1, NULL, 1)" . SQL.Only . pathText) [old, drvPath]
+        (info, derivers, updated) <-
+          bracket
+            (openStoreDB dir)
+            closeStoreDB
+            ( \db -> do
+                info <- queryPathInfo db old
+                derivers <- queryValidDerivers db out
+                registerPath db (registration old []) {prUltimate = Ultimate}
+                updated <- queryPathInfo db old
+                pure (info, derivers, updated)
+            )
+            `finally` forceRemoveIfExists root
+        pure $
+          assertEqual "the old path" (Just (NotUltimate, Set.empty, Nothing)) (trustOf <$> info)
+            `andThen` assertEqual "the derivation's output" [pathText drvPath] derivers
+            `andThen` assertEqual "registered again" (Just Ultimate) (piUltimate <$> updated),
+      -- Upstream lists a path that references itself among its referrers.
+      runTestM "a path's referrers are the valid paths that reference it, itself included" $ do
+        let target = at "h" "target"
+            user = at "i" "user"
+            selfish = at "j" "selfish"
+            other = at "k" "other"
+        inFreshStore $ \db -> do
+          registerPaths db [registration target [target], registration user [target], registration selfish [selfish, target], registration other []]
+          referrers <- queryReferrers db target
+          self <- queryReferrers db selfish
+          none <- queryReferrers db other
+          pure $
+            assertEqual "the target's" (map pathText [target, user, selfish]) referrers
+              `andThen` assertEqual "a self-referrer's" [pathText selfish] self
+              `andThen` assertEqual "an unreferenced path's" [] none,
+      runTestM "a path's valid derivers are the valid derivations listing it as an output, until one is unregistered" $ do
+        let out = at "l" "shared"
+            firstDrv = at "m" "first.drv"
+            secondDrv = at "n" "second.drv"
+            elsewhere = at "p" "elsewhere"
+        inFreshStore $ \db -> do
+          writeDerivation firstDrv [("out", out)]
+          writeDerivation secondDrv [("dev", elsewhere), ("out", out)]
+          registerPaths db [registration firstDrv [], registration secondDrv []]
+          both <- queryValidDerivers db out
+          dev <- queryValidDerivers db elsewhere
+          unregistered <- unregisterPathRow db (pathText firstDrv)
+          remaining <- queryValidDerivers db out
+          pure $
+            assertEqual "both" (map pathText [firstDrv, secondDrv]) both
+              `andThen` assertEqual "the other output's" [pathText secondDrv] dev
+              `andThen` assertEqual "unregistered" RowUnregistered unregistered
+              `andThen` assertEqual "remaining" [pathText secondDrv] remaining,
+      runTestM "a derivation whose file does not parse is refused with upstream's message, and nothing is registered" $ do
+        let drvPath = at "q" "broken.drv"
+        inFreshStore $ \db -> do
+          BS.writeFile (storePathToFilePath dir drvPath) "not a derivation"
+          outcome <- try (registerPath db (registration drvPath []))
+          valid <- isValidPath db drvPath
+          pure $ case outcome of
+            Left (err :: IOException)
+              | ("error parsing derivation '" <> T.unpack (storePathToText defaultStoreDir drvPath) <> "': ") `isPrefixOf` ioeGetErrorString err,
+                not valid ->
+                  Pass
+            other -> Fail ("expected the refusal, got: " <> T.pack (show (other, valid))),
+      runTestM "a hash part finds the valid path it begins, and only that one" $ do
+        let found = at "r" "found"
+            later = at "s" "later"
+        inFreshStore $ \db -> do
+          registerPaths db [registration found [], registration later []]
+          hit <- queryPathFromHashPart db (T.replicate 32 "r")
+          between <- queryPathFromHashPart db (T.replicate 31 "r" <> "s")
+          short <- queryPathFromHashPart db (T.replicate 31 "r")
+          pure $
+            assertEqual "the path it begins" (Right (Just (pathText found))) hit
+              `andThen` assertEqual "a hash no path begins with" (Right Nothing) between
+              `andThen` assertEqual "a hash part of another length" (Left "invalid hash part") short,
+      runTestM "a written derivation records the text address its path is made from" $ do
+        forceRemoveIfExists root
+        let drv = mkTestBuildDrv shell (at "x" "written-out") "true"
+            drvPath = at "v" "written.drv"
+        info <-
+          bracket (openStore testLogger dir) closeStore (\store -> writeDrv store drv drvPath >> queryPathInfo (stDB store) drvPath)
+            `finally` forceRemoveIfExists root
+        let expected = Proto.contentAddressFromParts Proto.TextMethod "sha256" (sha256Digest (toATerm drv))
+        pure (assertEqual "address" (Just expected) (piContentAddress <$> info)),
+      -- APFS and Windows take only names with a UTF-8 form, so there the
+      -- name with no UTF-8 reading cannot be made and the test passes over.
+      runTestM "an out-link's record holds the link's bytes, a name no text spells included, and the root is found under that name" $ do
+        forceRemoveIfExists root
+        let links = root </> "links"
+            top = at "w" "rooted"
+        createDirectoryIfMissing True links
+        linksPath <- OP.encodeFS links
+        let named = hostPathBytes linksPath >>= \bytes -> (,) (bytes <> "/result-\xff") <$> hostPathFromBytes (bytes <> "/result-\xff")
+        outcome <- case named of
+          Nothing -> pure Nothing
+          Just (linkBytes, linkPath) -> do
+            link <- OP.decodeFS linkPath
+            probe <- try (BS.writeFile link "") :: IO (Either IOException ())
+            case probe of
+              Left _ -> pure Nothing
+              Right () -> do
+                Dir.removeFile link
+                rooted <-
+                  bracket
+                    (openStore testLogger dir)
+                    closeStore
+                    ( \store -> do
+                        registerPath (stDB store) (registration top [])
+                        rooted <- addOutLinkRoot store link top
+                        recorded <- try (BS.readFile (autoRootsDir (stDir store) </> indirectRootRecordName linkBytes)) :: IO (Either IOException BS.ByteString)
+                        roots <- findRoots store
+                        pure (rooted, either (const Nothing) Just recorded, roots)
+                    )
+                pure (Just (link, linkBytes, rooted))
+        forceRemoveIfExists root
+        case outcome of
+          Nothing -> Pass <$ putStrLn "  SKIP  this platform names no file with a byte that has no UTF-8 reading"
+          Just (link, linkBytes, (rooted, recorded, roots)) ->
+            pure $
+              assertEqual "the link" (Right link) rooted
+                `andThen` assertEqual "the record" (Just linkBytes) recorded
+                `andThen` assertEqual "the roots" [GcRoot link (pathText top)] roots
+    ]
+
+-- | The schema an earlier nova-nix made a store's database with, before it
+-- held the trust columns and DerivationOutputs.
+earlierSchema :: [SQL.Query]
+earlierSchema =
+  [ "CREATE TABLE IF NOT EXISTS ValidPaths (\
+    \  id               INTEGER PRIMARY KEY AUTOINCREMENT,\
+    \  path             TEXT UNIQUE NOT NULL,\
+    \  hash             TEXT NOT NULL,\
+    \  registrationTime INTEGER NOT NULL,\
+    \  deriver          TEXT,\
+    \  narSize          INTEGER NOT NULL\
+    \)",
+    "CREATE TABLE IF NOT EXISTS Refs (\
+    \  referrer  INTEGER NOT NULL REFERENCES ValidPaths(id),\
+    \  reference INTEGER NOT NULL REFERENCES ValidPaths(id),\
+    \  PRIMARY KEY (referrer, reference)\
+    \)"
+  ]
 
 -- ---------------------------------------------------------------------------
 -- Tests: Store Operations + parseStorePath (Phase 2, Batch 2)
@@ -1335,13 +1564,19 @@ testParseStorePath = do
 -- Tests: Push (pure narinfo construction + closure computation)
 -- ---------------------------------------------------------------------------
 
--- | Who a directory the store creates is open to ("Nix.Store.Access").
--- The SDDL each is created with on Windows is checked on every
--- platform.  On Windows a new store's directories, the parents made for
--- them and a build directory are read back through the API: protected,
--- with nothing inherited, and granting what install-nova-nix grants on
--- @C:\\nix@, that less Users' entry, or the user alone, so no entry names
--- Authenticated Users or Everyone.
+-- | Who a directory the store creates is open to, and when one already
+-- there may hold a store or lead to one ("Nix.Store.Access").  The SDDL
+-- each is created with on Windows is checked on every platform, and so
+-- are the directories a store's open checks, install-nova-nix's rule
+-- over an owner and DACL, the security descriptor that rule reads, and
+-- the refusal's words.  On Windows a new store's directories, the
+-- parents made for them and a build directory are read back through the
+-- API: protected, with nothing inherited, and granting what
+-- install-nova-nix grants on @C:\\nix@, that less Users' entry, or the
+-- user alone, so no entry names Authenticated Users or Everyone.  A
+-- store nova-nix made opens again, and one whose parent another account
+-- owns, or whose parent's DACL lets another account change it, is
+-- refused naming that parent.
 testStoreAccessIO :: IO [Bool]
 testStoreAccessIO = do
   putStrLn "store/access"
@@ -1413,6 +1648,149 @@ testStoreAccessIO = do
         | otherwise = runTestM name $ do
             user <- processUserSid
             maybe (pure (Fail "no user SID was read")) check user
+      otherUser = "S-1-5-21-1-2-3-1002"
+      administrators = "S-1-5-32-544"
+      users = "S-1-5-32-545"
+      authenticatedUsers = "S-1-5-11"
+      creatorOwner = "S-1-3-0"
+      everyone = "S-1-1-0"
+      localService = "S-1-5-19"
+      -- Modify, FILE_GENERIC_READ | FILE_GENERIC_WRITE |
+      -- FILE_GENERIC_EXECUTE | DELETE, which a client edition's drive
+      -- root passes down to Authenticated Users.
+      modify = 0x1301BF
+      -- GENERIC_READ | GENERIC_EXECUTE, which C:\Users passes down to
+      -- Everyone.
+      genericReadExecute = 0xA0000000
+      -- Each right that lets an account change a directory, by its
+      -- winnt.h name.
+      changingRights =
+        [ ("FILE_WRITE_DATA", 0x2),
+          ("FILE_APPEND_DATA", 0x4),
+          ("FILE_WRITE_EA", 0x10),
+          ("FILE_DELETE_CHILD", 0x40),
+          ("FILE_WRITE_ATTRIBUTES", 0x100),
+          ("DELETE", 0x10000),
+          ("WRITE_DAC", 0x40000),
+          ("WRITE_OWNER", 0x80000),
+          ("GENERIC_ALL", 0x10000000),
+          ("GENERIC_WRITE", 0x40000000)
+        ]
+      allowing rights sid = AllowEntry rights <$> sidFromText sid
+      installerEntries = [allowing fullControl someUser, allowing fullControl localSystem, allowing fullControl administrators, allowing readAndExecute users]
+      -- The decision for someUser over an owner and a DACL, their SIDs
+      -- given as text, which is Nothing when one is not a SID.
+      decision owner entries = do
+        user <- sidFromText someUser
+        security <- DirSecurity <$> traverse sidFromText owner <*> traverse sequenceA entries
+        pure (securityDistrust user security)
+      decides label owner entries expected =
+        runTest label (fromMaybe (Fail "a SID in the case is not one") (assertEqual label <$> expected <*> decision owner entries))
+      accepted = Just Nothing
+      refusedAs reason = Just <$> reason
+      writableBy sid = refusedAs (WritableBy <$> sidFromText sid)
+      -- A SID, a DACL and a self-relative security descriptor laid out
+      -- as MS-DTYP gives them.  An entry is its type, flags and size,
+      -- then its access mask and SID where its type puts them.
+      le16 :: Word16 -> BS.ByteString
+      le16 value = BS.pack [fromIntegral value, fromIntegral (value `shiftR` 8)]
+      le32 :: Word32 -> BS.ByteString
+      le32 value = BS.pack [fromIntegral (value `shiftR` shift) | shift <- [0, 8, 16, 24]]
+      sidBytes text = do
+        rest <- T.stripPrefix "S-1-" text
+        (authority, subauthorities) <- case T.splitOn "-" rest of
+          first : more -> Just (first, more)
+          [] -> Nothing
+        value <- readMaybe (T.unpack authority) :: Maybe Integer
+        subs <- traverse (readMaybe . T.unpack) subauthorities
+        pure (BS.pack (1 : fromIntegral (length subs) : [fromIntegral (value `shiftR` shift) | shift <- [40, 32 .. 0]]) <> foldMap le32 subs)
+      entryOf kind flags body = BS.pack [kind, flags] <> le16 (fromIntegral (4 + BS.length body)) <> body
+      common kind flags mask sid trailing = entryOf kind flags (le32 mask <> sid <> trailing)
+      compound flags mask sid = entryOf 0x4 flags (le32 mask <> le16 1 <> le16 0 <> sid)
+      object kind flags mask objectFlags sid = entryOf kind flags (le32 mask <> le32 objectFlags <> BS.replicate (16 * popCount objectFlags) 0xAB <> sid)
+      aclOf entries = BS.pack [2, 0] <> le16 (fromIntegral (8 + sum (map BS.length entries))) <> le16 (fromIntegral (length entries)) <> le16 0 <> mconcat entries
+      -- The DACL is Nothing for a descriptor that says it has none, Just
+      -- Nothing for a null one, and otherwise the DACL's bytes.
+      descriptorOf owner dacl =
+        let ownerBytes = fromMaybe BS.empty owner
+            daclBytes = fromMaybe BS.empty (join dacl)
+            offsetOf part at = if BS.null part then 0 else at
+         in BS.pack [1, 0]
+              <> le16 (0x8000 .|. maybe 0 (const 0x4) dacl)
+              <> le32 (offsetOf ownerBytes 20)
+              <> le32 0
+              <> le32 0
+              <> le32 (offsetOf daclBytes (20 + fromIntegral (BS.length ownerBytes)))
+              <> ownerBytes
+              <> daclBytes
+      -- SIDs spelled byte by byte, apart from sidBytes.
+      systemBytes = BS.pack [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]
+      administratorsBytes = BS.pack [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 0x02, 0, 0]
+      authenticatedBytes = BS.pack [1, 1, 0, 0, 0, 0, 0, 5, 11, 0, 0, 0]
+      creatorOwnerBytes = BS.pack [1, 1, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0]
+      userBytes = BS.pack [1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0xE9, 0x03, 0, 0]
+      -- Owned by Administrators, with a DACL of one entry, full control
+      -- for SYSTEM passed down (OICI), spelled byte by byte.
+      fixture =
+        BS.pack
+          ( [1, 0, 0x04, 0x80, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 0, 0]
+              <> [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 0x02, 0, 0]
+              <> [2, 0, 28, 0, 1, 0, 0, 0]
+              <> [0, 0x03, 20, 0, 0xFF, 0x01, 0x1F, 0, 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]
+          )
+      setByte index value bytes = BS.take index bytes <> BS.singleton value <> BS.drop (index + 1) bytes
+      ownedByUser dacl = descriptorOf (Just userBytes) (Just (Just (aclOf dacl)))
+      -- The kinds of entry each layout holds, spelled apart from the
+      -- library's tables.
+      commonKinds = [0x0, 0x1, 0x2, 0x3, 0x9, 0xA, 0xD, 0xE]
+      objectKinds = [0x5, 0x6, 0x7, 0x8, 0xB, 0xC, 0xF, 0x10]
+      allowKinds = [0x0, 0x4, 0x5, 0x9, 0xB]
+      -- An entry's bytes and what it is read as, for a generated type,
+      -- flags, mask, object flags and SID.
+      encodedEntry (kind, flags, mask, objectFlags, sidText) = do
+        sid <- sidBytes sidText
+        named <- sidFromText sidText
+        let meaning
+              | kind `elem` allowKinds = AllowEntry mask named
+              | kind `elem` (0x4 : commonKinds <> objectKinds) = OtherEntry
+              | otherwise = UnknownEntry kind
+            bytes
+              | kind == 0x4 = compound flags mask sid
+              | kind `elem` objectKinds = object kind flags mask objectFlags sid
+              | otherwise = common kind flags mask sid BS.empty
+        pure (bytes, meaning)
+      genEntry = (,,,,) <$> QC.choose (0, 0x14) <*> QC.arbitrary <*> QC.arbitrary <*> QC.choose (0, 3) <*> genSid
+      genDacl = QC.oneof [pure Nothing, pure (Just Nothing), Just . Just <$> QC.resize 6 (QC.listOf genEntry)]
+      -- A generated descriptor's bytes and what they are read as.
+      encodedDescriptor (ownerText, daclSpec) = do
+        owner <- traverse sidBytes ownerText
+        ownerSid <- traverse sidFromText ownerText
+        entries <- traverse (traverse (traverse encodedEntry)) daclSpec
+        let dacl = fmap (fmap (aclOf . map fst)) entries
+        pure (descriptorOf owner dacl, DirSecurity ownerSid (fmap (map snd) =<< entries))
+      -- Open the store again, and expect it refused for the directory,
+      -- for the reason given.
+      refusedFor root dir reason = do
+        store <- unStoreDir <$> canonicalStoreDir (StoreDir root)
+        outcome <- try (openStore testLogger (StoreDir root) >>= closeStore)
+        pure $ case (reason, outcome) of
+          (Nothing, _) -> Fail "the reason names no SID"
+          (Just why, Left err)
+            | isUserError err -> assertEqual "the refusal" (distrustMessage dir store why) (ioeGetErrorString err)
+            | otherwise -> Fail ("expected a refusal, got: " <> T.pack (show (err :: IOException)))
+          (Just _, Right ()) -> Fail "the store was opened"
+      -- icacls changes a DACL or an owner, as another account's tools
+      -- would; its exit code says whether it could.
+      icacls args = do
+        (code, out, err) <- Proc.readProcessWithExitCode "icacls" args ""
+        pure (code, out <> err)
+      -- nova-nix makes the store, and icacls changes its parent.
+      madeThenChanged label args = do
+        let root = scratch label </> "nix" </> "store"
+        openStore testLogger (StoreDir root) >>= closeStore
+        parent <- takeDirectory . unStoreDir <$> canonicalStoreDir (StoreDir root)
+        (code, said) <- icacls (parent : args)
+        pure (root, parent, code, said)
   sequence
     [ runTest "a store directory's DACL is protected, with full control for the user, SYSTEM and Administrators and read and execute for Users, each passed down" $
         assertEqual
@@ -1528,7 +1906,254 @@ testStoreAccessIO = do
           after <- directoryDacl root
           pure $
             assertEqual "protected before the open" (Just False) (daclProtected <$> before)
-              `andThen` assertEqual "the DACL after the open" before after
+              `andThen` assertEqual "the DACL after the open" before after,
+      runTest "the directories down to a store are those below its volume root, outermost first, the store's made with StoreAccess and its parents with ParentAccess" $
+        assertEqual "the default store" [("C:\\nix", ParentAccess), ("C:\\nix\\store", StoreAccess)] (storeDirectories "C:\\nix\\store")
+          `andThen` assertEqual
+            "a store further down"
+            [("D:\\a", ParentAccess), ("D:\\a\\_temp", ParentAccess), ("D:\\a\\_temp\\store", StoreAccess)]
+            (storeDirectories "D:\\a\\_temp\\store")
+          `andThen` assertEqual "a store at a drive root" [] (storeDirectories "E:\\")
+          `andThen` assertEqual "a trailing separator" [("C:\\nix", ParentAccess), ("C:\\nix\\store", StoreAccess)] (storeDirectories "C:\\nix\\store\\"),
+      runTest "the directories a store's open checks are those down to the store, then its state directory, made with StoreAccess" $
+        assertEqual
+          "the default store"
+          [("C:\\nix", ParentAccess), ("C:\\nix\\store", StoreAccess), ("C:\\nix\\store\\.nova-nix", StoreAccess)]
+          (stateDirectories "C:\\nix\\store\\.nova-nix")
+          `andThen` assertEqual "a store at a drive root" [("E:\\.nova-nix", StoreAccess)] (stateDirectories "E:\\.nova-nix"),
+      decides "install-nova-nix's DACL, on a directory the user owns, is trusted with a store" (Just someUser) (Just installerEntries) accepted,
+      decides "a directory Administrators own, as one an elevated shell makes is, is trusted" (Just administrators) (Just installerEntries) accepted,
+      decides "a directory SYSTEM owns is trusted" (Just localSystem) (Just installerEntries) accepted,
+      decides "a directory another account owns is refused, naming its owner" (Just otherUser) (Just installerEntries) (refusedAs (OwnedBy . Just <$> sidFromText otherUser)),
+      decides "a directory with no owner is refused" Nothing (Just installerEntries) (refusedAs (Just (OwnedBy Nothing))),
+      decides "a directory with no DACL, or a null one, is refused" (Just someUser) Nothing (refusedAs (Just NoDacl)),
+      decides "an empty DACL, which grants no account anything, is trusted" (Just someUser) (Just []) accepted,
+      decides
+        "the DACL a client edition's drive root passes down is refused for its modify for Authenticated Users"
+        (Just someUser)
+        (Just [allowing fullControl administrators, allowing fullControl localSystem, allowing readAndExecute users, allowing modify authenticatedUsers])
+        (writableBy authenticatedUsers),
+      decides
+        "the DACL a server edition's drive root passes down is refused for its first grant to Users, to add a subdirectory"
+        (Just administrators)
+        (Just [allowing fullControl localSystem, allowing fullControl administrators, allowing readAndExecute users, allowing 0x4 users, allowing 0x2 users, allowing 0x10000000 creatorOwner])
+        (writableBy users),
+      decides
+        "read and execute for Users and Everyone, and the generic read and execute C:\\Users passes down, change nothing and are trusted"
+        (Just someUser)
+        (Just (installerEntries <> [allowing readAndExecute everyone, allowing genericReadExecute everyone]))
+        accepted,
+      decides "a deny, audit or alarm entry, whatever it names, is trusted" (Just someUser) (Just (Just OtherEntry : installerEntries)) accepted,
+      decides "an entry of a type nova-nix cannot read is refused" (Just someUser) (Just (installerEntries <> [Just (UnknownEntry 0x11)])) (refusedAs (Just UnreadableEntry)),
+      decides
+        "of two entries another account could change the directory through, the first is named"
+        (Just someUser)
+        (Just [allowing 0x40 authenticatedUsers, allowing fullControl users])
+        (writableBy authenticatedUsers),
+      runTest "each right that changes a directory, granted alone to another account, is refused, and every other right together is trusted" $
+        foldr
+          (\(name, rights) rest -> assertEqual name (writableBy authenticatedUsers) (decision (Just someUser) (Just [allowing rights authenticatedUsers])) `andThen` rest)
+          Pass
+          changingRights
+          `andThen` assertEqual
+            "every other right"
+            accepted
+            (decision (Just someUser) (Just [allowing (complement (foldr ((.|.) . snd) 0 changingRights)) authenticatedUsers])),
+      runTest "one SID is trusted whatever the case of its wide authority's hexadecimal digits" $
+        fromMaybe (Fail "not a SID") $ do
+          user <- sidFromText "S-1-0x123456789abc-1"
+          spelled <- sidFromText "S-1-0x123456789ABC-1"
+          pure (assertEqual "the decision" Nothing (securityDistrust user (DirSecurity (Just spelled) (Just [AllowEntry fullControl spelled])))),
+      -- What nova-nix creates a directory with, read back from the SDDL
+      -- it writes.
+      runTestM "a directory nova-nix creates, owned by the user, is trusted with a store, for every user and access" $
+        let readBack user sddl = do
+              entries <- sddlEntries sddl
+              DirSecurity (Just user) . Just <$> traverse allowEntryOf entries
+            allowEntryOf fields = case fields of
+              ["A", "OICI", rights, "", "", trustee] -> AllowEntry <$> readMaybe (T.unpack rights) <*> sidFromText trustee
+              _ -> Nothing
+         in property $
+              QC.forAll genSid $ \text -> case sidFromText text of
+                Nothing -> QC.counterexample ("refused " <> T.unpack text) False
+                Just user ->
+                  QC.conjoin
+                    [ QC.counterexample (show access) (fmap (securityDistrust user) (readBack user (accessSddl user access)) QC.=== Just Nothing)
+                    | access <- [StoreAccess, ParentAccess, OwnerAccess]
+                    ],
+      runTest "a security descriptor is read as MS-DTYP lays it out" $
+        fromMaybe (Fail "not a SID") $ do
+          owner <- sidFromText administrators
+          system <- sidFromText localSystem
+          pure $
+            assertEqual "the fixture" (Just (DirSecurity (Just owner) (Just [AllowEntry fullControl system]))) (parseSecurityDescriptor fixture)
+              `andThen` assertEqual "the fixture as built" fixture (descriptorOf (Just administratorsBytes) (Just (Just (aclOf [common 0x0 0x03 fullControl systemBytes BS.empty])))),
+      runTest "an inherit-only entry granting another account a change is refused" $
+        fromMaybe (Fail "not a SID") $ do
+          user <- sidFromText someUser
+          grantee <- sidFromText creatorOwner
+          -- OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE
+          pure (assertEqual "the decision" (Just (WritableBy grantee)) (descriptorDistrust user (ownedByUser [common 0x0 0x0B 0x10000000 creatorOwnerBytes BS.empty]))),
+      runTest "a null DACL, a descriptor that says it has no DACL, and one with no owner are refused" $
+        fromMaybe (Fail "not a SID") $ do
+          user <- sidFromText someUser
+          pure $
+            assertEqual "a null DACL" (Just NoDacl) (descriptorDistrust user (descriptorOf (Just userBytes) (Just Nothing)))
+              `andThen` assertEqual "no DACL" (Just NoDacl) (descriptorDistrust user (descriptorOf (Just userBytes) Nothing))
+              `andThen` assertEqual "no owner" (Just (OwnedBy Nothing)) (descriptorDistrust user (descriptorOf Nothing (Just (Just (aclOf []))))),
+      runTest "an allow entry of every kind is read, past a callback's data and an object entry's GUIDs" $
+        fromMaybe (Fail "not a SID") $ do
+          user <- sidFromText someUser
+          grantee <- sidFromText authenticatedUsers
+          pure $
+            assertEqual
+              "the entries"
+              (Just (DirSecurity (Just user) (Just (replicate 5 (AllowEntry 0x2 grantee)))))
+              ( parseSecurityDescriptor
+                  ( ownedByUser
+                      [ common 0x0 0x0 0x2 authenticatedBytes BS.empty,
+                        common 0x9 0x0 0x2 authenticatedBytes "callback data",
+                        compound 0x0 0x2 authenticatedBytes,
+                        object 0x5 0x0 0x2 3 authenticatedBytes,
+                        object 0xB 0x0 0x2 1 authenticatedBytes
+                      ]
+                  )
+              ),
+      runTest "a deny, audit or alarm entry of every kind grants nothing, and an entry of a later type, such as a mandatory label, is unreadable" $
+        fromMaybe (Fail "not a SID") $ do
+          user <- sidFromText someUser
+          let granting kind
+                | kind `elem` objectKinds = object kind 0x0 0xFFFFFFFF 2 authenticatedBytes
+                | otherwise = common kind 0x0 0xFFFFFFFF authenticatedBytes BS.empty
+              restricting = [0x1, 0x2, 0x3, 0xA, 0xD, 0xE, 0x6, 0x7, 0x8, 0xC, 0xF, 0x10]
+          pure $
+            assertEqual "the entries" (Just (DirSecurity (Just user) (Just (map (const OtherEntry) restricting)))) (parseSecurityDescriptor (ownedByUser (map granting restricting)))
+              `andThen` assertEqual "a mandatory label" (Just UnreadableEntry) (descriptorDistrust user (ownedByUser [common 0x11 0x0 0x1 authenticatedBytes BS.empty])),
+      runTest "bytes that are not a security descriptor are refused as unreadable" $
+        fromMaybe (Fail "not a SID") $ do
+          user <- sidFromText someUser
+          let malformed =
+                [ ("empty", BS.empty),
+                  ("a header cut short", BS.take 19 fixture),
+                  ("another revision", setByte 0 2 fixture),
+                  ("not self-relative", setByte 3 0x00 fixture),
+                  ("an owner past the end", setByte 4 200 fixture),
+                  ("an ACL past the end", setByte 38 60 fixture),
+                  ("an entry past its ACL", setByte 46 40 fixture),
+                  ("an entry smaller than its header", setByte 46 2 fixture),
+                  ("more entries than the ACL holds", setByte 40 2 fixture),
+                  ("a SID of another revision", setByte 20 2 fixture),
+                  ("a SID of sixteen subauthorities", descriptorOf (Just (BS.pack [1, 16, 0, 0, 0, 0, 0, 5] <> foldMap le32 (replicate 16 1))) Nothing)
+                ]
+          pure (foldr (\(name, bytes) rest -> assertEqual name (Just UnreadableDescriptor) (descriptorDistrust user bytes) `andThen` rest) Pass malformed),
+      runTestM "a descriptor is read back as it was laid out, and no part of it cut short is read" $
+        property $
+          QC.forAll ((,) <$> QC.oneof [pure Nothing, Just <$> genSid] <*> genDacl) $ \spec -> case encodedDescriptor spec of
+            Nothing -> QC.counterexample "a generated SID does not encode" False
+            Just (bytes, expected) ->
+              parseSecurityDescriptor bytes QC.=== Just expected
+                QC..&&. QC.conjoin [QC.counterexample ("cut to " <> show size) (parseSecurityDescriptor (BS.take size bytes) QC.=== Nothing) | size <- [0 .. BS.length bytes - 1]],
+      runTest "a refusal names the directory, what is wrong with it and the store, and says to move the directory aside" $
+        fromMaybe (Fail "not a SID") $ do
+          owner <- sidFromText otherUser
+          grantee <- sidFromText authenticatedUsers
+          let refusal = distrustMessage "C:\\nix" "C:\\nix\\store"
+              advice = ", so the store in C:\\nix\\store cannot be trusted; move C:\\nix aside and let nova-nix or install-nova-nix create it"
+          pure $
+            assertEqual "another owner" ("C:\\nix belongs to S-1-5-21-1-2-3-1002, not to you, SYSTEM or Administrators" <> advice) (refusal (OwnedBy (Just owner)))
+              `andThen` assertEqual "no owner" ("C:\\nix belongs to no one, not to you, SYSTEM or Administrators" <> advice) (refusal (OwnedBy Nothing))
+              `andThen` assertEqual "no DACL" ("C:\\nix has no DACL, which lets every account change it" <> advice) (refusal NoDacl)
+              `andThen` assertEqual "an unreadable entry" ("C:\\nix carries an access entry of a kind nova-nix cannot read" <> advice) (refusal UnreadableEntry)
+              `andThen` assertEqual "a grant" ("C:\\nix lets S-1-5-11 change it" <> advice) (refusal (WritableBy grantee))
+              `andThen` assertEqual "an unreadable descriptor" ("C:\\nix has a security descriptor nova-nix cannot read" <> advice) (refusal UnreadableDescriptor),
+      -- The first open checks every directory above the store's parents
+      -- in the temporary directory, which nova-nix did not make; the
+      -- second checks those it made.
+      onWindows "a store nova-nix made, and the parents it made for it, are trusted when it is opened again" $ \_ ->
+        fresh "reopened" $ do
+          let root = scratch "reopened" </> "nix" </> "store"
+          openStore testLogger (StoreDir root) >>= closeStore
+          outcome <- try (openStore testLogger (StoreDir root) >>= closeStore)
+          pure (either (\err -> Fail ("the second open failed: " <> T.pack (show (err :: IOException)))) (const Pass) outcome),
+      -- An evaluation's write can come before the store is opened: its
+      -- directories are made as the open makes them, and the state
+      -- directory, which only the open makes, is not.
+      onWindows "a store an evaluation writes to first is made closed to other users, its parents too" $ \user ->
+        fresh "eval-first" $ do
+          let root = scratch "eval-first" </> "nix" </> "store"
+          written <- evalNixIOStore (StoreDir root) tmpBase "builtins.toFile \"written\" \"by an evaluation\""
+          outer <- carries "the outer parent" (parentEntries user) (scratch "eval-first")
+          inner <- carries "the inner parent" (parentEntries user) (scratch "eval-first" </> "nix")
+          storeDir <- carries "the store directory" (storeEntries user) root
+          stateMade <- doesDirectoryExist (root </> metaDirName)
+          pure $
+            either (\err -> Fail ("the evaluation failed: " <> err)) (const Pass) written
+              `andThen` outer
+              `andThen` inner
+              `andThen` storeDir
+              `andThen` assertEqual "the state directory made" False stateMade,
+      onWindows "an evaluation's write into a store whose parent lets Authenticated Users change it is refused in the open's words" $ \_ ->
+        fresh "eval-refused" $ do
+          (root, parent, code, said) <- madeThenChanged "eval-refused" ["/grant", "*" <> T.unpack authenticatedUsers <> ":(OI)(CI)(M)"]
+          store <- unStoreDir <$> canonicalStoreDir (StoreDir root)
+          written <- evalNixIOStore (StoreDir root) tmpBase "builtins.toFile \"written\" \"by an evaluation\""
+          pure $ case (code, written, sidFromText authenticatedUsers) of
+            (ExitFailure _, _, _) -> Fail ("icacls could not grant the right: " <> T.pack said)
+            (ExitSuccess, Left err, Just grantee)
+              | T.pack (distrustMessage parent store (WritableBy grantee)) `T.isInfixOf` err -> Pass
+            (ExitSuccess, outcome, _) -> Fail ("expected the write refused, got: " <> T.pack (show outcome)),
+      -- LOCAL SERVICE stands for another user: giving a directory away
+      -- takes the restore privilege an elevated shell holds.
+      onWindows "a store whose parent another account owns is refused, naming the parent and its owner" $ \_ ->
+        fresh "owned" $ do
+          (root, parent, code, said) <- madeThenChanged "owned" ["/setowner", "*" <> T.unpack localService]
+          case code of
+            ExitFailure _ -> Pass <$ putStrLn ("  SKIP  giving a directory another owner needs an elevated shell: " <> said)
+            ExitSuccess -> refusedFor root parent (OwnedBy . Just <$> sidFromText localService),
+      onWindows "a store whose parent lets Authenticated Users change it is refused, by the read-only queries too, naming the parent and them" $ \_ ->
+        fresh "granted" $ do
+          (root, parent, code, said) <- madeThenChanged "granted" ["/grant", "*" <> T.unpack authenticatedUsers <> ":(OI)(CI)(M)"]
+          case code of
+            ExitFailure _ -> pure (Fail ("icacls could not grant the right: " <> T.pack said))
+            ExitSuccess -> do
+              opened <- refusedFor root parent (WritableBy <$> sidFromText authenticatedUsers)
+              store <- unStoreDir <$> canonicalStoreDir (StoreDir root)
+              queried <- try (sqValidPaths (localQueries (StoreDir root)) Set.empty)
+              pure $
+                opened `andThen` case (queried, sidFromText authenticatedUsers) of
+                  (Left err, Just grantee)
+                    | isUserError err -> assertEqual "the read-only refusal" (distrustMessage parent store (WritableBy grantee)) (ioeGetErrorString err)
+                  (outcome, _) -> Fail ("expected the read-only queries refused, got: " <> T.pack (show (outcome :: Either IOException (Set.Set StorePath)))),
+      -- Upstream's database beside the store makes the store's tree
+      -- answer a read-only query in place of nova-nix's database.
+      onWindows "a store upstream's database also manages, whose parent lets Authenticated Users change it, is refused before its tree answers a query" $ \_ ->
+        fresh "upstream" $ do
+          (root, parent, code, said) <- madeThenChanged "upstream" ["/grant", "*" <> T.unpack authenticatedUsers <> ":(OI)(CI)(M)"]
+          let upstreamDatabase = parent </> "var" </> "nix" </> "db" </> "db.sqlite"
+          createDirectoryIfMissing True (takeDirectory upstreamDatabase)
+          BS.writeFile upstreamDatabase BS.empty
+          store <- unStoreDir <$> canonicalStoreDir (StoreDir root)
+          queried <- try (sqValidPaths (localQueries (StoreDir root)) Set.empty)
+          pure $ case (code, queried, sidFromText authenticatedUsers) of
+            (ExitFailure _, _, _) -> Fail ("icacls could not grant the right: " <> T.pack said)
+            (ExitSuccess, Left err, Just grantee)
+              | isUserError err -> assertEqual "the refusal" (distrustMessage parent store (WritableBy grantee)) (ioeGetErrorString err)
+            (ExitSuccess, outcome, _) -> Fail ("expected the query refused, got: " <> T.pack (show (outcome :: Either IOException (Set.Set StorePath)))),
+      onWindows "a store whose parent passes down full control for CREATOR OWNER, an inherit-only entry, is refused" $ \_ ->
+        fresh "inherit-only" $ do
+          (root, parent, code, said) <- madeThenChanged "inherit-only" ["/grant", "*" <> T.unpack creatorOwner <> ":(OI)(CI)(IO)(F)"]
+          case code of
+            ExitFailure _ -> pure (Fail ("icacls could not grant the right: " <> T.pack said))
+            ExitSuccess -> refusedFor root parent (WritableBy <$> sidFromText creatorOwner),
+      onWindows "a store whose parent grants Users read and execute and denies Guests a write is trusted" $ \_ ->
+        fresh "read-only" $ do
+          (root, parent, granted, said) <- madeThenChanged "read-only" ["/grant", "*" <> T.unpack users <> ":(OI)(CI)(RX)"]
+          (denied, deniedSaid) <- icacls [parent, "/deny", "*S-1-5-32-546:(W)"]
+          case (granted, denied) of
+            (ExitSuccess, ExitSuccess) -> do
+              outcome <- try (openStore testLogger (StoreDir root) >>= closeStore)
+              pure (either (\err -> Fail ("the open failed: " <> T.pack (show (err :: IOException)))) (const Pass) outcome)
+            _ -> pure (Fail ("icacls could not change the DACL: " <> T.pack (said <> deniedSaid)))
     ]
 
 -- ---------------------------------------------------------------------------
@@ -1853,8 +2478,8 @@ testStoreDelete = do
       [ runTestM "referenced path is refused with its referrers listed" $ do
           registerPaths
             (stDB store)
-            [ PathRegistration dep "sha256:d" 1 Nothing [],
-              PathRegistration user "sha256:u" 1 Nothing [dep]
+            [ PathRegistration dep "sha256:d" 1 Nothing [] NotUltimate Set.empty Nothing,
+              PathRegistration user "sha256:u" 1 Nothing [dep] NotUltimate Set.empty Nothing
             ]
           outcome <- deleteNamed store (basenameOf dep)
           stillValid <- isValid store dep
@@ -1895,9 +2520,9 @@ testStoreDelete = do
           mapM_ plant batchPaths
           registerPaths
             (stDB store)
-            [ PathRegistration batchDep "sha256:bd" 1 Nothing [],
-              PathRegistration batchUser "sha256:bu" 1 Nothing [batchDep],
-              PathRegistration batchAfter "sha256:ba" 1 Nothing []
+            [ PathRegistration batchDep "sha256:bd" 1 Nothing [] NotUltimate Set.empty Nothing,
+              PathRegistration batchUser "sha256:bu" 1 Nothing [batchDep] NotUltimate Set.empty Nothing,
+              PathRegistration batchAfter "sha256:ba" 1 Nothing [] NotUltimate Set.empty Nothing
             ]
           reports <- newIORef []
           let report name removed = do
@@ -1924,7 +2549,7 @@ testStoreDelete = do
             other -> Fail ("wrong batch: " <> T.pack (show (other, reported, afterKept))),
         runTestM "a registered row without a tree deletes (repair case)" $ do
           let ghost = StorePath (T.replicate 32 "c") "del-ghost"
-          registerPath (stDB store) (PathRegistration ghost "sha256:g" 1 Nothing [])
+          registerPath (stDB store) (PathRegistration ghost "sha256:g" 1 Nothing [] NotUltimate Set.empty Nothing)
           outcome <- deleteNamed store (basenameOf ghost)
           pure $ case outcome of
             Right removed
@@ -1946,7 +2571,7 @@ testStoreDelete = do
         runTestM "a read-only registered tree deletes fully" $ do
           let solid = StorePath (T.replicate 32 "e") "del-solid"
               treePath = storePathToFilePath sd solid
-          registerPath (stDB store) (PathRegistration solid "sha256:s" 1 Nothing [])
+          registerPath (stDB store) (PathRegistration solid "sha256:s" 1 Nothing [] NotUltimate Set.empty Nothing)
           createDirectoryIfMissing True treePath
           TIO.writeFile (treePath </> "data.txt") "content"
           canonicalizeMetadata treePath
@@ -1960,7 +2585,7 @@ testStoreDelete = do
             Left err -> Fail err,
         runTestM "a self-referencing path deletes" $ do
           let selfp = StorePath (T.replicate 32 "f") "del-self"
-          registerPath (stDB store) (PathRegistration selfp "sha256:f" 1 Nothing [selfp])
+          registerPath (stDB store) (PathRegistration selfp "sha256:f" 1 Nothing [selfp] NotUltimate Set.empty Nothing)
           outcome <- deleteNamed store (basenameOf selfp)
           pure (assertEqual "self delete" (Right (DeleteOutcome True False)) outcome),
         runTestM "a target with neither row nor tree is an error" $ do
@@ -2111,7 +2736,7 @@ testStoreDelete = do
         runTestM "delete removes a registered store object named like a lock file" $ do
           let object = StorePath (T.replicate 32 "k") "flake.lock"
               objectPath = storePathToFilePath sd object
-          registerPath (stDB store) (PathRegistration object "sha256:m" 1 Nothing [])
+          registerPath (stDB store) (PathRegistration object "sha256:m" 1 Nothing [] NotUltimate Set.empty Nothing)
           TIO.writeFile objectPath "pinned inputs"
           outcome <- deleteNamed store (basenameOf object)
           gone <- not <$> Dir.doesPathExist objectPath
@@ -2139,7 +2764,7 @@ testStoreDelete = do
         runTestM "delete waits for a held path lock and proceeds on release" $ do
           let guarded = StorePath (T.replicate 32 "i") "del-locked"
               treePath = storePathToFilePath sd guarded
-          registerPath (stDB store) (PathRegistration guarded "sha256:l" 1 Nothing [])
+          registerPath (stDB store) (PathRegistration guarded "sha256:l" 1 Nothing [] NotUltimate Set.empty Nothing)
           createDirectoryIfMissing True treePath
           TIO.writeFile (treePath </> "data.txt") "guarded"
           holder <- acquirePathLock testLogger sd guarded
@@ -2313,9 +2938,9 @@ testStoreGC = do
           mapM_ (uncurry plant) [(dep, "dep"), (top, "top!"), (orphan, "orphan bytes")]
           registerPaths
             (stDB store)
-            [ PathRegistration dep "sha256:d" 1 Nothing [],
-              PathRegistration top "sha256:t" 1 Nothing [dep],
-              PathRegistration orphan "sha256:o" 1 Nothing []
+            [ PathRegistration dep "sha256:d" 1 Nothing [] NotUltimate Set.empty Nothing,
+              PathRegistration top "sha256:t" 1 Nothing [dep] NotUltimate Set.empty Nothing,
+              PathRegistration orphan "sha256:o" 1 Nothing [] NotUltimate Set.empty Nothing
             ]
         -- A refused collection is a failure of the test, not a result.
         collect = collectGarbage store >>= either (throwIO . userError . T.unpack) pure
@@ -2432,8 +3057,8 @@ testStoreGC = do
             mapM_ (uncurry plant) [(out, "o"), (dev, "d")]
             registerPaths
               (stDB store)
-              [ PathRegistration out "sha256:x" 1 Nothing [dev],
-                PathRegistration dev "sha256:y" 1 Nothing [out]
+              [ PathRegistration out "sha256:x" 1 Nothing [dev] NotUltimate Set.empty Nothing,
+                PathRegistration dev "sha256:y" 1 Nothing [out] NotUltimate Set.empty Nothing
               ]
             results <- collect
             remaining <- queryAllValidPaths (stDB store)
@@ -2535,7 +3160,7 @@ testStoreGC = do
                 case rooted of
                   Left err -> pure (Fail err)
                   Right link -> do
-                    let record = autoRootsDir sd </> indirectRootRecordName link
+                    let record = autoRootsDir sd </> indirectRootRecordName (TE.encodeUtf8 (T.pack link))
                     recordThere <- Dir.doesFileExist record
                     roots <- findRoots store
                     first <- collect
@@ -2557,7 +3182,7 @@ testStoreGC = do
               -- trailing separator, roots the path.
               runTestM "a symlink root into a store path's subtree or with a trailing separator roots the path" $ do
                 plant top "top"
-                registerPath (stDB store) (PathRegistration top "sha256:t" 1 Nothing [])
+                registerPath (stDB store) (PathRegistration top "sha256:t" 1 Nothing [] NotUltimate Set.empty Nothing)
                 let subLink = gcRootsDir sd </> "sub"
                     slashLink = gcRootsDir sd </> "slash"
                 Dir.createFileLink (storePathToFilePath sd top </> "data") subLink
@@ -2587,7 +3212,7 @@ testStoreGC = do
                     insideViaDotDot = takeDirectory (unStoreDir sd) </> takeFileName linkDir </> ".." </> takeFileName (unStoreDir sd) </> "result"
                 collapsed <- addOutLinkRoot store dotted top
                 target <- Dir.getSymbolicLinkTarget expectedLink
-                recorded <- BS.readFile (autoRootsDir sd </> indirectRootRecordName expectedLink)
+                recorded <- BS.readFile (autoRootsDir sd </> indirectRootRecordName (TE.encodeUtf8 (T.pack expectedLink)))
                 inside <- addOutLinkRoot store insideViaDotDot top
                 pure $ case (collapsed, inside) of
                   (Right link, Left insideErr)
@@ -3013,9 +3638,9 @@ testStoreOps = do
               p2 = StorePath "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn" "cl-p2"
           registerPaths
             (stDB store)
-            [ PathRegistration dep "sha256:cd" 1 Nothing [],
-              PathRegistration p1 "sha256:c1" 2 Nothing [dep],
-              PathRegistration p2 "sha256:c2" 3 Nothing [dep]
+            [ PathRegistration dep "sha256:cd" 1 Nothing [] NotUltimate Set.empty Nothing,
+              PathRegistration p1 "sha256:c1" 2 Nothing [dep] NotUltimate Set.empty Nothing,
+              PathRegistration p2 "sha256:c2" 3 Nothing [dep] NotUltimate Set.empty Nothing
             ]
           result <- computeClosure store [p1, p2]
           pure (assertEqual "closure order" (Right [dep, p1, p2]) result),

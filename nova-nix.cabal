@@ -127,6 +127,7 @@ library
     Nix.Builder.Sandbox
     Nix.Builder.Sandbox.Spawn
     Nix.Builder.Unpack
+    Nix.CacheDirectory
     Nix.Compression
     Nix.Config
     Nix.Daemon.Connection
@@ -330,8 +331,12 @@ executable nova-nix
 -- sandbox/linux.c, namespaces and a chroot, set up between their creation
 -- and the builder's exec, where nova-nix itself can run nothing; on
 -- macOS, sandbox/darwin.c, a profile applied in the builder's process
--- before its exec.  Both share sandbox/posix.c.  The runtime it links is
--- never started.  nova-nix finds it beside itself.
+-- before its exec; both share sandbox/posix.c.  On Windows,
+-- sandbox/windows.c starts the builder as a build slot's account, on a
+-- window station and desktop of its own, in a job, which takes advapi32's
+-- token and security calls and user32's window stations and desktops.
+-- The runtime it links is never started.  nova-nix finds it beside
+-- itself.
 -- ---------------------------------------------------------------------------
 
 executable nova-nix-sandbox
@@ -346,6 +351,11 @@ executable nova-nix-sandbox
     c-sources:      sandbox/linux.c sandbox/mountinfo.c sandbox/posix.c
   elif os(darwin)
     c-sources:      sandbox/darwin.c sandbox/posix.c
+  elif os(windows)
+    c-sources:      sandbox/windows.c
+    extra-libraries:
+        advapi32
+        user32
   else
     buildable: False
 
@@ -376,6 +386,7 @@ test-suite nova-nix-test
     Test.Store
     Test.Substituter
     Test.Trust
+    Test.WindowsSandbox
     UserResources
   default-language: Haskell2010
   default-extensions:
@@ -385,12 +396,13 @@ test-suite nova-nix-test
   -- under blocking foreign calls.
   ghc-options:      -Wall -Wcompat -Wno-pattern-namespace-specifier -threaded
   -- The sandbox helper's parsers, which the suite holds to the plans the
-  -- library renders and the mount tables it reads, and the key the Linux
-  -- sandbox tests plant.  No -std or -pedantic: GHC compiles the C it
-  -- generates for the executable's link with these options too, and the
-  -- RTS headers it includes are not strict C99; the C99-strict CI job
-  -- compiles these sources that way.
-  c-sources:        sandbox/plan.c sandbox/mountinfo.c test/cbits/sandbox_check.c test/cbits/keyring.c
+  -- library renders and the mount tables it reads, the key the Linux
+  -- sandbox tests plant, and the Windows calls the Windows sandbox tests
+  -- make, which build elsewhere as stubs.  No -std or -pedantic: GHC
+  -- compiles the C it generates for the executable's link with these
+  -- options too, and the RTS headers it includes are not strict C99; the
+  -- C99-strict CI job compiles these sources that way.
+  c-sources:        sandbox/plan.c sandbox/mountinfo.c test/cbits/sandbox_check.c test/cbits/keyring.c test/cbits/nn_test_sandbox_windows.c
   include-dirs:     sandbox
   cc-options:       -Wall -Wextra
 
@@ -419,15 +431,20 @@ test-suite nova-nix-test
     , zstd                >= 0.1 && < 0.2
 
   -- On Windows the store access tests read a directory's DACL back
-  -- through advapi32 (DirDacl); elsewhere the store metadata tests read
-  -- lstat (NodeStatus): a node's group and other bits, and a symlink's
-  -- own time.
+  -- through advapi32 (DirDacl), and the sandbox tests make build accounts
+  -- through netapi32 and advapi32, their passwords through bcrypt, and a
+  -- window station through user32; elsewhere the store metadata tests
+  -- read lstat (NodeStatus): a node's group and other bits, and a
+  -- symlink's own time.
   if os(windows)
     c-sources:
         test/cbits/nn_test_dacl.c
     cc-options:       -std=c99 -Wall -Wextra -pedantic
     extra-libraries:
         advapi32
+        bcrypt
+        netapi32
+        user32
   else
     build-depends:
         unix              >= 2.8 && < 2.9

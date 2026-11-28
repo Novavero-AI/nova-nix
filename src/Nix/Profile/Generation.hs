@@ -31,9 +31,18 @@
 -- released, as every lock file nova-nix takes does ("Nix.Store.Lock"), where
 -- upstream deletes it.
 --
+-- A rollback switches the profile's link to the newest generation below
+-- the current one, or to the one asked for, and wiping the history
+-- deletes the link of every generation but the current one, or of those
+-- made before a cutoff but the newest of them, each holding the
+-- profile's lock, as upstream does.  A generation's time is its link's own
+-- modification time.  A deleted generation's root record stays until the
+-- next collection finds its link gone, removes the record, and takes what
+-- only that generation kept.
+--
 -- The location, the names and the decisions are pure; the IO below lists
--- the profile's directory, reads its links, takes its lock and makes its
--- links.
+-- the profile's directory, reads its links and their times, takes its
+-- lock, and makes and removes its links.
 module Nix.Profile.Generation
   ( -- * Where profiles are
     StateHome (..),
@@ -53,9 +62,31 @@ module Nix.Profile.Generation
     generationName,
     parseGenerationName,
     generationsIn,
+    currentGeneration,
     NextGeneration (..),
     nextGeneration,
     listGenerations,
+
+    -- * When generations were made
+    EpochSeconds (..),
+    DatedGeneration (..),
+    generationDate,
+    currentEpochSeconds,
+    findGenerations,
+
+    -- * Rolling back and wiping history
+    Changes (..),
+    RollbackTarget (..),
+    rollbackPlan,
+    readGenerationNumber,
+    Days (..),
+    parseOlderThan,
+    cutoffBefore,
+    WipeScope (..),
+    WipeStep (..),
+    wipePlan,
+    switchGeneration,
+    wipeHistory,
 
     -- * A generation's store path
     NarTargets (..),
@@ -74,30 +105,34 @@ module Nix.Profile.Generation
   )
 where
 
-import Control.Exception (IOException, bracket, mask_, onException, try)
-import Control.Monad (when)
+import Control.Exception (IOException, bracket, catch, mask_, onException, try)
+import Control.Monad (unless, when)
 import Control.Monad.Except (ExceptT (..), runExceptT, throwError)
 import Control.Monad.IO.Class (liftIO)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
-import Data.Char (isDigit)
+import Data.Char (isAsciiLower, isAsciiUpper, isDigit, toUpper)
 import Data.Either (fromRight)
 import Data.Foldable (traverse_)
-import Data.List (isPrefixOf, sort, sortOn, stripPrefix)
+import Data.Int (Int32, Int64)
+import Data.List (isPrefixOf, sort, sortOn, stripPrefix, unsnoc)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Time.Clock.POSIX (getPOSIXTime, posixSecondsToUTCTime)
+import Data.Time.Format (defaultTimeLocale, formatTime)
 import Data.Word (Word64)
 import Nix.Environment (EnvLookup (..), lookupEnvBytes)
-import Nix.HostPath (hostPathBytes, hostPathFromBytes, hostPathText)
+import Nix.HostPath (absolutePath, hostPathBytes, hostPathFromBytes, hostPathText)
 import Nix.Logger (Logger (..), logWarning)
 import Nix.Profile.Manifest (Conflict, Manifest, ManifestError, attributeConflict, emptyManifest, manifestPackages, manifestReferences, parseManifest, renderManifest)
 import Nix.Profile.Tree (BuildEnvFailure (..), Built (..), Node (..), Package (..), Tree, buildProfile, storeTreeReader, warningText)
 import Nix.Store.Handle (canonicalStoreDir)
 import Nix.Store.Lock (LockMode (..), acquireLockFileWith, lockFileSuffix, releasePathLock)
+import Nix.Store.Metadata (nodeModificationTime)
 import Nix.Store.Ops (StoreOps (..))
 import Nix.Store.Path (StoreDir (..), StorePath, parseStorePathPrefix, storePathToFilePath)
 import qualified NovaCache.NAR as NAR
@@ -108,7 +143,6 @@ import System.OsPath (OsPath, (</>))
 import qualified System.OsPath as OP
 import Text.Read (readMaybe)
 #if defined(mingw32_HOST_OS)
-import Data.Maybe (fromMaybe)
 import Foreign.Ptr (nullPtr)
 import System.Win32.Shell (cSIDL_LOCAL_APPDATA, sHGFP_TYPE_CURRENT, sHGetFolderPath)
 #else
@@ -176,25 +210,6 @@ profileLinkPath place env = case place of
 -- | The default profile the link is made to: @profiles\/profile@.
 defaultProfilePath :: ProfileEnvironment -> OsPath
 defaultProfilePath env = profilesDirectory env </> ascii "profile"
-
--- | A path made absolute against a directory and collapsed, @.@ dropped
--- and @..@ taking off what precedes it, without reading a link:
--- upstream's @absPath@, which @--profile@ and a link's target go through
--- (@MixProfile::updateProfile@ in command.cc, @getDefaultProfile@ in
--- profiles.cc).
-absolutePath :: OsPath -> OsPath -> OsPath
-absolutePath base path = OP.joinPath (reverse (foldl' step [] (OP.splitDirectories joined)))
-  where
-    joined
-      | OP.isAbsolute path = path
-      | otherwise = base </> path
-    -- The components kept so far, last first.  A @..@ at the root stays
-    -- at the root.
-    step kept component
-      | component == ascii "." = kept
-      | component == ascii "..", parent : rest <- kept, not (OP.isAbsolute parent), parent /= component = rest
-      | component == ascii "..", root : _ <- kept, OP.isAbsolute root = kept
-      | otherwise = component : kept
 
 -- | Read where this user's profiles are from the environment, as upstream
 -- does: @NIX_STATE_HOME@, then on Unix @XDG_STATE_HOME@ and on Windows
@@ -350,19 +365,47 @@ parseGenerationName profileName name = do
   rest <- stripPrefix (OP.unpack profileName ++ [OP.unsafeFromChar '-']) (OP.unpack name)
   let chars = map OP.toChar rest
   number <- listToMaybe [take n chars | n <- [0 .. length chars], linkSuffix `isPrefixOf` drop n chars]
-  GenerationNumber <$> readUnsigned number
+  GenerationNumber <$> unsignedDecimal number
   where
     linkSuffix = "-link"
-    readUnsigned digits = case digits of
-      '+' : rest -> unsigned rest
-      _ -> unsigned digits
-    unsigned digits
-      | not (null digits), all isDigit digits = readMaybe digits >>= bounded
-      | otherwise = Nothing
-    bounded :: Integer -> Maybe Word64
-    bounded n
+
+-- | A profile's current generation, from what its link names as the link
+-- spells it: the generation that names when it parses as one of the
+-- profile's, as a switch writes it, by the generation's bare name, and
+-- none for an absolute or other target, or for a profile with no link,
+-- as upstream reads it.
+currentGeneration :: OsPath -> Maybe OsPath -> Maybe GenerationNumber
+currentGeneration profile target = target >>= parseGenerationName (OP.takeFileName profile)
+
+-- | Digits after an optional @+@, within 64 bits, as upstream reads an
+-- unsigned number.
+unsignedDecimal :: String -> Maybe Word64
+unsignedDecimal given = within =<< decimal (fromMaybe given (stripPrefix "+" given))
+  where
+    within :: Integer -> Maybe Word64
+    within n
       | n <= toInteger (maxBound :: Word64) = Just (fromInteger n)
       | otherwise = Nothing
+
+-- | Digits after an optional @+@ or @-@, within 32 bits, as upstream reads
+-- an int.
+signedDecimal :: String -> Maybe Int32
+signedDecimal given = within =<< signed
+  where
+    signed = case given of
+      '-' : digits -> negate <$> decimal digits
+      '+' : digits -> decimal digits
+      digits -> decimal digits
+    within :: Integer -> Maybe Int32
+    within n
+      | n >= toInteger (minBound :: Int32) && n <= toInteger (maxBound :: Int32) = Just (fromInteger n)
+      | otherwise = Nothing
+
+-- | One or more decimal digits, and nothing else.
+decimal :: String -> Maybe Integer
+decimal digits
+  | not (null digits), all isDigit digits = readMaybe digits
+  | otherwise = Nothing
 
 -- | The generations of a profile among the names of its directory, in
 -- order of number (@findGenerations@ in profiles.cc).  Names are taken in
@@ -483,6 +526,11 @@ data ProfileFailure
     TreeConflict !Conflict
   | -- | The store refused the generation's path or its root.
     StoreRefused !Text
+  | -- | A rollback to a generation the profile does not have.
+    NoSuchGeneration !GenerationNumber
+  | -- | A rollback to the generation before the current one, which the
+    -- profile does not have: the current one, when there is one.
+    NoOlderGeneration !(Maybe GenerationNumber)
   deriving (Eq, Show)
 
 -- | What a change makes of a profile's manifest.
@@ -657,6 +705,224 @@ withProfileLock logger profile action = do
   where
     waiting = "waiting for lock on profile \"" <> hostPathText profile <> "\""
     opening lockPath failure = ProfileIOFailed ("opening lock file \"" <> T.pack lockPath <> "\": " <> T.pack (show failure))
+
+-- ---------------------------------------------------------------------------
+-- When generations were made
+-- ---------------------------------------------------------------------------
+
+-- | A moment, in whole seconds since the epoch.
+newtype EpochSeconds = EpochSeconds Int64
+  deriving (Eq, Ord, Show)
+
+-- | A generation and when it was made: its link's own modification time.
+data DatedGeneration = DatedGeneration
+  { datedGeneration :: !Generation,
+    datedTime :: !EpochSeconds
+  }
+  deriving (Eq, Show)
+
+-- | The day a moment falls on in UTC, as @YYYY-MM-DD@, which a profile's
+-- history shows for each generation.
+generationDate :: EpochSeconds -> Text
+generationDate (EpochSeconds seconds) = T.pack (formatTime defaultTimeLocale "%Y-%m-%d" (posixSecondsToUTCTime (fromIntegral seconds)))
+
+-- | Now, rounded down to its second.
+currentEpochSeconds :: IO EpochSeconds
+currentEpochSeconds = EpochSeconds . floor <$> getPOSIXTime
+
+-- | A profile's generations in order of number, each with its link's own
+-- modification time, and its current generation, as upstream finds them:
+-- the directory is listed first, each generation's link read without
+-- following it, and then the profile's link.
+findGenerations :: OsPath -> IO (Either ProfileFailure ([DatedGeneration], Maybe GenerationNumber))
+findGenerations profile = runExceptT $ do
+  generations <- ExceptT (listGenerations profile)
+  dated <- traverse dating generations
+  current <- currentGeneration profile <$> ExceptT (profileToken profile)
+  pure (dated, current)
+  where
+    dating :: Generation -> ExceptT ProfileFailure IO DatedGeneration
+    dating generation = do
+      let path = generationPath generation
+      time <- liftIO (tryIO (OP.decodeFS path >>= nodeModificationTime))
+      case time of
+        Left failure -> throwError (ProfileIOFailed ("getting status of \"" <> hostPathText path <> "\": " <> T.pack (show failure)))
+        Right seconds -> pure (DatedGeneration generation (EpochSeconds seconds))
+
+-- ---------------------------------------------------------------------------
+-- Rolling back and wiping history
+-- ---------------------------------------------------------------------------
+
+-- | Whether a command changes the profile, or with @--dry-run@ only says
+-- what it would change.
+data Changes = MakeChanges | DryRun
+  deriving (Eq, Show)
+
+-- | The generation a rollback switches to.
+data RollbackTarget
+  = -- | The newest below the current one.
+    PreviousGeneration
+  | -- | The one of this number, which @--to@ gives.
+    GenerationAt !GenerationNumber
+  deriving (Eq, Show)
+
+-- | The generation a rollback switches to among a profile's generations
+-- in order of number, given its current one: the last listed that the
+-- target names, as upstream picks it.  A profile with no current
+-- generation has none below it.
+rollbackPlan :: RollbackTarget -> Maybe GenerationNumber -> [Generation] -> Either ProfileFailure Generation
+rollbackPlan target current generations = case reverse (filter (named target . generationNumber) generations) of
+  chosen : _ -> Right chosen
+  [] -> Left (refusal target)
+  where
+    named PreviousGeneration number = maybe False (number <) current
+    named (GenerationAt wanted) number = number == wanted
+    refusal PreviousGeneration = NoOlderGeneration current
+    refusal (GenerationAt wanted) = NoSuchGeneration wanted
+
+-- | A @--to@ value, as upstream reads one: an unsigned number of 64 bits,
+-- whose last character, when it is a letter, is a binary unit, @K@, @M@,
+-- @G@ or @T@ in either case, the number before it multiplied by 2^10,
+-- 2^20, 2^30 or 2^40 and wrapping past 64 bits as upstream's unsigned
+-- product does.  Any other letter, or a number that does not read, is
+-- refused in upstream's words, the number named without its unit.
+readGenerationNumber :: String -> Either Text GenerationNumber
+readGenerationNumber given = case unsnoc given of
+  Just (number, unit)
+    | isAsciiUpper unit || isAsciiLower unit -> do
+        let spelled = toUpper unit
+        multiplier <- maybe (Left ("invalid unit specifier '" <> T.singleton spelled <> "'")) Right (lookup spelled unitMultipliers)
+        GenerationNumber . (* multiplier) <$> unsigned number
+  _ -> GenerationNumber <$> unsigned given
+  where
+    unsigned number = maybe (Left ("'" <> T.pack number <> "' is not an integer")) Right (unsignedDecimal number)
+
+-- | The binary units a number upstream reads may end in, each with what
+-- it multiplies by.
+unitMultipliers :: [(Char, Word64)]
+unitMultipliers = [('K', 2 ^ (10 :: Int)), ('M', 2 ^ (20 :: Int)), ('G', 2 ^ (30 :: Int)), ('T', 2 ^ (40 :: Int))]
+
+-- | A number of days, as @--older-than@ gives one.
+newtype Days = Days Int32
+  deriving (Eq, Show)
+
+-- | An @--older-than@ value, as upstream reads one: a number of days,
+-- an int of at least 1, followed by @d@, refused in upstream's two
+-- messages otherwise.
+parseOlderThan :: String -> Either Text Days
+parseOlderThan spec = case unsnoc spec of
+  Just (count, 'd') -> maybe (Left ("invalid number of days specifier '" <> T.pack spec <> "'")) (Right . Days) (signedDecimal count >>= atLeastOne)
+  _ -> Left ("invalid number of days specifier '" <> T.pack spec <> "', expected something like '14d'")
+  where
+    atLeastOne days
+      | days >= 1 = Just days
+      | otherwise = Nothing
+
+-- | The moment a number of days before another.  The product is taken in
+-- 64 bits, where upstream takes it in an int, which more than 24855 days
+-- overflow.
+cutoffBefore :: EpochSeconds -> Days -> EpochSeconds
+cutoffBefore (EpochSeconds now) (Days days) = EpochSeconds (now - fromIntegral days * secondsPerDay)
+  where
+    secondsPerDay = 24 * 60 * 60
+
+-- | Which generations wiping a profile's history deletes.
+data WipeScope
+  = -- | Every one but the current one.
+    WipeEveryOld
+  | -- | Those made before this moment but the newest of them, and never
+    -- the current one.
+    WipeOlderThan !EpochSeconds
+  deriving (Eq, Show)
+
+-- | One step of wiping a profile's history.
+data WipeStep
+  = -- | Delete this generation.
+    RemoveGeneration !GenerationNumber
+  | -- | Keep this generation, made after the cutoff though a later one
+    -- was made before it, with upstream's warning.
+    KeepNewerGeneration !GenerationNumber
+  deriving (Eq, Show)
+
+-- | The steps of wiping a profile's history, given its generations in
+-- order of number with when each was made, and its current one, as
+-- upstream takes them.  Every generation but the current one goes, in
+-- order of number, or under a cutoff the generations are taken newest
+-- first: those down to the newest made before the cutoff stay, that one
+-- too, since the profile held it at the cutoff and can be rolled back to
+-- it, and of those after it each made before the cutoff goes, unless it
+-- is the current one, and each made after it stays with a warning, as a
+-- clock that was wrong or a copy that dropped the times leaves one.  A
+-- profile with no current generation keeps none for being current.
+wipePlan :: WipeScope -> Maybe GenerationNumber -> [DatedGeneration] -> [WipeStep]
+wipePlan scope current dated = case scope of
+  WipeEveryOld -> [RemoveGeneration number | number <- map numberOf dated, notCurrent number]
+  WipeOlderThan cutoff ->
+    let older entry = datedTime entry < cutoff
+        pastNewestOlder = drop 1 (dropWhile (not . older) (reverse dated))
+     in mapMaybe (olderStep older) pastNewestOlder
+  where
+    numberOf = generationNumber . datedGeneration
+    notCurrent number = Just number /= current
+    olderStep older entry
+      | not (older entry) = Just (KeepNewerGeneration (numberOf entry))
+      | notCurrent (numberOf entry) = Just (RemoveGeneration (numberOf entry))
+      | otherwise = Nothing
+
+-- | Switch a profile to the generation a rollback names, holding its lock,
+-- with upstream's line naming the two generations, the current one 0 when
+-- there is none; with 'DryRun' only the line.  The line and a wait on the
+-- lock go to the logger.
+switchGeneration :: Logger -> OsPath -> RollbackTarget -> Changes -> IO (Either ProfileFailure ())
+switchGeneration logger profile target changes = withProfileLock logger profile . runExceptT $ do
+  (dated, current) <- ExceptT (findGenerations profile)
+  destination <- ExceptT (pure (rollbackPlan target current (map datedGeneration dated)))
+  liftIO (logMessage logger ("switching profile from version " <> numberText (fromMaybe (GenerationNumber 0) current) <> " to " <> numberText (generationNumber destination)))
+  case changes of
+    DryRun -> pure ()
+    MakeChanges -> ExceptT (first ProfileIOFailed <$> replaceLink profile (OP.takeFileName (generationPath destination)))
+
+-- | Wipe a profile's history as 'wipePlan' plans it, holding its lock,
+-- with upstream's line for each generation deleted and its warning for
+-- each kept; with 'DryRun' the line says the generation would be deleted,
+-- and none is.  A generation is deleted by its name for its number, as
+-- upstream deletes one.  The lines, the warnings and a wait on the lock go
+-- to the logger.
+wipeHistory :: Logger -> OsPath -> WipeScope -> Changes -> IO (Either ProfileFailure ())
+wipeHistory logger profile scope changes = withProfileLock logger profile . runExceptT $ do
+  (dated, current) <- ExceptT (findGenerations profile)
+  traverse_ apply (wipePlan scope current dated)
+  where
+    apply step = case (step, changes) of
+      (KeepNewerGeneration number, _) ->
+        liftIO (logWarning logger ("not removing profile version " <> numberText number <> " because it is newer than the cutoff, even though a later version is older"))
+      (RemoveGeneration number, DryRun) -> liftIO (logMessage logger ("would remove profile version " <> numberText number))
+      (RemoveGeneration number, MakeChanges) -> do
+        liftIO (logMessage logger ("removing profile version " <> numberText number))
+        ExceptT (removeGenerationLink (generationName profile number))
+
+-- | A generation's number, as a message shows it.
+numberText :: GenerationNumber -> Text
+numberText (GenerationNumber n) = T.pack (show n)
+
+-- | Unlink what is at a generation's name, as upstream does: a link
+-- itself and never what it leads to, or a file, and nothing when nothing
+-- is there.  No call made here removes a directory's contents, so one
+-- that stands there, even put there while this runs, is a failure, as
+-- unlinking it is.  On Windows a directory link goes by RemoveDirectory,
+-- and anything else there by DeleteFile, which a directory refuses.
+removeGenerationLink :: OsPath -> IO (Either ProfileFailure ())
+removeGenerationLink path = do
+  removed <-
+    try $
+      if onWindows
+        then OsDir.removeDirectoryLink path `catch` \(failure :: IOException) -> unless (isDoesNotExistError failure) (OsDir.removeFile path)
+        else OsDir.removeFile path
+  pure $ case removed of
+    Right () -> Right ()
+    Left (failure :: IOException)
+      | isDoesNotExistError failure -> Right ()
+      | otherwise -> Left (ProfileIOFailed ("removing \"" <> hostPathText path <> "\": " <> T.pack (show failure)))
 
 -- ---------------------------------------------------------------------------
 -- Links

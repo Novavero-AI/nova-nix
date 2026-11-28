@@ -101,6 +101,9 @@ data CommandName
   | ProfileAddCommand
   | ProfileRemoveCommand
   | ProfileListCommand
+  | ProfileHistoryCommand
+  | ProfileRollbackCommand
+  | ProfileWipeHistoryCommand
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | What the reference says about a command, or about the global form.
@@ -169,6 +172,9 @@ commandWords name = case name of
   ProfileAddCommand -> ["profile", "add"]
   ProfileRemoveCommand -> ["profile", "remove"]
   ProfileListCommand -> ["profile", "list"]
+  ProfileHistoryCommand -> ["profile", "history"]
+  ProfileRollbackCommand -> ["profile", "rollback"]
+  ProfileWipeHistoryCommand -> ["profile", "wipe-history"]
 
 -- | A command as it is invoked, @nova-nix store gc@.
 commandInvocation :: CommandName -> Text
@@ -362,7 +368,7 @@ command name = case name of
           Form "--cache URL PATH..." "Push store paths (and their closures) to a binary cache"
             :| [Form "--cache URL --all" "Push every valid path except derivations, and their closures"],
         commandDescription =
-          "Copies the closure of each `PATH`, or with `--all` every valid path except derivations, to the binary cache at `URL`. A `PATH` is a store path, in full or as its base name; a derivation is refused, since a binary cache serves outputs. Paths the cache already holds are skipped, and every NAR is in place before any narinfo announces it. An `http://` or `https://` `URL` is a nova-cache server, which signs what it receives, and a narinfo is read back to check that the server signed it. A `file://` `URL` names a directory, which gets the layout upstream's `nix copy --to file://` writes, so that any web server can serve it: `nix-cache-info`, a narinfo for each path, signed with the secret key in `--secret-key-file`, and the NARs under `nar/`. The key file is one `nix-store --generate-binary-cache-key` writes, and a substituter of the cache trusts its public key. It prints how many paths it pushed and how many the cache already held.",
+          "Copies the closure of each `PATH`, or with `--all` every valid path except derivations, to the binary cache at `URL`. A `PATH` is a store path, in full or as its base name; a derivation is refused, since a binary cache serves outputs. Paths the cache already holds are skipped, and every NAR is in place before any narinfo announces it. An `http://` or `https://` `URL` is a nova-cache server, which signs what it receives, and a narinfo is read back to check that the server signed it. A `file://` `URL` names a directory, which gets the layout upstream's `nix copy --to file://` writes, so that any web server can serve it and a substituter can read it through the same `URL`: `nix-cache-info`, a narinfo for each path, signed with the secret key in `--secret-key-file`, and the NARs under `nar/`. The key file is one `nix-store --generate-binary-cache-key` writes, and a substituter of the cache trusts its public key. It prints how many paths it pushed and how many the cache already held.",
         commandExamples =
           Example
             "Push every path in the store except derivations, compressed with zstd, to a cache that takes the API key in `cache-api-key`."
@@ -444,16 +450,65 @@ command name = case name of
           Form "" "Print the packages in a profile"
             :| [Form "--json" "Print a profile's manifest as JSON"],
         commandDescription =
-          "Prints each package in a profile, as `nix profile list` does: its name, in bold, and its store paths, with a blank line between packages, and for a package a flake added its flake attribute and its original and locked flake references. With `--json` it prints the profile's `manifest.json` instead, indented when stdout is a terminal unless `--pretty` or `--no-pretty` says otherwise, the later of them winning. A profile with no manifest holds no packages. The default profile and its link are made when they are missing, and a profile whose current generation is outside the store is refused, as for every profile command.",
+          "Prints each package in a profile, as `nix profile list` does: its name, in bold when stdout takes colour, and its store paths, with a blank line between packages, and for a package a flake added its flake attribute and its original and locked flake references. "
+            <> stylingRule
+            <> " With `--json` it prints the profile's `manifest.json` instead, indented when stdout is a terminal unless `--pretty` or `--no-pretty` says otherwise, the later of them winning. A profile with no manifest holds no packages. The default profile and its link are made when they are missing, and a profile whose current generation is outside the store is refused, as for every profile command.",
         commandExamples =
           Example "List the packages in the default profile." ("profile" :| ["list"]) []
             :| [Example "Print the default profile's manifest, indented." ("profile" :| ["list", "--json", "--pretty"]) []]
+      }
+  ProfileHistoryCommand ->
+    CommandEntry
+      { commandForms = Form "" "Print each generation of a profile and what changed in it" :| [],
+        commandDescription =
+          "Prints each generation of a profile in order of number, as `nix profile history` does: `Version N (DATE):`, and `Version N (DATE) <- M:` after the first, where `DATE` is the day in UTC the generation was made and `M` the generation listed before it, with `N` in green for the current generation and in bold for the others when stdout takes colour; then a line for each package that differs from generation `M`'s, `NAME: OLD -> NEW`, with the empty-set sign for the versions of a package one of the two lacks, or `No changes.`, and a blank line before the next generation. `NAME` is what `profile remove --regex` matches, and a package's versions are those in its store paths' names, each once and joined by `, `, an epsilon standing for an empty one. "
+            <> stylingRule
+            <> " A generation whose store path is gone holds no packages. A generation was made when its link was. The default profile and its link are made when they are missing, and a profile whose current generation is outside the store is refused, as for every profile command.",
+        commandExamples =
+          Example "Show what changed in each generation of the default profile." ("profile" :| ["history"]) []
+            :| [Example "Show the generations of a profile other than the default." ("profile" :| ["history", "--profile", "./my-profile"]) []]
+      }
+  ProfileRollbackCommand ->
+    CommandEntry
+      { commandForms =
+          Form "" "Switch a profile to the generation before the current one"
+            :| [Form "--to N" "Switch a profile to generation N"],
+        commandDescription =
+          "Switches a profile to the newest generation older than its current one, or with `--to N` to generation `N`, as `nix profile rollback` does, and says `switching profile from version CURRENT to N`, `CURRENT` being 0 when the profile has no current generation, and so none older. A generation holds the packages the profile held when it was made, so a rollback brings back what a later change took off, and a change after a rollback makes a generation numbered after the newest. `N` may end in `K`, `M`, `G` or `T`, which multiply it by 1024 once to four times, as upstream reads a number. With `--dry-run` it says where it would switch and switches nothing. "
+            <> generationRules,
+        commandExamples =
+          Example "Switch the default profile back to the generation before the current one." ("profile" :| ["rollback"]) []
+            :| [Example "Switch the default profile to generation 2." ("profile" :| ["rollback", "--to", "2"]) []]
+      }
+  ProfileWipeHistoryCommand ->
+    CommandEntry
+      { commandForms =
+          Form "" "Delete every generation of a profile but the current one"
+            :| [Form "--older-than AGE" "Delete the generations of a profile made more than AGE ago, but the newest of them"],
+        commandDescription =
+          "Deletes every generation of a profile but its current one, as `nix profile wipe-history` does, saying `removing profile version N` for each, so that none can be rolled back to; the next `store gc` drops their roots and deletes what only they kept. With `--older-than Nd`, `N` a whole number of days from 1, it deletes only the generations made more than `N` days ago, but the newest of them, which the profile held then, and never the current one; one made since then that is numbered below the newest of them is kept, with a warning. A generation was made when its link was. With `--dry-run` it says `would remove profile version N` for each and deletes nothing. A profile with no current generation keeps none for being current. "
+            <> generationRules,
+        commandExamples =
+          Example "Delete every generation of the default profile but the current one." ("profile" :| ["wipe-history"]) []
+            :| [ Example "Delete the generations made more than 30 days ago, keeping the newest of them." ("profile" :| ["wipe-history", "--older-than", "30d"]) [],
+                 Example "Say which generations would be deleted, and delete none." ("profile" :| ["wipe-history", "--dry-run"]) []
+               ]
       }
 
 -- | What a profile is and where it is, as the descriptions of the
 -- commands that change one say.
 profileRules :: Text
 profileRules = "A profile is a link to one of its generations, `PROFILE-1-link`, `PROFILE-2-link` and on beside it, each a store path holding the packages' files linked into one tree and a `manifest.json` that lists the packages, and each a root the garbage collector keeps. The default profile is `profiles/profile` in the state directory, which is `$NIX_STATE_HOME`, else `$XDG_STATE_HOME/nix`, else `~/.local/state/nix`, or on Windows `nix\\state` in the Local AppData folder; `~/.nix-profile`, or with `use-xdg-base-directories` on `profile` in the state directory, links to it, and both are made when they are missing, whichever profile `--profile` names. A profile whose current generation is outside the store, as one upstream Nix keeps in `/nix/store` is while nova-nix uses another store, is refused. A change that finds the profile changed by another command since it began starts again. On Windows each link is a symlink, which needs Developer Mode or an elevated shell."
+
+-- | Where a profile's generations are and which profile a command that
+-- switches or deletes them refuses, as their descriptions say.
+generationRules :: Text
+generationRules = "A profile's generations are `PROFILE-1-link`, `PROFILE-2-link` and on beside it, and its current one is the one its link names by that bare name, as a switch writes it; a link naming anything else, an absolute path included, names no current generation. The default profile and its link are made when they are missing, and a profile whose current generation is outside the store is refused, as for every profile command. On Windows each link is a symlink, which needs Developer Mode or an elevated shell."
+
+-- | When upstream styles what it prints on stdout, as the descriptions of
+-- the commands that style a line say.
+stylingRule :: Text
+stylingRule = "Stdout takes colour when it is a terminal and `TERM` is set to something other than `dumb`, or whatever it is when `CLICOLOR_FORCE` or `FORCE_COLOR` is set, and never while `NO_COLOR` or `NOCOLOR` is set, whatever their values."
 
 -- | What a command that takes a target evaluates, as its description
 -- names it.
@@ -530,6 +585,9 @@ data FlagName
   | ProfileFlag
   | PriorityFlag
   | RegexFlag
+  | ToFlag
+  | OlderThanFlag
+  | DryRunFlag
   | JsonFlag
   | PrettyFlag
   | NoPrettyFlag
@@ -672,11 +730,17 @@ flag name = case name of
   PrintRootsFlag ->
     long "print-roots" Nothing "List the roots as `LINK -> PATH` and delete nothing" (CommandFlag (StoreGcCommand :| []))
   ProfileFlag ->
-    long "profile" (Just "PATH") "Work on the profile at `PATH` in place of the default profile" (CommandFlag (ProfileAddCommand :| [ProfileRemoveCommand, ProfileListCommand]))
+    long "profile" (Just "PATH") "Work on the profile at `PATH` in place of the default profile" (CommandFlag (ProfileAddCommand :| [ProfileRemoveCommand, ProfileListCommand, ProfileHistoryCommand, ProfileRollbackCommand, ProfileWipeHistoryCommand]))
   PriorityFlag ->
     long "priority" (Just "N") "Give the package priority `N` (default 5): of two files at one path, the profile links the one with the lower number" (CommandFlag (ProfileAddCommand :| []))
   RegexFlag ->
     long "regex" (Just "PATTERN") "Select the packages whose identifier a POSIX extended regular expression matches whole, ignoring case: for a package a flake added, its flake reference and attribute, and for any other the names of the store paths it holds, without their versions" (CommandFlag (ProfileRemoveCommand :| []))
+  ToFlag ->
+    long "to" (Just "N") "Switch to generation `N` in place of the one before the current" (CommandFlag (ProfileRollbackCommand :| []))
+  OlderThanFlag ->
+    long "older-than" (Just "AGE") "Delete only the generations older than `AGE`, `N` days written `Nd`, keeping the newest of them" (CommandFlag (ProfileWipeHistoryCommand :| []))
+  DryRunFlag ->
+    long "dry-run" Nothing "Say what the command would change, and change nothing" (CommandFlag (ProfileRollbackCommand :| [ProfileWipeHistoryCommand]))
   JsonFlag ->
     long "json" Nothing "Print JSON: the environment in place of the script, or the profile's `manifest.json` in place of its packages' lines" jsonCommands
   PrettyFlag ->
@@ -684,7 +748,7 @@ flag name = case name of
   NoPrettyFlag ->
     long "no-pretty" Nothing "With `--json`, print the JSON on one line, as when stdout is not a terminal" jsonCommands
   StoreFlag ->
-    long "store" (Just "DIR") "Use `DIR` as the store (default: the platform store)" (CommandFlag (EvalCommand :| [BuildCommand, DevelopCommand, PrintDevEnvCommand, TrustCommand, PushCommand, StoreDeleteCommand, StoreGcCommand, ProfileAddCommand, ProfileRemoveCommand, ProfileListCommand]))
+    long "store" (Just "DIR") "Use `DIR` as the store (default: the platform store)" (CommandFlag (EvalCommand :| [BuildCommand, DevelopCommand, PrintDevEnvCommand, TrustCommand, PushCommand, StoreDeleteCommand, StoreGcCommand, ProfileAddCommand, ProfileRemoveCommand, ProfileListCommand, ProfileHistoryCommand, ProfileRollbackCommand, ProfileWipeHistoryCommand]))
   HelpFlag ->
     long "help" Nothing "Print the commands, flags and settings, and exit" GlobalFlag
   VersionFlag ->
@@ -738,7 +802,7 @@ configuration :: Configuration
 configuration =
   Configuration
     { configSettings =
-        Setting "substituters" "Binary caches a build substitutes from" (Just SubstituterFlag)
+        Setting "substituters" "Binary caches a build substitutes from, each the `http://` or `https://` URL of one a server serves or the `file://` URL of a directory, such as one `push` writes (`file:///D:/cache` on Windows), which is asked at the `Priority` its `nix-cache-info` states, `0` when it states none" (Just SubstituterFlag)
           :| [ Setting "trusted-public-keys" "Public keys, one of whose signatures a substituted path must carry" (Just TrustedKeyFlag),
                Setting "fallback" "Build from source when a substitute fails" (Just FallbackFlag),
                Setting "keep-failed" "Keep the directory of a build that fails, and the rebuild of an output `--check` finds different as `PATH.check` (default `false`)" (Just KeepFailedFlag),
@@ -842,8 +906,9 @@ helpGap :: Int
 helpGap = 2
 
 -- | What @--help@ prints: the usage line, each command's forms, the flags
--- grouped by the commands they apply to, the settings and where they are
--- read, then the global form's flags.
+-- grouped by the commands they apply to, each group's title wrapped as its
+-- text is, the settings and where they are read, then the global form's
+-- flags.
 helpLines :: [Text]
 helpLines =
   usageLines
@@ -858,7 +923,7 @@ helpLines =
     usagePrefix = "Usage: "
     usageLines = case fmap (formUsage [programName]) (commandForms globalForm) of
       first :| rest -> (usagePrefix <> first) : map (indentBy (T.length usagePrefix)) rest
-    section header rows = "" : header : concatMap row rows
+    section header rows = "" : wrapWords helpWidth header ++ concatMap row rows
     commandRows =
       [ (formUsage (commandWords name) form, unmarked (formSummary form))
       | name <- commandNames,

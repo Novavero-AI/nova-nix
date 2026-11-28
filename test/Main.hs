@@ -27,9 +27,10 @@ import Test.Parser (testCurPos, testExprTypes, testLexer, testLineEndings, testP
 import Test.Pkgs (testBinutilsNativeX8664Windows, testBinutilsWindows, testBinutilsX8664Windows, testBusyboxWindows, testChecksForbidSubstitutes, testGcc10Windows, testGcc46CxxWindows, testGcc46Windows, testGccCoreWindows, testGccCoreX8664Windows, testGccLatestWindows, testGccNativeX8664Windows, testGccX8664Windows, testGnumakeWindows, testMesWindows, testMingwW64CrtX8664Windows, testMingwW64LatestWindows, testPkgsFetchurl, testSeedStdenvWindows, testStage0Pe32Chain, testStdenvWindows, testTinyccWindows, testWindowsRungs, testWindowsSources, testWorkflowSpellings)
 import Test.Push (testPushClosureIO, testPushDirectory, testPushMultipart, testPushPure)
 import Test.Realise (testDepGraph, testRealise)
-import Test.Store (testCaseSensitiveVolumeIO, testExecBit, testFoldingVolumeIO, testGcPure, testHashHelpers, testLinkOrdering, testNarKnownAnswer, testNarNameSafety, testParseStorePath, testPathLocks, testSerialiseIfReadableIO, testStoreAccessIO, testStoreDB, testStoreDelete, testStoreGC, testStoreGCUpstreamManaged, testStoreMetadata, testStoreNameSinks, testStoreNameSinksIO, testStoreOps, testStoreOpsIO, testStorePaths, testStoreWritesUpstreamManaged, testSymlinkWalksIO)
+import Test.Store (testCaseSensitiveVolumeIO, testExecBit, testFoldingVolumeIO, testGcPure, testHashHelpers, testLinkOrdering, testNarKnownAnswer, testNarNameSafety, testParseStorePath, testPathInfo, testPathLocks, testSerialiseIfReadableIO, testStoreAccessIO, testStoreDB, testStoreDelete, testStoreGC, testStoreGCUpstreamManaged, testStoreMetadata, testStoreNameSinks, testStoreNameSinksIO, testStoreOps, testStoreOpsIO, testStorePaths, testStoreWritesUpstreamManaged, testSymlinkWalksIO)
 import Test.Substituter (testNarInfoValidation, testStatedContentAddress, testSubstituter, testSubstituterRetry, testVerifySigs)
 import Test.Trust (testTrust, testTrustScanIO, testTrustWindowsGraphs)
+import Test.WindowsSandbox (testWindowsSandboxIO, windowsSandboxAccounts, windowsSandboxAccountsFlag, windowsSandboxBuilder, windowsSandboxBuilderFlag)
 
 main :: IO ()
 main = do
@@ -50,6 +51,8 @@ main = do
     [flag, source] | flag == namesOnlyChildFlag -> inTestSession (namesOnlyChild source)
     [flag] | flag == arenaCycleChildFlag -> arenaCycleChild
     [flag] | flag == writeCliJsonFlag -> BS.writeFile cliJsonPath Ref.referenceJson
+    flag : rest | flag == windowsSandboxAccountsFlag -> windowsSandboxAccounts rest
+    flag : rest | flag == windowsSandboxBuilderFlag -> windowsSandboxBuilder rest
     _ -> withRunTempRoot (inTestSession runSuite)
 
 -- | Give the run a temporary root of its own and point the process's
@@ -283,7 +286,9 @@ runSuite = do
           testSandboxFallbackIO,
           testLinuxSandboxIO,
           testDarwinSandboxIO,
+          testWindowsSandboxIO,
           testStoreDB,
+          testPathInfo,
           testParseStorePath,
           testDaemonWire,
           testDaemonProtocol,

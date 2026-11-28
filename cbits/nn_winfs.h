@@ -36,6 +36,16 @@ unsigned long nn_token_user_sid(wchar_t **sid, const char **failed);
  * name, a file as well as a directory. */
 unsigned long nn_dir_create_sddl(const wchar_t *path, const wchar_t *sddl);
 
+/* The owner and DACL of the entry at path itself, a link read as itself
+ * and not followed, as the self-relative security descriptor
+ * GetSecurityInfo returns, written to *descriptor for the caller to
+ * release with LocalFree, with its length in bytes in *length.  Returns
+ * 0, or the Win32 error code of the call that failed, with *failed naming
+ * that call (a static string) and *descriptor NULL: ERROR_FILE_NOT_FOUND
+ * or ERROR_PATH_NOT_FOUND from CreateFileW when nothing has the name. */
+unsigned long nn_entry_security(const wchar_t *path, void **descriptor,
+                                unsigned long *length, const char **failed);
+
 #endif
 
 #endif

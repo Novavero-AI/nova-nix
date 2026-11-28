@@ -119,6 +119,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Nix.Daemon.Protocol (ContentAddress, ContentAddressMethod (..), contentAddressFromParts)
 import Nix.Derivation (Derivation (..), fromATerm, toATerm)
 import Nix.Hash (FileIngestionMethod (..), makeFixedOutputPath, makeSourcePath, makeTextPath, sha256Digest)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), pathCaseHack, trySetCaseSensitiveDir, volumeCaseHack)
@@ -137,8 +138,7 @@ import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.NAR.Stream as Stream
 import System.Directory
-  ( createDirectoryIfMissing,
-    doesDirectoryExist,
+  ( doesDirectoryExist,
     doesPathExist,
     listDirectory,
     renamePath,
@@ -259,6 +259,8 @@ placeInStore store srcPath sp deriver refs = do
 -- | Compute the registration metadata for a store path already present on
 -- disk, without moving anything.  Used by 'placeInStore' after its move,
 -- and by 'materializeEvalSources' to register a verified adopted tree.
+-- The path is not ultimately trusted and has no signatures or content
+-- address; a caller that knows better says so in the registration.
 registrationFor :: Store -> StorePath -> Maybe Text -> [StorePath] -> IO PathRegistration
 registrationFor store sp deriver refs = do
   let destPath = storePathToFilePath (stDir store) sp
@@ -273,7 +275,10 @@ registrationFor store sp deriver refs = do
         prNarHash = Hash.formatNixHash (Hash.hashBytes narBytes),
         prNarSize = BS.length narBytes,
         prDeriver = deriver,
-        prReferences = refs
+        prReferences = refs,
+        prUltimate = NotUltimate,
+        prSignatures = Set.empty,
+        prContentAddress = Nothing
       }
 
 -- | Move a file or directory, by a rename, as upstream's @movePath@
@@ -547,7 +552,6 @@ foldlIO z (x : xs) f = do
 writeDrvAterm :: Store -> StorePath -> BS.ByteString -> IO ()
 writeDrvAterm store sp aterm = do
   let destPath = storePathToFilePath (stDir store) sp
-  createDirectoryIfMissing True (unStoreDir (stDir store))
   existing <- try (BS.readFile destPath)
   unless (either (\(_ :: IOException) -> False) (== aterm) existing) $ do
     Dir.removePathForcibly destPath
@@ -559,14 +563,26 @@ writeDrvAterm store sp aterm = do
 
 -- | Serialize a derivation to ATerm, write it to the store, and register
 -- it: a @.drv@ is a store object like any other, so it gets a ValidPaths
--- row with its NAR hash and its references.  Reference scans may name a
--- @.drv@ (one in a build's input closure, where a @drvPath@'s context puts
--- it), and an unregistered referent fails the whole registration batch.
+-- row with its NAR hash, its references and the text address its path is
+-- made from ('textAddress').  Reference scans may name a @.drv@ (one in a
+-- build's input closure, where a @drvPath@'s context puts it), and an
+-- unregistered referent fails the whole registration batch.
 writeDrv :: Store -> Derivation -> StorePath -> IO ()
 writeDrv store drv sp = do
-  writeDrvAterm store sp (toATerm drv)
+  let aterm = toATerm drv
+  writeDrvAterm store sp aterm
   reg <- registrationFor store sp Nothing (drvReferences drv)
-  registerPath (stDB store) reg
+  registerPath (stDB store) reg {prContentAddress = textAddress aterm}
+
+-- | The content address of a store object made from a text, as a @.drv@
+-- is: the SHA-256 of its bytes under the text method.
+textAddress :: BS.ByteString -> Maybe ContentAddress
+textAddress = contentAddressFromParts TextMethod sha256Algo . sha256Digest
+
+-- | The algorithm every content address nova-nix makes a path from hashes
+-- with.
+sha256Algo :: Text
+sha256Algo = "sha256"
 
 -- | A @.drv@'s references: its input sources and input @.drv@ paths -
 -- the same set upstream records when writing a derivation to the store.
@@ -595,7 +611,7 @@ writeDrvClosure store closure = do
         Just sp -> do
           writeDrvAterm store sp aterm
           case fromATerm aterm of
-            Right drv -> Just <$> registrationFor store sp Nothing (drvReferences drv)
+            Right drv -> (\reg -> Just reg {prContentAddress = textAddress aterm}) <$> registrationFor store sp Nothing (drvReferences drv)
             Left err ->
               throwIO
                 ( userError
@@ -1154,13 +1170,14 @@ materializeEvalSources store sourceCache = do
         unless valid $ do
           let dest = storePathToFilePath (stDir store) sp
           onDisk <- doesPathExist dest
-          adoptable <- if onDisk then adoptedTreeMatches (stCaseSensitivity store) dest sp else pure False
-          reg <-
-            if adoptable
-              then canonicalizeMetadata dest >> registrationFor store sp Nothing []
-              else do
-                when onDisk (Dir.removePathForcibly dest)
-                restoreSource store srcText sp >>= either (refuse (storePathToText defaultStoreDir sp)) pure
+          adopted <- if onDisk then adoptedTreeAddress (stCaseSensitivity store) dest sp else pure Nothing
+          reg <- case adopted of
+            Just address -> do
+              canonicalizeMetadata dest
+              (\reg -> reg {prContentAddress = Just address}) <$> registrationFor store sp Nothing []
+            Nothing -> do
+              when onDisk (Dir.removePathForcibly dest)
+              restoreSource store srcText sp >>= either (refuse (storePathToText defaultStoreDir sp)) pure
           registerPath (stDB store) reg
     refuse spText reason =
       throwIO (userError (T.unpack ("refusing to register " <> spText <> ": " <> reason)))
@@ -1197,14 +1214,14 @@ restoreSource store srcText sp = do
       case streamed of
         Left (NarStreamRefused reason) -> pure (Left reason)
         Left (NarStreamMalformed reason) -> pure (Left ("the dump of " <> srcText <> " does not parse: " <> reason))
-        Right (digest, size)
-          | not (recursiveDigestNames sp digest) -> do
-              abortNarUnpack sink
-              pure (Left (srcText <> " changed after evaluation hashed it, so it no longer reproduces its store path; re-evaluate"))
-          | otherwise -> do
-              finished <- finishNarUnpack sink
-              either (pure . Left) (const (sealAndRecheck digest size)) finished
-    sealAndRecheck digest size = do
+        Right (digest, size) -> case sourceAddress sp digest of
+          Nothing -> do
+            abortNarUnpack sink
+            pure (Left (srcText <> " changed after evaluation hashed it, so it no longer reproduces its store path; re-evaluate"))
+          Just address -> do
+            finished <- finishNarUnpack sink
+            either (pure . Left) (const (sealAndRecheck digest size address)) finished
+    sealAndRecheck digest size address = do
       canonicalizeMetadata dest
       onDisk <- ExecBit.narHashOfPath (volumeCaseHack (stCaseSensitivity store)) dest
       pure $
@@ -1217,14 +1234,19 @@ restoreSource store srcText sp = do
                   prNarHash = Hash.formatNixHash digest,
                   prNarSize = size,
                   prDeriver = Nothing,
-                  prReferences = []
+                  prReferences = [],
+                  prUltimate = NotUltimate,
+                  prSignatures = Set.empty,
+                  prContentAddress = Just address
                 }
 
--- | Whether a recursive NAR digest and a store path's own name derive
--- exactly that path, as a @source@ path's address is derived.
-recursiveDigestNames :: StorePath -> Hash.NixHash -> Bool
-recursiveDigestNames sp (Hash.NixHash digest) =
-  makeFixedOutputPath (spName sp) "sha256" NarIngestion digest == Right sp
+-- | The content address a recursive NAR digest gives a store path, when
+-- the digest and the path's own name derive exactly that path, as a
+-- @source@ path's address is derived.
+sourceAddress :: StorePath -> Hash.NixHash -> Maybe ContentAddress
+sourceAddress sp (Hash.NixHash digest)
+  | makeFixedOutputPath (spName sp) sha256Algo NarIngestion digest == Right sp = contentAddressFromParts (FixedMethod NarIngestion) sha256Algo digest
+  | otherwise = Nothing
 
 -- | Register the store objects evaluation wrote: makes each one's
 -- metadata canonical ('canonicalizeMetadata') and records it in the DB.
@@ -1261,18 +1283,20 @@ materializeEvalStoreWrites store storeWrites = do
                   -- between evaluation and registration, and registering
                   -- it would record a hash its bytes do not have, then
                   -- seal the lie.  Refuse loudly instead.
-                  reproduces <- writeReproducesPath (stCaseSensitivity store) dest sp refs mode
-                  unless reproduces $
-                    throwIO
-                      ( userError
-                          ( "refusing to register "
-                              <> T.unpack spText
-                              <> ": the on-disk content does not reproduce its store path; "
-                              <> "delete the path and re-evaluate"
-                          )
-                      )
-                  canonicalizeMetadata dest
-                  Just <$> registrationFor store sp Nothing refs
+                  address <- writtenAddress (stCaseSensitivity store) dest sp refs mode
+                  case address of
+                    Nothing ->
+                      throwIO
+                        ( userError
+                            ( "refusing to register "
+                                <> T.unpack spText
+                                <> ": the on-disk content does not reproduce its store path; "
+                                <> "delete the path and re-evaluate"
+                            )
+                        )
+                    Just reproduced -> do
+                      canonicalizeMetadata dest
+                      (\reg -> Just reg {prContentAddress = Just reproduced}) <$> registrationFor store sp Nothing refs
 
 -- | Add a tree, given as its NAR, as the path the SHA-256 of the NAR, a
 -- name and the store paths it references make ('makeSourcePath'), and
@@ -1311,31 +1335,33 @@ addSourceTree store name refs entry =
     sealed sp dest = do
       canonicalizeMetadata dest
       reg <- registrationFor store sp Nothing (Set.toAscList refs)
-      pure (if prNarHash reg == Hash.formatNixHash (Hash.hashBytes nar) then Just reg else Nothing)
+      pure (if prNarHash reg == Hash.formatNixHash (Hash.hashBytes nar) then Just reg {prContentAddress = contentAddressFromParts (FixedMethod NarIngestion) sha256Algo (sha256Digest nar)} else Nothing)
 
--- | Whether on-disk content re-derives exactly the store path it is
--- about to be registered under, under the scheme that named the write.
--- An unreadable destination counts as a mismatch.
-writeReproducesPath :: CaseSensitivity -> FilePath -> StorePath -> [StorePath] -> StoreWriteMode -> IO Bool
-writeReproducesPath sensitivity dest sp refs mode = case mode of
-  WriteRecursive -> adoptedTreeMatches sensitivity dest sp
-  WriteFlat ->
-    withFileBytes (\bytes -> makeFixedOutputPath (spName sp) "sha256" FlatIngestion (sha256Digest bytes) == Right sp)
-  WriteText ->
-    withFileBytes (\bytes -> makeTextPath (spName sp) (sha256Digest bytes) refs == Right sp)
+-- | The content address under which on-disk content re-derives exactly
+-- the store path it is about to be registered under, by the scheme that
+-- named the write, or 'Nothing' when it does not.  An unreadable
+-- destination counts as a mismatch.
+writtenAddress :: CaseSensitivity -> FilePath -> StorePath -> [StorePath] -> StoreWriteMode -> IO (Maybe ContentAddress)
+writtenAddress sensitivity dest sp refs mode = case mode of
+  WriteRecursive -> adoptedTreeAddress sensitivity dest sp
+  WriteFlat -> withFileDigest (\digest -> makeFixedOutputPath (spName sp) sha256Algo FlatIngestion digest == Right sp) (FixedMethod FlatIngestion)
+  WriteText -> withFileDigest (\digest -> makeTextPath (spName sp) digest refs == Right sp) TextMethod
   where
-    withFileBytes check = do
+    withFileDigest derives method = do
       result <- try (BS.readFile dest) :: IO (Either IOException BS.ByteString)
-      pure (either (const False) check result)
+      pure $ case sha256Digest <$> result of
+        Right digest | derives digest -> contentAddressFromParts method sha256Algo digest
+        _ -> Nothing
 
--- | Whether an on-disk tree reproduces the source store path it is about to
--- be registered under: its recursive NAR digest and the path's own name must
--- derive exactly this path.  An unreadable tree counts as a mismatch.  The
--- sensitivity is the store volume's, which decides the case-hack mode the
--- tree is read back under.
-adoptedTreeMatches :: CaseSensitivity -> FilePath -> StorePath -> IO Bool
-adoptedTreeMatches sensitivity dest sp =
-  maybe False (recursiveDigestNames sp . NAR.narHash)
+-- | The content address under which an on-disk tree reproduces the source
+-- store path it is about to be registered under ('sourceAddress'), or
+-- 'Nothing' when its recursive NAR digest and the path's own name do not
+-- derive exactly this path.  An unreadable tree counts as a mismatch.
+-- The sensitivity is the store volume's, which decides the case-hack mode
+-- the tree is read back under.
+adoptedTreeAddress :: CaseSensitivity -> FilePath -> StorePath -> IO (Maybe ContentAddress)
+adoptedTreeAddress sensitivity dest sp =
+  (>>= sourceAddress sp . NAR.narHash)
     <$> ExecBit.serialiseIfReadable (volumeCaseHack sensitivity) dest
 
 -- | Recursively copy a file or directory tree to a destination path.

@@ -199,13 +199,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The sources that build on Linux: test/cbits/nn_test_dacl.c builds on
-      # Windows alone, and sandbox/darwin.c on macOS alone, against headers
-      # this runner does not have.  The macOS build checks the latter.
+      # The sources that build on Linux: test/cbits/nn_test_dacl.c and
+      # sandbox/windows.c build on Windows alone, and sandbox/darwin.c on
+      # macOS alone, against headers this runner does not have.  The macOS
+      # build checks sandbox/darwin.c, and the Windows build
+      # sandbox/windows.c and test/cbits/nn_test_sandbox_windows.c, which
+      # builds here as the stubs it holds for every other OS.
       - name: Compile C99 with strict warnings
         run: |
-          for f in cbits/*.c sandbox/*.c test/cbits/sandbox_check.c test/cbits/keyring.c; do
-            [ "$f" = sandbox/darwin.c ] && continue
+          for f in cbits/*.c sandbox/*.c test/cbits/sandbox_check.c test/cbits/keyring.c test/cbits/nn_test_sandbox_windows.c; do
+            case "$f" in sandbox/darwin.c | sandbox/windows.c) continue ;; esac
             echo "Checking $f ..."
             gcc -std=c99 -Wall -Wextra -pedantic -Werror -fsyntax-only -Icbits -Isandbox "$f"
           done
@@ -481,10 +484,27 @@ jobs:
         if: runner.os == 'macOS'
         run: cc -std=c99 -Wall -Wextra -pedantic -Werror -fsyntax-only -Icbits -Isandbox sandbox/darwin.c
 
-      # The suite's macOS sandbox group runs the helper this job built, and
-      # skips where nothing names it.
-      - name: Name the built sandbox helper (macOS)
-        if: runner.os == 'macOS'
+      # The Windows sandbox backend, and the Windows calls its tests make,
+      # build against Windows' headers alone, so the C99 Strict job, on
+      # Linux, leaves them to this step, which compiles each as the build
+      # does, with GHC's own C compiler, and fails on any warning.
+      - name: Compile the Windows sandbox backend as C99 with strict warnings (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/c99-strict"
+          mkdir -p "$out"
+          for f in sandbox/windows.c test/cbits/nn_test_sandbox_windows.c; do
+            echo "Checking $f ..."
+            ghc -c "$f" -Isandbox -optc-std=c99 -optc-Wall -optc-Wextra -optc-pedantic -optc-Werror -o "$out/$(basename "$f" .c).o"
+          done
+
+      # The suite's macOS and Windows sandbox groups run the helper this job
+      # built, and skip where nothing names it.
+      - name: Name the built sandbox helper (macOS, Windows)
+        if: runner.os == 'macOS' || runner.os == 'Windows'
+        shell: bash
         run: echo "NOVA_NIX_TEST_SANDBOX_HELPER=$(cabal list-bin exe:nova-nix-sandbox)" >> "$GITHUB_ENV"
 
       # Upstream's worker-protocol fixtures are the bytes its own
@@ -527,6 +547,95 @@ jobs:
             echo "::error::the test suite was killed by signal $((status - 128))"
           fi
           exit "$status"
+
+      # The sandbox helper's Windows backend, run as the service that holds
+      # each build slot's token would run it: as SYSTEM, which holds the
+      # privileges to start a process as another account.  A scheduled
+      # task runs the suite's account checks as SYSTEM at normal priority;
+      # they write what they print to a log, printed here, make two
+      # build-slot accounts, run builds as each through the helper, and
+      # remove the accounts, each one's logon right first, however they
+      # end.  The user a build must be kept from is the runner's: its
+      # profile, TEMP, APPDATA and hive, this step's process, a file only
+      # it may read and a file in its profile, both of which the step makes
+      # and removes.  A result of 0 counts only when the log ends with the
+      # checks' count.  Windows PowerShell carries the ScheduledTasks module
+      # itself.
+      - name: The sandbox helper runs builds as build accounts, checked as SYSTEM (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 30
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $suite = cabal list-bin test:nova-nix-test
+          $helper = cabal list-bin exe:nova-nix-sandbox
+          $bash = 'C:\msys64\usr\bin\bash.exe'
+          if (-not (Test-Path -LiteralPath $bash)) { throw "no MSYS2 bash at $bash" }
+          $log = Join-Path $env:RUNNER_TEMP 'windows-sandbox-accounts.log'
+          $userOnly = Join-Path $env:TEMP 'nova-nix-sandbox-user-only.txt'
+          $profileFile = Join-Path $env:USERPROFILE 'nova-nix-sandbox-profile.txt'
+          $task = 'nova-nix-sandbox-accounts'
+          $flag = '--windows-sandbox-accounts'
+          $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          # LastTaskResult before a task has run.
+          $notRun = 267011
+          # A task's priority, 4 to 6 being the normal class.
+          $normalPriority = 5
+          $limit = New-TimeSpan -Minutes 20
+          $pollSeconds = 5
+          $result = $notRun
+          try {
+            Set-Content -LiteralPath $userOnly -Value 'the runner user alone may read this'
+            icacls $userOnly /inheritance:r /grant:r "*${user}:F" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "icacls failed with $LASTEXITCODE" }
+            Set-Content -LiteralPath $profileFile -Value 'a file in the runner user profile'
+            $arguments = "$flag `"$log`" `"$helper`" `"$bash`" $user `"$env:USERPROFILE`" `"$env:TEMP`" " +
+              "`"$env:APPDATA`" $PID `"$userOnly`" `"$profileFile`""
+            $action = New-ScheduledTaskAction -Execute $suite -Argument $arguments
+            $principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+            $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit $limit -Priority $normalPriority
+            Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings | Out-Null
+            try {
+              Start-ScheduledTask -TaskName $task
+              $deadline = (Get-Date) + $limit
+              do {
+                Start-Sleep -Seconds $pollSeconds
+                $state = (Get-ScheduledTask -TaskName $task).State
+                $result = (Get-ScheduledTaskInfo -TaskName $task).LastTaskResult
+              } while (($state -eq 'Running' -or $state -eq 'Queued' -or $result -eq $notRun) -and (Get-Date) -lt $deadline)
+            } finally {
+              if ((Get-ScheduledTask -TaskName $task).State -eq 'Running') { Stop-ScheduledTask -TaskName $task }
+              Unregister-ScheduledTask -TaskName $task -Confirm:$false
+            }
+          } finally {
+            Remove-Item -LiteralPath $userOnly, $profileFile -Force -ErrorAction SilentlyContinue
+          }
+          $lines = @()
+          if (Test-Path -LiteralPath $log) { $lines = @(Get-Content -LiteralPath $log -Encoding UTF8) }
+          $lines
+          "the account checks ended with $result"
+          if (-not ($lines | Select-String -Pattern "^${flag}: [0-9]+/[0-9]+ passed$")) {
+            throw 'the account checks did not finish: their log has no count'
+          }
+          exit $result
+
+      # The account checks remove the accounts they make, and their logon
+      # right; this removes any account a run that ended early left, by the
+      # name prefix the checks give them (test/Test/WindowsSandbox.hs), and
+      # leaves such an account's right on its SID, which the discarded
+      # runner takes with it.  Windows PowerShell carries the LocalAccounts
+      # module itself, where PowerShell 7 loads it through a compatibility
+      # session.
+      - name: Remove leftover build accounts (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          # Listed in full first, so that removing one does not cut the
+          # listing short.
+          @(Get-LocalUser | Where-Object Name -like 'nnslot*') | ForEach-Object {
+            "removing the leftover account $($_.Name)"
+            Remove-LocalUser -SID $_.SID
+          }
 
       # A crash or a memory-pressure kill on macOS leaves a report the
       # runner keeps; print this job's, since the runner is discarded.
@@ -654,6 +763,53 @@ jobs:
           Assert-AclEntry 'the store' @(icacls $store) $storeEntries
           Assert-AclEntry 'the state directory' @(icacls (Join-Path $store '.nova-nix')) $storeEntries
           Assert-AclEntry 'the build directory' @(Get-Content -LiteralPath $out) @("${user}:(OI)(CI)(F)")
+
+      # nova-nix refuses a store under a directory another account could
+      # change, naming the directory, before it makes anything in it.  A
+      # folder made at the drive root, as another user can make C:\nix
+      # before nova-nix runs, takes the root's access control list, which
+      # lets other users change what is made in it.  The parent the step
+      # above made for its store, given to LOCAL SERVICE, stands for a
+      # C:\nix another account owns.
+      - name: A store under a directory another account could change is refused (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = cabal list-bin exe:nova-nix
+          $drv = Join-Path $env:RUNNER_TEMP 'acl.nix'
+          $log = Join-Path $env:RUNNER_TEMP 'refused.log'
+          function Assert-Refused([string]$Directory, [string]$Store) {
+            & $exe --store $Store build --no-out-link $drv 2> $log | Out-Null
+            $code = $LASTEXITCODE
+            $said = Get-Content -Raw -LiteralPath $log
+            Write-Output $said
+            # The runner ends the step with the last native command's exit
+            # status, and this refusal is the outcome the step wants.
+            $global:LASTEXITCODE = 0
+            if ($code -eq 0) {
+              Write-Output "::error::a build in $Store ran"
+              exit 1
+            }
+            if (-not $said.Contains("error: $Directory ") -or -not $said.Contains("so the store in $Store cannot be trusted; move $Directory aside")) {
+              Write-Output "::error::the build in $Store failed, but not with a refusal naming $Directory"
+              exit 1
+            }
+            Write-Output "ok    a store in $Store is refused, naming $Directory"
+          }
+
+          $inherited = Join-Path $env:SystemDrive 'nova-nix-inherited'
+          New-Item -ItemType Directory -Path $inherited | Out-Null
+          Assert-Refused $inherited (Join-Path $inherited 'store')
+          if (@(Get-ChildItem -Force -LiteralPath $inherited).Count -ne 0) {
+            Write-Output "::error::nova-nix made something in $inherited before refusing it"
+            exit 1
+          }
+
+          $parent = Join-Path $env:SystemDrive 'nova-nix-acl'
+          icacls $parent /setowner '*S-1-5-19'
+          if ($LASTEXITCODE -ne 0) { throw "icacls exited $LASTEXITCODE" }
+          Assert-Refused $parent (Join-Path $parent 'store')
 
       # An installed nova-nix finds the helper beside it, and no profile
       # names that copy, so with the restriction on, which the step asserts,
@@ -856,10 +1012,6 @@ jobs:
               }
             }
           }
-
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
       # Every source pkgs/windows fetches, from the public cache where it
       # holds it, so the builds below fetch none.
@@ -1318,10 +1470,6 @@ jobs:
         with:
           name: stage0-nova-nix
           path: ${{ runner.temp }}
-
-      - name: Provision the store root
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path C:\nix\store | Out-Null
 
       # Every source pkgs/windows fetches, from the public cache where it
       # holds it, so the builds below fetch none.  They name no substituter

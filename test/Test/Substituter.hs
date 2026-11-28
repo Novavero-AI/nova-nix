@@ -18,6 +18,7 @@ import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -25,13 +26,14 @@ import GHC.IO.Encoding (getFileSystemEncoding, mkTextEncoding, setFileSystemEnco
 import HttpFixture (Reply (..), httpResponse, withHttpServer)
 import qualified Network.HTTP.Client as HTTP
 import Nix.Builder (BuildConfig (..), BuildResult (..), buildWithDeps, defaultBuildConfig, substitutePaths)
+import Nix.Daemon.Protocol (parseContentAddress, parseSignature)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), currentPlatform)
 import Nix.Hash (moduloHashFinalize, moduloHashInit, moduloHashUpdate, rawHashWithAlgo)
 import Nix.Http (FetchRetryPolicy (..), RetryEffects (..), defaultFetchRetryPolicy, ioRetryEffects)
 import qualified Nix.Realise as Realise
 import Nix.Store (Store (..), caseHackDiskNames, closeStore, onDiskNameKey, openStore, releasePathLock, tryAcquirePathLock, unpackNarEntry, writeDrv)
 import Nix.Store.CaseSensitive (CaseSensitivity (..), probeCaseSensitivity, trySetCaseSensitiveDir, volumeCaseHack)
-import Nix.Store.DB (PathRegistration (..))
+import Nix.Store.DB (PathRegistration (..), Ultimate (..))
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (executablePermissions, readOnlyPermissions)
 import Nix.Store.Path (StoreDir (..), defaultStoreDir, storePathToFilePath, storePathToText)
@@ -73,22 +75,7 @@ testSubstituter = do
   -- sibling names the way a store on that volume would.
   tmpSensitivity <- tempCaseSensitivity
   sequence
-    [ -- sortCaches: priority ordering
-      runTest "sortCaches priority ordering" $
-        let c1 = Subst.CacheConfig "https://a.example.com" ["key-a"] 40
-            c2 = Subst.CacheConfig "https://b.example.com" ["key-b"] 10
-            c3 = Subst.CacheConfig "https://c.example.com" ["key-c"] 30
-            sorted = Subst.sortCaches [c1, c2, c3]
-         in case sorted of
-              [s1, s2, s3] ->
-                if Subst.ccPriority s1 == 10 && Subst.ccPriority s2 == 30 && Subst.ccPriority s3 == 40
-                  then Pass
-                  else Fail ("bad order: " <> T.pack (show (map Subst.ccPriority sorted)))
-              _ -> Fail "expected 3 caches",
-      -- sortCaches: empty list
-      runTest "sortCaches empty" $
-        assertEqual "empty-sort" [] (Subst.sortCaches []),
-      -- readBodyCapped: the client-side body cap (mirror of the server's
+    [ -- readBodyCapped: the client-side body cap (mirror of the server's
       -- readBodyLimited).  A body reader is just IO ByteString yielding
       -- chunks then empty.
       runTestM "readBodyCapped concatenates under the cap" $ do
@@ -473,6 +460,28 @@ testSubstituter = do
             | prNarSize reg /= BS.length streamTestNar -> Fail "registration NarSize diverges"
             | prNarHash reg /= CHash.formatNixHash streamTestDigest -> Fail "registration NarHash diverges"
             | otherwise -> Pass,
+      -- A substituted path keeps the signatures its narinfo carries and
+      -- the content address its tree was held to, as upstream registers
+      -- the path info it copies; a Sig line that does not parse is left
+      -- out.
+      runTestM "materialize registers the narinfo's signatures and the content address it checked" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpStore = tmpBase </> "nova-nix-test-materialize-trust"
+            address = case streamTestDigest of
+              CHash.NixHash digest -> "fixed:r:sha256:" <> Nix32.encode digest
+            signature = "cache.example.org-1:AQI="
+            narInfo = (streamTestNarInfo streamTestNar) {NarInfo.niSigs = [signature, "not a signature"], NarInfo.niCA = Just address}
+        forceRemoveIfExists tmpStore
+        createDirectoryIfMissing True tmpStore
+        store <- openStore testLogger (StoreDir tmpStore)
+        source <- chunkReader (streamChunks 7 streamTestNar)
+        result <- Subst.materializeNarFromSource store (StorePath sampleHash "stream") narInfo streamTestDigest [] Nothing source
+        closeStore store
+        forceRemoveIfExists tmpStore
+        let expected = (NotUltimate, either (const Set.empty) Set.singleton (parseSignature (TE.encodeUtf8 signature)), either (const Nothing) Just (parseContentAddress address))
+        pure $ case result of
+          Left err -> Fail ("materialize failed: " <> Subst.attemptFailureMessage err)
+          Right reg -> assertEqual "trust" expected (prUltimate reg, prSignatures reg, prContentAddress reg),
       runTestM "materialize removes the tree on a digest mismatch" $ do
         tmpBase <- getTemporaryDirectory
         let tmpStore = tmpBase </> "nova-nix-test-materialize-digest"
@@ -1427,7 +1436,7 @@ testStatedContentAddress = do
         result <- either (pure . Left . ("unpack: " <>)) (const (Subst.checkStatedAddress (volumeCaseHack sensitivity) dir sp dest address)) written
         forceRemoveIfExists root
         pure result
-      holds label tree address = runTestM label $ assertEqual label (Right ()) <$> checked tree (Just address)
+      holds label tree address = runTestM label $ assertEqual label (Right (either (const Nothing) Just (parseContentAddress address))) <$> checked tree (Just address)
       mismatch label tree address = runTestM label $ do
         result <- checked tree (Just address)
         pure $ case result of
@@ -1442,7 +1451,7 @@ testStatedContentAddress = do
       moduloDigest modulus chunks = (\start -> moduloHashFinalize (foldl' moduloHashUpdate start chunks)) <$> moduloHashInit "sha256" modulus
   sequence
     [ runTestM "a narinfo with no content address holds the tree to its NarHash alone" $
-        assertEqual "none" (Right ()) <$> checked directory Nothing,
+        assertEqual "none" (Right Nothing) <$> checked directory Nothing,
       holds "a tree whose NAR has the recursive address stated is held" directory (spelled "fixed:r:" "sha256" (digestOf "sha256" (NAR.serialise directory))),
       holds "an address in another algorithm is read in that one" directory (spelled "fixed:r:" "sha1" (digestOf "sha1" (NAR.serialise directory))),
       mismatch "a tree whose NAR has another digest is refused in upstream's words" directory (spelled "fixed:r:" "sha256" (digestOf "sha256" "something else")),
@@ -1581,7 +1590,7 @@ testSubstituterRetry = do
                           config = (defaultBuildConfig (StoreDir root)) {bcCaches = caches}
                       bracket_ (forceRemoveIfExists root) (forceRemoveIfExists root) $
                         bracket (openStore testLogger (StoreDir root)) closeStore $ \store -> do
-                          offers <- evalStateT (traverse (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy quietRetry Realise.NoFallback caches) (high :| [low])) Subst.emptyNarInfoMemo
+                          offers <- evalStateT (traverse (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy quietRetry Realise.NoFallback caches) (high :| [low])) Subst.emptyCacheMemo
                           case traverse offeredSubstitute offers of
                             Nothing -> pure (Fail ("not offered: " <> T.pack (show (fmap offerCache offers))))
                             Just batch -> do
@@ -1591,6 +1600,11 @@ testSubstituterRetry = do
                 withHttpServer (route (const narInfoOk) (const narOk)) $ \base _ _ ->
                   assertEqual "references" (Realise.Offered base [])
                     <$> queryOffer Realise.NoFallback [trustingCache base 40] sp,
+              runTestM "an HTTP cache configured with trailing slashes is asked, and named, without them" $
+                withHttpServer (route (const narInfoOk) (const narOk)) $ \base requests _ -> do
+                  offer <- queryOffer Realise.NoFallback [trustingCache (base <> "//") 40] sp
+                  seen <- requests
+                  pure (assertEqual "offer and requests" (Realise.Offered base [], [narInfoPath]) (offer, seen)),
               runTestM "a reference query passes over a narinfo no trusted key signed" $
                 withHttpServer (route (const unsignedNarInfo) (const narOk)) $ \base _ _ ->
                   assertEqual "references" Realise.NotOffered
@@ -1786,7 +1800,7 @@ testSubstituterRetry = do
     statusCode = T.unpack . T.take 3
     quietRetry = RetryEffects {reSleepMs = const (pure ()), reJitter = pure 0, reWarn = const (pure ())}
     queryOffer fallback caches path =
-      offerCache <$> evalStateT (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy quietRetry fallback caches path) Subst.emptyNarInfoMemo
+      offerCache <$> evalStateT (Subst.queryReferencesWith testLogger defaultFetchRetryPolicy quietRetry fallback caches path) Subst.emptyCacheMemo
     hash = T.replicate 32 "b"
     sp = StorePath hash "retry"
     narInfoPath = "/" <> TE.encodeUtf8 hash <> ".narinfo"

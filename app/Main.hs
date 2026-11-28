@@ -12,7 +12,7 @@ module Main (main) where
 
 import Control.Applicative ((<|>))
 import Control.Exception (AsyncException (UserInterrupt), bracket, bracketOnError, displayException, handle, handleJust, try)
-import Control.Monad (filterM, mfilter, void, when, (>=>))
+import Control.Monad (filterM, foldM_, mfilter, void, when, (>=>))
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
@@ -71,8 +71,8 @@ import Nix.Http (defaultFetchRetryPolicy)
 import Nix.Json (Json, renderJson)
 import Nix.Logger (Logger, escapeFilterFor, handleLogger)
 import Nix.Parser (ParsedSource, SourceError (..), SourceOrigin (..), parseNixWithScope)
-import Nix.Profile.Generation (Change (..), ProfileFailure (..), ProfileLinkPlace (..), absolutePath, checkProfileStore, readManifest, readProfileEnvironment, resolveDefaultProfile, updateProfile)
-import Nix.Profile.Manifest (Conflict (..), ConflictSide (..), Element (..), FlakeSource (..), Manifest (..), Matcher (..), Selection (..), Selector (..), addElement, defaultPriority, elementIdentifier, flakeAttribute, manifestErrorText, manifestJson, regexMatcher, selectElements)
+import Nix.Profile.Generation (Change (..), Changes (..), DatedGeneration (..), Generation (..), GenerationNumber (..), ProfileFailure (..), ProfileLinkPlace (..), RollbackTarget (..), WipeScope (..), absolutePath, checkProfileStore, currentEpochSeconds, cutoffBefore, findGenerations, generationDate, parseOlderThan, readGenerationNumber, readManifest, readProfileEnvironment, resolveDefaultProfile, switchGeneration, updateProfile, wipeHistory)
+import Nix.Profile.Manifest (Conflict (..), ConflictSide (..), Element (..), FlakeSource (..), Manifest (..), Matcher (..), Selection (..), Selector (..), addElement, changeLine, defaultPriority, elementIdentifier, emptyManifest, flakeAttribute, manifestChanges, manifestErrorText, manifestJson, regexMatcher, selectElements)
 import Nix.Profile.Tree (buildEnvFailureText)
 import Nix.Push (PushCompression (..), PushConfig (..), PushSummary (..), defaultPartSize, isDerivationPath, loadKeyFile, outputPathsOnly, parsePushCompression, pushPaths, storePathBasename)
 import Nix.Push.Directory (DirectoryPush (..), PushTarget (..), loadSecretKeyFile, pushTarget, pushToDirectory)
@@ -220,6 +220,9 @@ main = do
     CmdProfileAdd target attrPath selection priority -> profileAddCommand config opts storeDir dataDir target attrPath selection priority
     CmdProfileRemove selection removals -> profileRemoveCommand config storeDir selection removals
     CmdProfileList selection format -> profileListCommand config storeDir selection format
+    CmdProfileHistory selection -> profileHistoryCommand config storeDir selection
+    CmdProfileRollback selection to changes -> profileRollbackCommand config storeDir selection to changes
+    CmdProfileWipeHistory selection olderThan changes -> profileWipeHistoryCommand config storeDir selection olderThan changes
     CmdUsage -> mapM_ (TIO.hPutStrLn stderr) helpLines >> exitFailure
     CmdHelp -> toStdout (mapM_ TIO.putStrLn helpLines)
     CmdVersion -> toStdout (putStrLn versionLine)
@@ -948,21 +951,23 @@ recordedDerivation drvClosure = either (failWith . ("error: " <>)) pure . record
 chosenStoreDir :: CliOpts -> IO StoreDir
 chosenStoreDir opts = canonicalStoreDir (maybe platformStoreDir StoreDir (optStore opts))
 
--- | Default priority for a config- or CLI-configured substituter
--- (cache.nixos.org is 40).
+-- | The priority a config- or CLI-configured HTTP substituter is asked at
+-- (cache.nixos.org is 40).  A @file:\/\/@ one is asked at the priority its
+-- @nix-cache-info@ states ("Nix.Substituter").
 substituterPriority :: Int
 substituterPriority = 50
 
 -- | Turn resolved settings into the cache list.  One 'CacheConfig' per
--- substituter, each carrying the whole trusted-key set: upstream's keys
--- are not bound to a substituter, so a narinfo from any cache is accepted
--- by any trusted key.  A substituter with no trusted key anywhere is not
--- refused here (it simply accepts nothing at the signature gate), matching
--- upstream, where @substituters@ and @trusted-public-keys@ are independent.
+-- substituter, by its URL as configured, each carrying the whole
+-- trusted-key set: upstream's keys are not bound to a substituter, so a
+-- narinfo from any cache is accepted by any trusted key.  A substituter
+-- with no trusted key anywhere is not refused here (it simply accepts
+-- nothing at the signature gate), matching upstream, where @substituters@
+-- and @trusted-public-keys@ are independent.
 configToCaches :: NixConfig -> [CacheConfig]
 configToCaches config =
   [ CacheConfig
-      { ccUrl = T.dropWhileEnd (== '/') url,
+      { ccUrl = url,
         ccPublicKeys = ncTrustedPublicKeys config,
         ccPriority = substituterPriority
       }
@@ -1839,7 +1844,113 @@ profileListCommand config storeDir selection format = do
   manifest <- readManifest profile >>= either (failError . profileFailureText storeDir) pure
   case format of
     ListJson layout -> printJson layout (manifestJson manifest)
-    ListText -> toStdout (mapM_ TIO.putStrLn (listLines storeDir manifest))
+    ListText -> do
+      styling <- stdoutStyling
+      toStdout (mapM_ TIO.putStrLn (listLines styling storeDir manifest))
+
+-- | Print each generation of a profile and what changed in it from the
+-- one listed before it, as upstream's @profile history@ does.  A
+-- generation's lines are printed once its manifest is read, so one that
+-- cannot be read stops the command after the lines of those before it.
+profileHistoryCommand :: NixConfig -> StoreDir -> ProfileSelection -> IO ()
+profileHistoryCommand config storeDir selection = do
+  profile <- chosenProfile config selection
+  -- Upstream reads the generations of a profile of any store; here they
+  -- would be read against a store that does not hold them, as for list.
+  checkProfileStore storeDir profile >>= either (failError . profileFailureText storeDir) pure
+  (dated, current) <- findGenerations profile >>= either (failError . profileFailureText storeDir) pure
+  styling <- stdoutStyling
+  let printGeneration previous entry = do
+        let generation = datedGeneration entry
+        manifest <- readManifest (generationPath generation) >>= either (failError . profileFailureText storeDir) pure
+        toStdout (mapM_ TIO.putStrLn (historyLines styling current previous entry manifest))
+        pure (Just (generationNumber generation, manifest))
+  foldM_ printGeneration Nothing dated
+
+-- | One generation's lines in a profile's history, as upstream prints
+-- them: a blank line when a generation was listed before it,
+-- @Version N (DATE)@, the date in UTC, then @ <- M@ for that earlier
+-- generation and a colon, the number in green for the current generation
+-- and in bold for the others, then what changed from the earlier
+-- generation's manifest, or from none, each line indented by two spaces.
+historyLines :: Styling -> Maybe GenerationNumber -> Maybe (GenerationNumber, Manifest) -> DatedGeneration -> Manifest -> [T.Text]
+historyLines styling current previous (DatedGeneration (Generation number _) made) manifest =
+  [T.empty | isJust previous]
+    ++ ["Version " <> style styling numberStyle <> generationText number <> style styling ansiNormal <> " (" <> generationDate made <> ")" <> maybe T.empty ((" <- " <>) . generationText . fst) previous <> ":"]
+    ++ map (indent <>) (if null changes then ["No changes."] else map changeLine changes)
+  where
+    changes = manifestChanges (maybe emptyManifest snd previous) manifest
+    numberStyle
+      | Just number == current = ansiGreen
+      | otherwise = ansiBold
+    indent = "  "
+
+-- | A generation's number, as a message shows it.
+generationText :: GenerationNumber -> T.Text
+generationText (GenerationNumber n) = T.pack (show n)
+
+-- | Switch a profile to the generation before its current one, or to the
+-- one the last @--to@ names, as upstream's @profile rollback@ does.  Every
+-- @--to@ is read, in order, and the first that does not read is refused, as
+-- upstream reads each as it parses its flags; the default profile is
+-- resolved first, as upstream resolves it before it parses them.
+profileRollbackCommand :: NixConfig -> StoreDir -> ProfileSelection -> [String] -> Changes -> IO ()
+profileRollbackCommand config storeDir selection toArgs changes = do
+  profile <- chosenProfile config selection
+  numbers <- either failError pure (traverse readGenerationNumber toArgs)
+  let target = maybe PreviousGeneration GenerationAt (listToMaybe (reverse numbers))
+  checkProfileStore storeDir profile >>= either (failError . profileFailureText storeDir) pure
+  logger <- cliLogger
+  switchGeneration logger profile target changes >>= either (failError . profileFailureText storeDir) pure
+
+-- | Delete a profile's generations but the current one, or with
+-- @--older-than@ those made before its cutoff but the newest of them, as
+-- upstream's @profile wipe-history@ does.  The cutoff is taken from the
+-- clock as the age is read, before the profile's lock is waited for, as
+-- upstream takes it.
+profileWipeHistoryCommand :: NixConfig -> StoreDir -> ProfileSelection -> Maybe String -> Changes -> IO ()
+profileWipeHistoryCommand config storeDir selection olderThan changes = do
+  profile <- chosenProfile config selection
+  scope <- case olderThan of
+    Nothing -> pure WipeEveryOld
+    Just age -> do
+      days <- either failError pure (parseOlderThan age)
+      now <- currentEpochSeconds
+      pure (WipeOlderThan (cutoffBefore now days))
+  checkProfileStore storeDir profile >>= either (failError . profileFailureText storeDir) pure
+  logger <- cliLogger
+  wipeHistory logger profile scope changes >>= either (failError . profileFailureText storeDir) pure
+
+-- | Whether a line printed on stdout keeps the escapes that style it.
+data Styling = Styled | Plain
+
+-- | Whether this run's stdout takes the escapes that style a line, as
+-- upstream decides for its stdout: never while @NO_COLOR@ or @NOCOLOR@ is
+-- set, always while @CLICOLOR_FORCE@ or @FORCE_COLOR@ is, and otherwise
+-- when stdout is a terminal and @TERM@ is set to something other than
+-- @dumb@.  A variable counts as set whatever its value, an empty one
+-- included.
+stdoutStyling :: IO Styling
+stdoutStyling = do
+  uncoloured <- anySet ["NO_COLOR", "NOCOLOR"]
+  forced <- anySet ["CLICOLOR_FORCE", "FORCE_COLOR"]
+  terminal <- hIsTerminalDevice stdout
+  term <- lookupEnvBytes "TERM"
+  pure (if not uncoloured && (forced || terminal && rendersColour term) then Styled else Plain)
+  where
+    anySet = fmap (any (/= EnvUnset)) . traverse lookupEnvBytes
+    rendersColour term = case term of
+      EnvUnset -> False
+      EnvValue value -> value /= "dumb"
+      EnvUnpairedSurrogate -> True
+
+-- | An escape as a styled line holds it: itself when stdout takes them,
+-- and nothing otherwise, where upstream writes the line with every escape
+-- taken out.
+style :: Styling -> T.Text -> T.Text
+style styling escape = case styling of
+  Styled -> escape
+  Plain -> T.empty
 
 -- | Print JSON as upstream's @printJSON@ prints it
 -- (common-args.cc, from 2.34.9): indented or on one line as the layout says,
@@ -1853,27 +1964,28 @@ printJson layout json = do
     Compact -> pure False
   toStdout (BS.putStr (if indented then renderIndentedJson json else renderJson json <> "\n"))
 
--- | The escapes upstream sets a name in bold, then red, and back with.
-ansiBold, ansiRed, ansiNormal :: T.Text
+-- | The escapes upstream sets text in bold, red or green, and back with.
+ansiBold, ansiRed, ansiGreen, ansiNormal :: T.Text
 ansiBold = "\ESC[1m"
 ansiRed = "\ESC[31;1m"
+ansiGreen = "\ESC[32;1m"
 ansiNormal = "\ESC[0m"
 
--- | What @profile list@ prints (@CmdProfileList::run@ in profile.cc): for
--- each element its name in bold, with @(inactive)@ in red after an inactive
--- one's, its flake's lines for one a flake made, and its paths as the store
--- spells them, with a blank line between elements.  Upstream's logger writes
--- the escapes to stdout whatever stdout is (@Logger::writeToStdout@ in
--- logging.cc at 2.35.4).
-listLines :: StoreDir -> Manifest -> [T.Text]
-listLines storeDir (Manifest elements) = intercalate [""] (map elementLines (Map.toAscList elements))
+-- | What @profile list@ prints, as upstream prints it: for each element
+-- its name, in bold, with @(inactive)@, in red, after an inactive one's,
+-- its flake's lines for one a flake made, and its paths as the store spells
+-- them, with a blank line between elements.  The escapes are written only
+-- where stdout takes them ('stdoutStyling'); a name holding an escape of its
+-- own keeps it, where upstream takes every escape out of the line.
+listLines :: Styling -> StoreDir -> Manifest -> [T.Text]
+listLines styling storeDir (Manifest elements) = intercalate [""] (map elementLines (Map.toAscList elements))
   where
     elementLines (name, element) =
-      ("Name:               " <> ansiBold <> name <> ansiNormal <> activity (elementActivity element))
+      ("Name:               " <> style styling ansiBold <> name <> style styling ansiNormal <> activity (elementActivity element))
         : maybe [] sourceLines (elementSource element)
         ++ ["Store paths:        " <> T.unwords (sort [T.pack (storePathToFilePath storeDir path) | path <- Set.toList (elementPaths element)])]
     activity Active = ""
-    activity Inactive = " " <> ansiRed <> "(inactive)" <> ansiNormal
+    activity Inactive = " " <> style styling ansiRed <> "(inactive)" <> style styling ansiNormal
     sourceLines source =
       [ "Flake attribute:    " <> flakeAttribute source,
         "Original flake URL: " <> sourceOriginalUrl source,
@@ -1918,6 +2030,8 @@ profileFailureText storeDir failure = case failure of
         "\n"
       ]
   StoreRefused reason -> reason
+  NoSuchGeneration number -> "profile version " <> generationText number <> " does not exist"
+  NoOlderGeneration current -> "no profile version older than the current (" <> generationText (fromMaybe (GenerationNumber 0) current) <> ") exists"
   where
     quotedPath path = "\"" <> hostPathText path <> "\""
 

@@ -126,25 +126,26 @@ import Nix.Builder.Log (openLogPipe, streamBuildLog)
 import Nix.Builder.Sandbox (DarwinOptions (..), DarwinPathInputs (..), DarwinPaths (..), DarwinPlan (..), DarwinProfile (..), HelperOutcome (..), Network, PathPresence (..), PlanInputs (..), SandboxBackend (..), SandboxConfig (..), SandboxFallback (..), SandboxPath (..), SandboxUse (..), backendFallback, chrootSkeleton, darwinOptions, darwinParameters, darwinPathsInSandbox, darwinProfile, darwinSetupFailureMessage, darwinStageName, defaultSandboxConfig, helperOutcome, hostSandboxBackend, renderDarwinPlan, renderPlan, rootRefusal, sandboxHome, sandboxPlan, sandboxUse, setupFailureMessage, setupStageName, unavailableMessage)
 import Nix.Builder.Sandbox.Spawn (HelperRun (..), bytesFilePath, filePathBytes, processIsRoot, profileFilters, resolvedPath, runHelper, sandboxAvailability, sealChroot, warnFallback, withChroot)
 import Nix.Builder.Unpack (UnpackLimits, builtinUnpackBuilder, defaultUnpackLimits, runBuiltinUnpack)
+import Nix.Daemon.Protocol (ContentAddress, ContentAddressMethod (..), contentAddressFromParts)
 import Nix.DependencyGraph (DepGraph, TopoResult (..), buildDepGraph, buildDepGraphFrom, topoSort)
 import Nix.Derivation (Derivation (..), DerivationOutput (..), Platform, currentPlatform, extraPlatforms, fixedOutput, fromATerm, platformToText)
 import Nix.Derivation.StructuredAttrs (decodeStructuredAttrs, renderAttrsJson, renderAttrsShell, stringsAttr, structuredAttrsKey, withOutputPlaceholders)
-import Nix.Hash (IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
+import Nix.Hash (FileIngestionMethod (..), IncrementalHash, bytesToHexText, hashFinalizeBytes, hashInitWithAlgo, hashPlaceholder, hashUpdateChunk, hexToBytes, makeStorePath, rawHashWithAlgo, sha256Digest)
 import Nix.Http (AttemptFailure (..), FetchRetryPolicy, attemptFailureMessage, catchSync, defaultFetchRetryPolicy, fetchStatusFailure, ioRetryEffects, retryTransient, transferFailureHandlers, withTransfer, withUserAgent)
 import Nix.Logger (Logger (..))
 import Nix.Push (narHashMatches)
 import Nix.Realise (BuildMode (..), CheckVerdict (..), ClosureOutcome, DifferingRebuild (..), Fallback (..), FetchOutcome (..), Offer (QueryFailed), RealiseEffects (..), RealiseSettings (..), Realised (..), Registration (..), SubstEffects (..), SubstitutesSetting (..), Undelivered (..), checkedOutputPath, noWriteAccessMessage, realise, realiseFailureMessage, realiseFailureStatus, realiseRequests, requestsFailureMessage, requestsFailureStatus, substituteClosure)
-import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration, Store (..), UpstreamHazard (..), acquirePathLock, canonicalizeMetadata, finishNarUnpack, freshCopyPath, isValid, moveOutput, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, replaceWithCopy, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
+import Nix.Store (CaseSensitivity, PathInfo (..), PathLock, PathRegistration (..), Store (..), Ultimate (..), UpstreamHazard (..), acquirePathLock, canonicalizeMetadata, finishNarUnpack, freshCopyPath, isValid, moveOutput, newNarUnpackSink, placeInStore, queryPathInfo, queryReferences, registerPaths, releasePathLock, replaceWithCopy, rewriteBytes, rewriteStoreHashes, scanReferences, sinkNarStream, upstreamManagedRefusal, volumeCaseHack)
 import qualified Nix.Store.ExecBit as ExecBit
 import Nix.Store.Metadata (foreignOwnedNode, isPlainFile, writableByOthers)
 import Nix.Store.Path (BadStorePath, StoreDir (..), StorePath (spHash, spName), defaultStoreDir, defaultStoreDirText, parseStorePath, parseStorePathPrefix, storePathToFilePath, storePathToText, unStoreDir)
 import Nix.Store.Symlink (WalkNode (..), classifyWalkNode)
-import Nix.Substituter (CacheConfig, NarInfoMemo, SubstResult (..), Substitute, emptyNarInfoMemo, fetchSubstituteWith, narStreamFailure, queryNextOfferWith, queryReferencesWith, substitutePath, withXzAttempt)
+import Nix.Substituter (CacheConfig, CacheMemo, SubstResult (..), Substitute, emptyCacheMemo, fetchSubstituteWith, narStreamFailure, queryNextOfferWith, queryReferencesWith, substitutePath, withXzAttempt)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Hash as Hash
 import qualified NovaCache.NAR as NAR
 import qualified NovaCache.Xz as Xz
-import System.Directory (createDirectoryIfMissing, removePathForcibly)
+import System.Directory (removePathForcibly)
 import qualified System.Environment
 import System.Exit (ExitCode (..))
 import System.FilePath (isAbsolute, isPathSeparator, takeDirectory, takeFileName, (</>))
@@ -870,7 +871,6 @@ runPlannedBuild config context drv run buildDir plans finish = do
       -- the name beside one may hold a fresh copy one left half made.
       clearScratch = for_ plans $ \p -> removePathForcibly (scratchDir p) *> removePathForcibly (freshCopyPath (scratchDir p))
   clearScratch
-  createDirectoryIfMissing True (unStoreDir (bcStoreDir config))
   -- The cleanup contract: outputs are written at their store paths, not
   -- in the build directory, so an interrupt or a throw between the
   -- builder starting and registration committing would otherwise strand
@@ -2403,8 +2403,10 @@ compareOutput caseHack drvPath (built, recorded) = do
       pure (Right (if narHashMatches recorded rebuilt then Nothing else Just built))
 
 -- | Place a scanned output in the store and check a fixed output's
--- content, returning its 'PathRegistration'; @Nothing@ for an output
--- registered before the build.
+-- content, returning its t'PathRegistration'; @Nothing@ for an output
+-- registered before the build.  The output is ultimately trusted, as
+-- upstream marks an output it built, and a fixed output has the content
+-- address it was checked against ('fixedOutputAddress').
 placeOutput :: Store -> StorePath -> Maybe Text -> ScannedOutput -> IO (Either Text (Maybe PathRegistration))
 placeOutput store drvPath deriver scanned = case scanned of
   AlreadyRegistered -> pure (Right Nothing)
@@ -2422,7 +2424,20 @@ placeOutput store drvPath deriver scanned = case scanned of
         -- clears the read-only marks placing set.
         removePathForcibly targetPath
         pure (Left err)
-      Right () -> pure (Right (Just reg))
+      Right () -> pure (Right (Just reg {prUltimate = Ultimate, prContentAddress = fixedOutputAddress output}))
+
+-- | The content address a fixed output's declaration gives it: its
+-- method, algorithm and hash, which 'verifyFixedOutput' holds the output
+-- to.  None for an output that is not fixed.
+fixedOutputAddress :: DerivationOutput -> Maybe ContentAddress
+fixedOutputAddress out
+  | T.null (doHashAlgo out) = Nothing
+  | otherwise = hexToBytes (doHash out) >>= contentAddressFromParts (FixedMethod ingestion) algo
+  where
+    (recursive, algo) = splitHashMode (doHashAlgo out)
+    ingestion
+      | recursive = NarIngestion
+      | otherwise = FlatIngestion
 
 -- | A reference cycle, named by the reference that closes it: the node
 -- reached again while it is still on the walk's path, and the node whose
@@ -2638,7 +2653,7 @@ buildWithDeps config store rootDrv rootDrvPath = do
       graph <- acyclicGraph <$> buildDepGraph (readDrvFromStore config) rootDrv rootDrvPath
       either (pure . stoppedResult) realiseGraph graph
     realiseGraph depGraph = do
-      result <- evalStateT (realise (realiseSettings config) (bcMode config) (realiseEffects config store) depGraph rootDrvPath) emptyNarInfoMemo
+      result <- evalStateT (realise (realiseSettings config) (bcMode config) (realiseEffects config store) depGraph rootDrvPath) emptyCacheMemo
       case result of
         Left failure -> pure (BuildFailure (realiseFailureMessage (bcStoreDir config) failure) (realiseFailureStatus failure))
         Right () ->
@@ -2699,7 +2714,7 @@ realiseRequestsWith config effects requests = do
   either (pure . Left) realiseIn graph
   where
     realiseIn depGraph = do
-      result <- evalStateT (realiseRequests (realiseSettings config) effects depGraph requests) emptyNarInfoMemo
+      result <- evalStateT (realiseRequests (realiseSettings config) effects depGraph requests) emptyCacheMemo
       pure (first (\failure -> BuildStop (requestsFailureMessage (bcStoreDir config) failure) (requestsFailureStatus failure)) result)
 
 -- | Check one derivation the store holds, every output of it, as
@@ -2746,9 +2761,9 @@ readDrvFromStore config sp = do
 -- Realisation effects
 -- ---------------------------------------------------------------------------
 
--- | A realisation's effects, which carry a t'NarInfoMemo' through the run,
--- so each cache is asked about each path once.
-type Realising = StateT NarInfoMemo IO
+-- | A realisation's effects, which carry a t'CacheMemo' through the run,
+-- so each cache is opened once and asked about each path once.
+type Realising = StateT CacheMemo IO
 
 -- | The store, caches and builder that "Nix.Realise" drives.
 realiseEffects :: BuildConfig -> Store -> RealiseEffects Substitute Realising
@@ -2788,7 +2803,7 @@ substEffects config store =
 -- narinfo is read ('fetchSubstituteWith'), and the outcome is a failed one.
 substituteFromCaches :: BuildConfig -> Store -> [StorePath] -> IO ClosureOutcome
 substituteFromCaches config store paths =
-  evalStateT (substituteClosure (substEffects config store) paths) emptyNarInfoMemo
+  evalStateT (substituteClosure (substEffects config store) paths) emptyCacheMemo
 
 -- | Build one derivation, naming it in any failure.
 buildReporting :: BuildConfig -> Store -> Derivation -> StorePath -> IO (Either Text ())

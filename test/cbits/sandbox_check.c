@@ -112,10 +112,34 @@ static int render_darwin(struct buffer *buffer, const struct plan *plan)
     return plan->parameters[2 * plan->parameter_count] == NULL;
 }
 
+static int render_windows(struct buffer *buffer, const struct plan *plan)
+{
+    char cap[LENGTH_DIGITS_MAX + 1];
+    snprintf(cap, sizeof cap, "%llu", plan->memory_cap);
+    return append_token(buffer, "backend") && append_token(buffer, "windows") && append_token(buffer, "build-dir")
+        && append_token(buffer, plan->build_dir) && append_token(buffer, "token")
+        && append_number(buffer, plan->token_handle) && append_token(buffer, "slot-sid")
+        && append_token(buffer, plan->slot_sid) && append_token(buffer, "desktop")
+        && append_token(buffer, plan->desktop) && append_token(buffer, "memory-cap") && append_token(buffer, cap);
+}
+
+static int render_backend(struct buffer *buffer, const struct plan *plan)
+{
+    switch (plan->backend) {
+    case PLAN_LINUX:
+        return render_linux(buffer, plan);
+    case PLAN_DARWIN:
+        return render_darwin(buffer, plan);
+    case PLAN_WINDOWS:
+        return render_windows(buffer, plan);
+    }
+    return 0;
+}
+
 static int render(struct buffer *buffer, const struct plan *plan)
 {
     size_t i;
-    if (!(plan->backend == PLAN_LINUX ? render_linux(buffer, plan) : render_darwin(buffer, plan)))
+    if (!render_backend(buffer, plan))
         return 0;
     for (i = 0; i < plan->environment_count; i++)
         if (!append_token(buffer, "env") || !append_token(buffer, plan->environment[i]))

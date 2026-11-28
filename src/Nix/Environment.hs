@@ -16,7 +16,10 @@
 -- Nix string carries, and a name is read as UTF-8.  An unpaired
 -- surrogate has no UTF-8 form, so a value holding one is refused rather
 -- than approximated, the rule the NAR serialiser applies to such a file
--- name.
+-- name.  A variable set to nothing is set, as upstream reads it on every
+-- platform: @GetEnvironmentVariableW@ is asked first for the space the
+-- value needs, which is none only when the variable is not set, where
+-- 'System.Environment.lookupEnv' reads a value of no characters as unset.
 --
 -- A command-line argument is read the same way: its bytes as the file
 -- system takes them when it names a file, which on POSIX are the bytes
@@ -33,7 +36,10 @@ import Data.ByteString (ByteString)
 import Data.Char (GeneralCategory (Surrogate), generalCategory)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import System.Environment (lookupEnv)
+import Data.Word (Word32)
+import Foreign.C.String (CWString, peekCWStringLen, withCWString)
+import Foreign.Marshal.Array (allocaArray)
+import Foreign.Ptr (nullPtr)
 #else
 import qualified Data.ByteString.Char8 as BS8
 import qualified System.OsPath as OP
@@ -53,15 +59,15 @@ data EnvLookup
 
 -- | Look up a variable by the bytes of its name.  Nothing is caught: the
 -- read cannot fail other than by finding nothing, since @getenv@ answers
--- NULL for a missing name and base's 'System.Environment.lookupEnv'
--- answers 'Nothing' whenever @GetEnvironmentVariableW@ finds no value.
+-- NULL for a missing name and @GetEnvironmentVariableW@ needs no space
+-- for one.
 lookupEnvBytes :: ByteString -> IO EnvLookup
 #if defined(mingw32_HOST_OS)
 lookupEnvBytes name = case TE.decodeUtf8' name of
   -- A Windows name is UTF-16, so bytes with no UTF-8 reading name no
   -- variable.
   Left _ -> pure EnvUnset
-  Right decoded -> maybe EnvUnset utf8Value <$> lookupEnv (T.unpack decoded)
+  Right decoded -> maybe EnvUnset utf8Value <$> windowsVariable (T.unpack decoded)
   where
     -- base decodes a surrogate pair into one character and keeps an
     -- unpaired surrogate as its own code point ('hasNoUtf8Form').
@@ -91,4 +97,23 @@ argumentBytes arg = Just . BS8.pack . map OP.toChar . OP.unpack <$> OP.encodeFS 
 -- has no UTF-8 form and which 'T.pack' would replace with U+FFFD.
 hasNoUtf8Form :: Char -> Bool
 hasNoUtf8Form = (== Surrogate) . generalCategory
+
+-- | A variable's value, as upstream reads one: @GetEnvironmentVariableW@
+-- asked for the space the value needs with its terminating NUL, none for
+-- a variable that is not set, then for the value, which on success is
+-- shorter than the space given and otherwise is the space it now needs,
+-- had it grown between the calls.
+windowsVariable :: String -> IO (Maybe String)
+windowsVariable name = withCWString name $ \key -> do
+  needed <- c_GetEnvironmentVariable key nullPtr 0
+  if needed == 0 then pure Nothing else Just <$> readValue key needed
+  where
+    readValue key space = allocaArray (fromIntegral space) $ \buffer -> do
+      written <- c_GetEnvironmentVariable key buffer space
+      if written >= space
+        then readValue key written
+        else peekCWStringLen (buffer, fromIntegral written)
+
+foreign import ccall unsafe "windows.h GetEnvironmentVariableW"
+  c_GetEnvironmentVariable :: CWString -> CWString -> Word32 -> IO Word32
 #endif
