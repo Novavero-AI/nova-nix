@@ -131,6 +131,8 @@ library
     Nix.CacheDirectory
     Nix.Compression
     Nix.Config
+    Nix.Daemon.Connection
+    Nix.Daemon.Ops
     Nix.Daemon.Protocol
     Nix.Daemon.Wire
     Nix.Environment
