@@ -253,6 +253,7 @@ import Nix.Store.Path.Internal (maskedOutputPath)
 import qualified NovaCache.Base32 as Nix32
 import qualified NovaCache.Base64 as B64
 import qualified NovaCache.NAR as NAR
+import NovaCache.NAR.Stream (narMaxDepth)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Info
 import Text.Regex.TDFA (matchAllText)
@@ -6168,26 +6169,32 @@ filteredSourceNar filterFn rawRoot = do
   -- above it for the lstats to refuse.
   rootPath <- resolveSymlinks rawRoot
   rootType <- getFileType rootPath
-  entry <- buildEntry rootPath rootType
+  entry <- buildEntry 0 rootPath rootType
   pure (NAR.serialise entry)
   where
-    buildEntry path fileType = case fileType of
-      "regular" -> do
-        executable <- isExecutableFile path
-        bytes <- readFileBytes path
-        pure (NAR.NarRegular executable bytes)
-      "symlink" -> NAR.NarSymlink . TE.encodeUtf8 <$> readSymlinkTarget path
-      "directory" -> do
-        children <- listDirectory path
-        kept <- mapM (keepChild path) children
-        pure (NAR.NarDirectory (catMaybes kept))
-      other -> throwEvalError ("builtins.path: unsupported file type '" <> other <> "' at " <> path)
-    keepChild parent (name, listedType) = do
+    -- An entry 'narMaxDepth' levels below the root is refused once the
+    -- filter has kept it, before it is read, as upstream's dump of a
+    -- filtered tree refuses it: no parser accepts its archive.
+    buildEntry depth path fileType
+      | depth >= narMaxDepth =
+          throwEvalError ("path '" <> path <> "' exceeds maximum NAR directory depth of " <> T.pack (show narMaxDepth))
+      | otherwise = case fileType of
+          "regular" -> do
+            executable <- isExecutableFile path
+            bytes <- readFileBytes path
+            pure (NAR.NarRegular executable bytes)
+          "symlink" -> NAR.NarSymlink . TE.encodeUtf8 <$> readSymlinkTarget path
+          "directory" -> do
+            children <- listDirectory path
+            kept <- mapM (keepChild (depth + 1) path) children
+            pure (NAR.NarDirectory (catMaybes kept))
+          other -> throwEvalError ("builtins.path: unsupported file type '" <> other <> "' at " <> path)
+    keepChild childDepth parent (name, listedType) = do
       let childPath = parent <> "/" <> name
       childType <- entryFileType childPath listedType
       keep <- filterAccepts childPath childType
       if keep
-        then Just . (,) (TE.encodeUtf8 name) <$> buildEntry childPath childType
+        then Just . (,) (TE.encodeUtf8 name) <$> buildEntry childDepth childPath childType
         else pure Nothing
     filterAccepts path fileType = do
       partial <- applyValue filterFn (mkStr path)
