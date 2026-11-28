@@ -38,11 +38,12 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (poll, wait, withAsync)
 import Control.Exception (IOException, bracket, finally, try)
 import Control.Monad (unless, void, when, (<=<))
+import Data.Bits ((.&.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
-import Data.List (intercalate)
+import Data.List (intercalate, isPrefixOf, sort)
 import Data.Maybe (fromMaybe, isJust, isNothing, mapMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -50,6 +51,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Word (Word32, Word64)
+import qualified DirDacl
 import Foreign.C.Error (Errno (..), eINVAL)
 import Foreign.C.String (CString, CWString, peekCString, peekCWString, withCWString)
 import Foreign.C.Types (CInt (..), CULLong (..), CULong (..))
@@ -61,14 +63,18 @@ import GHC.IO.Handle (hDuplicateTo)
 import qualified Nix.Builder.Sandbox as Sandbox
 import qualified Nix.Builder.Sandbox.Spawn as Spawn
 import Nix.Logger (Logger (..))
-import Nix.Store.Access (Sid, sidFromText, sidText)
+import Nix.Store (canonicalizeMetadata)
+import Nix.Store.Access (Sid, createStoreDirectory, sidFromText, sidText)
+import Nix.Store.CaseSensitive (processCaseHack)
+import qualified Nix.Store.ExecBit as ExecBit
 import qualified NovaCache.Base64 as B64
 import Numeric (showHex)
 import qualified System.Directory as Dir
 import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
-import System.FilePath (takeDirectory, takeFileName, (</>))
+import System.FilePath (takeDirectory, takeDrive, takeFileName, (</>))
 import System.IO (BufferMode (..), Handle, IOMode (..), hClose, hFlush, hSetBuffering, stderr, stdout, withBinaryFile)
+import System.IO.Error (ioeGetFileName)
 import qualified System.Info as SI
 import qualified System.Process as Proc
 import System.Timeout (timeout)
@@ -82,6 +88,24 @@ import Text.Read (readMaybe)
 
 foreign import ccall unsafe "nova_test_account_make"
   c_account_make :: CWString -> Ptr CWString -> Ptr CString -> IO CULong
+
+foreign import ccall unsafe "nova_test_group_make"
+  c_group_make :: CWString -> IO CULong
+
+foreign import ccall unsafe "nova_test_group_add"
+  c_group_add :: CWString -> CWString -> IO CULong
+
+foreign import ccall unsafe "nova_test_group_remove"
+  c_group_remove :: CWString -> IO CULong
+
+foreign import ccall unsafe "nova_test_account_sid"
+  c_account_sid :: CWString -> Ptr CWString -> IO CULong
+
+foreign import ccall unsafe "nova_test_mkdir"
+  c_mkdir :: CWString -> IO CULong
+
+foreign import ccall unsafe "nova_test_lock"
+  c_lock :: CWString -> IO CULong
 
 foreign import ccall unsafe "nova_test_account_remove"
   c_account_remove :: CWString -> Ptr CString -> IO CULong
@@ -386,22 +410,54 @@ windowsSandboxInstall args = case args of
             command = unwords [quoted suite, windowsSandboxServiceFlag, T.unpack service, quoted (checksConfig root)]
             victim = Victim (T.pack sid) profile temp appData pid onlyFile profileFile
         code <-
-          withAccount (accountPrefix <> tag <> "a") $ \one ->
-            withAccount (accountPrefix <> tag <> "b") $ \two ->
-              withService service command $ \serviceSid ->
-                withChecksRoot root serviceSid $ do
-                  BS.writeFile (checksConfig root) (TE.encodeUtf8 (T.pack (show (ServiceChecks root helper bash victim one two))))
-                  runChecks service (checksLog root)
+          withBuildersGroup $
+            withAccount (accountPrefix <> tag <> "a") $ \one ->
+              withAccount (accountPrefix <> tag <> "b") $ \two ->
+                withService service command $ \serviceSid ->
+                  withChecksRoot root serviceSid $ do
+                    BS.writeFile (checksConfig root) (TE.encodeUtf8 (T.pack (show (ServiceChecks root helper bash victim one two))))
+                    runChecks service (checksLog root)
         exitWith code
   _ -> do
     putStrLn ("usage: " <> windowsSandboxInstallFlag <> " PARENT HELPER BASH SID PROFILE TEMP APPDATA PID USER-ONLY-FILE PROFILE-FILE")
     exitFailure
 
 -- | Run an action with a slot's account made for it, with the batch
--- logon right, and removed after it, its right first, however the action
--- ends, a failure to make it included.
+-- logon right and a member of the build accounts' group, and removed
+-- after it, its right first, however the action ends, a failure to make
+-- it included.
 withAccount :: Text -> (SlotAccount -> IO a) -> IO a
-withAccount name use = (makeAccount name >>= use) `finally` removeAccount name
+withAccount name use = (makeAccount name >>= joined >>= use) `finally` removeAccount name
+  where
+    joined account = do
+      withCWString buildersGroupName $ \group -> withCWString (T.unpack name) $ \member ->
+        succeeded ("adding " <> T.unpack name <> " to the group " <> buildersGroupName) =<< c_group_add group member
+      pure account
+
+-- | The build accounts' local group, the one the store names
+-- ("Nix.Store.Access"), which the checks make and every slot's account
+-- is a member of.
+buildersGroupName :: String
+buildersGroupName = "nixbld"
+
+-- | Run an action with the build accounts' group made for it and removed
+-- after it however the action ends.  A group of that name already on the
+-- machine fails the checks rather than being taken for theirs.
+withBuildersGroup :: IO a -> IO a
+withBuildersGroup action =
+  withCWString buildersGroupName $ \wide -> do
+    succeeded ("making the group " <> buildersGroupName) =<< c_group_make wide
+    action `finally` (c_group_remove wide >>= reportRemoval)
+  where
+    reportRemoval code =
+      unless (code == 0) (putStrLn ("  removing the group " <> buildersGroupName <> " failed with Win32 error " <> show code))
+
+-- | The SID of the build accounts' group, which the administrator's run
+-- made.
+buildersGroupSid :: IO Sid
+buildersGroupSid = do
+  text <- withCWString buildersGroupName $ \wide -> wideResult (c_account_sid wide)
+  maybe (ioError (userError ("the group " <> buildersGroupName <> " has no SID: " <> T.unpack text))) pure (sidFromText text)
 
 makeAccount :: Text -> IO SlotAccount
 makeAccount name =
@@ -618,9 +674,10 @@ accountChecks checks = do
       fixture = Fixture (scHelper checks) builder root service systemRoot runs
   makeDirectory tools (toolsSddl service)
   Dir.copyFile self builder
+  builders <- buildersGroupSid
   withSlot fixture (scSlotOne checks) $ \one ->
     withSlot fixture (scSlotTwo checks) $ \two ->
-      accountCheckList fixture checks one two
+      (<>) <$> accountCheckList fixture checks one two <*> storeAccountChecks fixture builders one two
 
 -- | Windows' directory where the environment does not say.
 defaultSystemRoot :: FilePath
@@ -971,6 +1028,185 @@ powerShellEnvironment fixture slot =
         "LOCALAPPDATA=" <> slotBuildDir slot
       ]
 
+-- ---------------------------------------------------------------------------
+-- The store, as build accounts meet it
+-- ---------------------------------------------------------------------------
+
+-- | The store's layout as build accounts meet it, this process being the
+-- service: a store directory made where the machine has the build
+-- accounts' group, an output a slot makes in it, which this process
+-- registers, and what each slot may do to it before and after.  The
+-- store is made at the system drive's root, since the store's open
+-- checks every directory on the way to it, and the runner's own are not
+-- the store's to vouch for.
+storeAccountChecks :: Fixture -> Sid -> Slot -> Slot -> IO [Bool]
+storeAccountChecks fixture builders one two = do
+  putStrLn "store/build-accounts"
+  tag <- Proc.getCurrentPid
+  let base = takeDrive (fxSystemRoot fixture) </> ("nova-nix-store-accounts-" <> show tag)
+      store = base </> "store"
+      output = store </> "output"
+      file = output </> "file"
+      locked = store </> "locked"
+      lockedFile = locked </> "file"
+      service = sidText (fxService fixture)
+      sidOf slot = sidText (slotSid slot)
+      -- Each entry of a DACL as DirDacl reads it, the SIDs given as text.
+      allowing flags rights sid = DirDacl.DaclEntry 0 flags rights (Just sid)
+      itself = 0x0
+      -- OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE.
+      passedDown = 0x3
+      -- INHERITED_ACE.
+      inheritedFlag = 0x10
+      carries label protected expected path = do
+        dacl <- try (DirDacl.directoryDacl path)
+        pure $ case dacl of
+          Left (failure :: IOException) -> Fail (label <> ": " <> T.pack (show failure))
+          Right found -> assertEqual label (Just (DirDacl.Dacl protected (sort expected))) (fmap (\reading -> reading {DirDacl.daclEntries = sort (DirDacl.daclEntries reading)}) found)
+      ownerOf path = do
+        owner <- try (DirDacl.entryOwner path)
+        pure (either (\(failure :: IOException) -> Left (T.pack (show failure))) Right owner)
+      -- The rights a build might use to change a node.
+      changes =
+        [ ("write its data", fileWriteData),
+          ("append to it", fileAppendData),
+          ("write its attributes", fileWriteAttributes),
+          ("delete it", deleteRight),
+          ("change its DACL", writeDac),
+          ("change its owner", writeOwner)
+        ]
+      refusedOpens slot path = traverse (\(label, access) -> (,) (label <> " as " <> sidOf slot) <$> runBuilder fixture slot id ["open-for", show access, path])
+      refusedChanges slot path = refusedOpens slot path changes
+      -- What the group's grant leaves out on the store's directory: the
+      -- two rights it holds, FILE_ADD_FILE and FILE_ADD_SUBDIRECTORY, are
+      -- the first two the list names on a file.
+      storeChanges = drop 2 changes
+      allRefused = foldr (andThen . refusedAttempt) Pass
+  results <-
+    sequence
+      [ runTestM "where the machine has the build accounts' group, a store's directory grants its entries to itself alone, and the group the right to create entries alone" $ do
+          createStoreDirectory store
+          carries
+            "the store's DACL"
+            True
+            [ allowing itself fileAllAccess service,
+              allowing itself fileAllAccess localSystemSid,
+              allowing itself fileAllAccess administratorsSid,
+              allowing itself readAndExecute usersSid,
+              allowing itself createOnly (sidText builders)
+            ]
+            store,
+        -- The group's entry is the only one that lets a slot create in the
+        -- store's directory, so a slot making its output there is the group
+        -- entry standing for the account's.
+        runTestM "a build account makes its output in the store's directory through the group's entry, and what it makes takes its token's own DACL" $ do
+          made <- runBuilder fixture one id ["mkdir", output]
+          filled <- runBuilder fixture one id ["create", file]
+          aside <- refusedOpens one store storeChanges
+          owner <- ownerOf output
+          dacl <- try (DirDacl.directoryDacl output)
+          let entries = either (\(_ :: IOException) -> []) (maybe [] DirDacl.daclEntries) dacl
+          pure $
+            ranAs ExitSuccess made
+              `andThen` assertEqual "the output made" (Just 0) (attempt made)
+              `andThen` assertEqual "a file made in it" (Just 0) (attempt filled)
+              `andThen` assertEqual "its owner" (Right (Just (sidOf one))) owner
+              `andThen` assertEqual "an entry it took from the store's directory" [] (filter ((/= 0) . (.&. inheritedFlag) . DirDacl.deFlags) entries)
+              `andThen` assertEqual "an entry for the group" [] (filter ((== Just (sidText builders)) . DirDacl.deSid) entries)
+              `andThen` allRefused aside,
+        runTestM "another build account cannot reach an output while it is built" $ do
+          outcomes <-
+            traverse
+              (\(label, operation) -> (,) label <$> runBuilder fixture two id operation)
+              [ ("read the other slot's output", ["open", file]),
+                ("create in the other slot's output", ["create", output </> "added"]),
+                ("delete the other slot's file", ["delete", file])
+              ]
+          pure (allRefused outcomes),
+        runTestM "registering an output makes each node this process's, as the service's, with a valid path's DACL, and keeps its NAR hash" $ do
+          before <- ExecBit.narHashOfPath processCaseHack output
+          canonicalizeMetadata output
+          after <- ExecBit.narHashOfPath processCaseHack output
+          owners <- traverse ownerOf [output, file]
+          -- A directory's entries are passed down; a file's carry no
+          -- inheritance flags.
+          let valid flags =
+                [ allowing flags fileAllAccess service,
+                  allowing flags fileAllAccess localSystemSid,
+                  allowing flags fileAllAccess administratorsSid,
+                  allowing flags readAndExecute usersSid,
+                  allowing flags readAndExecute (sidText builders),
+                  allowing flags readControl ownerRightsSid
+                ]
+          outputDacl <- carries "the output's DACL" True (valid passedDown) output
+          fileDacl <- carries "its file's DACL" True (valid itself) file
+          pure $
+            assertEqual "the NAR hash" before after
+              `andThen` assertEqual "the owners" [Right (Just service), Right (Just service)] owners
+              `andThen` outputDacl
+              `andThen` fileDacl,
+        runTestM "a registered output is kept from every build, the one that made it included, and each may read it" $ do
+          changed <- concat <$> traverse (\slot -> (<>) <$> refusedChanges slot file <*> refusedChanges slot output) [one, two]
+          others <-
+            traverse
+              (\(label, slot, operation) -> (,) label <$> runBuilder fixture slot id operation)
+              [ ("create in it as the slot that made it", one, ["create", output </> "added"]),
+                ("create in it as another slot", two, ["create", output </> "added"]),
+                ("delete its file as the slot that made it", one, ["delete", file])
+              ]
+          readings <- traverse (\slot -> runBuilder fixture slot id ["open", file]) [one, two]
+          pure (allRefused (changed <> others) `andThen` assertEqual "reading it" [Just 0, Just 0] (map attempt readings)),
+        -- Whether the service can take such an output, holding the
+        -- privileges it is given and no others, is what this measures, so
+        -- the log says which it did: made the output its own, or failed,
+        -- naming the node it could not reach.
+        runTestM "registering an output whose DACL a build set to grant it alone makes it this process's, or fails naming a node of it" $ do
+          steps <- traverse (runBuilder fixture one id) [["mkdir", locked], ["create", lockedFile], ["lock", lockedFile], ["lock", locked]]
+          registered <- try (canonicalizeMetadata locked)
+          outcome <- case registered of
+            Right () -> do
+              putStrLn "  NOTE  registering an output that grants this process nothing made it this process's"
+              owner <- ownerOf locked
+              pure (assertEqual "its owner" (Right (Just service)) owner)
+            Left err -> do
+              putStrLn ("  NOTE  registering an output that grants this process nothing failed: " <> show (err :: IOException))
+              pure (assertEqual "the failure names a node of the output" True (maybe False (locked `isPrefixOf`) (ioeGetFileName err)))
+          pure (assertEqual "the build's steps" (replicate 4 (Just 0)) (map attempt steps) `andThen` outcome)
+      ]
+  -- What the slot locked is the slot's to remove, where registering it did
+  -- not make it this process's.
+  _ <- runBuilder fixture one id ["remove-tree", locked]
+  removed <- try (Dir.removePathForcibly base)
+  either (\err -> putStrLn ("  removing " <> base <> ": " <> show (err :: IOException))) pure removed
+  pure results
+
+-- | The rights a node's DACL grants (winnt.h): @FILE_ALL_ACCESS@,
+-- @FILE_GENERIC_READ | FILE_GENERIC_EXECUTE@, the build accounts' group's
+-- create-only grant on the store's directory, and @READ_CONTROL@.
+fileAllAccess, readAndExecute, createOnly, readControl :: Word32
+fileAllAccess = 0x1F01FF
+readAndExecute = 0x1200A9
+createOnly = 0x1000A6
+readControl = 0x20000
+
+-- | The rights a build could change a node through (winnt.h):
+-- @FILE_WRITE_DATA@, @FILE_APPEND_DATA@, @FILE_WRITE_ATTRIBUTES@,
+-- @DELETE@, @WRITE_DAC@ and @WRITE_OWNER@.
+fileWriteData, fileAppendData, fileWriteAttributes, deleteRight, writeDac, writeOwner :: CULong
+fileWriteData = 0x2
+fileAppendData = 0x4
+fileWriteAttributes = 0x100
+deleteRight = 0x10000
+writeDac = 0x40000
+writeOwner = 0x80000
+
+-- | The well-known SIDs a store's DACLs name beside SYSTEM's:
+-- Administrators, Users and OWNER RIGHTS.
+administratorsSid, usersSid, ownerRightsSid :: Text
+administratorsSid = "S-1-5-32-544"
+usersSid = "S-1-5-32-545"
+ownerRightsSid = "S-1-3-4"
+
 -- | That a builder's attempt was refused access, labelled.
 refusedAttempt :: (Text, Run) -> TestResult
 refusedAttempt (label, run) =
@@ -1127,7 +1363,13 @@ windowsSandboxBuilder operation = case operation of
     exitWith (if code == 0 then ExitSuccess else ExitFailure (fromIntegral code))
   ["crash"] -> c_crash
   ["open", path] -> attemptOn path (`c_open` genericRead)
+  ["open-for", accessText, path] | Just access <- readMaybe accessText -> attemptOn path (`c_open` access)
   ["create", path] -> attemptOn path c_create
+  ["mkdir", path] -> attemptOn path c_mkdir
+  ["lock", path] -> attemptOn path c_lock
+  ["remove-tree", path] -> do
+    removed <- try (Dir.removePathForcibly path)
+    logLine ("result", either (\(failure :: IOException) -> T.pack (show failure)) (const "0") removed)
   ["delete", path] -> attemptOn path c_delete
   ["list", wildcard] -> attemptOn wildcard c_list
   ["key", path] -> attemptOn path c_open_key

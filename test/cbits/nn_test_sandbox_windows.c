@@ -1041,7 +1041,128 @@ unsigned long nova_test_open_process(unsigned long pid)
     return 0;
 }
 
+/* Make the local group NAME, which the build accounts are made members
+ * of; one already there is a failure, ERROR_ALIAS_EXISTS, so a machine's
+ * own group is never taken for the tests'. */
+unsigned long nova_test_group_make(const wchar_t *name)
+{
+    LOCALGROUP_INFO_0 group;
+    DWORD bad_field = 0;
+    group.lgrpi0_name = (LPWSTR)name;
+    return NetLocalGroupAdd(NULL, 0, (LPBYTE)&group, &bad_field);
+}
+
+/* Make the local account MEMBER a member of the local group GROUP, before
+ * it is logged on, so its token holds the group. */
+unsigned long nova_test_group_add(const wchar_t *group, const wchar_t *member)
+{
+    LOCALGROUP_MEMBERS_INFO_3 entry;
+    entry.lgrmi3_domainandname = (LPWSTR)member;
+    return NetLocalGroupAddMembers(NULL, group, 3, (LPBYTE)&entry, 1);
+}
+
+/* Remove the local group NAME; one already gone is no failure. */
+unsigned long nova_test_group_remove(const wchar_t *name)
+{
+    NET_API_STATUS status = NetLocalGroupDel(NULL, name);
+    return status == NERR_Success || status == NERR_GroupNotFound || status == ERROR_NO_SUCH_ALIAS ? 0 : status;
+}
+
+/* The SID of the account NAME, in the string form ConvertSidToStringSidW
+ * writes, to *SID for LocalFree. */
+unsigned long nova_test_account_sid(const wchar_t *name, wchar_t **sid)
+{
+    BYTE sid_bytes[SECURITY_MAX_SID_SIZE];
+    unsigned long error = account_sid(name, sid_bytes);
+    *sid = NULL;
+    if (error != 0)
+        return error;
+    if (!ConvertSidToStringSidW(sid_bytes, sid)) {
+        *sid = NULL;
+        return GetLastError();
+    }
+    return 0;
+}
+
+/* Make the directory PATH with no security descriptor of its own, as a
+ * builder makes one: it takes what its parent passes down, or the
+ * token's default DACL where the parent passes nothing down. */
+unsigned long nova_test_mkdir(const wchar_t *path)
+{
+    return CreateDirectoryW(path, NULL) ? 0 : GetLastError();
+}
+
+/* Give PATH a protected DACL granting this process's user alone full
+ * control, passed down, as a build would to keep its output from the
+ * service. */
+unsigned long nova_test_lock(const wchar_t *path)
+{
+    union {
+        TOKEN_USER user;
+        BYTE bytes[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+    } buffer;
+    union {
+        ACL acl;
+        BYTE bytes[sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) + SECURITY_MAX_SID_SIZE];
+    } list;
+    HANDLE token;
+    DWORD size;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return GetLastError();
+    if (!GetTokenInformation(token, TokenUser, &buffer, sizeof buffer, &size)) {
+        DWORD error = GetLastError();
+        CloseHandle(token);
+        return error;
+    }
+    CloseHandle(token);
+    if (!InitializeAcl(&list.acl, sizeof list, ACL_REVISION))
+        return GetLastError();
+    if (!AddAccessAllowedAceEx(&list.acl, ACL_REVISION, OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE, FILE_ALL_ACCESS,
+                               buffer.user.User.Sid))
+        return GetLastError();
+    return SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                 NULL, NULL, &list.acl, NULL);
+}
+
 #else
+
+unsigned long nova_test_group_make(const wchar_t *name)
+{
+    (void)name;
+    return NOT_ON_WINDOWS;
+}
+
+unsigned long nova_test_group_add(const wchar_t *group, const wchar_t *member)
+{
+    (void)group;
+    (void)member;
+    return NOT_ON_WINDOWS;
+}
+
+unsigned long nova_test_group_remove(const wchar_t *name)
+{
+    (void)name;
+    return NOT_ON_WINDOWS;
+}
+
+unsigned long nova_test_account_sid(const wchar_t *name, wchar_t **sid)
+{
+    (void)name;
+    *sid = NULL;
+    return NOT_ON_WINDOWS;
+}
+
+unsigned long nova_test_mkdir(const wchar_t *path)
+{
+    (void)path;
+    return NOT_ON_WINDOWS;
+}
+
+unsigned long nova_test_lock(const wchar_t *path)
+{
+    (void)path;
+    return NOT_ON_WINDOWS;
+}
 
 unsigned long nova_test_account_make(const wchar_t *name, wchar_t **password, const char **failed)
 {
