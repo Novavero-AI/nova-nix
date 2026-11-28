@@ -339,6 +339,35 @@ testSubstituter = do
           Left (Subst.FatalFailure err) | "hash mismatch" `T.isInfixOf` err -> Pass
           Left other -> Fail ("expected fatal hash mismatch, got: " <> Subst.attemptFailureMessage other)
           Right _ -> Fail "digest mismatch was accepted",
+      -- The parser refuses what upstream's refuses past the grammar, so a
+      -- cache's archive holding a name, a target or a nesting past the
+      -- format's limits does not unpack, and the attempt fails with the
+      -- parser's words, digest and size notwithstanding.
+      runTestM "streaming unpack refuses an archive past upstream's NAR limits" $ do
+        tmpBase <- getTemporaryDirectory
+        let tmpDir = tmpBase </> "nova-nix-test-stream-limits"
+            file = NAR.NarRegular False "x"
+            nested depth = foldr (\_ inner -> NAR.NarDirectory [("d", inner)]) file [1 .. depth :: Int]
+            refused (entry, refusal) = do
+              forceRemoveIfExists tmpDir
+              createDirectoryIfMissing True tmpDir
+              let nar = NAR.serialise entry
+              source <- chunkReader (streamChunks 7 nar)
+              result <- Subst.consumeNarStream tmpSensitivity (tmpDir </> "out") (streamTestNarInfo nar) (CHash.hashBytes nar) source
+              pure $ case result of
+                Left failure -> assertEqual "refusal" ("NAR stream parse failed: " <> refusal) (Subst.attemptFailureMessage failure)
+                Right _ -> Fail ("an archive past the limits was accepted: " <> refusal)
+        results <-
+          traverse
+            refused
+            [ (NAR.NarDirectory [(BS.replicate 256 0x61, file)], "entry name: declared length 256 exceeds the 255-byte limit"),
+              (NAR.NarSymlink (BS.replicate 4096 0x61), "symlink target: declared length 4096 exceeds the 4095-byte limit"),
+              (NAR.NarSymlink "", "empty NAR symlink target"),
+              (NAR.NarSymlink "a\NULb", "NAR symlink target holds NUL: \"a\\NULb\""),
+              (nested 64, "NAR directory nesting exceeds the maximum depth of 64: \"d\"")
+            ]
+        forceRemoveIfExists tmpDir
+        pure (foldr andThen Pass results),
       -- A narinfo lying about NarSize in either direction is refused
       -- at NarDone - the grammar completed, so the mismatch is the
       -- narinfo misdeclaring, and fatal.

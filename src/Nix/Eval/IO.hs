@@ -958,9 +958,12 @@ instance MonadEval EvalIO where
 
   addSourceNar name narBytes =
     case NAR.deserialise narBytes of
-      -- Unreachable in practice: the bytes come from NAR.serialise of a
-      -- tree this process just built.  Kept total for the FFI-adjacent
-      -- boundary rather than trusting the round trip.
+      -- The bytes come from NAR.serialise of a tree this process just
+      -- walked, so they fail to parse only when the tree holds a name or
+      -- a link target past the format's limits: the walk archives one,
+      -- as upstream's dump does, and the parser refuses it, as
+      -- upstream's parse of that dump does.  On Windows a name of 255
+      -- UTF-16 units can pass 255 bytes of UTF-8.
       Left err -> throwEvalError ("builtins.path: internal NAR round-trip error: " <> T.pack err)
       Right entry -> do
         sp <- storePathOrThrow (makeFixedOutputPath name "sha256" NarIngestion (sha256Digest narBytes))
